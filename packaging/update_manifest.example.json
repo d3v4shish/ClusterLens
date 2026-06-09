@@ -1,0 +1,30 @@
+{
+  "app_id": "ClusterLens",
+  "channel": "stable",
+  "version": "0.4.0a1",
+  "published_utc": "2026-05-15T00:00:00Z",
+  "artifacts": [
+    {
+      "name": "ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "variant": "cpu",
+      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "sha256": "replace-with-release-sha256",
+      "signature": "replace-with-detached-signature-or-signed-binary-proof",
+      "size_bytes": 0
+    },
+    {
+      "name": "ClusterLens-0.4.0a1-windows-x64-gpu-cu121.zip",
+      "variant": "gpu-cu121",
+      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-gpu-cu121.zip",
+      "sha256": "replace-with-release-sha256",
+      "signature": "replace-with-detached-signature-or-signed-binary-proof",
+      "size_bytes": 0
+    }
+  ],
+  "minimum_supported_version": "0.4.0a1",
+  "notes": [
+    "Updates must preserve the platform runtime root: %LOCALAPPDATA% on Windows, XDG user-data on Linux, and ~/Library/Application Support on macOS.",
+    "The updater must verify sha256 and code signature before replacing binaries.",
+    "The app must run release gates before a public update is published."
+  ]
+}

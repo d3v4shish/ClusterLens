@@ -1,0 +1,90 @@
+{
+  "app_id": "ClusterLens",
+  "display_name": "ClusterLens",
+  "version_source": "pyproject.toml",
+  "runtime_root": "%LOCALAPPDATA%\\ClusterLens",
+  "runtime_roots": {
+    "windows": "%LOCALAPPDATA%\\ClusterLens",
+    "linux": "$XDG_DATA_HOME/ClusterLens or ~/.local/share/ClusterLens",
+    "macos": "~/Library/Application Support/ClusterLens"
+  },
+  "installer": {
+    "target": "windows-x64",
+    "build_guard_script": "scripts/build_production_package.py",
+    "variant_build_script": "scripts/build_pyqt_binary.py",
+    "pyinstaller_spec": "packaging/pyqt_production.spec",
+    "windows_installer_script": "packaging/windows_installer.iss",
+    "build_variants": [
+      {
+        "id": "cpu",
+        "label": "CPU",
+        "default_package_mode": "onefile",
+        "requirements": "packaging/requirements-build-cpu.txt",
+        "artifact_suffix": "cpu",
+        "runtime_downloads": "model weights only",
+        "notes": "Default public build. Must not include nvidia-* or triton wheels."
+      },
+      {
+        "id": "gpu-cu121",
+        "label": "GPU CUDA 12.1",
+        "default_package_mode": "onedir",
+        "requirements": "packaging/requirements-build-gpu-cu121.txt",
+        "artifact_suffix": "gpu-cu121",
+        "runtime_downloads": "model weights only",
+        "notes": "Separate large package for NVIDIA CUDA systems. Uses onedir to avoid PyInstaller one-file archive limits."
+      }
+    ],
+    "platform_targets": [
+      "windows-x64",
+      "linux-x64",
+      "macos-x64",
+      "macos-arm64"
+    ],
+    "entrypoint": "apps.pyqt_production.app:run",
+    "icon_png": "apps/pyqt_production/assets/app_icon.png",
+    "icon_ico": "apps/pyqt_production/assets/app_icon.ico",
+    "include_runtime_dirs": [
+      "model_assets"
+    ],
+    "include_optional_accelerators": [
+      "hf_xet",
+      "onnxruntime-gpu or onnxruntime-directml",
+      "torch CUDA build when GPU package is shipped"
+    ],
+    "code_signing": {
+      "required_for_public_release": true,
+      "certificate_path_env": "IMAGE_CLUSTERING_SIGNING_CERT",
+      "timestamp_server_env": "IMAGE_CLUSTERING_TIMESTAMP_SERVER"
+    }
+  },
+  "runtime_cleanup_policy": {
+    "uninstall_default": "preserve_user_data",
+    "user_option_remove_all": true,
+    "cleanup_script": "scripts/cleanup_production_runtime.ps1",
+    "cross_platform_cleanup_script": "scripts/cleanup_production_runtime.py",
+    "preserved_by_cache_clear": [
+      "image tag database",
+      "logs",
+      "crash records",
+      "model assets",
+      "cached model downloads"
+    ]
+  },
+  "release_gates": {
+    "command": "python -m apps.pyqt_production.release_gates --report-dir %LOCALAPPDATA%\\ClusterLens\\benchmarks\\release_gates",
+    "commands": {
+      "windows": "python -m apps.pyqt_production.release_gates --report-dir %LOCALAPPDATA%\\ClusterLens\\benchmarks\\release_gates",
+      "linux": "python -m apps.pyqt_production.release_gates --report-dir ${XDG_DATA_HOME:-~/.local/share}/ClusterLens/benchmarks/release_gates",
+      "macos": "python -m apps.pyqt_production.release_gates --report-dir ~/Library/Application Support/ClusterLens/benchmarks/release_gates"
+    },
+    "requires_valid_bundled_fallback_model": true,
+    "requires_runtime_migrations": true,
+    "requires_support_bundle_redaction": true
+  },
+  "updater": {
+    "channel": "stable",
+    "manifest_file": "packaging/update_manifest.example.json",
+    "must_verify_signature_before_install": true,
+    "must_preserve_runtime_root": true
+  }
+}

@@ -1,0 +1,14 @@
+PyQt6>=6.6,<7.0
+numpy>=1.26,<2.0
+scikit-learn>=1.4,<2.0
+Pillow>=10.0,<12.0
+transformers>=4.40,<5.0
+timm>=1.0,<2.0
+facenet-pytorch>=2.6,<3.0
+faiss-cpu>=1.8,<2.0
+hdbscan>=0.8.33,<1.0
+imagehash>=4.3,<5.0
+onnxruntime>=1.17,<2.0
+opencv-python>=4.9,<5.0
+hf_xet>=1.1,<2.0
+pyinstaller>=6.20,<7.0
