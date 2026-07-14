@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.folder:
-        gates.append(_benchmark_smoke_gate(args.folder, report_dir, args.allow_downloads))
+        gates.append(_benchmark_smoke_gate(args.folder, report_dir, args.allow_downloads, fallback))
     else:
         gates.append(GateResult("benchmark_smoke", "SKIP", "Pass --folder to run a real-image smoke benchmark."))
 
@@ -116,17 +116,20 @@ def _path_gates(layout) -> list[GateResult]:
     return gates
 
 
-def _benchmark_smoke_gate(folder: str, report_dir: Path, allow_downloads: bool) -> GateResult:
+def _benchmark_smoke_gate(folder: str, report_dir: Path, allow_downloads: bool, fallback_model: str | None) -> GateResult:
     try:
         from apps.pyqt_production import benchmark
 
+        if not allow_downloads and not fallback_model:
+            return GateResult("benchmark_smoke", "FAIL", "No bundled fallback model is available for the smoke benchmark.")
+        model_name = fallback_model or "fast_preview"
         args = [
             "--bench",
             "cluster",
             "--folder",
             folder,
             "--models",
-            "fast_preview",
+            model_name,
             "--backends",
             "cosine-kmeans",
             "--passes",
@@ -138,7 +141,11 @@ def _benchmark_smoke_gate(folder: str, report_dir: Path, allow_downloads: bool) 
         if allow_downloads:
             args.append("--allow-downloads")
         exit_code = benchmark.main(args)
-        return GateResult("benchmark_smoke", "PASS" if exit_code == 0 else "FAIL", f"exit_code={exit_code}")
+        return GateResult(
+            "benchmark_smoke",
+            "PASS" if exit_code == 0 else "FAIL",
+            f"exit_code={exit_code} model={model_name}",
+        )
     except Exception as exc:
         return GateResult("benchmark_smoke", "FAIL", str(exc))
 

@@ -1,0 +1,16 @@
+{
+  "display_name": "ArcFace R100 Glint360K",
+  "bundle_kind": "embedder",
+  "profile": "latest_gpu",
+  "supported_modes": ["human"],
+  "summary": "Official InsightFace R100 Glint360K embedder from the antelopev2 pack for high-end GPU identity matching.",
+  "hardware_class": "Desktop GPU",
+  "recommended_pair_id": "scrfd_10g_kps",
+  "source_url": "https://github.com/deepinsight/insightface/tree/master/model_zoo",
+  "license": "Verify InsightFace model license before distribution.",
+  "input_name": "input.1",
+  "input_size": [112, 112],
+  "output_name": "1333",
+  "mean": [127.5, 127.5, 127.5],
+  "std": [128.0, 128.0, 128.0]
+}

@@ -34,6 +34,11 @@ def test_variant_builder_matches_manifest_variants() -> None:
     assert build_pyqt_binary.BUILD_VARIANTS["gpu-cu121"].default_package_mode == "onedir"
 
 
+def test_variant_builder_prepares_default_bundled_model_assets() -> None:
+    assert build_pyqt_binary.DEFAULT_BUNDLED_MODEL_ASSETS == ("fast_preview", "resnet", "convnext")
+    assert build_pyqt_binary.DEFAULT_MODEL_ASSET_OUTPUT_DIR == REPO_ROOT / "build" / "model_assets"
+
+
 def test_cpu_requirements_force_cpu_torch_wheels() -> None:
     requirements = (REPO_ROOT / "packaging" / "requirements-build-cpu.txt").read_text(encoding="utf-8")
 

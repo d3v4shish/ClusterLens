@@ -73,6 +73,31 @@ HF_CACHE_DIR_NAMES = {
     "mobileclip": ("models--apple--mobileclip_s0_timm",),
 }
 
+HF_CACHE_REQUIRED_FILES = {
+    "clip": (
+        ("config.json",),
+        ("preprocessor_config.json", "processor_config.json"),
+        ("tokenizer.json", "vocab.json"),
+        ("model.safetensors", "pytorch_model.bin"),
+    ),
+    "openclip": (
+        ("config.json",),
+        ("preprocessor_config.json", "processor_config.json"),
+        ("tokenizer.json", "vocab.json"),
+        ("model.safetensors", "pytorch_model.bin", "open_clip_pytorch_model.bin"),
+    ),
+    "siglip": (
+        ("config.json",),
+        ("preprocessor_config.json", "processor_config.json"),
+        ("tokenizer.json", "spiece.model"),
+        ("model.safetensors", "pytorch_model.bin"),
+    ),
+    "mobileclip": (
+        ("config.json",),
+        ("model.safetensors", "pytorch_model.bin", "open_clip_pytorch_model.bin"),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ModelAssetBundle:
@@ -266,7 +291,8 @@ class ModelAssetService:
 
         hf_hub_dir = cache_dir / "huggingface" / "hub"
         for directory_name in HF_CACHE_DIR_NAMES.get(normalized, ()):
-            if (hf_hub_dir / directory_name).exists():
+            required_groups = HF_CACHE_REQUIRED_FILES.get(normalized, ())
+            if _hf_cache_snapshot_complete(hf_hub_dir / directory_name, required_groups):
                 return True
         return False
 
@@ -441,3 +467,20 @@ def _path_size(path: Path) -> int:
         except OSError:
             continue
     return total
+
+
+def _hf_cache_snapshot_complete(repo_dir: Path, required_groups: tuple[tuple[str, ...], ...]) -> bool:
+    if not required_groups or not repo_dir.exists():
+        return False
+    candidates: list[Path] = []
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.exists():
+        for path in snapshots_dir.iterdir():
+            if path.is_dir():
+                candidates.append(path)
+    if not candidates:
+        candidates.append(repo_dir)
+    for root in candidates:
+        if all(any((root / relative_path).exists() for relative_path in group) for group in required_groups):
+            return True
+    return False

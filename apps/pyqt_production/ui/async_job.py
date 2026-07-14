@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from itertools import count
+from time import monotonic, sleep
 
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 
@@ -113,7 +114,13 @@ class AsyncJob(QObject):
         return bool(self._cancel_requested)
 
 
-__all__ = ["AsyncJob", "start_job_in_thread", "raise_if_cancelled", "Cancelled"]
+__all__ = [
+    "AsyncJob",
+    "Cancelled",
+    "raise_if_cancelled",
+    "start_job_in_thread",
+    "wait_for_thread_shutdown",
+]
 
 
 def start_job_in_thread(job: AsyncJob) -> QThread:
@@ -126,7 +133,8 @@ def start_job_in_thread(job: AsyncJob) -> QThread:
     thread.setObjectName(job._debug_name)
     job.moveToThread(thread)
     thread.started.connect(job.run)
-    thread.started.connect(lambda: append_qt_diagnostic(f"[ThreadStart] {thread.objectName()}"))
+    thread_name = thread.objectName()
+    thread.started.connect(lambda name=thread_name: append_qt_diagnostic(f"[ThreadStart] {name}"))
 
     def _stop_thread(*_args) -> None:
         thread.quit()
@@ -134,9 +142,37 @@ def start_job_in_thread(job: AsyncJob) -> QThread:
     job._worker_completed.connect(_stop_thread)
     job._worker_failed.connect(_stop_thread)
     job._worker_cancelled.connect(_stop_thread)
-    thread.finished.connect(lambda: append_qt_diagnostic(f"[ThreadFinish] {thread.objectName()}"))
+    thread.finished.connect(lambda name=thread_name: append_qt_diagnostic(f"[ThreadFinish] {name}"))
     thread.finished.connect(job.deleteLater)
     thread.finished.connect(job._signal_relay.deleteLater)
     thread.finished.connect(thread.deleteLater)
     thread.start()
     return thread
+
+
+def wait_for_thread_shutdown(
+    thread,
+    *,
+    timeout_ms: int = 2500,
+    quit_thread: bool = True,
+    poll_interval_s: float = 0.01,
+) -> bool:
+    if thread is None:
+        return True
+    try:
+        if not thread.isRunning():
+            return True
+        if quit_thread:
+            thread.quit()
+        if isinstance(thread, QThread):
+            deadline = monotonic() + max(float(timeout_ms), 0.0) / 1000.0
+            while thread.isRunning():
+                if monotonic() >= deadline:
+                    return False
+                sleep(poll_interval_s)
+            return True
+        return bool(thread.wait(timeout_ms))
+    except RuntimeError:
+        return True
+    except Exception:
+        return False

@@ -9,11 +9,13 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from threading import Lock
 
-from PIL import Image
+from PIL import Image, ImageOps
 from PyQt6.QtCore import QRect, QSize, Qt
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen
+from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
 
 from infra.settings import get_settings
+
+THUMBNAIL_CACHE_VERSION = "exif_v2"
 
 
 class ThumbnailService:
@@ -48,15 +50,36 @@ class ThumbnailService:
     def thumbnail_path(self, image_path: str, size: int) -> Path:
         source = Path(image_path).resolve()
         stat = source.stat()
-        digest = hashlib.sha256(f"{source}|{stat.st_mtime_ns}|{size}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{THUMBNAIL_CACHE_VERSION}|{source}|{stat.st_mtime_ns}|{size}".encode("utf-8")).hexdigest()
         return self.settings.thumbnail_cache_dir / f"{digest}.webp"
+
+    def invalidate_paths(self, image_paths: Sequence[str], *, sizes: Sequence[int] | None = None) -> None:
+        normalized_paths = {str(path or "").strip() for path in image_paths if str(path or "").strip()}
+        if not normalized_paths:
+            return
+        size_filter = {max(1, int(size)) for size in sizes or () if int(size) > 0}
+        with self._qimage_cache_lock:
+            stale_keys = [
+                key
+                for key in self._qimage_cache
+                if str(key[0]) in normalized_paths and (not size_filter or int(key[1]) in size_filter)
+            ]
+            for key in stale_keys:
+                self._qimage_cache.pop(key, None)
+        for image_path in normalized_paths:
+            if size_filter:
+                for size in size_filter:
+                    try:
+                        self.thumbnail_path(image_path, size).unlink(missing_ok=True)
+                    except Exception:
+                        continue
 
     def ensure_thumbnail(self, image_path: str, size: int) -> Path:
         thumb_path = self.thumbnail_path(image_path, size)
         if thumb_path.exists():
             return thumb_path
         with Image.open(image_path) as image:
-            image = image.convert("RGB")
+            image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((size, size))
             canvas = Image.new("RGB", (size, size), (255, 255, 255))
             left = (size - image.width) // 2
@@ -70,6 +93,37 @@ class ThumbnailService:
             self._new_since_prune = 0
         return thumb_path
 
+    def _load_scaled_source_qimage(self, image_path: str, size: int) -> QImage:
+        reader = QImageReader(str(image_path))
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
+            target_size = source_size.scaled(
+                QSize(size, size),
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+            if target_size.isValid() and target_size.width() > 0 and target_size.height() > 0:
+                reader.setScaledSize(target_size)
+        image = reader.read()
+        if image.isNull():
+            return image
+        scaled = image.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = QImage(size, size, QImage.Format.Format_RGB32)
+        canvas.fill(QColor("#FFFFFF"))
+        painter = QPainter(canvas)
+        try:
+            offset_x = max(0, (size - scaled.width()) // 2)
+            offset_y = max(0, (size - scaled.height()) // 2)
+            painter.drawImage(offset_x, offset_y, scaled)
+        finally:
+            painter.end()
+        return canvas
+
     def load_qimage(self, image_path: str, size: int) -> QImage:
         cache_key = (image_path, size)
         with self._qimage_cache_lock:
@@ -78,22 +132,19 @@ class ThumbnailService:
                 self._qimage_cache.move_to_end(cache_key)
                 return QImage(cached)
 
-        thumb_path = self.ensure_thumbnail(image_path, size)
-        image = QImage(str(thumb_path))
+        thumb_path = self.thumbnail_path(image_path, size)
+        image = QImage(str(thumb_path)) if thumb_path.exists() else QImage()
         if image.isNull():
-            image = QImage(image_path)
-        scaled = image.scaled(
-            size,
-            size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+            image = self._load_scaled_source_qimage(image_path, size)
+        if image.isNull():
+            thumb_path = self.ensure_thumbnail(image_path, size)
+            image = QImage(str(thumb_path))
         with self._qimage_cache_lock:
-            self._qimage_cache[cache_key] = QImage(scaled)
+            self._qimage_cache[cache_key] = QImage(image)
             self._qimage_cache.move_to_end(cache_key)
             while len(self._qimage_cache) > self.qimage_cache_size:
                 self._qimage_cache.popitem(last=False)
-        return scaled
+        return image
 
     @staticmethod
     def _normalize_contact_sheet_size(size: QSize | tuple[int, int] | int) -> tuple[int, int]:
@@ -122,8 +173,11 @@ class ThumbnailService:
         if not preview_paths:
             painter = QPainter(canvas)
             try:
-                painter.setPen(QColor("#64748B"))
-                painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, "No preview")
+                painter.setPen(QPen(QColor("#CBD5E1")))
+                placeholder = canvas.rect().adjusted(12, 12, -12, -12)
+                painter.drawRect(placeholder)
+                painter.drawLine(placeholder.topLeft(), placeholder.bottomRight())
+                painter.drawLine(placeholder.bottomLeft(), placeholder.topRight())
             finally:
                 painter.end()
             return canvas
@@ -159,7 +213,9 @@ class ThumbnailService:
                     thumb_path = self.ensure_thumbnail(image_path, thumb_request_size)
                     tile_image = QImage(str(thumb_path))
                     if tile_image.isNull():
-                        tile_image = QImage(str(image_path))
+                        reader = QImageReader(str(image_path))
+                        reader.setAutoTransform(True)
+                        tile_image = reader.read()
                 except Exception:
                     tile_image = QImage()
                 if tile_image.isNull():
@@ -175,8 +231,11 @@ class ThumbnailService:
                 painter.drawImage(offset_x, offset_y, scaled)
                 loaded_tiles += 1
             if loaded_tiles == 0:
-                painter.setPen(QColor("#64748B"))
-                painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, "Preview unavailable")
+                painter.setPen(QPen(QColor("#CBD5E1")))
+                placeholder = canvas.rect().adjusted(12, 12, -12, -12)
+                painter.drawRect(placeholder)
+                painter.drawLine(placeholder.topLeft(), placeholder.bottomRight())
+                painter.drawLine(placeholder.bottomLeft(), placeholder.topRight())
         finally:
             painter.end()
         return canvas

@@ -31,7 +31,7 @@ from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary
 from app.services.clustering_options import clustering_model_names, model_label
 from app.services.gallery_actions import GalleryActionService
 from app.services.model_assets import BUNDLED_ONNX_INPUT_SIZES, ModelAssetService
-from apps.pyqt_production.ui.async_job import AsyncJob, start_job_in_thread
+from apps.pyqt_production.ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from apps.pyqt_production.ui.error_mbox import confirmBox, errorBox, infoBox
 from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME
 from apps.shared.runtime_support import RuntimeLayout, open_path_in_shell
@@ -966,7 +966,7 @@ class ProductionSettingsDialog(QDialog):
         packages = diagnostics.get("packages") or {}
         return "\n".join(
             [
-                f"App: ClusterLens {self._app_version()}",
+                f"App: Image Clustering PyQt Production {self._app_version()}",
                 f"Python: {sys.version.split()[0]}",
                 f"Executable: {sys.executable}",
                 f"Frozen executable: {bool(getattr(sys, 'frozen', False))}",
@@ -1029,7 +1029,10 @@ class ProductionSettingsDialog(QDialog):
         if thread is None:
             return
         self._thread_roles[thread] = (str(role), job)
-        thread.finished.connect(self._on_async_thread_finished, Qt.ConnectionType.QueuedConnection)
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def _release_finished_thread(self, thread) -> None:
         if thread is None:
@@ -1070,9 +1073,8 @@ class ProductionSettingsDialog(QDialog):
                 self._release_gate_job = None
             self.run_release_gates_button.setEnabled(True)
 
-    @pyqtSlot()
-    def _on_async_thread_finished(self) -> None:
-        self._release_finished_thread(self.sender())
+    def _on_async_thread_finished(self, thread=None) -> None:
+        self._release_finished_thread(thread)
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready_to_close = True
@@ -1089,13 +1091,7 @@ class ProductionSettingsDialog(QDialog):
                     job.cancel()
                 except Exception:
                     pass
-            if thread is None:
-                continue
-            try:
-                if thread.isRunning():
-                    thread.quit()
-                    ready_to_close = bool(thread.wait(timeout_ms)) and ready_to_close
-            except Exception:
+            if not wait_for_thread_shutdown(thread, timeout_ms=timeout_ms):
                 ready_to_close = False
         if ready_to_close:
             self._cache_usage_job = None

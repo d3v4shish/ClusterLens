@@ -8,6 +8,7 @@ facenet-pytorch>=2.6,<3.0
 faiss-cpu>=1.8,<2.0
 hdbscan>=0.8.33,<1.0
 imagehash>=4.3,<5.0
+onnx>=1.15,<2.0
 onnxruntime>=1.17,<2.0
 opencv-python>=4.9,<5.0
 hf_xet>=1.1,<2.0

@@ -1,0 +1,22 @@
+{
+  "display_name": "YOLO5Face Nano",
+  "bundle_kind": "detector",
+  "backend_family": "yolo",
+  "profile": "edge",
+  "supported_modes": ["human"],
+  "summary": "Fast YOLO-style face detector. Use it for detection only; identity matching still depends on the embedder.",
+  "hardware_class": "Edge GPU / desktop GPU",
+  "recommended_pair_id": "arcface_r50",
+  "source_url": "https://github.com/deepcam-cn/yolov5-face",
+  "license": "Verify YOLO5Face model license before distribution.",
+  "input_name": "images",
+  "input_size": [640, 640],
+  "output_boxes_name": "boxes",
+  "output_scores_name": "scores",
+  "mean": [0.0, 0.0, 0.0],
+  "std": [255.0, 255.0, 255.0],
+  "score_threshold": 0.35,
+  "max_detections": 50,
+  "boxes_normalized": true,
+  "box_format": "xyxy"
+}

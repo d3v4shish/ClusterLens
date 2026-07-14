@@ -1,0 +1,22 @@
+{
+  "display_name": "SCRFD 2.5G",
+  "bundle_kind": "detector",
+  "backend_family": "scrfd",
+  "profile": "balanced",
+  "supported_modes": ["human"],
+  "summary": "Balanced SCRFD detector for reliable gallery review and search quality.",
+  "hardware_class": "Desktop CPU / GPU",
+  "recommended_pair_id": "arcface_r50",
+  "source_url": "https://github.com/deepinsight/insightface/tree/master/detection/scrfd",
+  "license": "Verify InsightFace model license before distribution.",
+  "input_name": "images",
+  "input_size": [640, 640],
+  "output_boxes_name": "boxes",
+  "output_scores_name": "scores",
+  "mean": [0.0, 0.0, 0.0],
+  "std": [255.0, 255.0, 255.0],
+  "score_threshold": 0.35,
+  "max_detections": 50,
+  "boxes_normalized": true,
+  "box_format": "xyxy"
+}

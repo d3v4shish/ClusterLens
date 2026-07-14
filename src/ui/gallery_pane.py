@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 from queue import Empty, PriorityQueue
 from pathlib import Path
 from threading import Event, Lock
 from time import perf_counter
 
-from PyQt6.QtCore import QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage, QPixmap
+from PyQt6.QtCore import QEvent, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
 from app.selection import SelectionTarget
 from app.services.gallery_actions import GalleryActionService
 from app.services.image_tags import ImageTagService
+from app.services.photo_metadata import MetadataSidecarService
 from app.services.thumbnails import ThumbnailService
 from infra.logging_config import get_logger
 from infra.qt_diagnostics import append_qt_diagnostic
@@ -21,10 +21,14 @@ from infra.settings import get_settings
 from .error_mbox import ExifMetadataDialog, ImageTagsDialog, confirmBox, errorBox, infoBox
 from .gallery_model import GalleryImageModel, GalleryItemDelegate
 from .photo_inspector_dialog import PhotoInspectorDialog
-from .async_job import AsyncJob, start_job_in_thread
+from .async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from .common import build_help_inline
 
 LOGGER = get_logger(__name__)
+
+MAX_PENDING_UI_ITEMS_PER_FLUSH = 24
+MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE = 48
+MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE = 24
 
 
 GALLERY_HELP = {
@@ -210,6 +214,7 @@ class GalleryPane(QWidget):
     remove_from_review_requested = pyqtSignal(list)
     paths_removed = pyqtSignal(list)
     metadata_changed = pyqtSignal(list)
+    visible_paths_changed = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -220,6 +225,7 @@ class GalleryPane(QWidget):
         self.thumbnail_prefetch_rows = int(self.settings.thumbnail_prefetch_rows)
         self.images: list[str] = []
         self.request_generation = 0
+        self._last_visible_paths: tuple[str, ...] = ()
         self.loader_queue = ThumbnailRequestQueue()
         self.loader_threads: list[ImageLoaderThread] = []
         self._retained_loader_threads: list[ImageLoaderThread] = []
@@ -231,10 +237,8 @@ class GalleryPane(QWidget):
         self.loaded_indexes: set[int] = set()
         self.failed_indexes: set[int] = set()
         self.pending_indexes: set[int] = set()
-        self.pending_ui_items: list[tuple[int, str, object]] = []
-        self.pixmap_cache: OrderedDict[tuple[str, int], QPixmap] = OrderedDict()
-        self._pixmap_cache_size = int(self.settings.thumbnail_cache_size)
-        self.thumbnail_service = ThumbnailService(qimage_cache_size=self._pixmap_cache_size)
+        self.pending_ui_items: list[tuple[int, str, QImage]] = []
+        self.thumbnail_service = ThumbnailService(qimage_cache_size=self.settings.thumbnail_cache_size)
         self.action_service = GalleryActionService()
         self.image_tag_service: ImageTagService | None = None
         self.first_paint_start = 0.0
@@ -243,9 +247,20 @@ class GalleryPane(QWidget):
         self.metrics_context: dict[str, dict[str, object]] = {}
         self.inspector_context_provider = None  # optional callable(path) -> dict
         self.inspector_display_mode = "advanced"
+        self.face_edit_service_provider = None
+        self.face_edit_saved_callback = None
+        self.face_draft_provider = None
+        self.face_draft_updated_callback = None
+        self.face_box_drag_enabled_provider = None
+        self.face_box_move_callback = None
+        self.face_remove_all_callback = None
+        self.face_reset_draft_callback = None
+        self.face_auto_clean_callback = None
         self.action_target_provider = None
         self.metadata_service = None
+        self.image_tag_service = None
         self.review_action_mode = "add"
+        self._face_box_drag_state = None
         self.main_layout = QVBoxLayout(self)
         self.action_bar = QHBoxLayout()
         self.status_label = QLabel("")
@@ -329,6 +344,8 @@ class GalleryPane(QWidget):
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
+        self.list_view.setLayoutMode(QListView.LayoutMode.Batched)
+        self.list_view.setBatchSize(24)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
         self.list_view.setUniformItemSizes(True)
@@ -339,6 +356,7 @@ class GalleryPane(QWidget):
         self.list_view.doubleClicked.connect(self.on_item_double_clicked)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self.on_context_menu)
+        self.list_view.viewport().installEventFilter(self)
         self.list_view.verticalScrollBar().valueChanged.connect(self.schedule_visible_refresh)
         self.list_view.horizontalScrollBar().valueChanged.connect(self.schedule_visible_refresh)
         self.main_layout.addWidget(self.list_view)
@@ -361,6 +379,8 @@ class GalleryPane(QWidget):
         self.retry_failed_button.clicked.connect(self.retry_failed_visible)
         self._add_menu_action(self.metadata_menu, "Write EXIF", GALLERY_HELP["write_exif"], self.slotAddExif)
         self._add_menu_action(self.metadata_menu, "Tags: Checked/Group", GALLERY_HELP["tags"], self.slotEditTags)
+        self.export_sidecars_action = self._add_menu_action(self.metadata_menu, "Export Sidecars", GALLERY_HELP["metadata_menu"], self.slotExportMetadataSidecars)
+        self.import_sidecars_action = self._add_menu_action(self.metadata_menu, "Import Sidecars", GALLERY_HELP["metadata_menu"], self.slotImportMetadataSidecars)
         self._add_menu_action(self.file_ops_menu, "Copy Selection", GALLERY_HELP["copy_selection"], self.slotCopySelected)
         self._add_menu_action(self.file_ops_menu, "Move Selection", GALLERY_HELP["move_selection"], self.slotMoveSelected)
         self._add_menu_action(self.file_ops_menu, "Delete Selection", GALLERY_HELP["delete_selection"], self.slotDeleteSelect)
@@ -404,8 +424,20 @@ class GalleryPane(QWidget):
         image_path = index.data(self.model.PathRole)
         if not image_path:
             return
+        inspector_context = self._inspector_context_for_path(str(image_path))
+        can_edit_faces = bool(
+            isinstance(inspector_context.get("face_review"), dict)
+            and self._active_face_edit_service() is not None
+        )
+        can_remove_all_faces = bool(can_edit_faces and callable(self.face_remove_all_callback))
+        can_reset_face_draft = bool(can_edit_faces and callable(self.face_reset_draft_callback))
+        can_auto_clean_faces = bool(can_edit_faces and callable(self.face_auto_clean_callback))
         menu = QMenu(self)
         open_inspector = menu.addAction("Open Inspector")
+        edit_faces = menu.addAction("Edit Faces") if can_edit_faces else None
+        auto_clean_faces = menu.addAction("Auto-Clean This Image") if can_auto_clean_faces else None
+        remove_all_faces = menu.addAction("Remove All Face Boxes From This Image") if can_remove_all_faces else None
+        reset_face_draft = menu.addAction("Reset Face Draft For This Image") if can_reset_face_draft else None
         open_folder = menu.addAction("Open Containing Folder")
         copy_path = menu.addAction("Copy Path")
         copy_paths_action = menu.addAction("Copy Paths (Selection)")
@@ -422,6 +454,23 @@ class GalleryPane(QWidget):
         action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
         if action == open_inspector:
             self.on_item_double_clicked(index)
+        elif edit_faces is not None and action == edit_faces:
+            self._open_inspector(index, allow_face_edit=True)
+        elif auto_clean_faces is not None and action == auto_clean_faces:
+            try:
+                self.face_auto_clean_callback(str(image_path))
+            except Exception:
+                LOGGER.exception("Gallery auto-clean face boxes failed image_path=%s", image_path)
+        elif remove_all_faces is not None and action == remove_all_faces:
+            try:
+                self.face_remove_all_callback(str(image_path))
+            except Exception:
+                LOGGER.exception("Gallery remove-all face boxes failed image_path=%s", image_path)
+        elif reset_face_draft is not None and action == reset_face_draft:
+            try:
+                self.face_reset_draft_callback(str(image_path))
+            except Exception:
+                LOGGER.exception("Gallery reset face draft failed image_path=%s", image_path)
         elif action == open_folder:
             try:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(str(image_path)).parent)))
@@ -541,7 +590,7 @@ class GalleryPane(QWidget):
         thread = start_job_in_thread(job)
         self._action_thread_jobs[thread] = job
         thread.finished.connect(
-            self._on_action_thread_finished,
+            lambda thread=thread: self._on_action_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
         self._active_action_thread = thread
@@ -738,6 +787,65 @@ class GalleryPane(QWidget):
 
         self._start_action_job("Updating image tags", _run, _done)
 
+    def slotExportMetadataSidecars(self) -> None:
+        target = self._selection_for_actions()
+        if target is None:
+            return
+        if self.image_tag_service is None:
+            errorBox("Sidecar export unavailable", "Image tag service is not configured.")
+            return
+        output_dir = QFileDialog.getExistingDirectory(self, "Export Metadata Sidecars")
+        if not output_dir:
+            self.status_label.setText("Sidecar export cancelled.")
+            return
+        paths = target.as_list()
+
+        def _run(progress, cancel_check):
+            _ = cancel_check
+            progress(0, "Exporting metadata sidecars...")
+            service = MetadataSidecarService(tag_service=self.image_tag_service)
+            written = service.export_sidecars(paths, output_dir=output_dir)
+            progress(100, "Metadata sidecar export complete.")
+            return written
+
+        def _done(written) -> None:
+            count = len(dict(written or {}))
+            self.status_label.setText(f"Exported {count} metadata sidecar file(s).")
+            infoBox("Sidecar export complete", f"Exported {count} sidecar file(s) to:\n{output_dir}")
+
+        self._start_action_job("Exporting metadata sidecars", _run, _done)
+
+    def slotImportMetadataSidecars(self) -> None:
+        if self.image_tag_service is None:
+            errorBox("Sidecar import unavailable", "Image tag service is not configured.")
+            return
+        sidecar_paths, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "Import Metadata Sidecars",
+            "",
+            "ClusterLens Sidecars (*.clusterlens.json *.json)",
+        )
+        if not sidecar_paths:
+            self.status_label.setText("Sidecar import cancelled.")
+            return
+
+        def _run(progress, cancel_check):
+            _ = cancel_check
+            progress(0, "Importing metadata sidecars...")
+            service = MetadataSidecarService(tag_service=self.image_tag_service)
+            imported = service.import_sidecars(sidecar_paths, mirror_to_exif=False)
+            progress(100, "Metadata sidecar import complete.")
+            return imported
+
+        def _done(imported) -> None:
+            paths = list(dict(imported or {}).keys())
+            if paths:
+                self.metadata_changed.emit(paths)
+            self.status_label.setText(f"Imported {len(paths)} metadata sidecar file(s).")
+            infoBox("Sidecar import complete", f"Imported metadata for {len(paths)} image(s).")
+
+        self._start_action_job("Importing metadata sidecars", _run, _done)
+
     def slotOpenSelectedFolders(self) -> None:
         target = self._selection_for_actions()
         if target is None:
@@ -841,8 +949,23 @@ class GalleryPane(QWidget):
     def update_gallery_with_options(self, images=None, *, clear_pixmaps: bool = True, reset_scroll: bool = True) -> None:
         if self._shutting_down:
             return
+        next_images = list(images) if images is not None else list(self.images)
+        reuse_existing = (
+            next_images == list(self.images)
+            and next_images == self.model.image_paths()
+            and not clear_pixmaps
+            and not reset_scroll
+        )
         if images is not None:
-            self.images = list(images)
+            self.images = next_images
+        if reuse_existing:
+            self.refresh_selection_target_hint()
+            if not self.images:
+                self.status_label.setText("No images in the current selection.")
+            return
+        if self._last_visible_paths:
+            self._last_visible_paths = ()
+            self.visible_paths_changed.emit([])
         self.model.set_images(self.images)
         self.reset_gallery_state(clear_pixmaps=clear_pixmaps, reset_scroll=reset_scroll)
         self.refresh_selection_target_hint()
@@ -874,12 +997,9 @@ class GalleryPane(QWidget):
             self.max_thumbnail_workers = max(1, int(worker_count))
         if prefetch_rows is not None:
             self.thumbnail_prefetch_rows = max(0, int(prefetch_rows))
-        if pixmap_cache_size is not None:
-            self._pixmap_cache_size = max(64, int(pixmap_cache_size))
-            while len(self.pixmap_cache) > self._pixmap_cache_size:
-                self.pixmap_cache.popitem(last=False)
-        if qimage_cache_size is not None:
-            self.thumbnail_service.set_qimage_cache_size(int(qimage_cache_size))
+        cache_size = qimage_cache_size if qimage_cache_size is not None else pixmap_cache_size
+        if cache_size is not None:
+            self.thumbnail_service.set_qimage_cache_size(int(cache_size))
         if self.images:
             self.update_gallery_with_options(images=self.images, clear_pixmaps=True, reset_scroll=False)
 
@@ -911,7 +1031,6 @@ class GalleryPane(QWidget):
         if self._shutting_down:
             return
         self.cancel_loader()
-        self.pixmap_cache.clear()
         self.thumbnail_service.clear_memory_cache()
         self.model.clear_pixmaps()
         self.loaded_indexes.clear()
@@ -923,6 +1042,25 @@ class GalleryPane(QWidget):
                 self.schedule_visible_refresh()
             else:
                 self.status_label.setText("Gallery caches cleared.")
+
+    def invalidate_image_paths(self, image_paths: list[str] | set[str] | tuple[str, ...], *, reload_visible: bool = True) -> None:
+        if self._shutting_down:
+            return
+        targets = {str(path) for path in image_paths if str(path)}
+        if not targets:
+            return
+        self.thumbnail_service.invalidate_paths(targets, sizes=[self.image_size])
+        changed_rows = self.model.clear_pixmaps_for_paths(targets)
+        if not changed_rows:
+            return
+        changed_set = {int(row) for row in changed_rows}
+        self.loaded_indexes.difference_update(changed_set)
+        self.failed_indexes.difference_update(changed_set)
+        self.pending_indexes.difference_update(changed_set)
+        self.pending_ui_items = [item for item in self.pending_ui_items if int(item[0]) not in changed_set]
+        if reload_visible:
+            self.status_label.setText("Reloading updated thumbnails...")
+            self.schedule_visible_refresh()
 
     def remove_images(self, image_paths: list[str]) -> None:
         removed = {str(path) for path in image_paths if path}
@@ -942,8 +1080,12 @@ class GalleryPane(QWidget):
         if not appended:
             return
         self.images.extend(appended)
-        # Preserve scroll position when appending.
-        self.update_gallery_with_options(images=self.images, clear_pixmaps=False, reset_scroll=False)
+        self.model.append_images(appended)
+        self.loader_queue.configure(self.request_generation, self.images, self.image_size)
+        self.refresh_selection_target_hint()
+        self.status_label.setText(f"Loading {len(self.images)} images...")
+        self._ensure_loader()
+        self.schedule_visible_refresh()
 
     def reset_gallery_state(self, clear_pixmaps: bool, reset_scroll: bool):
         self.request_generation += 1
@@ -953,8 +1095,6 @@ class GalleryPane(QWidget):
         self.failed_indexes.clear()
         self.pending_indexes.clear()
         self.pending_ui_items.clear()
-        if clear_pixmaps:
-            self.pixmap_cache.clear()
         if reset_scroll:
             self.list_view.scrollToTop()
             self.list_view.verticalScrollBar().setValue(0)
@@ -1034,34 +1174,187 @@ class GalleryPane(QWidget):
             self.image_selected.emit(image_path)
 
     def on_item_double_clicked(self, index) -> None:
+        self._open_inspector(index)
+
+    def _inspector_context_for_path(self, path: str) -> dict[str, object]:
+        ctx: dict[str, object] = {"membership": self.membership_context.get(path, {})}
+        extra = self.inspector_context_provider(path) if callable(self.inspector_context_provider) else None
+        if isinstance(extra, dict):
+            ctx.update(extra)
+        return ctx
+
+    def _active_face_edit_service(self):
+        if callable(self.face_edit_service_provider):
+            try:
+                return self.face_edit_service_provider()
+            except Exception:
+                return None
+        return None
+
+    def _open_inspector(self, index, *, allow_face_edit: bool | None = None) -> None:
         image_path = index.data(self.model.PathRole)
         if not image_path:
             return
         row = int(index.row())
-
-        def _ctx(path: str) -> dict[str, object]:
-            ctx: dict[str, object] = {"membership": self.membership_context.get(path, {})}
-            extra = self.inspector_context_provider(path) if callable(self.inspector_context_provider) else None
-            if isinstance(extra, dict):
-                ctx.update(extra)
-            return ctx
+        face_service = self._active_face_edit_service()
+        current_context = self._inspector_context_for_path(str(image_path))
+        edit_enabled = bool(
+            face_service is not None
+            and isinstance(current_context.get("face_review"), dict)
+            and (allow_face_edit is True or allow_face_edit is None)
+        )
 
         dialog = PhotoInspectorDialog(
             image_path=None,
             image_paths=list(self.images),
             start_index=row,
             context={"metrics_by_backend": self.metrics_context},
-            context_provider=_ctx,
+            context_provider=self._inspector_context_for_path,
             metadata_service=self.metadata_service,
             display_mode=self.inspector_display_mode,
+            face_service=face_service,
+            allow_face_edit=edit_enabled,
+            face_draft_provider=self.face_draft_provider,
+            face_draft_updated_callback=self.face_draft_updated_callback,
+            face_edit_saved_callback=self.face_edit_saved_callback,
+            face_auto_clean_callback=self.face_auto_clean_callback,
             parent=self,
         )
         dialog.exec()
 
-    def cancel_loader(self):
+    def eventFilter(self, watched, event):
+        if watched is self.list_view.viewport() and self._face_box_drag_enabled():
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                drag_state = self._face_box_drag_hit_state(event.position())
+                if drag_state is not None:
+                    self._face_box_drag_state = drag_state
+                    self.list_view.setCurrentIndex(drag_state["index"])
+                    self.on_item_clicked(drag_state["index"])
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseMove and self._face_box_drag_state is not None:
+                normalized_point = self._normalized_view_point(event.position(), self._face_box_drag_state["pixmap_rect"])
+                if normalized_point is not None:
+                    moved_box = self._move_normalized_face_box(
+                        self._face_box_drag_state["box"],
+                        self._face_box_drag_state["origin"],
+                        normalized_point,
+                    )
+                    if moved_box is not None:
+                        self._face_box_drag_state["current_box"] = moved_box
+                        self._face_box_drag_state["started"] = True
+                        preview_boxes = list(self._face_box_drag_state["all_boxes"])
+                        preview_boxes[int(self._face_box_drag_state["box_index"])] = moved_box
+                        self.model.set_preview_face_boxes(self._face_box_drag_state["path"], preview_boxes)
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and self._face_box_drag_state is not None:
+                drag_state = dict(self._face_box_drag_state)
+                self._face_box_drag_state = None
+                self.model.clear_preview_face_boxes(str(drag_state.get("path") or ""))
+                if (
+                    bool(drag_state.get("started"))
+                    and callable(self.face_box_move_callback)
+                    and drag_state.get("current_box") is not None
+                ):
+                    self.face_box_move_callback(
+                        str(drag_state.get("path") or ""),
+                        int(drag_state.get("box_index") or 0),
+                        tuple(float(value) for value in drag_state["current_box"]),
+                    )
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _face_box_drag_enabled(self) -> bool:
+        if callable(self.face_box_drag_enabled_provider):
+            try:
+                return bool(self.face_box_drag_enabled_provider())
+            except Exception:
+                return False
+        return False
+
+    def _face_box_drag_hit_state(self, position):
+        index = self.list_view.indexAt(position.toPoint())
+        if not index.isValid():
+            return None
+        pixmap_rect = self._pixmap_rect_for_index(index)
+        if pixmap_rect is None:
+            return None
+        normalized_point = self._normalized_view_point(position, pixmap_rect)
+        if normalized_point is None:
+            return None
+        face_boxes = tuple(index.data(self.model.FaceBoxesRole) or ())
+        hit_index = None
+        for box_index in range(len(face_boxes) - 1, -1, -1):
+            box = face_boxes[box_index]
+            if float(box[0]) <= normalized_point[0] <= float(box[2]) and float(box[1]) <= normalized_point[1] <= float(box[3]):
+                hit_index = box_index
+                break
+        if hit_index is None:
+            return None
+        image_path = str(index.data(self.model.PathRole) or "")
+        if not image_path:
+            return None
+        return {
+            "index": index,
+            "path": image_path,
+            "box_index": int(hit_index),
+            "box": tuple(float(value) for value in face_boxes[hit_index]),
+            "all_boxes": tuple(tuple(float(value) for value in box) for box in face_boxes),
+            "current_box": tuple(float(value) for value in face_boxes[hit_index]),
+            "started": False,
+            "origin": normalized_point,
+            "pixmap_rect": pixmap_rect,
+        }
+
+    def _pixmap_rect_for_index(self, index):
+        image = index.data(self.model.PixmapRole)
+        if not isinstance(image, QImage) or image.isNull():
+            return None
+        slot_rect = self.delegate.image_slot_rect_for(self.list_view.visualRect(index))
+        return self.delegate.draw_rect_for_image(image, slot_rect)
+
+    @staticmethod
+    def _normalized_view_point(position, pixmap_rect):
+        x = float(position.x())
+        y = float(position.y())
+        if x < pixmap_rect.x() or y < pixmap_rect.y():
+            return None
+        if x > pixmap_rect.x() + pixmap_rect.width() or y > pixmap_rect.y() + pixmap_rect.height():
+            return None
+        return (
+            max(0.0, min(1.0, (x - pixmap_rect.x()) / max(1.0, float(pixmap_rect.width())))),
+            max(0.0, min(1.0, (y - pixmap_rect.y()) / max(1.0, float(pixmap_rect.height())))),
+        )
+
+    @staticmethod
+    def _move_normalized_face_box(box, origin, point):
+        x1, y1, x2, y2 = [float(value) for value in box]
+        delta_x = float(point[0]) - float(origin[0])
+        delta_y = float(point[1]) - float(origin[1])
+        width = max(0.001, x2 - x1)
+        height = max(0.001, y2 - y1)
+        next_x1 = max(0.0, min(1.0 - width, x1 + delta_x))
+        next_y1 = max(0.0, min(1.0 - height, y1 + delta_y))
+        return (
+            next_x1,
+            next_y1,
+            next_x1 + width,
+            next_y1 + height,
+        )
+
+    def cancel_loader(self, *, timeout_ms: int = 2500):
         self.refresh_timer.stop()
         self.flush_timer.stop()
         append_qt_diagnostic(f"[Gallery] cancel_loader thread_count={len(self.loader_threads)}")
+        deadline_s = perf_counter() + (max(0, int(timeout_ms)) / 1000.0)
+
+        def _thread_timeout_ms(thread) -> int:
+            if isinstance(thread, QThread):
+                return max(0, int((deadline_s - perf_counter()) * 1000.0))
+            return max(0, int(timeout_ms))
+
         try:
             self.loader_queue.cancel()
         except Exception:
@@ -1069,7 +1362,8 @@ class GalleryPane(QWidget):
         for thread in list(self.loader_threads):
             try:
                 if thread.isRunning():
-                    thread.wait(2500)
+                    wait_timeout_ms = _thread_timeout_ms(thread)
+                    wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms)
                 if thread.isRunning():
                     self._retain_loader_thread(thread)
                     append_qt_diagnostic(f"[Gallery] loader_still_running {thread.objectName()}")
@@ -1086,6 +1380,16 @@ class GalleryPane(QWidget):
         self.pending_indexes.clear()
         self.pending_ui_items.clear()
         ready_to_close = True
+        deadline_s = perf_counter() + (max(0, int(timeout_ms)) / 1000.0)
+
+        def _remaining_timeout_ms() -> int:
+            return max(0, int((deadline_s - perf_counter()) * 1000.0))
+
+        def _thread_timeout_ms(thread) -> int:
+            if isinstance(thread, QThread):
+                return _remaining_timeout_ms()
+            return max(0, int(timeout_ms))
+
         action_pairs: list[tuple[object | None, object | None]] = []
         seen_action_threads: set[int] = set()
         for job, thread in [(self._active_action_job, self._active_action_thread), *self._retained_action_refs]:
@@ -1104,8 +1408,8 @@ class GalleryPane(QWidget):
                     pass
             try:
                 if thread.isRunning():
-                    thread.quit()
-                    ready_to_close = bool(thread.wait(timeout_ms)) and ready_to_close
+                    wait_timeout_ms = _thread_timeout_ms(thread)
+                    ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         if ready_to_close:
@@ -1113,11 +1417,12 @@ class GalleryPane(QWidget):
             self._active_action_job = None
             self._retained_action_refs = []
             self._action_thread_jobs = {}
-        self.cancel_loader()
+        self.cancel_loader(timeout_ms=_remaining_timeout_ms())
         for thread in list(self._retained_loader_threads):
             try:
                 if thread.isRunning():
-                    ready_to_close = bool(thread.wait(timeout_ms)) and ready_to_close
+                    wait_timeout_ms = _thread_timeout_ms(thread)
+                    ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         self._retained_loader_threads = [thread for thread in self._retained_loader_threads if thread.isRunning()]
@@ -1153,9 +1458,7 @@ class GalleryPane(QWidget):
             if self._active_action_job is job:
                 self._active_action_job = None
 
-    @pyqtSlot()
-    def _on_action_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_action_thread_finished(self, thread=None) -> None:
         if thread is None:
             return
         self._release_action_refs(self._action_thread_jobs.get(thread), thread)
@@ -1171,9 +1474,7 @@ class GalleryPane(QWidget):
         self.loader_threads = [existing for existing in self.loader_threads if existing is not thread]
         self._retained_loader_threads = [existing for existing in self._retained_loader_threads if existing is not thread]
 
-    @pyqtSlot()
-    def _on_loader_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_loader_thread_finished(self, thread=None) -> None:
         if thread is None:
             return
         self._release_loader_thread(thread)
@@ -1200,7 +1501,7 @@ class GalleryPane(QWidget):
                 Qt.ConnectionType.QueuedConnection,
             )
             thread.finished.connect(
-                self._on_loader_thread_finished,
+                lambda thread=thread: self._on_loader_thread_finished(thread),
                 Qt.ConnectionType.QueuedConnection,
             )
             thread.start()
@@ -1210,6 +1511,17 @@ class GalleryPane(QWidget):
         if self._shutting_down:
             return
         self.refresh_timer.start(self.settings.gallery_flush_interval_ms)
+
+    def _emit_visible_paths(self, visible_indexes: list[int]) -> None:
+        next_paths = tuple(
+            str(self.images[index])
+            for index in list(visible_indexes or [])
+            if 0 <= int(index) < len(self.images) and str(self.images[index] or "").strip()
+        )
+        if next_paths == self._last_visible_paths:
+            return
+        self._last_visible_paths = next_paths
+        self.visible_paths_changed.emit(list(next_paths))
 
     def _visible_and_prefetch_indexes(self) -> tuple[list[int], list[int]]:
         total = len(self.images)
@@ -1252,21 +1564,24 @@ class GalleryPane(QWidget):
         if self._shutting_down:
             return
         visible_indexes, prefetch_indexes = self._visible_and_prefetch_indexes()
+        self._emit_visible_paths(visible_indexes)
         if not visible_indexes and not prefetch_indexes:
             return
         visible_missing = [
             index
             for index in visible_indexes
-            if index not in self.loaded_indexes and index not in self.failed_indexes
+            if index not in self.loaded_indexes and index not in self.failed_indexes and index not in self.pending_indexes
         ]
         prefetch_missing = [
             index
             for index in prefetch_indexes
-            if index not in self.loaded_indexes and index not in self.failed_indexes
+            if index not in self.loaded_indexes and index not in self.failed_indexes and index not in self.pending_indexes
         ]
         if not visible_missing and not prefetch_missing:
             self.update_status()
             return
+        visible_missing = visible_missing[:MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE]
+        prefetch_missing = prefetch_missing[:MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE]
         self._ensure_loader()
         self.pending_indexes.update(visible_missing)
         self.pending_indexes.update(prefetch_missing)
@@ -1307,16 +1622,20 @@ class GalleryPane(QWidget):
             self.update_status()
             return
         self.pending_ui_items.sort(key=lambda item: item[0])
-        for index, image_path, qimage in self.pending_ui_items:
-            pixmap = self.get_or_create_pixmap(image_path, qimage)
-            self.model.set_pixmap(index, pixmap)
+        batch = self.pending_ui_items[:MAX_PENDING_UI_ITEMS_PER_FLUSH]
+        self.pending_ui_items = self.pending_ui_items[MAX_PENDING_UI_ITEMS_PER_FLUSH:]
+        for index, image_path, qimage in batch:
+            self.model.set_image(index, qimage)
             self.loaded_indexes.add(index)
             if not self.first_paint_emitted:
                 self.first_paint_emitted = True
                 latency_ms = int((perf_counter() - self.first_paint_start) * 1000)
                 self.first_paint_ready.emit(latency_ms)
-        self.pending_ui_items.clear()
         self.update_status()
+        if self.pending_ui_items:
+            if not self.flush_timer.isActive():
+                self.flush_timer.start(self.settings.gallery_flush_interval_ms)
+            return
         self.schedule_visible_refresh()
 
     def update_status(self, last_error: str = ""):
@@ -1339,19 +1658,6 @@ class GalleryPane(QWidget):
         if last_error:
             message += f" Last error: {last_error}"
         self.status_label.setText(message)
-
-    def get_or_create_pixmap(self, image_path, qimage):
-        cache_key = (image_path, self.image_size)
-        pixmap = self.pixmap_cache.get(cache_key)
-        if pixmap is not None:
-            self.pixmap_cache.move_to_end(cache_key)
-            return pixmap
-        pixmap = QPixmap.fromImage(qimage)
-        self.pixmap_cache[cache_key] = pixmap
-        self.pixmap_cache.move_to_end(cache_key)
-        while len(self.pixmap_cache) > self._pixmap_cache_size:
-            self.pixmap_cache.popitem(last=False)
-        return pixmap
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

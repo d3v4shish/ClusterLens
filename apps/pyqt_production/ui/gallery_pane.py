@@ -22,7 +22,7 @@ from infra.settings import get_settings
 from .error_mbox import ExifMetadataDialog, ImageTagsDialog, confirmBox, errorBox, infoBox
 from .gallery_model import GalleryImageModel, GalleryItemDelegate
 from .photo_inspector_dialog import PhotoInspectorDialog
-from .async_job import AsyncJob, start_job_in_thread
+from .async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from .common import build_help_inline
 
 LOGGER = get_logger(__name__)
@@ -553,7 +553,7 @@ class GalleryPane(QWidget):
         thread = start_job_in_thread(job)
         self._action_thread_jobs[thread] = job
         thread.finished.connect(
-            self._on_action_thread_finished,
+            lambda thread=thread: self._on_action_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
         self._active_action_thread = thread
@@ -1271,9 +1271,9 @@ class GalleryPane(QWidget):
             pass
         for thread in list(self.loader_threads):
             try:
-                if thread.isRunning():
-                    thread.wait(2500)
-                if thread.isRunning():
+                if wait_for_thread_shutdown(thread, timeout_ms=2500, quit_thread=False):
+                    append_qt_diagnostic(f"[Gallery] loader_stopped {thread.objectName()}")
+                elif thread.isRunning():
                     self._retain_loader_thread(thread)
                     append_qt_diagnostic(f"[Gallery] loader_still_running {thread.objectName()}")
                 else:
@@ -1305,11 +1305,7 @@ class GalleryPane(QWidget):
                     job.cancel()
                 except Exception:
                     pass
-            try:
-                if thread.isRunning():
-                    thread.quit()
-                    ready_to_close = bool(thread.wait(timeout_ms)) and ready_to_close
-            except Exception:
+            if not wait_for_thread_shutdown(thread, timeout_ms=timeout_ms):
                 ready_to_close = False
         if ready_to_close:
             self._active_action_thread = None
@@ -1318,10 +1314,7 @@ class GalleryPane(QWidget):
             self._action_thread_jobs = {}
         self.cancel_loader()
         for thread in list(self._retained_loader_threads):
-            try:
-                if thread.isRunning():
-                    ready_to_close = bool(thread.wait(timeout_ms)) and ready_to_close
-            except Exception:
+            if not wait_for_thread_shutdown(thread, timeout_ms=timeout_ms, quit_thread=False):
                 ready_to_close = False
         self._retained_loader_threads = [thread for thread in self._retained_loader_threads if thread.isRunning()]
         if self.loader_threads or self._retained_loader_threads:
@@ -1356,9 +1349,7 @@ class GalleryPane(QWidget):
             if self._active_action_job is job:
                 self._active_action_job = None
 
-    @pyqtSlot()
-    def _on_action_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_action_thread_finished(self, thread=None) -> None:
         if thread is None:
             return
         self._release_action_refs(self._action_thread_jobs.get(thread), thread)
@@ -1374,9 +1365,7 @@ class GalleryPane(QWidget):
         self.loader_threads = [existing for existing in self.loader_threads if existing is not thread]
         self._retained_loader_threads = [existing for existing in self._retained_loader_threads if existing is not thread]
 
-    @pyqtSlot()
-    def _on_loader_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_loader_thread_finished(self, thread=None) -> None:
         if thread is None:
             return
         self._release_loader_thread(thread)
@@ -1403,7 +1392,7 @@ class GalleryPane(QWidget):
                 Qt.ConnectionType.QueuedConnection,
             )
             thread.finished.connect(
-                self._on_loader_thread_finished,
+                lambda thread=thread: self._on_loader_thread_finished(thread),
                 Qt.ConnectionType.QueuedConnection,
             )
             thread.start()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from apps.pyqt_production.identity import MODEL_ASSETS_APP_ID
+from apps.pyqt_production.identity import PRODUCTION_APP_ID
 from apps.shared.runtime_support import activate_runtime_root, configure_rotating_logging, install_crash_handlers
 from app.services.model_assets import MODEL_LICENSES, MODEL_MANIFEST_VERSION, MODEL_SOURCE_LABELS, MODEL_SOURCE_URLS, sha256_file
 
@@ -29,9 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     output_dir = Path(args.output_dir).resolve()
-    runtime_root = output_dir / ".runtime"
-    os.environ["IMAGE_CLUSTERING_APP_DIR"] = str(runtime_root)
-    runtime_layout = activate_runtime_root(MODEL_ASSETS_APP_ID)
+    runtime_layout = activate_runtime_root(PRODUCTION_APP_ID)
     configure_rotating_logging(runtime_layout)
     install_crash_handlers(runtime_layout)
 

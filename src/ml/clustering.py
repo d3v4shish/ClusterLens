@@ -91,6 +91,7 @@ class ClusteringService:
         pca_dim: int | None = None,
         similarity_mode: str = "semantic",
         outlier_policy: str = "assign",
+        backend_options: dict[str, object] | None = None,
     ) -> tuple[dict[int, list[int]], dict]:
         matrix = np.asarray(embeddings, dtype=np.float32)
         if matrix.shape[0] == 0:
@@ -99,7 +100,13 @@ class ClusteringService:
             raise ValueError("Cluster count cannot exceed image count.")
 
         metric_matrix = self.prepare_matrix(matrix, pca_dim, similarity_mode)
-        return self.cluster_prepared(metric_matrix, num_clusters, backend=backend, outlier_policy=outlier_policy)
+        return self.cluster_prepared(
+            metric_matrix,
+            num_clusters,
+            backend=backend,
+            outlier_policy=outlier_policy,
+            backend_options=backend_options,
+        )
 
     def prepare_matrix(
         self,
@@ -129,12 +136,14 @@ class ClusteringService:
         backend: str = "cosine-kmeans",
         outlier_policy: str = "assign",
         performance_profile: str | None = None,
+        backend_options: dict[str, object] | None = None,
     ) -> tuple[dict[int, list[int]], dict]:
         labels, used_backend = self._labels_for_backend(
             metric_matrix,
             num_clusters,
             backend,
             performance_profile=performance_profile,
+            backend_options=backend_options,
         )
         clusters = self._clusters_from_labels(metric_matrix, labels, num_clusters, outlier_policy)
         clusters = self._merge_tiny_clusters(metric_matrix, clusters)
@@ -295,6 +304,7 @@ class ClusteringService:
         backend: str,
         *,
         performance_profile: str | None = None,
+        backend_options: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, str]:
         profile = str(performance_profile or "balanced").strip().lower()
         if backend == "faiss" and faiss is not None:
@@ -302,8 +312,28 @@ class ClusteringService:
             return self._faiss_kmeans(matrix, num_clusters), "faiss"
         if backend == "hdbscan" and hdbscan is not None:
             LOGGER.info("Clustering with HDBSCAN")
-            min_cluster_size = max(self.settings.min_graph_cluster_size, 2)
-            labels = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean").fit_predict(matrix)
+            options = dict(backend_options or {})
+            min_cluster_size = max(
+                2,
+                self._backend_option_int(
+                    options,
+                    "min_cluster_size",
+                    self.settings.min_graph_cluster_size,
+                    minimum=2,
+                ),
+            )
+            min_samples_value = self._backend_option_int(options, "min_samples", 0, minimum=0)
+            min_samples = None if min_samples_value <= 0 else min_samples_value
+            cluster_selection_epsilon = self._backend_option_float(options, "cluster_selection_epsilon", 0.0, minimum=0.0)
+            allow_single_cluster = self._backend_option_bool(options, "allow_single_cluster", False)
+            labels = hdbscan.HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                metric="euclidean",
+                cluster_selection_epsilon=cluster_selection_epsilon,
+                cluster_selection_method="eom",
+                allow_single_cluster=allow_single_cluster,
+            ).fit_predict(matrix)
             return labels.astype(np.int32), "hdbscan"
         if backend == "graph":
             LOGGER.info("Clustering with kNN graph")
@@ -335,6 +365,50 @@ class ClusteringService:
             return labels.astype(np.int32), "minibatch-kmeans" if backend == "sklearn" else backend
         labels = KMeans(n_clusters=num_clusters, random_state=42, n_init=10).fit_predict(matrix)
         return labels.astype(np.int32), "sklearn" if backend == "sklearn" else backend
+
+    @staticmethod
+    def _backend_option_int(
+        options: dict[str, object],
+        key: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+    ) -> int:
+        try:
+            value = int(options.get(key, default) or default)
+        except Exception:
+            value = int(default)
+        if minimum is not None:
+            value = max(int(minimum), value)
+        return value
+
+    @staticmethod
+    def _backend_option_float(
+        options: dict[str, object],
+        key: str,
+        default: float,
+        *,
+        minimum: float | None = None,
+    ) -> float:
+        try:
+            value = float(options.get(key, default) or default)
+        except Exception:
+            value = float(default)
+        if minimum is not None:
+            value = max(float(minimum), value)
+        return value
+
+    @staticmethod
+    def _backend_option_bool(options: dict[str, object], key: str, default: bool) -> bool:
+        value = options.get(key, default)
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
 
     def _clusters_from_labels(
         self,

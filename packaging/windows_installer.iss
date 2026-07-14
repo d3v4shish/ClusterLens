@@ -14,7 +14,7 @@
   #define BuildVariant "cpu"
 #endif
 #ifndef AppPublisher
-  #define AppPublisher "ClusterLens"
+  #define AppPublisher "d3v4shish"
 #endif
 #ifndef AppExeName
   #define AppExeName "ClusterLens.exe"

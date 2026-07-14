@@ -1,0 +1,16 @@
+{
+  "display_name": "MobileFaceNet ArcFace",
+  "bundle_kind": "embedder",
+  "profile": "edge",
+  "supported_modes": ["human"],
+  "summary": "Compact ArcFace-style embedder for faster edge deployment.",
+  "hardware_class": "Edge CPU / small GPU",
+  "recommended_pair_id": "scrfd_500m_kps",
+  "source_url": "https://github.com/deepinsight/insightface",
+  "license": "Verify InsightFace model license before distribution.",
+  "input_name": "input.1",
+  "input_size": [112, 112],
+  "output_name": "516",
+  "mean": [127.5, 127.5, 127.5],
+  "std": [128.0, 128.0, 128.0]
+}

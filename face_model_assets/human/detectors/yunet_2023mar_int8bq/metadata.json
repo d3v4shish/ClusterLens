@@ -1,0 +1,22 @@
+{
+  "display_name": "YuNet 2023 Mar INT8-BQ",
+  "bundle_kind": "detector",
+  "backend_family": "yunet",
+  "profile": "edge",
+  "supported_modes": ["human"],
+  "summary": "Block-quantized YuNet variant for the smallest CPU footprint.",
+  "hardware_class": "Edge CPU / low-power desktop",
+  "recommended_pair_id": "mobilefacenet_arcface",
+  "source_url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+  "license": "MIT license in OpenCV Zoo.",
+  "input_name": "input",
+  "input_size": [320, 320],
+  "output_boxes_name": "faces",
+  "output_scores_name": "scores",
+  "mean": [0.0, 0.0, 0.0],
+  "std": [255.0, 255.0, 255.0],
+  "score_threshold": 0.3,
+  "max_detections": 32,
+  "boxes_normalized": false,
+  "box_format": "xyxy"
+}
