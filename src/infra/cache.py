@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sqlite3
 from collections import OrderedDict
@@ -11,6 +12,9 @@ import numpy as np
 from .settings import get_settings
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class CacheService:
     def __init__(self, memory_cache_size: int | None = None) -> None:
         self.settings = get_settings()
@@ -19,11 +23,21 @@ class CacheService:
         self._initialize_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.settings.embedding_cache_db)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA temp_store=MEMORY")
-        return conn
+        db_path = Path(self.settings.embedding_cache_db)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            return conn
+        except sqlite3.DatabaseError:
+            conn.close()
+            self._reset_corrupt_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            return conn
 
     def _initialize_db(self) -> None:
         self.settings.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -41,6 +55,15 @@ class CacheService:
                 """
             )
             conn.commit()
+
+    def _reset_corrupt_db(self, db_path: Path) -> None:
+        LOGGER.warning("Embedding cache database is invalid; rebuilding %s", db_path)
+        for suffix in ("", "-wal", "-shm"):
+            target = db_path if not suffix else db_path.with_name(db_path.name + suffix)
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning("Failed to remove invalid cache file %s: %s", target, exc)
 
     @staticmethod
     def build_embedding_key(image_path: str, model_name: str, signature: str) -> str:

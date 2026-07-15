@@ -1,0 +1,16 @@
+{
+  "display_name": "SFace 2021 Dec",
+  "bundle_kind": "embedder",
+  "profile": "opencv_cpu",
+  "supported_modes": ["human"],
+  "summary": "Official OpenCV Zoo SFace MobileFaceNet embedder for CPU-friendly identity matching.",
+  "hardware_class": "Desktop CPU / OpenCV",
+  "recommended_pair_id": "yunet_2026may",
+  "source_url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface",
+  "license": "Apache 2.0 via OpenCV Zoo.",
+  "input_name": "data",
+  "input_size": [112, 112],
+  "output_name": "fc1",
+  "mean": [127.5, 127.5, 127.5],
+  "std": [128.0, 128.0, 128.0]
+}

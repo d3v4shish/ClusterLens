@@ -28,11 +28,22 @@ class RuntimeStorageSummary:
     total_bytes: int
 
 
+@dataclass(frozen=True)
+class GeneratedStorageSummary:
+    runtime_root: str
+    config_location: str
+    cache_root: str
+    target_bytes: dict[str, int]
+    target_paths: dict[str, tuple[str, ...]]
+    total_bytes: int
+
+
 class CacheMaintenanceService:
     DIRECTORY_TARGETS = (
         "cluster_results/",
         "cluster_meanings/",
         "embedding_indexes/",
+        "face_model_assets/",
         "thumbnails/",
         "onnx_models/",
         "tmp/",
@@ -48,6 +59,7 @@ class CacheMaintenanceService:
             "cluster_results/": cache_dir / "cluster_results",
             "cluster_meanings/": cache_dir / "cluster_meanings",
             "embedding_indexes/": cache_dir / "embedding_indexes",
+            "face_model_assets/": cache_dir / "face_model_assets",
             "thumbnails/": self.settings.thumbnail_cache_dir,
             "onnx_models/": cache_dir / "onnx_models",
             "tmp/": cache_dir / "tmp",
@@ -85,6 +97,44 @@ class CacheMaintenanceService:
             target_bytes=target_bytes,
             total_bytes=sum(target_bytes.values()),
         )
+
+    def describe_generated_storage(self, *, config_location: str = "") -> GeneratedStorageSummary:
+        target_paths = self.generated_storage_targets()
+        target_bytes = {
+            name: sum(self._path_size(Path(path)) for path in paths)
+            for name, paths in target_paths.items()
+        }
+        return GeneratedStorageSummary(
+            runtime_root=str(self.settings.base_dir),
+            config_location=str(config_location or ""),
+            cache_root=str(self.settings.cache_dir),
+            target_bytes=target_bytes,
+            target_paths={name: tuple(str(path) for path in paths) for name, paths in target_paths.items()},
+            total_bytes=sum(target_bytes.values()),
+        )
+
+    def generated_storage_targets(self) -> dict[str, tuple[Path, ...]]:
+        cache_dir = self.settings.cache_dir
+        rebuildable = self.rebuildable_targets()
+        return {
+            "logs": (self.settings.log_dir,),
+            "thumbnails": (self.settings.thumbnail_cache_dir,),
+            "rebuildable_caches": (
+                self.settings.embedding_cache_db,
+                rebuildable["cluster_results/"],
+                rebuildable["cluster_meanings/"],
+                rebuildable["embedding_indexes/"],
+            ),
+            "face_databases": self._face_database_paths(),
+            "ann_files": self._ann_file_paths(),
+            "model_caches": (
+                cache_dir / "face_model_assets",
+                cache_dir / "onnx_models",
+                cache_dir / "huggingface",
+                cache_dir / "torch",
+            ),
+            "temp_files": (cache_dir / "tmp",),
+        }
 
     def clear_rebuildable_disk_targets(self, *, exclude: set[str] | None = None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         exclude = {str(name) for name in (exclude or set())}
@@ -134,6 +184,26 @@ class CacheMaintenanceService:
         failures.extend(download_failures)
         return tuple(cleared), tuple(failures)
 
+    def clear_face_storage_targets(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self._clear_named_paths([*self._face_database_paths(), *self._ann_file_paths()], recreate_dirs=())
+
+    def clear_model_cache_targets(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        cache_dir = self.settings.cache_dir
+        paths = (
+            cache_dir / "face_model_assets",
+            cache_dir / "onnx_models",
+            cache_dir / "huggingface",
+            cache_dir / "torch",
+        )
+        return self._clear_named_paths(paths, recreate_dirs=(cache_dir / "face_model_assets", cache_dir / "onnx_models"))
+
+    def clear_log_files(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        log_dir = self.settings.log_dir
+        if not log_dir.exists():
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return (), ()
+        return self._clear_named_paths(tuple(log_dir.iterdir()), recreate_dirs=(log_dir,))
+
     def clear_partial_model_downloads(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         candidates = (
             self.settings.cache_dir / "huggingface" / "hub",
@@ -157,6 +227,40 @@ class CacheMaintenanceService:
                 except OSError as exc:
                     failures.append(f"{path}: {exc}")
         return tuple(removed), tuple(failures)
+
+    def _face_database_paths(self) -> tuple[Path, ...]:
+        cache_dir = self.settings.cache_dir
+        return tuple(sorted(cache_dir.glob("face_search*.db*")))
+
+    def _ann_file_paths(self) -> tuple[Path, ...]:
+        cache_dir = self.settings.cache_dir
+        return tuple(sorted(cache_dir.glob("face_search*.faiss*")))
+
+    def _clear_named_paths(self, paths, *, recreate_dirs: tuple[Path, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        cleared: list[str] = []
+        failures: list[str] = []
+        for path in tuple(dict.fromkeys(Path(item) for item in paths)):
+            try:
+                if path.exists():
+                    self._remove_target(path)
+                    cleared.append(self._display_target_name(path))
+            except OSError as exc:
+                failures.append(f"{self._display_target_name(path)}: {exc}")
+        for path in recreate_dirs:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                failures.append(f"{self._display_target_name(path)}: {exc}")
+        return tuple(cleared), tuple(failures)
+
+    def _display_target_name(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.settings.cache_dir))
+        except ValueError:
+            try:
+                return str(path.relative_to(self.settings.base_dir))
+            except ValueError:
+                return str(path)
 
     def _recreate_directories(self, *, exclude: set[str]) -> None:
         self.settings.cache_dir.mkdir(parents=True, exist_ok=True)

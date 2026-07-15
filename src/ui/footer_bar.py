@@ -42,6 +42,7 @@ class WorkspaceFooter(QWidget):
 
         self.status_label = ElidedLabel("Idle", self)
         self.metrics_label = ElidedLabel("", self)
+        self.performance_dashboard_label = self.metrics_label
         self.metrics_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.storage_label = ElidedLabel("Storage: scanning...", self)
         self.storage_label.setMinimumWidth(220)
@@ -70,6 +71,9 @@ class WorkspaceFooter(QWidget):
 
     def set_metrics(self, text: str) -> None:
         self.metrics_label.setText(text or "")
+
+    def set_performance_dashboard(self, text: str) -> None:
+        self.performance_dashboard_label.setText(text or "")
 
     def set_storage_usage(self, text: str, *, tooltip: str = "") -> None:
         full_text = str(text or "").strip() or "Storage: unavailable"

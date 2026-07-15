@@ -1,0 +1,16 @@
+{
+  "display_name": "ArcFace R50",
+  "bundle_kind": "embedder",
+  "profile": "balanced",
+  "supported_modes": ["human"],
+  "summary": "Balanced ArcFace embedder for strong general-purpose identity matching.",
+  "hardware_class": "Desktop CPU / GPU",
+  "recommended_pair_id": "scrfd_2.5g_kps",
+  "source_url": "https://github.com/deepinsight/insightface",
+  "license": "Verify InsightFace model license before distribution.",
+  "input_name": "input",
+  "input_size": [112, 112],
+  "output_name": "embedding",
+  "mean": [127.5, 127.5, 127.5],
+  "std": [128.0, 128.0, 128.0]
+}

@@ -1,0 +1,22 @@
+{
+  "display_name": "YuNet 2023 Mar",
+  "bundle_kind": "detector",
+  "backend_family": "yunet",
+  "profile": "edge",
+  "supported_modes": ["human"],
+  "summary": "Lightweight OpenCV Zoo YuNet detector for fast CPU-friendly face detection.",
+  "hardware_class": "Edge CPU / desktop CPU",
+  "recommended_pair_id": "mobilefacenet_arcface",
+  "source_url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+  "license": "MIT license in OpenCV Zoo.",
+  "input_name": "input",
+  "input_size": [320, 320],
+  "output_boxes_name": "faces",
+  "output_scores_name": "scores",
+  "mean": [0.0, 0.0, 0.0],
+  "std": [255.0, 255.0, 255.0],
+  "score_threshold": 0.3,
+  "max_detections": 50,
+  "boxes_normalized": false,
+  "box_format": "xyxy"
+}

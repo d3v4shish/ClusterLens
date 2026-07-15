@@ -4,7 +4,7 @@ import os
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -52,6 +52,28 @@ except Exception:
             pass
 
 LOGGER = get_logger(__name__)
+
+
+@contextmanager
+def _huggingface_offline_context(enabled: bool):
+    if not enabled:
+        yield
+        return
+    overrides = {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+    }
+    previous = {name: os.environ.get(name) for name in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @dataclass(frozen=True)
@@ -270,26 +292,30 @@ class ModelManager:
         elif base_model_name == "dino":
             from timm import create_model
 
-            model = create_model("vit_small_patch16_224_dino", pretrained=True, num_classes=0)
+            with _huggingface_offline_context(not self.allow_model_downloads):
+                model = create_model("vit_small_patch16_224_dino", pretrained=True, num_classes=0)
             family = "timm"
             preprocess = self._default_preprocess(input_size)
         elif base_model_name == "dino_large":
             from timm import create_model
 
             input_size = (518, 518)
-            model = create_model("vit_large_patch14_dinov2", pretrained=True, num_classes=0)
+            with _huggingface_offline_context(not self.allow_model_downloads):
+                model = create_model("vit_large_patch14_dinov2", pretrained=True, num_classes=0)
             family = "timm"
             preprocess, input_size = self._timm_preprocess(model, fallback_input_size=input_size)
         elif base_model_name == "dinov2_base":
             from timm import create_model
 
-            model = create_model("vit_base_patch14_dinov2", pretrained=True, num_classes=0)
+            with _huggingface_offline_context(not self.allow_model_downloads):
+                model = create_model("vit_base_patch14_dinov2", pretrained=True, num_classes=0)
             family = "timm"
             preprocess, input_size = self._timm_preprocess(model, fallback_input_size=(518, 518))
         elif base_model_name == "mobileclip":
             from timm import create_model
 
-            model = create_model("hf_hub:apple/mobileclip_s0_timm", pretrained=True, num_classes=0)
+            with _huggingface_offline_context(not self.allow_model_downloads):
+                model = create_model("hf_hub:apple/mobileclip_s0_timm", pretrained=True, num_classes=0)
             family = "timm"
             preprocess, input_size = self._timm_preprocess(model, fallback_input_size=(256, 256))
         else:

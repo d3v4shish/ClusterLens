@@ -11,7 +11,7 @@ from PyQt6.QtGui import QImageReader, QKeyEvent, QKeySequence, QPixmap, QShortcu
 from PyQt6.QtWidgets import QDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSplitter, QTextBrowser, QVBoxLayout, QWidget
 
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
-from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread
+from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from .zoomable_image import ZoomableImageView
 
 
@@ -240,7 +240,7 @@ class PhotoInspectorDialog(QDialog):
         thread = start_job_in_thread(job)
         self._thread_jobs[thread] = job
         thread.finished.connect(
-            self._on_async_thread_finished,
+            lambda thread=thread: self._on_async_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
         self._active_thread = thread
@@ -293,7 +293,7 @@ class PhotoInspectorDialog(QDialog):
         thread = start_job_in_thread(job)
         self._thread_jobs[thread] = job
         thread.finished.connect(
-            self._on_async_thread_finished,
+            lambda thread=thread: self._on_async_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
         self._preview_thread = thread
@@ -335,9 +335,8 @@ class PhotoInspectorDialog(QDialog):
             return
         self._release_async_refs(self._thread_jobs.get(thread), thread)
 
-    @pyqtSlot()
-    def _on_async_thread_finished(self) -> None:
-        self._handle_finished_thread(self.sender())
+    def _on_async_thread_finished(self, thread=None) -> None:
+        self._handle_finished_thread(thread)
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready_to_close = True
@@ -352,14 +351,7 @@ class PhotoInspectorDialog(QDialog):
                     job.cancel()
                 except Exception:
                     pass
-            thread_finished = True
-            if thread is not None:
-                try:
-                    thread.quit()
-                    thread_finished = bool(thread.wait(timeout_ms))
-                except RuntimeError:
-                    thread_finished = True
-            ready_to_close = bool(thread_finished) and ready_to_close
+            ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=timeout_ms) and ready_to_close
         self._active_job = None
         self._active_thread = None
         self._preview_job = None

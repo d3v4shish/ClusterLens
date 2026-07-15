@@ -6,6 +6,7 @@ import unittest
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -123,6 +124,8 @@ class ProductionSupportTests(unittest.TestCase):
         store = QSettings(PRODUCTION_QSETTINGS_ORG, PRODUCTION_QSETTINGS_APP)
         store.setValue("setup/completed", True)
         store.setValue("safety/read_only_mode", False)
+        store.setValue("workspace/default_view", "clustering")
+        store.setValue("workspace/faces_mode", "basic")
         store.sync()
 
     @staticmethod
@@ -144,6 +147,20 @@ class ProductionSupportTests(unittest.TestCase):
             timeout_s=5.0,
         )
 
+    class _PollingAsyncQThread(QThread):
+        def __init__(self):
+            super().__init__()
+            self.stop_event = Event()
+            self.wait_calls: list[int] = []
+
+        def wait(self, timeout_ms: int = 0):
+            self.wait_calls.append(int(timeout_ms))
+            return super().wait(timeout_ms)
+
+        def run(self):
+            while not self.stop_event.is_set():
+                time.sleep(0.01)
+
     def tearDown(self):
         settings_mod._RUNTIME_BASE_DIR = None
 
@@ -153,6 +170,20 @@ class ProductionSupportTests(unittest.TestCase):
                 settings_mod._RUNTIME_BASE_DIR = None
                 resolved = settings_mod.get_runtime_base_dir()
                 self.assertEqual(Path(tmp), resolved)
+
+    def test_production_wait_for_thread_shutdown_polls_python_qthreads(self):
+        from apps.pyqt_production.ui.async_job import wait_for_thread_shutdown
+
+        thread = self._PollingAsyncQThread()
+        thread.start()
+        self._wait_for(thread.isRunning, timeout_s=1.0)
+
+        thread.stop_event.set()
+        ready = wait_for_thread_shutdown(thread, timeout_ms=500)
+
+        self.assertTrue(ready)
+        self.assertEqual([], thread.wait_calls)
+        self._wait_for(lambda: not thread.isRunning(), timeout_s=1.0)
 
     def test_production_icon_asset_resolves_from_repo(self):
         icon_path = production_icon_path()
@@ -166,6 +197,46 @@ class ProductionSupportTests(unittest.TestCase):
         window = ProductionClusterApp(RUNTIME_LAYOUT)
         self.assertFalse(window.windowIcon().isNull())
         window.close()
+
+    def test_production_window_switches_to_faces_workspace(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFacesWorkspaceTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+
+                window.set_active_workspace("faces")
+                APP.processEvents()
+
+                self.assertEqual("faces", window._active_workspace)
+                self.assertIs(window.workspace_stack.currentWidget(), window.faces_pane)
+                self.assertTrue(window.faces_workspace_button.isChecked())
+                self.assertFalse(window.clustering_workspace_button.isChecked())
+                window.close()
+
+    def test_production_face_results_open_in_main_gallery(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFaceResultsGalleryTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                image_a = str(Path(tmp) / "a.jpg")
+                image_b = str(Path(tmp) / "b.jpg")
+                window.faces_pane.context_for_path = lambda path: {"origin": "faces", "path": path}
+
+                window._open_face_results_in_main_gallery([image_a, image_b])
+                self._wait_for(lambda: list(window.gallery_pane.images) == [image_a, image_b], timeout_s=2.0)
+
+                self.assertEqual("clustering", window._active_workspace)
+                self.assertEqual([image_a, image_b], list(window.gallery_pane.images))
+                self.assertEqual("faces", window.gallery_pane.inspector_context_provider(image_a)["origin"])
+                window.close()
 
     def test_benchmark_schema_writes_json_and_markdown(self):
         with TemporaryDirectory() as tmp:

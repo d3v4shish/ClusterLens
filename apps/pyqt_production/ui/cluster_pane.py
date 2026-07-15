@@ -28,7 +28,7 @@ from app.services.cluster_explanations import ClusterExplanation
 from app.services.cluster_meanings import ClusterMeaning
 from app.services.image_tags import ClusterTagSummary
 from app.services.thumbnails import ThumbnailService
-from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread
+from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from .common import build_help_inline
 
 
@@ -1143,7 +1143,10 @@ class ClusterPane(QWidget):
         self._hover_preview_job = job
         thread = start_job_in_thread(job)
         self._thread_jobs[thread] = job
-        thread.finished.connect(self._on_async_thread_finished, Qt.ConnectionType.QueuedConnection)
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._hover_preview_thread = thread
 
     def _apply_hover_preview_image(self, image: QImage, generation: int) -> None:
@@ -1231,9 +1234,7 @@ class ClusterPane(QWidget):
             if self._hover_preview_job is job:
                 self._hover_preview_job = None
 
-    @pyqtSlot()
-    def _on_async_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_async_thread_finished(self, thread=None) -> None:
         if thread is None:
             return
         self._release_async_refs(self._thread_jobs.get(thread), thread)
@@ -1247,14 +1248,7 @@ class ClusterPane(QWidget):
                     job.cancel()
                 except Exception:
                     pass
-            thread_finished = True
-            if thread is not None:
-                try:
-                    thread.quit()
-                    thread_finished = bool(thread.wait(timeout_ms))
-                except RuntimeError:
-                    thread_finished = True
-            ready_to_close = bool(thread_finished) and ready_to_close
+            ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=timeout_ms) and ready_to_close
         self._hover_preview_job = None
         self._hover_preview_thread = None
         if ready_to_close:

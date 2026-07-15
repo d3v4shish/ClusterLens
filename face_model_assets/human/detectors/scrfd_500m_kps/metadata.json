@@ -1,0 +1,22 @@
+{
+  "display_name": "SCRFD 500M",
+  "bundle_kind": "detector",
+  "backend_family": "scrfd",
+  "profile": "edge",
+  "supported_modes": ["human"],
+  "summary": "Small SCRFD detector for faster desktop and edge review passes.",
+  "hardware_class": "Edge CPU / small GPU",
+  "recommended_pair_id": "mobilefacenet_arcface",
+  "source_url": "https://github.com/deepinsight/insightface/tree/master/detection/scrfd",
+  "license": "Verify InsightFace model license before distribution.",
+  "input_name": "images",
+  "input_size": [640, 640],
+  "output_boxes_name": "boxes",
+  "output_scores_name": "scores",
+  "mean": [0.0, 0.0, 0.0],
+  "std": [255.0, 255.0, 255.0],
+  "score_threshold": 0.3,
+  "max_detections": 24,
+  "boxes_normalized": true,
+  "box_format": "xyxy"
+}

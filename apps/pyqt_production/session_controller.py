@@ -161,7 +161,9 @@ class ClusteringSessionController(QObject):
         process.setProcessEnvironment(environment)
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
-        process.finished.connect(self._on_finished)
+        process.finished.connect(
+            lambda exit_code, exit_status, process=process: self._on_finished(process, exit_code, exit_status)
+        )
         process.errorOccurred.connect(self._on_error)
         self._process = process
         LOGGER.info(
@@ -201,7 +203,9 @@ class ClusteringSessionController(QObject):
         process.setProcessEnvironment(environment)
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
-        process.finished.connect(self._on_finished)
+        process.finished.connect(
+            lambda exit_code, exit_status, process=process: self._on_finished(process, exit_code, exit_status)
+        )
         process.errorOccurred.connect(self._on_error)
         process.started.connect(self._send_pending_daemon_request)
         self._process = process
@@ -341,11 +345,11 @@ class ClusteringSessionController(QObject):
             with self._stderr_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(details + "\n")
 
-    def _on_finished(self, exit_code: int, exit_status) -> None:  # noqa: ANN001
+    def _on_finished(self, process: QProcess | None, exit_code: int, exit_status) -> None:  # noqa: ANN001
         self._drain_stdout_lines()
         self._drain_stderr_lines(flush=True)
-        sender = self.sender()
-        process = sender if isinstance(sender, QProcess) else self._process
+        if process is None:
+            process = self._process
         if process is not self._process:
             LOGGER.info("Previous production worker exited: code=%s status=%s", exit_code, exit_status)
             if process is not None:

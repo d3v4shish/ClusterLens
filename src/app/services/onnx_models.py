@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from infra.runtime import ExecutionPolicy, RuntimeCapabilityService
+from infra.runtime import ExecutionPolicy, RuntimeCapabilityService, preload_onnx_cuda_runtime_libraries
 from infra.settings import get_settings
 
 try:
@@ -69,10 +69,7 @@ class OnnxModelService:
                 return None
 
         try:
-            self._sessions[cache_key] = ort.InferenceSession(
-                str(onnx_path),
-                providers=[selected_provider, "CPUExecutionProvider"],
-            )
+            self._sessions[cache_key] = self._create_session_with_fallback(onnx_path, selected_provider)
         except Exception:
             return None
         return self._sessions[cache_key]
@@ -85,10 +82,7 @@ class OnnxModelService:
         if cache_key in self._sessions:
             return self._sessions[cache_key]
         try:
-            self._sessions[cache_key] = ort.InferenceSession(
-                str(onnx_path),
-                providers=[selected_provider, "CPUExecutionProvider"],
-            )
+            self._sessions[cache_key] = self._create_session_with_fallback(onnx_path, selected_provider)
         except Exception:
             return None
         return self._sessions[cache_key]
@@ -108,6 +102,19 @@ class OnnxModelService:
         if self.execution_policy.uses_directml and "DmlExecutionProvider" in providers:
             return "DmlExecutionProvider"
         return "CPUExecutionProvider"
+
+    @staticmethod
+    def _create_session_with_fallback(onnx_path: Path, provider: str):
+        selected = str(provider or "CPUExecutionProvider")
+        ordered = [selected, "CPUExecutionProvider"] if selected != "CPUExecutionProvider" else ["CPUExecutionProvider"]
+        if selected == "CUDAExecutionProvider":
+            preload_onnx_cuda_runtime_libraries()
+        try:
+            return ort.InferenceSession(str(onnx_path), providers=ordered)
+        except Exception:
+            if selected == "CPUExecutionProvider":
+                raise
+            return ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
     @staticmethod
     def _export(model: torch.nn.Module, input_size: tuple[int, int], onnx_path: Path, provider: str) -> None:

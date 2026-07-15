@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BUNDLED_MODEL_ASSETS = ("fast_preview", "resnet", "convnext")
+DEFAULT_MODEL_ASSET_OUTPUT_DIR = REPO_ROOT / "build" / "model_assets"
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ def build_variant(
     python = venv_python(venv_dir)
     dist_dir = dist_root / f"{target}-{variant.name}"
     work_dir = work_root / variant.name
+    model_assets_dir = DEFAULT_MODEL_ASSET_OUTPUT_DIR
 
     print(f"Variant: {variant.name} ({variant.description})")
     print(f"Package mode: {package_mode}")
@@ -111,6 +114,7 @@ def build_variant(
         run([str(python), "-m", "pip", "install", "--no-deps", "-e", str(REPO_ROOT)], dry_run=dry_run)
 
     verify_variant_environment(python, variant, dry_run=dry_run)
+    prepare_bundled_model_assets(python, output_dir=model_assets_dir, dry_run=dry_run)
     if prepare_only:
         return 0
 
@@ -118,6 +122,7 @@ def build_variant(
     env["CLUSTERLENS_BUILD_VARIANT"] = variant.name
     env["CLUSTERLENS_PACKAGE_MODE"] = package_mode
     env["CLUSTERLENS_EXECUTABLE_NAME"] = "ClusterLens"
+    env["CLUSTERLENS_MODEL_ASSETS_DIR"] = str(model_assets_dir)
     command = [
         str(python),
         "-m",
@@ -153,6 +158,22 @@ if sys.argv[1] == "cpu" and bad_cuda:
     raise SystemExit(3)
 """
     run([str(python), "-c", script, variant.name], dry_run=dry_run)
+
+
+def prepare_bundled_model_assets(python: Path, *, output_dir: Path, dry_run: bool) -> None:
+    run(
+        [
+            str(python),
+            str(REPO_ROOT / "scripts" / "export_prod_onnx_assets.py"),
+            "--models",
+            ",".join(DEFAULT_BUNDLED_MODEL_ASSETS),
+            "--output-dir",
+            str(output_dir),
+            "--preferred-execution-mode",
+            "cpu",
+        ],
+        dry_run=dry_run,
+    )
 
 
 def platform_target() -> str:

@@ -1,0 +1,16 @@
+{
+  "display_name": "AdaFace R100",
+  "bundle_kind": "embedder",
+  "profile": "accuracy",
+  "supported_modes": ["human"],
+  "summary": "Higher-capacity embedder for the best human identity matching quality.",
+  "hardware_class": "Desktop GPU",
+  "recommended_pair_id": "scrfd_10g_kps",
+  "source_url": "https://github.com/mk-minchul/AdaFace",
+  "license": "Verify AdaFace model license before distribution.",
+  "input_name": "input",
+  "input_size": [112, 112],
+  "output_name": "embedding",
+  "mean": [127.5, 127.5, 127.5],
+  "std": [128.0, 128.0, 128.0]
+}

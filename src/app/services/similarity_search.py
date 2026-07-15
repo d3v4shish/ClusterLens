@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,17 @@ class SearchResult:
     hash_distance: int = -1
     hash_backend: str = "phash"
     orb_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class DuplicateReviewGroup:
+    query_image_path: str
+    candidate_path: str
+    score: float
+    hash_distance: int
+    hash_backend: str
+    match_reason: str
+    exact: bool
 
 
 @dataclass
@@ -446,6 +458,68 @@ class SimilaritySearchService:
             )
         )
         return scored_results[: max(1, request.top_k)]
+
+    @staticmethod
+    def build_duplicate_review_groups(
+        query_image_path: str,
+        results: list[SearchResult],
+        *,
+        exact_hash_distance: int = 0,
+    ) -> list[DuplicateReviewGroup]:
+        query = str(query_image_path or "").strip()
+        groups: list[DuplicateReviewGroup] = []
+        for result in list(results or []):
+            candidate = str(result.image_path or "").strip()
+            if not candidate or (query and candidate == query):
+                continue
+            hash_distance = int(getattr(result, "hash_distance", -1))
+            if hash_distance < 0:
+                hash_distance = int(getattr(result, "phash_distance", -1))
+            groups.append(
+                DuplicateReviewGroup(
+                    query_image_path=query,
+                    candidate_path=candidate,
+                    score=float(result.score),
+                    hash_distance=hash_distance,
+                    hash_backend=str(getattr(result, "hash_backend", "phash") or "phash"),
+                    match_reason=str(result.match_reason or ""),
+                    exact=hash_distance >= 0 and hash_distance <= int(exact_hash_distance),
+                )
+            )
+        groups.sort(
+            key=lambda group: (
+                0 if group.exact else 1,
+                group.hash_distance if group.hash_distance >= 0 else 9999,
+                -group.score,
+                group.candidate_path,
+            )
+        )
+        return groups
+
+    @staticmethod
+    def export_duplicate_decisions(decisions: list[dict[str, object]], output_path: str | Path) -> dict[str, object]:
+        clean_decisions: list[dict[str, object]] = []
+        for item in list(decisions or []):
+            if not isinstance(item, dict):
+                continue
+            keeper = str(item.get("keeper_path", item.get("keeper", "")) or "").strip()
+            duplicate = str(item.get("duplicate_path", item.get("duplicate", "")) or "").strip()
+            if not keeper or not duplicate:
+                continue
+            clean_decisions.append(
+                {
+                    "keeper_path": keeper,
+                    "duplicate_path": duplicate,
+                    "action": str(item.get("action", "review") or "review"),
+                    "tag": str(item.get("tag", "") or ""),
+                    "score": float(item.get("score", 0.0) or 0.0),
+                    "hash_distance": int(item.get("hash_distance", -1) or -1),
+                    "source_files_changed": False,
+                }
+            )
+        payload = {"version": 1, "decisions": clean_decisions}
+        Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return payload
 
     def _build_query_embedding(self, request: SimilaritySearchRequest) -> np.ndarray:
         if request.search_mode == "text":

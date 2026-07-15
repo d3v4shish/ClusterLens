@@ -1,7 +1,12 @@
 ﻿from __future__ import annotations
 
+import base64
+import ctypes
 from dataclasses import dataclass, field
 import importlib.util
+import os
+from pathlib import Path
+import site
 import sys
 import time
 import warnings
@@ -17,6 +22,13 @@ try:
     import onnxruntime as ort
 except Exception:
     ort = None
+
+
+_ONNX_CUDA_LIBS_PRELOADED = False
+_ONNX_PROVIDER_PROBE_CACHE: dict[str, bool] = {}
+_ONNX_PROVIDER_PROBE_MODEL = base64.b64decode(
+    "CAg6VQoZCgVpbnB1dBIGb3V0cHV0IghJZGVudGl0eRIFcHJvYmVaFwoFaW5wdXQSDgoMCAESCAoCCAEKAggBYhgKBm91dHB1dBIOCgwIARIICgIIAQoCCAFCBAoAEBE="
+)
 
 
 def _package_version(name: str) -> str:
@@ -41,6 +53,52 @@ def _module_available(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except Exception:
         return False
+
+
+def preload_onnx_cuda_runtime_libraries() -> bool:
+    global _ONNX_CUDA_LIBS_PRELOADED
+    if _ONNX_CUDA_LIBS_PRELOADED:
+        return True
+
+    loaded_any = False
+    preload_dlls = getattr(ort, "preload_dlls", None) if ort is not None else None
+    if callable(preload_dlls):
+        try:
+            preload_dlls(directory="")
+            _ONNX_CUDA_LIBS_PRELOADED = True
+            return True
+        except TypeError:
+            try:
+                preload_dlls()
+                _ONNX_CUDA_LIBS_PRELOADED = True
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    if os.name != "posix":
+        return False
+
+    seen: set[str] = set()
+    for site_root in site.getsitepackages():
+        nvidia_root = Path(site_root) / "nvidia"
+        if not nvidia_root.exists():
+            continue
+        for lib_dir in sorted(nvidia_root.glob("*/lib")):
+            for lib_path in sorted(lib_dir.glob("*.so*")):
+                resolved = str(lib_path.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    ctypes.CDLL(resolved, mode=ctypes.RTLD_GLOBAL)
+                    loaded_any = True
+                except OSError:
+                    continue
+
+    _ONNX_CUDA_LIBS_PRELOADED = loaded_any
+    return loaded_any
 
 
 def available_execution_modes() -> tuple[str, ...]:
@@ -140,6 +198,10 @@ class ExecutionPolicy:
         return self.effective_mode == "cuda" and self.torch_device == "cuda"
 
     @property
+    def uses_onnx_cuda(self) -> bool:
+        return self.onnx_provider == "CUDAExecutionProvider"
+
+    @property
     def uses_directml(self) -> bool:
         return self.effective_mode == "directml"
 
@@ -147,6 +209,7 @@ class ExecutionPolicy:
 class RuntimeCapabilityService:
     def __init__(self) -> None:
         self._cached: RuntimeCapabilities | None = None
+        self._provider_probe_cache = _ONNX_PROVIDER_PROBE_CACHE
 
     def detect(self, refresh: bool = False) -> RuntimeCapabilities:
         if self._cached is not None and not refresh:
@@ -197,10 +260,21 @@ class RuntimeCapabilityService:
         if preferred not in {"auto", "cuda", "directml", "cpu"}:
             preferred = "auto"
 
+        cuda_onnx_usable = capabilities.has_onnx_cuda and self._onnx_provider_usable(
+            "CUDAExecutionProvider",
+            refresh=refresh,
+        )
+        directml_usable = capabilities.has_onnx_directml and self._onnx_provider_usable(
+            "DmlExecutionProvider",
+            refresh=refresh,
+        )
+
         if preferred in {"auto", "cuda"} and capabilities.torch_cuda_available:
-            provider = "CUDAExecutionProvider" if capabilities.has_onnx_cuda else "CPUExecutionProvider"
+            provider = "CUDAExecutionProvider" if cuda_onnx_usable else "CPUExecutionProvider"
             reason = f"Using CUDA Torch on {capabilities.cuda_device_name or 'GPU'}."
-            if provider != "CUDAExecutionProvider":
+            if capabilities.has_onnx_cuda and provider != "CUDAExecutionProvider":
+                reason += " ONNX CUDA provider failed verification; ONNX falls back to CPU."
+            elif provider != "CUDAExecutionProvider":
                 reason += " ONNX CUDA provider is unavailable; ONNX falls back to CPU."
             return ExecutionPolicy(
                 preferred_mode=preferred,
@@ -210,10 +284,23 @@ class RuntimeCapabilityService:
                 reason=reason,
             )
 
-        if preferred in {"auto", "cuda"} and preferred == "cuda":
-            return self._cpu_fallback(capabilities, preferred, "CUDA requested but no CUDA-capable Torch runtime is available.")
+        if preferred in {"auto", "cuda"} and cuda_onnx_usable:
+            return ExecutionPolicy(
+                preferred_mode=preferred,
+                effective_mode="cuda",
+                torch_device="cpu",
+                onnx_provider="CUDAExecutionProvider",
+                reason="Using CUDA ONNX Runtime. Torch workloads remain on CPU.",
+            )
 
-        if preferred in {"auto", "directml"} and capabilities.has_onnx_directml:
+        if preferred in {"auto", "cuda"} and preferred == "cuda":
+            return self._cpu_fallback(
+                capabilities,
+                preferred,
+                "CUDA requested but neither CUDA Torch nor a verified CUDA ONNX Runtime is available.",
+            )
+
+        if preferred in {"auto", "directml"} and directml_usable:
             return ExecutionPolicy(
                 preferred_mode=preferred,
                 effective_mode="directml",
@@ -223,7 +310,11 @@ class RuntimeCapabilityService:
             )
 
         if preferred == "directml":
-            return self._cpu_fallback(capabilities, preferred, "DirectML requested but DmlExecutionProvider is unavailable.")
+            return self._cpu_fallback(
+                capabilities,
+                preferred,
+                "DirectML requested but DmlExecutionProvider is unavailable or failed verification.",
+            )
 
         if preferred == "cpu":
             return ExecutionPolicy(
@@ -235,6 +326,30 @@ class RuntimeCapabilityService:
             )
 
         return self._cpu_fallback(capabilities, preferred, "")
+
+    def _onnx_provider_usable(self, provider: str, *, refresh: bool = False) -> bool:
+        normalized = str(provider or "").strip()
+        if not normalized or normalized == "CPUExecutionProvider":
+            return True
+        capabilities = self.detect(refresh=refresh)
+        if ort is None or normalized not in capabilities.onnx_providers:
+            return False
+        cache_key = normalized.casefold()
+        if not refresh and cache_key in self._provider_probe_cache:
+            return self._provider_probe_cache[cache_key]
+        try:
+            if normalized == "CUDAExecutionProvider":
+                preload_onnx_cuda_runtime_libraries()
+            session = ort.InferenceSession(
+                _ONNX_PROVIDER_PROBE_MODEL,
+                providers=[normalized, "CPUExecutionProvider"],
+            )
+            providers = tuple(str(item) for item in session.get_providers())
+            usable = normalized in providers and (providers[0] == normalized or len(providers) == 1)
+        except Exception:
+            usable = False
+        self._provider_probe_cache[cache_key] = usable
+        return usable
 
     def diagnostics(self, preferred_mode: str = "auto") -> dict[str, object]:
         capabilities = self.detect()
@@ -306,6 +421,8 @@ class RuntimeCapabilityService:
                 sample = torch.randn(1, 3, 16, 16)
                 t0 = time.perf_counter()
                 torch.onnx.export(model, sample, str(tmp), input_names=["input"], output_names=["output"], opset_version=17)
+                if policy.onnx_provider == "CUDAExecutionProvider":
+                    preload_onnx_cuda_runtime_libraries()
                 providers = [policy.onnx_provider, "CPUExecutionProvider"]
                 session = ort.InferenceSession(str(tmp), providers=providers)
                 input_name = session.get_inputs()[0].name
