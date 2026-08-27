@@ -13,9 +13,11 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSpinBox,
     QTreeView,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -115,6 +117,8 @@ CLUSTERING_HELP = {
 
 class SourcePane(QWidget):
     directory_changed = pyqtSignal(str)
+    recent_folder_remove_requested = pyqtSignal(str)
+    recent_folders_clear_requested = pyqtSignal()
     state_changed = pyqtSignal()
     hide_requested = pyqtSignal()
     run_requested = pyqtSignal()
@@ -123,7 +127,12 @@ class SourcePane(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = get_settings()
-        self.selected_directory = "D:/" if os.name == "nt" else "/home"
+        # The folder tree needs a browse root, but that root is not an implicit
+        # user selection. Keeping these states separate prevents a fresh launch
+        # from reporting both `/home` and "No folder selected".
+        self.selected_directory = ""
+        self._recent_directories: list[str] = []
+        self._browse_root = "C:/" if os.name == "nt" else "/home"
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -143,6 +152,13 @@ class SourcePane(QWidget):
         self.hide_button.clicked.connect(self.hide_requested.emit)
         header.addWidget(title)
         header.addStretch(1)
+        self.recent_folders_button = QToolButton(self)
+        self.recent_folders_button.setText("Recent")
+        self.recent_folders_button.setToolTip("Open or manage recently selected folders.")
+        self.recent_folders_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.recent_folders_menu = QMenu(self.recent_folders_button)
+        self.recent_folders_button.setMenu(self.recent_folders_menu)
+        header.addWidget(self.recent_folders_button)
         header.addWidget(self.hide_button)
         layout.addLayout(header)
 
@@ -153,11 +169,11 @@ class SourcePane(QWidget):
 
         self.file_model = QFileSystemModel()
         self.file_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
-        self.file_model.setRootPath(self.selected_directory)
+        self.file_model.setRootPath(self._browse_root)
 
         self.file_tree = QTreeView()
         self.file_tree.setModel(self.file_model)
-        self.file_tree.setRootIndex(self.file_model.index(self.selected_directory))
+        self.file_tree.setRootIndex(self.file_model.index(self._browse_root))
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setColumnHidden(1, True)
         self.file_tree.setColumnHidden(2, True)
@@ -186,6 +202,38 @@ class SourcePane(QWidget):
         layout.addWidget(self.basic_action_section)
         self.set_running(False)
         self.basic_action_section.hide()
+        self.set_recent_directories([])
+
+    @staticmethod
+    def _recent_folder_label(path: str) -> str:
+        normalized = os.path.normpath(str(path or ""))
+        name = os.path.basename(normalized) or normalized
+        parent = os.path.dirname(normalized)
+        return f"{name} — {parent}" if parent and parent != normalized else name
+
+    def set_recent_directories(self, directories: list[str]) -> None:
+        self._recent_directories = [str(path) for path in directories if str(path or "").strip()]
+        self.recent_folders_menu.clear()
+        if not self._recent_directories:
+            empty_action = self.recent_folders_menu.addAction("No recent folders")
+            empty_action.setEnabled(False)
+            self.recent_folders_button.setToolTip("No recent folders yet.")
+            return
+        self.recent_folders_button.setToolTip("Open or manage recently selected folders.")
+        for path in self._recent_directories:
+            action = self.recent_folders_menu.addAction(self._recent_folder_label(path))
+            action.setToolTip(path)
+            action.triggered.connect(lambda _checked=False, value=path: self.set_selected_directory(value))
+        self.recent_folders_menu.addSeparator()
+        remove_menu = self.recent_folders_menu.addMenu("Remove from history")
+        for path in self._recent_directories:
+            action = remove_menu.addAction(self._recent_folder_label(path))
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda _checked=False, value=path: self.recent_folder_remove_requested.emit(value)
+            )
+        clear_action = self.recent_folders_menu.addAction("Clear history")
+        clear_action.triggered.connect(self.recent_folders_clear_requested.emit)
 
     def populate_drives(self) -> None:
         self.directory_combobox.clear()
@@ -193,10 +241,10 @@ class SourcePane(QWidget):
             from string import ascii_uppercase
 
             drives = [f"{letter}:/" for letter in ascii_uppercase if os.path.exists(f"{letter}:/")]
-            self.selected_directory = drives[0] if drives else "C:/"
+            self._browse_root = drives[0] if drives else "C:/"
         else:
             drives = ["/", "/home"]
-            self.selected_directory = "/home"
+            self._browse_root = "/home"
         self.directory_combobox.addItems(drives)
 
     def on_directory_selected(self, index) -> None:
@@ -206,6 +254,7 @@ class SourcePane(QWidget):
 
     def on_directory_changed(self, _index) -> None:
         root_directory = self.directory_combobox.currentText()
+        self._browse_root = root_directory
         self.selected_directory = root_directory
         self.file_model.setRootPath(root_directory)
         self.file_tree.setRootIndex(self.file_model.index(root_directory))
@@ -276,6 +325,27 @@ class ClusteringOptionsPane(QWidget):
         header.addWidget(self.hide_button)
         layout.addLayout(header)
 
+        self._applying_preset = False
+        self.preset_group = QGroupBox("Clustering preset", self)
+        preset_layout = QFormLayout(self.preset_group)
+        self.preset_combo = QComboBox(self.preset_group)
+        self.preset_combo.addItem("Fast Preview", "fast_preview")
+        self.preset_combo.addItem("Balanced", "balanced")
+        self.preset_combo.addItem("High Quality", "high_quality")
+        self.preset_combo.addItem("Custom", "custom")
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData("balanced"))
+        self.preset_summary = QLabel("Balanced quality, time, and memory use.")
+        self.preset_summary.setWordWrap(True)
+        preset_layout.addRow("Preset", self.preset_combo)
+        preset_layout.addRow(self.preset_summary)
+        self.preset_group.setVisible(self.option_scope == "production")
+        layout.addWidget(self.preset_group)
+
+        self.technical_panel = QWidget(self)
+        technical_layout = QVBoxLayout(self.technical_panel)
+        technical_layout.setContentsMargins(0, 0, 0, 0)
+        technical_layout.setSpacing(6)
+
         embedding_group = QGroupBox("Embedding Models")
         embedding_group.setToolTip(CLUSTERING_HELP["embedding_models"])
         embedding_layout = QGridLayout(embedding_group)
@@ -291,7 +361,7 @@ class ClusteringOptionsPane(QWidget):
             checkbox.toggled.connect(self.state_changed.emit)
             self.embedding_checkboxes[model_name] = checkbox
             embedding_layout.addWidget(checkbox, index // 2, index % 2)
-        layout.addWidget(embedding_group)
+        technical_layout.addWidget(embedding_group)
 
         backend_group = QGroupBox("Cluster Backends")
         backend_group.setToolTip(CLUSTERING_HELP["cluster_backends"])
@@ -308,7 +378,7 @@ class ClusteringOptionsPane(QWidget):
             checkbox.toggled.connect(self.state_changed.emit)
             self.backend_checkboxes[backend] = checkbox
             backend_layout.addWidget(checkbox, index // 2, index % 2)
-        layout.addWidget(backend_group)
+        technical_layout.addWidget(backend_group)
 
         options_group = QGroupBox("Options")
         options_layout = QFormLayout(options_group)
@@ -389,7 +459,8 @@ class ClusteringOptionsPane(QWidget):
         self.tag_match_combobox.setToolTip(CLUSTERING_HELP["tag_match"])
         self.tag_match_combobox.currentIndexChanged.connect(self.state_changed.emit)
         options_layout.addRow(build_help_label("Tag Match", CLUSTERING_HELP["tag_match"], help_key="tag_match"), self.tag_match_combobox)
-        layout.addWidget(options_group)
+        technical_layout.addWidget(options_group)
+        layout.addWidget(self.technical_panel)
 
         button_row = QHBoxLayout()
         self.cluster_button = QPushButton("Run Clustering")
@@ -403,6 +474,91 @@ class ClusteringOptionsPane(QWidget):
         self.cluster_button.clicked.connect(self.run_requested.emit)
         self.cancel_button.clicked.connect(self.cancel_requested.emit)
         self._last_metrics_text = ""
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        for checkbox in (*self.embedding_checkboxes.values(), *self.backend_checkboxes.values(), *self.similarity_checkboxes.values()):
+            checkbox.toggled.connect(self._mark_custom_preset)
+        for widget in (
+            self.outlier_combobox,
+            self.cluster_spinbox,
+            self.recursive_checkbox,
+            self.onnx_checkbox,
+            self.result_cache_checkbox,
+            self.embedding_cache_lookup_checkbox,
+            self.tag_filter_field,
+            self.tag_match_combobox,
+        ):
+            signal = getattr(widget, "textChanged", None) or getattr(widget, "valueChanged", None) or getattr(widget, "toggled", None) or getattr(widget, "currentIndexChanged", None)
+            if signal is not None:
+                signal.connect(self._mark_custom_preset)
+        if self.option_scope == "production":
+            self._apply_preset("balanced")
+        else:
+            self.technical_panel.show()
+
+    def _on_preset_changed(self, _index: int) -> None:
+        preset = str(self.preset_combo.currentData() or "custom")
+        self._apply_preset(preset)
+        self.state_changed.emit()
+
+    def _mark_custom_preset(self, *_args) -> None:
+        if self._applying_preset or self.option_scope != "production":
+            return
+        custom_index = self.preset_combo.findData("custom")
+        if self.preset_combo.currentIndex() != custom_index:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(custom_index)
+            self.preset_combo.blockSignals(False)
+        self.technical_panel.show()
+        self.preset_summary.setText("Custom settings. Review model, grouping, cache, and runtime tradeoffs below.")
+
+    def _apply_preset(self, preset: str) -> None:
+        preset = str(preset or "custom")
+        summaries = {
+            "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
+            "balanced": "Balanced quality, time, and memory use for most photo folders.",
+            "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
+            "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
+        }
+        self.preset_summary.setText(summaries.get(preset, summaries["custom"]))
+        # The production controls pane is only shown in Advanced workspace
+        # mode, so presets should populate its controls instead of concealing
+        # them. Hiding this panel made HDBSCAN, graph clustering, model,
+        # similarity, outlier, and runtime options appear to have been removed.
+        self.technical_panel.setVisible(True)
+        if preset == "custom":
+            return
+        configurations = {
+            "fast_preview": {
+                "models": {"fast_preview"}, "backends": {"cosine-kmeans"}, "modes": {"semantic"},
+                "outlier": "assign", "clusters": 8, "onnx": True,
+            },
+            "balanced": {
+                "models": {"dino"}, "backends": {"cosine-kmeans"}, "modes": {"semantic"},
+                "outlier": "assign", "clusters": 12, "onnx": False,
+            },
+            "high_quality": {
+                "models": {"dinov2_base", "clip"}, "backends": {"hdbscan", "graph"}, "modes": {"semantic", "cosine"},
+                "outlier": "isolate", "clusters": 16, "onnx": False,
+            },
+        }
+        config = configurations.get(preset)
+        if config is None:
+            return
+        self._applying_preset = True
+        try:
+            for name, checkbox in self.embedding_checkboxes.items():
+                checkbox.setChecked(name in config["models"])
+            for name, checkbox in self.backend_checkboxes.items():
+                checkbox.setChecked(name in config["backends"])
+            for name, checkbox in self.similarity_checkboxes.items():
+                checkbox.setChecked(name in config["modes"])
+            self.outlier_combobox.setCurrentText(str(config["outlier"]))
+            self.cluster_spinbox.setValue(int(config["clusters"]))
+            self.onnx_checkbox.setChecked(bool(config["onnx"]))
+            self.result_cache_checkbox.setChecked(True)
+            self.embedding_cache_lookup_checkbox.setChecked(True)
+        finally:
+            self._applying_preset = False
 
     def set_running(self, running: bool) -> None:
         self.cluster_button.setEnabled(not running)
@@ -446,6 +602,7 @@ class ClusteringOptionsPane(QWidget):
     def export_state(self) -> dict[str, object]:
         similarity_modes = self.selected_similarity_modes()
         return {
+            "preset": str(self.preset_combo.currentData() or "custom"),
             "embedding_models": self.selected_embedding_models(),
             "clustering_backends": self.selected_clustering_backends(),
             "similarity_modes": similarity_modes,
@@ -463,6 +620,13 @@ class ClusteringOptionsPane(QWidget):
     def apply_state(self, state: dict[str, object] | None) -> None:
         if not state:
             return
+        self._applying_preset = True
+        preset = str(state.get("preset") or "custom")
+        preset_index = self.preset_combo.findData(preset)
+        if preset_index >= 0:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(preset_index)
+            self.preset_combo.blockSignals(False)
         embedding_models = set(
             normalize_embedding_models(
                 state.get("embedding_models"),
@@ -500,6 +664,14 @@ class ClusteringOptionsPane(QWidget):
         self.embedding_cache_lookup_checkbox.setChecked(bool(state.get("use_embedding_cache_lookup", True)))
         self.tag_filter_field.setText(str(state.get("tag_filter") or ""))
         self.tag_match_combobox.setCurrentText(str(state.get("tag_match") or "Any"))
+        self._applying_preset = False
+        self.technical_panel.setVisible(preset == "custom" or self.option_scope != "production")
+        self.preset_summary.setText({
+            "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
+            "balanced": "Balanced quality, time, and memory use for most photo folders.",
+            "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
+            "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
+        }.get(preset, "Custom settings."))
 
     def update_metrics(self, metrics: dict) -> None:
         ordered_keys = [

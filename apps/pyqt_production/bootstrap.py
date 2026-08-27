@@ -16,4 +16,7 @@ def bootstrap_runtime() -> tuple[RuntimeLayout, Path]:
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
     layout = activate_runtime_root(APP_NAME, legacy_app_names=LEGACY_PRODUCTION_APP_IDS)
+    from infra.settings import configure_model_cache_environment
+
+    configure_model_cache_environment()
     return layout, repo_root

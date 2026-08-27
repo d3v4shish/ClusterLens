@@ -9,6 +9,7 @@ import numpy as np
 from PIL import ExifTags, Image
 
 from infra.cancel import raise_if_cancelled
+from infra.atomic_io import atomic_write_text
 from infra.settings import get_settings
 from ml.embeddings import EmbeddingService
 
@@ -518,7 +519,7 @@ class SimilaritySearchService:
                 }
             )
         payload = {"version": 1, "decisions": clean_decisions}
-        Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_text(Path(output_path), json.dumps(payload, indent=2, sort_keys=True))
         return payload
 
     def _build_query_embedding(self, request: SimilaritySearchRequest) -> np.ndarray:

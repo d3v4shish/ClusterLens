@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from infra.atomic_io import atomic_write_text
 from infra.settings import get_settings
 
 
@@ -142,9 +143,7 @@ class SavedSearchService:
                 for record in records
             ],
         }
-        tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        tmp_path.replace(self.file_path)
+        atomic_write_text(self.file_path, json.dumps(payload, indent=2, sort_keys=True))
 
 
 def _utc_timestamp() -> str:

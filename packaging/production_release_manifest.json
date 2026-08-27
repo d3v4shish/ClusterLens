@@ -18,11 +18,11 @@
       {
         "id": "cpu",
         "label": "CPU",
-        "default_package_mode": "onefile",
+        "default_package_mode": "onedir",
         "requirements": "packaging/requirements-build-cpu.txt",
         "artifact_suffix": "cpu",
         "runtime_downloads": "model weights only",
-        "notes": "Default public build. Must not include nvidia-* or triton wheels."
+        "notes": "Default public build. Uses one-folder PyInstaller output inside native installers and must not include nvidia-* or triton wheels."
       },
       {
         "id": "gpu-cu121",
@@ -44,11 +44,12 @@
     "icon_png": "apps/pyqt_production/assets/app_icon.png",
     "icon_ico": "apps/pyqt_production/assets/app_icon.ico",
     "include_runtime_dirs": [
-      "model_assets"
+      "model_assets",
+      "face_model_assets metadata catalog"
     ],
     "include_optional_accelerators": [
       "hf_xet",
-      "onnxruntime-gpu or onnxruntime-directml",
+      "onnxruntime-gpu for CUDA packages",
       "torch CUDA build when GPU package is shipped"
     ],
     "code_signing": {

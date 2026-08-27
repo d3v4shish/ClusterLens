@@ -125,14 +125,11 @@ class SettingsDialog(QDialog):
 
         runtime_actions = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh Diagnostics")
-        self.install_directml_button = QPushButton("Install DirectML (Windows GPU)")
         self.install_cuda_button = QPushButton("Install CUDA (NVIDIA)")
         self.verify_gpu_button = QPushButton("Verify GPU")
         if sys.platform != "win32":
-            self.install_directml_button.setVisible(False)
             self.install_cuda_button.setVisible(False)
         runtime_actions.addWidget(self.refresh_button)
-        runtime_actions.addWidget(self.install_directml_button)
         runtime_actions.addWidget(self.install_cuda_button)
         runtime_actions.addWidget(self.verify_gpu_button)
         runtime_form.addRow(runtime_actions)
@@ -285,7 +282,6 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
         self.refresh_button.clicked.connect(self.refresh_runtime_diagnostics)
-        self.install_directml_button.clicked.connect(lambda: self._launch_installer("enable_gpu_directml.ps1"))
         self.install_cuda_button.clicked.connect(lambda: self._launch_installer("enable_gpu_cuda.ps1"))
         self.verify_gpu_button.clicked.connect(self._verify_gpu)
         self.install_yunet_face_model_button.clicked.connect(self._install_yunet_face_model)
@@ -961,7 +957,6 @@ class SettingsDialog(QDialog):
             f"- torch: {packages.get('torch') or '-'}",
             f"- onnx: {packages.get('onnx') or '-'}",
             f"- onnxruntime: {packages.get('onnxruntime') or '-'}",
-            f"- onnxruntime-directml: {packages.get('onnxruntime-directml') or '-'}",
             f"- onnxruntime-gpu: {packages.get('onnxruntime-gpu') or '-'}",
             f"- hf_xet: {packages.get('hf_xet') or '-'}",
             f"- flash-attn: {packages.get('flash-attn') or '-'}",
@@ -1025,7 +1020,6 @@ class SettingsDialog(QDialog):
             [
                 "",
                 "Notes:",
-                "- DirectML GPU acceleration applies only to Windows ONNX-enabled torchvision models (fast_preview, convnext, resnet).",
                 "- CUDA acceleration requires a CUDA-enabled Torch build plus NVIDIA drivers.",
                 "- hf_xet is optional but improves Hugging Face download speed; include it in the packaged Python runtime if you ship a one-file exe.",
                 "- Flash attention is not bundled automatically. If you want that optimization in the final exe, ship a Torch/CUDA stack that already provides it and verify it on the target machine.",

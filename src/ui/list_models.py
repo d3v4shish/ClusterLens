@@ -61,3 +61,81 @@ class ListEntryModel(QAbstractListModel):
 
     def clear(self) -> None:
         self.set_items([])
+
+
+class PagedListEntryModel(ListEntryModel):
+    """A bounded, filterable list model that exposes data one page at a time."""
+
+    def __init__(self, parent=None, *, page_size: int = 50) -> None:
+        super().__init__(parent)
+        self.page_size = max(1, int(page_size))
+        self._all_items: list[ListEntry] = []
+        self._matching_items: list[ListEntry] = []
+        self._query = ""
+        self._sort_descending = False
+
+    @property
+    def total_count(self) -> int:
+        return len(self._matching_items)
+
+    @property
+    def source_count(self) -> int:
+        return len(self._all_items)
+
+    def set_source_items(self, items: list[ListEntry], *, preserve_payload: object | None = None) -> None:
+        self.beginResetModel()
+        self._all_items = list(items)
+        self._rebuild_matches()
+        self._items = self._matching_items[: self.page_size]
+        self.endResetModel()
+        _ = preserve_payload
+
+    def set_filter_text(self, query: str) -> None:
+        normalized = str(query or "").strip().casefold()
+        if normalized == self._query:
+            return
+        self.beginResetModel()
+        self._query = normalized
+        self._rebuild_matches()
+        self._items = self._matching_items[: self.page_size]
+        self.endResetModel()
+
+    def set_sort_descending(self, descending: bool) -> None:
+        descending = bool(descending)
+        if descending == self._sort_descending:
+            return
+        self.beginResetModel()
+        self._sort_descending = descending
+        self._rebuild_matches()
+        self._items = self._matching_items[: self.page_size]
+        self.endResetModel()
+
+    def canFetchMore(self, parent: QModelIndex = QModelIndex()) -> bool:
+        return not parent.isValid() and len(self._items) < len(self._matching_items)
+
+    def fetchMore(self, parent: QModelIndex = QModelIndex()) -> None:
+        if parent.isValid() or not self.canFetchMore(parent):
+            return
+        start = len(self._items)
+        end = min(start + self.page_size, len(self._matching_items))
+        self.beginInsertRows(QModelIndex(), start, end - 1)
+        self._items.extend(self._matching_items[start:end])
+        self.endInsertRows()
+
+    def row_for_payload(self, payload: object) -> int:
+        for row, item in enumerate(self._matching_items):
+            if item.payload == payload:
+                while row >= len(self._items) and self.canFetchMore():
+                    self.fetchMore()
+                return row
+        return -1
+
+    def _rebuild_matches(self) -> None:
+        if self._query:
+            items = [
+                item for item in self._all_items
+                if self._query in f"{item.title} {item.tooltip}".casefold()
+            ]
+        else:
+            items = list(self._all_items)
+        self._matching_items = sorted(items, key=lambda item: item.title.casefold(), reverse=self._sort_descending)

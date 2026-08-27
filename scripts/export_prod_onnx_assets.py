@@ -17,7 +17,14 @@ if str(SRC_ROOT) not in sys.path:
 
 from apps.pyqt_production.identity import PRODUCTION_APP_ID
 from apps.shared.runtime_support import activate_runtime_root, configure_rotating_logging, install_crash_handlers
-from app.services.model_assets import MODEL_LICENSES, MODEL_MANIFEST_VERSION, MODEL_SOURCE_LABELS, MODEL_SOURCE_URLS, sha256_file
+from app.services.model_assets import (
+    MODEL_LICENSES,
+    MODEL_MANIFEST_VERSION,
+    MODEL_SOURCE_LABELS,
+    MODEL_SOURCE_URLS,
+    ModelAssetManifestV2,
+    sha256_file,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,28 +76,43 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("ONNX session creation failed")
             source_path = onnx_service.model_dir / f"{model_name}_{bundle.input_size[0]}x{bundle.input_size[1]}.onnx"
             if not source_path.exists():
+                asset_bundle = model_manager.model_asset_service.find_bundle(model_name)
+                if asset_bundle is not None and tuple(asset_bundle.input_size) == tuple(bundle.input_size):
+                    source_path = asset_bundle.model_path
+            if not source_path.exists():
                 raise FileNotFoundError(f"Exported ONNX bundle not found: {source_path}")
             target_dir = output_dir / model_name
             target_dir.mkdir(parents=True, exist_ok=True)
             target_model = target_dir / "model.onnx"
-            shutil.copy2(source_path, target_model)
+            if not _same_file(source_path, target_model):
+                shutil.copy2(source_path, target_model)
             sha256 = sha256_file(target_model)
-            metadata = {
-                "manifest_version": MODEL_MANIFEST_VERSION,
-                "model_name": model_name,
-                "family": bundle.family,
-                "input_size": [int(bundle.input_size[0]), int(bundle.input_size[1])],
-                "signature": bundle.signature,
-                "sha256": sha256,
-                "size_bytes": int(target_model.stat().st_size),
-                "source_label": MODEL_SOURCE_LABELS.get(model_name, ""),
-                "source_url": MODEL_SOURCE_URLS.get(model_name, ""),
-                "license": MODEL_LICENSES.get(model_name, "Review upstream model license before distribution."),
-                "source_path": str(source_path),
-                "target_model": str(target_model),
-                "onnx_providers": list(runtime_service.detect().onnx_providers),
-                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            }
+            runtime_target = "cuda" if execution_policy.effective_mode == "cuda" else "cpu"
+            precision = "fp16" if runtime_target == "cuda" else "fp32"
+            metadata = ModelAssetManifestV2(
+                model_name=model_name,
+                purpose="image_embedding",
+                format="onnx",
+                target=runtime_target,
+                min_compute_capability="7.0" if runtime_target == "cuda" else "",
+                precision=precision,
+                sha256=sha256,
+                size_bytes=int(target_model.stat().st_size),
+                source_label=MODEL_SOURCE_LABELS.get(model_name, ""),
+                source_url=MODEL_SOURCE_URLS.get(model_name, ""),
+                license=MODEL_LICENSES.get(model_name, "Review upstream model license before distribution."),
+                input_size=(int(bundle.input_size[0]), int(bundle.input_size[1])),
+                signature=bundle.signature,
+            ).as_dict()
+            metadata.update(
+                {
+                    "family": bundle.family,
+                    "source_path": str(source_path),
+                    "target_model": str(target_model),
+                    "onnx_providers": list(runtime_service.detect().onnx_providers),
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             (target_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
             manifest["bundles"].append(metadata)
         except Exception as exc:
@@ -99,7 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"manifest": str(manifest_path)}, indent=2))
-    return 0
+    return 1 if manifest["failures"] else 0
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":

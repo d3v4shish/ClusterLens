@@ -1,3 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
 -r requirements-build-base.txt
 torch==2.2.2
 torchvision==0.17.2
+# ONNX Runtime's PyPI 1.18.0 wheel is CUDA 11.x. Use the official
+# CUDA 12.x feed artifact for PyTorch 2.2.x CUDA 12.1 + cuDNN 8.x.
+onnxruntime-gpu @ https://aiinfra.pkgs.visualstudio.com/2692857e-05ef-43b4-ba9c-ccf1c22c437c/_packaging/9387c3aa-d9ad-4513-968c-383f6f7f53b8/pypi/download/onnxruntime-gpu/1.18/onnxruntime_gpu-1.18.0-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=546fbf2dcb7a2830ca69bde0c38665a88a9454e923ebb76bedf85eaed33a6f4a

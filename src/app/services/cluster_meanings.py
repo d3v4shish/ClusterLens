@@ -13,6 +13,7 @@ import numpy as np
 
 from infra.logging_config import get_logger
 from infra.settings import get_settings
+from infra.atomic_io import atomic_write_text
 
 
 LOGGER = get_logger(__name__)
@@ -155,6 +156,7 @@ class ClusterMeaningCacheService:
         image_paths: list[str] | tuple[str, ...],
         path_fingerprints: dict[str, tuple[int, int]] | None,
         explanation_model: str,
+        model_signature: str = "",
         prompt_version: str = CLUSTER_MEANING_PROMPT_VERSION,
     ) -> str:
         fingerprint_payload = []
@@ -168,6 +170,7 @@ class ClusterMeaningCacheService:
                 "cluster_id": int(cluster_id),
                 "image_fingerprints": fingerprint_payload,
                 "explanation_model": str(explanation_model),
+                "model_signature": str(model_signature or ""),
                 "prompt_version": str(prompt_version),
             },
             sort_keys=True,
@@ -186,7 +189,7 @@ class ClusterMeaningCacheService:
 
     def save(self, key: str, meaning: ClusterMeaning) -> None:
         path = self.cache_dir / f"{key}.json"
-        path.write_text(json.dumps(meaning.as_context(), indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(meaning.as_context(), indent=2))
 
 
 class ClusterMeaningService:
@@ -274,6 +277,8 @@ class ClusterMeaningService:
         misses: list[tuple[str, int, list[str], str]] = []
         cache_hits = 0
         cache_misses = 0
+        signature_fn = getattr(getattr(embedding_service, "model_manager", None), "static_signature", None)
+        model_signature = str(signature_fn(model_name, False) or "") if callable(signature_fn) else ""
 
         for comparison_key, clusters in clusters_by_key.items():
             meanings[comparison_key] = {}
@@ -287,6 +292,7 @@ class ClusterMeaningService:
                     image_paths=list(image_paths),
                     path_fingerprints=path_fingerprints,
                     explanation_model=model_name,
+                    model_signature=model_signature,
                 )
                 cached = self.cache_service.load(cache_key)
                 if cached is not None:

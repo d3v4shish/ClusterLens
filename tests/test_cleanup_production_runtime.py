@@ -60,12 +60,17 @@ def test_yes_deletes_cache_targets_and_preserves_user_data(tmp_path: Path) -> No
 def test_optional_logs_scope_deletes_logs(tmp_path: Path) -> None:
     root = tmp_path / "ClusterLens"
     log_file = root / "logs" / "app.log"
-    log_file.parent.mkdir(parents=True)
-    log_file.write_bytes(b"log")
+    operation_journal = root / "logs" / "file_operations.sqlite3"
+    operation_audit = root / "logs" / "file_operations.jsonl"
+    for path in (log_file, operation_journal, operation_audit):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"log")
 
     assert cleanup.main(["--runtime-root", str(root), "--logs", "--yes"]) == 0
 
     assert not log_file.exists()
+    assert operation_journal.exists()
+    assert operation_audit.exists()
 
 
 def test_all_user_data_requires_second_confirmation(tmp_path: Path) -> None:

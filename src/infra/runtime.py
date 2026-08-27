@@ -3,6 +3,7 @@
 import base64
 import ctypes
 from dataclasses import dataclass, field
+import importlib
 import importlib.util
 import os
 from pathlib import Path
@@ -11,24 +12,39 @@ import sys
 import time
 import warnings
 
-import torch
-
 try:
     from importlib import metadata as _importlib_metadata
 except Exception:  # pragma: no cover
     _importlib_metadata = None
 
-try:
-    import onnxruntime as ort
-except Exception:
-    ort = None
-
-
 _ONNX_CUDA_LIBS_PRELOADED = False
 _ONNX_PROVIDER_PROBE_CACHE: dict[str, bool] = {}
+_MODULE_UNSET = object()
+_TORCH_MODULE: object = _MODULE_UNSET
+_ONNX_RUNTIME_MODULE: object = _MODULE_UNSET
 _ONNX_PROVIDER_PROBE_MODEL = base64.b64decode(
     "CAg6VQoZCgVpbnB1dBIGb3V0cHV0IghJZGVudGl0eRIFcHJvYmVaFwoFaW5wdXQSDgoMCAESCAoCCAEKAggBYhgKBm91dHB1dBIOCgwIARIICgIIAQoCCAFCBAoAEBE="
 )
+
+
+def _load_optional_module(name: str, cache_name: str):
+    cached = globals()[cache_name]
+    if cached is not _MODULE_UNSET:
+        return cached
+    try:
+        cached = importlib.import_module(name)
+    except Exception:
+        cached = None
+    globals()[cache_name] = cached
+    return cached
+
+
+def _torch_module():
+    return _load_optional_module("torch", "_TORCH_MODULE")
+
+
+def _onnx_runtime_module():
+    return _load_optional_module("onnxruntime", "_ONNX_RUNTIME_MODULE")
 
 
 def _package_version(name: str) -> str:
@@ -61,6 +77,7 @@ def preload_onnx_cuda_runtime_libraries() -> bool:
         return True
 
     loaded_any = False
+    ort = _onnx_runtime_module()
     preload_dlls = getattr(ort, "preload_dlls", None) if ort is not None else None
     if callable(preload_dlls):
         try:
@@ -102,14 +119,13 @@ def preload_onnx_cuda_runtime_libraries() -> bool:
 
 
 def available_execution_modes() -> tuple[str, ...]:
-    modes = ["auto", "cuda"]
-    if sys.platform == "win32":
-        modes.append("directml")
-    modes.append("cpu")
-    return tuple(modes)
+    return ("auto", "cuda", "cpu")
 
 
 def _flash_sdp_enabled() -> bool:
+    torch = _torch_module()
+    if torch is None:
+        return False
     backend = getattr(getattr(torch, "backends", None), "cuda", None)
     probe = getattr(backend, "flash_sdp_enabled", None)
     if callable(probe):
@@ -144,9 +160,7 @@ def _build_remediation(
         else:
             remediation.append("Installed Torch build is CPU-only (CUDA requires CUDA Torch wheels).")
     if not packages.get("onnx"):
-        remediation.append("Install onnx (python package) to export models for ONNX Runtime (DirectML/CUDA ONNX).")
-    if sys.platform == "win32" and not capabilities.has_onnx_directml:
-        remediation.append("Install onnxruntime-directml for Windows DirectML support.")
+        remediation.append("Install onnx (python package) to export models for ONNX Runtime CUDA/CPU inference.")
     if not capabilities.has_onnx_cuda:
         remediation.append("Install an ONNX Runtime GPU build (onnxruntime-gpu) for CUDA ONNX inference.")
     if not bool(optional_details.get("hf_xet_installed")):
@@ -177,12 +191,21 @@ class RuntimeCapabilities:
         return "CUDAExecutionProvider" in self.onnx_providers
 
     @property
-    def has_onnx_directml(self) -> bool:
-        return "DmlExecutionProvider" in self.onnx_providers
-
-    @property
     def has_onnx_cpu(self) -> bool:
         return "CPUExecutionProvider" in self.onnx_providers
+
+
+@dataclass(frozen=True)
+class RuntimeSelection:
+    requested_backend: str = "auto"
+    actual_backend: str = "cpu"
+    cuda_device: str = ""
+    precision: str = "fp32"
+    model_artifact: str = ""
+    torch_device: str = "cpu"
+    onnx_provider: str = "CPUExecutionProvider"
+    fallback_reason: str = ""
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -192,6 +215,10 @@ class ExecutionPolicy:
     torch_device: str = "cpu"
     onnx_provider: str = "CPUExecutionProvider"
     reason: str = ""
+    fallback_reason: str = ""
+    error: str = ""
+    precision: str = "fp32"
+    model_artifact: str = ""
 
     @property
     def uses_cuda(self) -> bool:
@@ -202,8 +229,22 @@ class ExecutionPolicy:
         return self.onnx_provider == "CUDAExecutionProvider"
 
     @property
-    def uses_directml(self) -> bool:
-        return self.effective_mode == "directml"
+    def cuda_required_unavailable(self) -> bool:
+        return self.preferred_mode == "cuda" and self.effective_mode != "cuda"
+
+    @property
+    def runtime_selection(self) -> RuntimeSelection:
+        return RuntimeSelection(
+            requested_backend=self.preferred_mode,
+            actual_backend=self.effective_mode,
+            cuda_device="cuda:0" if self.effective_mode == "cuda" else "",
+            precision=self.precision,
+            model_artifact=self.model_artifact,
+            torch_device=self.torch_device,
+            onnx_provider=self.onnx_provider,
+            fallback_reason=self.fallback_reason,
+            error=self.error,
+        )
 
 
 class RuntimeCapabilityService:
@@ -215,10 +256,12 @@ class RuntimeCapabilityService:
         if self._cached is not None and not refresh:
             return self._cached
 
-        torch_version = str(getattr(torch, "__version__", ""))
-        cuda_build = bool(getattr(torch.version, "cuda", None))
-        cuda_available = bool(torch.cuda.is_available())
-        cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+        torch = _torch_module()
+        ort = _onnx_runtime_module()
+        torch_version = str(getattr(torch, "__version__", "")) if torch is not None else ""
+        cuda_build = bool(getattr(getattr(torch, "version", None), "cuda", None)) if torch is not None else False
+        cuda_available = bool(torch is not None and torch.cuda.is_available())
+        cuda_device_count = int(torch.cuda.device_count()) if torch is not None and cuda_available else 0
         cuda_device_name = ""
         cuda_total_memory_mb = 0
         if cuda_available and cuda_device_count > 0:
@@ -257,31 +300,50 @@ class RuntimeCapabilityService:
     def select_policy(self, preferred_mode: str = "auto", refresh: bool = False) -> ExecutionPolicy:
         capabilities = self.detect(refresh=refresh)
         preferred = str(preferred_mode or "auto").strip().lower()
-        if preferred not in {"auto", "cuda", "directml", "cpu"}:
+        if preferred not in {"auto", "cuda", "cpu"}:
             preferred = "auto"
+
+        # A CPU-only request must not initialize or probe a CUDA provider. In
+        # addition to wasting startup time, probing can print provider errors
+        # and briefly reserve GPU runtime resources in download/maintenance
+        # workers that deliberately requested CPU execution.
+        if preferred == "cpu":
+            return ExecutionPolicy(
+                preferred_mode=preferred,
+                effective_mode="cpu",
+                torch_device="cpu",
+                onnx_provider="CPUExecutionProvider",
+                reason="Using CPU runtime by preference.",
+            )
 
         cuda_onnx_usable = capabilities.has_onnx_cuda and self._onnx_provider_usable(
             "CUDAExecutionProvider",
-            refresh=refresh,
-        )
-        directml_usable = capabilities.has_onnx_directml and self._onnx_provider_usable(
-            "DmlExecutionProvider",
             refresh=refresh,
         )
 
         if preferred in {"auto", "cuda"} and capabilities.torch_cuda_available:
             provider = "CUDAExecutionProvider" if cuda_onnx_usable else "CPUExecutionProvider"
             reason = f"Using CUDA Torch on {capabilities.cuda_device_name or 'GPU'}."
+            fallback_reason = ""
             if capabilities.has_onnx_cuda and provider != "CUDAExecutionProvider":
-                reason += " ONNX CUDA provider failed verification; ONNX falls back to CPU."
+                fallback_reason = (
+                    "ONNX CUDA provider failed verification; GPU model inference uses CUDA Torch "
+                    "instead of CPU ONNX."
+                )
+                reason += f" {fallback_reason}"
             elif provider != "CUDAExecutionProvider":
-                reason += " ONNX CUDA provider is unavailable; ONNX falls back to CPU."
+                fallback_reason = (
+                    "ONNX CUDA provider is unavailable; GPU model inference uses CUDA Torch "
+                    "instead of CPU ONNX."
+                )
+                reason += f" {fallback_reason}"
             return ExecutionPolicy(
                 preferred_mode=preferred,
                 effective_mode="cuda",
                 torch_device="cuda",
                 onnx_provider=provider,
                 reason=reason,
+                fallback_reason=fallback_reason,
             )
 
         if preferred in {"auto", "cuda"} and cuda_onnx_usable:
@@ -293,36 +355,15 @@ class RuntimeCapabilityService:
                 reason="Using CUDA ONNX Runtime. Torch workloads remain on CPU.",
             )
 
-        if preferred in {"auto", "cuda"} and preferred == "cuda":
+        if preferred == "cuda":
             return self._cpu_fallback(
                 capabilities,
                 preferred,
                 "CUDA requested but neither CUDA Torch nor a verified CUDA ONNX Runtime is available.",
-            )
-
-        if preferred in {"auto", "directml"} and directml_usable:
-            return ExecutionPolicy(
-                preferred_mode=preferred,
-                effective_mode="directml",
-                torch_device="cpu",
-                onnx_provider="DmlExecutionProvider",
-                reason="Using ONNX DirectML on Windows. Torch workloads remain on CPU.",
-            )
-
-        if preferred == "directml":
-            return self._cpu_fallback(
-                capabilities,
-                preferred,
-                "DirectML requested but DmlExecutionProvider is unavailable or failed verification.",
-            )
-
-        if preferred == "cpu":
-            return ExecutionPolicy(
-                preferred_mode=preferred,
-                effective_mode="cpu",
-                torch_device="cpu",
-                onnx_provider="CPUExecutionProvider",
-                reason="Using CPU runtime by preference.",
+                error=(
+                    "CUDA was explicitly requested, but no compatible CUDA runtime is available. "
+                    "Install NVIDIA drivers plus CUDA Torch or onnxruntime-gpu, then rerun Runtime Verify."
+                ),
             )
 
         return self._cpu_fallback(capabilities, preferred, "")
@@ -332,6 +373,7 @@ class RuntimeCapabilityService:
         if not normalized or normalized == "CPUExecutionProvider":
             return True
         capabilities = self.detect(refresh=refresh)
+        ort = _onnx_runtime_module()
         if ort is None or normalized not in capabilities.onnx_providers:
             return False
         cache_key = normalized.casefold()
@@ -358,7 +400,6 @@ class RuntimeCapabilityService:
             "torch": _package_version("torch") or capabilities.torch_version,
             "onnxruntime": _package_version("onnxruntime") or capabilities.onnx_version,
             "onnx": _package_version("onnx"),
-            "onnxruntime-directml": _package_version("onnxruntime-directml"),
             "onnxruntime-gpu": _package_version("onnxruntime-gpu"),
             "hf_xet": _first_package_version("hf_xet", "hf-xet"),
             "flash-attn": _first_package_version("flash-attn", "flash_attn"),
@@ -386,15 +427,16 @@ class RuntimeCapabilityService:
             "torch": _package_version("torch") or capabilities.torch_version,
             "onnxruntime": _package_version("onnxruntime") or capabilities.onnx_version,
             "onnx": _package_version("onnx"),
-            "onnxruntime-directml": _package_version("onnxruntime-directml"),
             "onnxruntime-gpu": _package_version("onnxruntime-gpu"),
             "hf_xet": _first_package_version("hf_xet", "hf-xet"),
             "flash-attn": _first_package_version("flash-attn", "flash_attn"),
         }
         optional_details = _optional_runtime_details()
 
+        torch = _torch_module()
+        ort = _onnx_runtime_module()
         torch_smoke: dict[str, object] | None = None
-        if policy.effective_mode == "cuda" and capabilities.torch_cuda_available:
+        if torch is not None and policy.effective_mode == "cuda" and capabilities.torch_cuda_available:
             try:
                 t0 = time.perf_counter()
                 x = torch.randn(1024, 1024, device="cuda")
@@ -432,7 +474,7 @@ class RuntimeCapabilityService:
                 onnx_smoke = {"ok": False, "error": str(exc)}
 
         flash_attention_smoke: dict[str, object] | None = None
-        if policy.effective_mode == "cuda" and capabilities.torch_cuda_available:
+        if torch is not None and policy.effective_mode == "cuda" and capabilities.torch_cuda_available:
             try:
                 q = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
                 with warnings.catch_warnings(record=True) as caught:
@@ -474,7 +516,7 @@ class RuntimeCapabilityService:
         }
 
     @staticmethod
-    def _cpu_fallback(capabilities: RuntimeCapabilities, preferred: str, prefix: str) -> ExecutionPolicy:
+    def _cpu_fallback(capabilities: RuntimeCapabilities, preferred: str, prefix: str, *, error: str = "") -> ExecutionPolicy:
         parts: list[str] = []
         if prefix:
             parts.append(prefix)
@@ -494,4 +536,6 @@ class RuntimeCapabilityService:
             torch_device="cpu",
             onnx_provider="CPUExecutionProvider",
             reason=" ".join(parts).strip() or "Using CPU runtime.",
+            fallback_reason=" ".join(parts).strip() or "Using CPU runtime.",
+            error=error,
         )

@@ -4,6 +4,7 @@ import sys
 import time
 import unittest
 import logging
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from apps.pyqt_production.icon_assets import production_icon_path
 from apps.pyqt_production.identity import PRODUCTION_QSETTINGS_APP, PRODUCTION_QSETTINGS_ORG
+from apps.pyqt_production.model_download_controller import ModelDownloadController
 from apps.shared.benchmark_schema import BenchmarkStage, build_report, write_report
 from apps.pyqt_production.session_controller import ClusteringSessionController
 from apps.shared.runtime_migrations import RuntimeMigrationService
@@ -122,10 +124,15 @@ class _FakeResultCacheService:
 class ProductionSupportTests(unittest.TestCase):
     def setUp(self):
         store = QSettings(PRODUCTION_QSETTINGS_ORG, PRODUCTION_QSETTINGS_APP)
+        self._production_settings_snapshot = {
+            key: store.value(key)
+            for key in store.allKeys()
+        }
         store.setValue("setup/completed", True)
         store.setValue("safety/read_only_mode", False)
         store.setValue("workspace/default_view", "clustering")
         store.setValue("workspace/faces_mode", "basic")
+        store.setValue("runtime/preferred_mode", "cpu")
         store.sync()
 
     @staticmethod
@@ -163,6 +170,11 @@ class ProductionSupportTests(unittest.TestCase):
 
     def tearDown(self):
         settings_mod._RUNTIME_BASE_DIR = None
+        store = QSettings(PRODUCTION_QSETTINGS_ORG, PRODUCTION_QSETTINGS_APP)
+        store.clear()
+        for key, value in self._production_settings_snapshot.items():
+            store.setValue(key, value)
+        store.sync()
 
     def test_settings_uses_exact_image_clustering_app_dir_override(self):
         with TemporaryDirectory() as tmp:
@@ -170,6 +182,17 @@ class ProductionSupportTests(unittest.TestCase):
                 settings_mod._RUNTIME_BASE_DIR = None
                 resolved = settings_mod.get_runtime_base_dir()
                 self.assertEqual(Path(tmp), resolved)
+
+    def test_workers_receive_the_canonical_runtime_root(self):
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"CLUSTERLENS_RUNTIME_ROOT": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionWorkerEnvironmentTest")
+                clustering_environment = ClusteringSessionController(layout)._worker_environment()
+                download_environment = ModelDownloadController(layout)._worker_environment()
+                for environment in (clustering_environment, download_environment):
+                    self.assertEqual(str(layout.root), environment.value("CLUSTERLENS_RUNTIME_ROOT"))
+                    self.assertEqual(str(layout.root), environment.value("IMAGE_CLUSTERING_APP_DIR"))
+                    self.assertEqual(str(layout.model_assets_dir), environment.value("IMAGE_CLUSTERING_MODEL_ASSETS_DIR"))
 
     def test_production_wait_for_thread_shutdown_polls_python_qthreads(self):
         from apps.pyqt_production.ui.async_job import wait_for_thread_shutdown
@@ -207,14 +230,49 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionFacesWorkspaceTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                self.assertIsNone(window.faces_pane)
 
                 window.set_active_workspace("faces")
-                APP.processEvents()
+                self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
 
                 self.assertEqual("faces", window._active_workspace)
                 self.assertIs(window.workspace_stack.currentWidget(), window.faces_pane)
+                self.assertEqual(["human"], list(window.face_services_global))
+                self.assertEqual(1, window.faces_pane.face_mode_combo.count())
                 self.assertTrue(window.faces_workspace_button.isChecked())
                 self.assertFalse(window.clustering_workspace_button.isChecked())
+                window.close()
+
+    def test_production_face_provider_never_instantiates_an_uninstalled_default_pack(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.services import face_search
+        from app.services.model_assets import ModelAssetService
+
+        with TemporaryDirectory() as tmp:
+            runtime_root = Path(tmp) / "runtime"
+            managed_models = Path(tmp) / "managed-face-models"
+            with (
+                patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": str(runtime_root)}, clear=False),
+                patch.object(face_search, "face_model_runtime_root_dir", return_value=managed_models),
+                patch.object(ModelAssetService, "local_cache_present", return_value=True),
+            ):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFaceProviderFallbackTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+
+                service = window._face_service_for_pipeline(
+                    "global",
+                    "human",
+                    face_search.DEFAULT_HUMAN_FACE_DETECTOR_ID,
+                    face_search.DEFAULT_HUMAN_FACE_EMBEDDER_ID,
+                )
+
+                self.assertEqual(face_search.BUILTIN_HUMAN_DETECTOR_ID, service.detector_id)
+                self.assertEqual(face_search.BUILTIN_HUMAN_EMBEDDER_ID, service.embedder_id)
+                self.assertEqual("face_search_index.db", Path(service.db_path).name)
+                self.assertTrue(service.is_ready())
+                self.assertNotIn("_internal", service.readiness_message())
                 window.close()
 
     def test_production_face_results_open_in_main_gallery(self):
@@ -226,6 +284,8 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionFaceResultsGalleryTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                window.set_active_workspace("faces")
+                self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
                 image_a = str(Path(tmp) / "a.jpg")
                 image_b = str(Path(tmp) / "b.jpg")
                 window.faces_pane.context_for_path = lambda path: {"origin": "faces", "path": path}
@@ -297,6 +357,7 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertEqual(0, result.previous_version)
                 self.assertEqual(1, result.current_version)
                 self.assertTrue((layout.root / "runtime_migrations.json").exists())
+                self.assertTrue((layout.root / "runtime_migrations.sqlite3").exists())
                 self.assertTrue((layout.support_dir / "migration_backups" / "v1" / "image_tags.sqlite3").exists())
 
     def test_clustering_pipeline_cache_hit_reports_zero_live_backend_time(self):
@@ -394,6 +455,95 @@ class ProductionSupportTests(unittest.TestCase):
                     )
                     self.assertEqual(["--worker", "--daemon"], controller._worker_arguments(daemon=True))
 
+    def test_session_controller_failed_start_is_terminal_and_removes_request(self):
+        from apps.pyqt_production.worker_protocol import ProductionClusterRequest
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionFailedWorkerStartTest")
+                controller = ClusteringSessionController(layout)
+                controller.worker_program = str(Path(tmp) / "missing-worker-program")
+                failures: list[str] = []
+                running_states: list[bool] = []
+                controller.failed.connect(failures.append)
+                controller.running_changed.connect(running_states.append)
+                request = ProductionClusterRequest(
+                    directory=tmp,
+                    embedding_models=["fast_preview"],
+                    num_clusters=2,
+                    clustering_backends=["cosine-kmeans"],
+                    recursive=False,
+                    similarity_mode="semantic",
+                    outlier_policy="assign",
+                    use_onnx=False,
+                    reuse_result_cache=True,
+                    use_embedding_cache_lookup=True,
+                    preferred_execution_mode="cpu",
+                )
+
+                self.assertTrue(controller.start(request))
+                self._wait_for(lambda: bool(failures), timeout_s=3.0)
+
+                self.assertFalse(controller.is_running())
+                self.assertIsNone(controller._request_file)
+                self.assertEqual([True, False], running_states)
+                self.assertFalse(list((layout.cache_dir / "tmp").glob("cluster_request_*.json")))
+
+    def test_warm_session_controller_failed_start_emits_failure(self):
+        from apps.pyqt_production.worker_protocol import ProductionClusterRequest
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionFailedWarmWorkerStartTest")
+                controller = ClusteringSessionController(layout)
+                controller.set_keep_worker_warm(True)
+                controller.worker_program = str(Path(tmp) / "missing-warm-worker-program")
+                failures: list[str] = []
+                running_states: list[bool] = []
+                controller.failed.connect(failures.append)
+                controller.running_changed.connect(running_states.append)
+                request = ProductionClusterRequest(
+                    directory=tmp,
+                    embedding_models=["fast_preview"],
+                    num_clusters=2,
+                    clustering_backends=["cosine-kmeans"],
+                    recursive=False,
+                    similarity_mode="semantic",
+                    outlier_policy="assign",
+                    use_onnx=False,
+                    reuse_result_cache=True,
+                    use_embedding_cache_lookup=True,
+                    preferred_execution_mode="cpu",
+                )
+
+                self.assertTrue(controller.start(request))
+                self._wait_for(lambda: bool(failures), timeout_s=3.0)
+
+                self.assertFalse(controller.is_running())
+                self.assertEqual([False], running_states)
+
+    def test_model_download_failed_start_is_terminal_and_removes_request(self):
+        from app.services.model_downloads import ModelDownloadItem
+        from apps.pyqt_production.model_download_controller import ModelDownloadController
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionFailedModelDownloadStartTest")
+                controller = ModelDownloadController(layout)
+                controller.worker_program = str(Path(tmp) / "missing-model-worker-program")
+                failures: list[str] = []
+                running_states: list[bool] = []
+                controller.failed.connect(failures.append)
+                controller.running_changed.connect(running_states.append)
+
+                self.assertTrue(controller.start([ModelDownloadItem("dino")]))
+                self._wait_for(lambda: bool(failures), timeout_s=3.0)
+
+                self.assertFalse(controller.is_running())
+                self.assertIsNone(controller._request_file)
+                self.assertEqual([True, False], running_states)
+                self.assertFalse(list((layout.cache_dir / "tmp").glob("model_download_request_*.json")))
+
     def test_production_entrypoint_routes_worker_mode_without_starting_gui(self):
         from apps.pyqt_production import __main__ as production_main
 
@@ -437,12 +587,20 @@ class ProductionSupportTests(unittest.TestCase):
             use_embedding_cache_lookup=True,
             generate_cluster_meanings=True,
             cluster_meaning_model="clip",
+            batch_size_cpu=11,
+            batch_size_gpu=37,
+            preprocess_workers=6,
+            vram_headroom_mb=1536,
         )
         self.assertEqual(["semantic", "cosine"], request.similarity_modes)
         self.assertTrue(request.generate_cluster_meanings)
         self.assertTrue(request.generate_cluster_explanations)
         self.assertEqual("clip", request.cluster_meaning_model)
         self.assertTrue(request.allow_model_downloads)
+        self.assertEqual(11, request.as_dict()["batch_size_cpu"])
+        self.assertEqual(37, request.as_dict()["batch_size_gpu"])
+        self.assertEqual(6, request.as_dict()["preprocess_workers"])
+        self.assertEqual(1536, request.as_dict()["vram_headroom_mb"])
 
     def test_session_controller_releases_completed_worker_payload(self):
         with TemporaryDirectory() as tmp:
@@ -583,6 +741,33 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertTrue(resolved.allow_model_downloads)
                 window.close()
 
+    def test_missing_facenet_scan_request_starts_visible_shared_download_after_confirmation(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFaceModelDownloadTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+
+                with (
+                    patch.object(window.model_asset_service, "model_available_without_download", return_value=False),
+                    patch.object(window.model_download_controller, "is_running", return_value=False),
+                    patch.object(window.model_download_controller, "start", return_value=True) as start_download,
+                    patch("apps.pyqt_production.app.confirmBox", return_value=True) as confirm_download,
+                ):
+                    window._request_face_model_download("facenet")
+
+                requested_items = start_download.call_args.args[0]
+                self.assertEqual(["facenet"], [item.model_name for item in requested_items])
+                self.assertEqual("facenet", window._active_post_install_model_name)
+                prompt_text = str(confirm_download.call_args.args[1])
+                self.assertIn("visible in Jobs", prompt_text)
+                self.assertIn("cancellable", prompt_text)
+                window._active_post_install_model_name = None
+                window.close()
+
     def test_production_offline_model_mode_skips_download_prompt_and_falls_back(self):
         from apps.pyqt_production.app import ProductionClusterApp
         from apps.pyqt_production.worker_protocol import ProductionClusterRequest
@@ -642,7 +827,6 @@ class ProductionSupportTests(unittest.TestCase):
             "torch": "2.2.2+cu121",
             "onnxruntime": "1.18.0",
             "onnx": "1.16.0",
-            "onnxruntime-directml": "",
             "onnxruntime-gpu": "1.18.0",
             "hf_xet": "",
             "hf-xet": "",
@@ -665,7 +849,7 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertIn("packaged exe", remediation)
         self.assertIn("Flash SDP", remediation)
 
-    def test_production_basic_mode_keeps_file_operations_visible(self):
+    def test_production_gallery_uses_one_overflow_without_legacy_buttons(self):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
         window = ProductionClusterApp(RUNTIME_LAYOUT)
@@ -675,17 +859,16 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertEqual("basic", window._clustering_mode)
         self.assertEqual("basic", window.gallery_pane.inspector_display_mode)
         self.assertTrue(window.gallery_pane.open_folder_button.isVisible())
-        self.assertTrue(window.gallery_pane.file_ops_menu_button.isVisible())
-        self.assertTrue(window.gallery_pane.more_menu_button.isVisible())
-        self.assertFalse(window.gallery_pane.copy_paths_button.isVisible())
-        self.assertFalse(window.gallery_pane.export_paths_button.isVisible())
-        self.assertFalse(window.gallery_pane.copy_button.isVisible())
-        self.assertFalse(window.gallery_pane.move_button.isVisible())
-        self.assertFalse(window.gallery_pane.delete_button.isVisible())
-        self.assertFalse(window.gallery_pane.metadata_menu_button.isVisible())
-        self.assertFalse(window.gallery_pane.exif_button.isVisible())
-        self.assertFalse(window.gallery_pane.tags_button.isVisible())
+        self.assertTrue(window.gallery_pane.actions_menu_button.isVisible())
+        self.assertTrue(window.gallery_pane.file_ops_menu.menuAction().isVisible())
+        self.assertFalse(window.gallery_pane.metadata_menu.menuAction().isVisible())
         self.assertFalse(window.gallery_pane.selected_tags_button.isVisible())
+        for legacy_name in (
+            "copy_paths_button", "export_paths_button", "copy_button", "move_button",
+            "delete_button", "exif_button", "tags_button", "retry_failed_button",
+            "metadata_menu_button", "file_ops_menu_button", "more_menu_button",
+        ):
+            self.assertFalse(hasattr(window.gallery_pane, legacy_name))
         self.assertFalse(window.tag_manager_button.isVisible())
         self.assertFalse(window.suggest_tags_button.isVisible())
         self.assertTrue(window.cluster_pane.details_scroll.isHidden())
@@ -696,16 +879,14 @@ class ProductionSupportTests(unittest.TestCase):
         window.set_clustering_mode("advanced")
         APP.processEvents()
 
-        self.assertFalse(window.gallery_pane.exif_button.isVisible())
-        self.assertFalse(window.gallery_pane.tags_button.isVisible())
         self.assertTrue(window.gallery_pane.selected_tags_button.isVisible())
-        self.assertTrue(window.gallery_pane.metadata_menu_button.isVisible())
-        self.assertTrue(window.gallery_pane.file_ops_menu_button.isVisible())
-        self.assertTrue(window.gallery_pane.more_menu_button.isVisible())
-        self.assertFalse(window.gallery_pane.export_paths_button.isVisible())
+        self.assertTrue(window.gallery_pane.actions_menu_button.isVisible())
+        self.assertTrue(window.gallery_pane.metadata_menu.menuAction().isVisible())
+        self.assertTrue(window.gallery_pane.file_ops_menu.menuAction().isVisible())
         self.assertEqual("advanced", window.gallery_pane.inspector_display_mode)
-        self.assertTrue(window.tag_manager_button.isVisible())
-        self.assertTrue(window.suggest_tags_button.isVisible())
+        self.assertFalse(window.tag_manager_button.isVisible())
+        self.assertFalse(window.suggest_tags_button.isVisible())
+        self.assertTrue(window.cluster_actions_menu_action.isVisible())
         self.assertFalse(window.cluster_pane.details_scroll.isHidden())
         self.assertFalse(window.cluster_pane.meaning_label.isHidden())
         self.assertFalse(window.cluster_pane.shape_widget.isHidden())
@@ -756,6 +937,27 @@ class ProductionSupportTests(unittest.TestCase):
         )
         self.assertEqual(["clip"], window.clustering_pane.selected_embedding_models())
         self.assertEqual(["graph"], window.clustering_pane.selected_clustering_backends())
+
+    def test_production_presets_keep_advanced_technical_controls_visible(self):
+        from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
+
+        window = ProductionClusterApp(RUNTIME_LAYOUT)
+        window.show()
+        window.set_clustering_mode("advanced")
+        APP.processEvents()
+
+        pane = window.clustering_pane
+        self.assertEqual("balanced", pane.preset_combo.currentData())
+        self.assertTrue(pane.technical_panel.isVisible())
+        self.assertTrue(pane.backend_checkboxes["hdbscan"].isVisible())
+
+        for preset in ("fast_preview", "high_quality"):
+            pane.preset_combo.setCurrentIndex(pane.preset_combo.findData(preset))
+            APP.processEvents()
+            self.assertTrue(pane.technical_panel.isVisible())
+            self.assertTrue(pane.backend_checkboxes["hdbscan"].isVisible())
+
+        window.close()
         window.close()
 
     def test_production_shell_request_enforces_curated_scope(self):
@@ -775,14 +977,14 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertFalse(request.generate_cluster_meanings)
         window.close()
 
-    def test_production_shell_uses_production_owned_ui_modules(self):
+    def test_production_shell_uses_shared_authoritative_ui_modules(self):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
         window = ProductionClusterApp(RUNTIME_LAYOUT)
-        self.assertTrue(window.gallery_pane.__class__.__module__.startswith("apps.pyqt_production.ui."))
-        self.assertTrue(window.cluster_pane.__class__.__module__.startswith("apps.pyqt_production.ui."))
-        self.assertTrue(window.clustering_pane.__class__.__module__.startswith("apps.pyqt_production.ui."))
-        self.assertTrue(window.footer_bar.__class__.__module__.startswith("apps.pyqt_production.ui."))
+        self.assertTrue(window.gallery_pane.__class__.__module__.startswith("ui."))
+        self.assertTrue(window.cluster_pane.__class__.__module__.startswith("ui."))
+        self.assertTrue(window.clustering_pane.__class__.__module__.startswith("ui."))
+        self.assertTrue(window.footer_bar.__class__.__module__.startswith("ui."))
         window.close()
 
     def test_production_settings_dialog_uses_production_owned_copy(self):
@@ -933,10 +1135,16 @@ class ProductionSupportTests(unittest.TestCase):
                 captured_requests: list[object] = []
                 original_discover = ImageDiscoveryService.discover_result
 
-                def _discover(service, directory, recursive=None):
+                def _discover(service, directory, recursive=None, progress_callback=None, cancel_check=None):
                     discovery_thread_flags.append(QThread.currentThread() is APP.thread())
                     time.sleep(0.05)
-                    return original_discover(service, directory, recursive=recursive)
+                    return original_discover(
+                        service,
+                        directory,
+                        recursive=recursive,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
 
                 def _start(request):
                     captured_requests.append(request)
@@ -944,6 +1152,10 @@ class ProductionSupportTests(unittest.TestCase):
 
                 with patch("apps.pyqt_production.app.confirmBox", return_value=True), patch.object(
                     ImageDiscoveryService, "discover_result", autospec=True, side_effect=_discover
+                ), patch.object(
+                    window,
+                    "_prepare_request_model_downloads",
+                    side_effect=lambda request: replace(request, allow_model_downloads=False),
                 ), patch.object(window.session_controller, "start", side_effect=_start):
                     window.run_clustering()
                     APP.processEvents()
@@ -975,7 +1187,8 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertIn("Storage:", window.footer_bar.storage_label._full_text)
                 self.assertIn("Tag database", window.footer_bar.storage_label.toolTip())
                 self.assertIn("Runtime temp files", window.footer_bar.storage_label.toolTip())
-                self.assertEqual("Clear Caches / Temp", window.footer_bar.clear_storage_button.text())
+                self.assertEqual("Clear rebuildable data", window.footer_bar.clear_storage_button.text())
+                self.assertFalse(window.footer_bar.clear_storage_button.isVisible())
                 self.assertTrue(window.footer_bar.clear_storage_button.isEnabled())
 
                 with patch("apps.pyqt_production.app.confirmBox", return_value=True):
@@ -986,7 +1199,7 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertTrue((layout.cache_dir / "image_tags.sqlite3").exists())
                 self.assertFalse((layout.benchmarks_dir / "bench.json").exists())
                 self.assertFalse((layout.support_dir / "bundle.zip").exists())
-                self.assertIn("Cleared", window.footer_bar.status_label.toolTip())
+                self.assertIn("clear", window.footer_bar.status_label.toolTip().lower())
                 window.close()
 
 

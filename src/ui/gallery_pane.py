@@ -6,11 +6,11 @@ from threading import Event, Lock
 from time import perf_counter
 
 from PyQt6.QtCore import QEvent, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage
+from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage, QImageReader
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
 from app.selection import SelectionTarget
-from app.services.gallery_actions import GalleryActionService
+from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
 from app.services.image_tags import ImageTagService
 from app.services.photo_metadata import MetadataSidecarService
 from app.services.thumbnails import ThumbnailService
@@ -23,6 +23,7 @@ from .gallery_model import GalleryImageModel, GalleryItemDelegate
 from .photo_inspector_dialog import PhotoInspectorDialog
 from .async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from .common import build_help_inline
+from .icons import apply_icon, themed_icon
 
 LOGGER = get_logger(__name__)
 
@@ -33,9 +34,9 @@ MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE = 24
 
 GALLERY_HELP = {
     "current_group": (
-        "Show which image set gallery actions will use when nothing is checked.\n"
+        "Show which photo set gallery actions will use when nothing is explicitly selected.\n"
         "In clustering mode this is usually the selected cluster from the right pane.\n"
-        "Checked images override the current group for tag, EXIF, copy, move, and delete actions."
+        "Explicitly selected photos override the current group for metadata and file actions."
     ),
     "select_current_group": (
         "Check or uncheck every image in the current group.\n"
@@ -43,15 +44,15 @@ GALLERY_HELP = {
         "Use this when you want gallery actions to target the whole cluster quickly."
     ),
     "write_exif": (
-        "Write EXIF metadata to the checked images, or to the current group if nothing is checked.\n"
-        "Checked images win over the current group when both exist.\n"
+        "Write EXIF metadata to selected photos, or to the current group if nothing is selected.\n"
+        "Selected photos take priority when both targets exist.\n"
         "This does not change clustering directly, but the files themselves are updated."
     ),
     "tags": (
-        "Edit image tags for the checked images, or for the current group if nothing is checked.\n"
-        "Checked images win over the current group when both exist.\n"
+        "Edit image tags for selected photos, or for the current group if nothing is selected.\n"
+        "Selected photos take priority when both targets exist.\n"
         "In clustering mode the current group is usually the selected cluster.\n"
-        "Use Tags Selected Only when you do not want this cluster fallback.\n"
+        "Use Tag selected photos when you do not want this group fallback.\n"
         "The local tag database is authoritative, and EXIF mirroring is optional."
     ),
     "tags_selected_only": (
@@ -61,44 +62,44 @@ GALLERY_HELP = {
     ),
     "metadata_menu": (
         "Metadata tools for the current gallery target.\n"
-        "Use Tags Selected Only for small manual tag edits; this menu keeps broader EXIF and checked/group tag actions out of the main row."
+        "Use Tag selected photos for small manual edits; this menu contains broader metadata actions for the resolved target."
     ),
     "file_ops_menu": (
-        "Copy, move, or delete the checked images, or the current group if nothing is checked.\n"
-        "Delete is grouped here to reduce accidental clicks on the main gallery row."
+        "Copy, move, or send selected photos to ClusterLens Trash, or use the current group if nothing is selected.\n"
+        "Destructive actions stay separated from the main gallery row."
     ),
     "more_menu": (
         "Less frequent gallery utilities: copy paths, export paths, and retry failed thumbnails.\n"
         "These actions use the same checked-images-first target rules unless the action says otherwise."
     ),
     "open_folder": (
-        "Open the containing folder for the checked images, or for the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Open the containing folder for selected photos, or for the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "If the selection spans multiple folders, the app opens a limited number and reports the rest."
     ),
     "copy_paths": (
-        "Copy the file paths for the checked images, or for the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Copy paths for selected photos, or for the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "Paths are copied as newline-separated text so they can be pasted into editors or scripts."
     ),
     "export_paths": (
-        "Export the file paths for the checked images, or for the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Export paths for selected photos, or for the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "The export writes one absolute path per line to a text file."
     ),
     "copy_selection": (
-        "Copy the checked images, or the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Copy selected photos, or the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "Copied files inherit image tags inside the app's tag database."
     ),
     "move_selection": (
-        "Move the checked images, or the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Move selected photos, or the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "Moved files keep their image tags by updating the tag database paths."
     ),
     "delete_selection": (
-        "Delete the checked images, or the current group if nothing is checked.\n"
-        "Checked images override the current group.\n"
+        "Move selected photos to ClusterLens Trash, or use the current group if nothing is selected.\n"
+        "Selected photos take priority.\n"
         "Use this carefully because the whole selected cluster can become the current group."
     ),
     "retry_failed": (
@@ -215,6 +216,8 @@ class GalleryPane(QWidget):
     paths_removed = pyqtSignal(list)
     metadata_changed = pyqtSignal(list)
     visible_paths_changed = pyqtSignal(list)
+    empty_select_folder_requested = pyqtSignal()
+    empty_run_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -237,9 +240,11 @@ class GalleryPane(QWidget):
         self.loaded_indexes: set[int] = set()
         self.failed_indexes: set[int] = set()
         self.pending_indexes: set[int] = set()
+        self._active_thumbnail_indexes: set[int] = set()
         self.pending_ui_items: list[tuple[int, str, QImage]] = []
         self.thumbnail_service = ThumbnailService(qimage_cache_size=self.settings.thumbnail_cache_size)
         self.action_service = GalleryActionService()
+        self.read_only_mode = False
         self.image_tag_service: ImageTagService | None = None
         self.first_paint_start = 0.0
         self.first_paint_emitted = False
@@ -267,6 +272,7 @@ class GalleryPane(QWidget):
         self.progress_bar = QProgressBar()
         self.model = GalleryImageModel(self)
         self.delegate = GalleryItemDelegate(self.image_size, self)
+        self.delegate.copy_requested.connect(self._copy_image_to_clipboard)
         self._item_spacing = 12
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
@@ -278,51 +284,17 @@ class GalleryPane(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        self.target_hint_label = QLabel("Current Group: Visible Images")
-        self.select_group_button = QPushButton("Select Current Group")
-        self.selected_tags_button = QPushButton("Tags Selected Only")
-        self.open_folder_button = QPushButton("Open Folder")
-        self.metadata_menu_button = QPushButton("Metadata")
-        self.file_ops_menu_button = QPushButton("File Ops")
-        self.more_menu_button = QPushButton("More")
+        self.target_hint_label = QLabel("Current group: visible photos")
+        self.select_group_button = QPushButton("Select current group")
+        self.selected_tags_button = QPushButton("Tag selected photos")
+        self.open_folder_button = QPushButton("Reveal folder")
+        self.actions_menu_button = QPushButton("More actions")
 
-        # Keep concrete buttons for stable tests and external callers, but expose
-        # the less frequent commands through compact menus to avoid row overflow.
-        self.exif_button = QPushButton("Write EXIF", self)
-        self.tags_button = QPushButton("Tags: Checked/Group", self)
-        self.copy_paths_button = QPushButton("Copy Paths", self)
-        self.export_paths_button = QPushButton("Export Paths", self)
-        self.copy_button = QPushButton("Copy Selection", self)
-        self.move_button = QPushButton("Move Selection", self)
-        self.delete_button = QPushButton("Delete Selection", self)
-        self.retry_failed_button = QPushButton("Retry Failed", self)
-        self.exif_button.setToolTip(GALLERY_HELP["write_exif"])
-        self.tags_button.setToolTip(GALLERY_HELP["tags"])
-        self.copy_paths_button.setToolTip(GALLERY_HELP["copy_paths"])
-        self.export_paths_button.setToolTip(GALLERY_HELP["export_paths"])
-        self.copy_button.setToolTip(GALLERY_HELP["copy_selection"])
-        self.move_button.setToolTip(GALLERY_HELP["move_selection"])
-        self.delete_button.setToolTip(GALLERY_HELP["delete_selection"])
-        self.retry_failed_button.setToolTip(GALLERY_HELP["retry_failed"])
-        self._legacy_action_buttons = [
-            self.exif_button,
-            self.tags_button,
-            self.copy_paths_button,
-            self.export_paths_button,
-            self.copy_button,
-            self.move_button,
-            self.delete_button,
-            self.retry_failed_button,
-        ]
-        for button in self._legacy_action_buttons:
-            button.hide()
-
-        self.metadata_menu = QMenu(self.metadata_menu_button)
-        self.file_ops_menu = QMenu(self.file_ops_menu_button)
-        self.more_menu = QMenu(self.more_menu_button)
-        self.metadata_menu_button.setMenu(self.metadata_menu)
-        self.file_ops_menu_button.setMenu(self.file_ops_menu)
-        self.more_menu_button.setMenu(self.more_menu)
+        self.metadata_menu = QMenu("Metadata", self)
+        self.file_ops_menu = QMenu("File actions", self)
+        self.more_menu = QMenu("Utilities", self)
+        self.actions_menu = QMenu(self.actions_menu_button)
+        self.actions_menu_button.setMenu(self.actions_menu)
         self.action_bar.addWidget(
             build_help_inline(
                 self.target_hint_label,
@@ -335,12 +307,43 @@ class GalleryPane(QWidget):
         self.action_bar.addWidget(build_help_inline(self.select_group_button, GALLERY_HELP["select_current_group"], help_key="select_current_group"))
         self.action_bar.addWidget(build_help_inline(self.selected_tags_button, GALLERY_HELP["tags_selected_only"], help_key="tags_selected_only"))
         self.action_bar.addWidget(build_help_inline(self.open_folder_button, GALLERY_HELP["open_folder"], help_key="open_folder"))
-        self.action_bar.addWidget(build_help_inline(self.metadata_menu_button, GALLERY_HELP["metadata_menu"], help_key="metadata_menu"))
-        self.action_bar.addWidget(build_help_inline(self.file_ops_menu_button, GALLERY_HELP["file_ops_menu"], help_key="file_ops_menu"))
-        self.action_bar.addWidget(build_help_inline(self.more_menu_button, GALLERY_HELP["more_menu"], help_key="more_menu"))
+        self.action_bar.addWidget(build_help_inline(self.actions_menu_button, GALLERY_HELP["more_menu"], help_key="more_menu"))
         self.main_layout.addLayout(self.action_bar)
 
+        self.empty_state = QWidget(self)
+        self.empty_state.setObjectName("galleryEmptyState")
+        self.empty_state.setAccessibleName("Empty gallery")
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(32, 32, 32, 32)
+        empty_layout.setSpacing(10)
+        empty_layout.addStretch(1)
+        self.empty_state_title = QLabel("No photos to show")
+        self.empty_state_title.setProperty("role", "section")
+        self.empty_state_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state_description = QLabel("Choose a folder to begin.")
+        self.empty_state_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state_description.setWordWrap(True)
+        empty_actions = QHBoxLayout()
+        empty_actions.addStretch(1)
+        self.empty_select_folder_button = QPushButton("Choose folder")
+        self.empty_select_folder_button.setProperty("kind", "primary")
+        self.empty_run_button = QPushButton("Run clustering")
+        apply_icon(self.empty_select_folder_button, "folder")
+        apply_icon(self.empty_run_button, "scan")
+        self.empty_select_folder_button.clicked.connect(self.empty_select_folder_requested.emit)
+        self.empty_run_button.clicked.connect(self.empty_run_requested.emit)
+        empty_actions.addWidget(self.empty_select_folder_button)
+        empty_actions.addWidget(self.empty_run_button)
+        empty_actions.addStretch(1)
+        empty_layout.addWidget(self.empty_state_title)
+        empty_layout.addWidget(self.empty_state_description)
+        empty_layout.addLayout(empty_actions)
+        empty_layout.addStretch(1)
+        self.main_layout.addWidget(self.empty_state, stretch=1)
+
         self.list_view = QListView()
+        self.list_view.setAccessibleName("Photo results")
+        self.list_view.setAccessibleDescription("Photo tiles. Use arrow keys to move, Space to select, and Enter to open the inspector.")
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -352,6 +355,7 @@ class GalleryPane(QWidget):
         self.list_view.setSpacing(self._item_spacing)
         self.list_view.setGridSize(QSize(self.delegate.card_width + self._item_spacing, self.delegate.card_height + self._item_spacing))
         self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
+        self.list_view.selectionModel().selectionChanged.connect(lambda *_args: self.refresh_selection_target_hint())
         self.list_view.clicked.connect(self.on_item_clicked)
         self.list_view.doubleClicked.connect(self.on_item_double_clicked)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -360,6 +364,7 @@ class GalleryPane(QWidget):
         self.list_view.verticalScrollBar().valueChanged.connect(self.schedule_visible_refresh)
         self.list_view.horizontalScrollBar().valueChanged.connect(self.schedule_visible_refresh)
         self.main_layout.addWidget(self.list_view)
+        self.list_view.hide()
 
         self.status_label.setWordWrap(True)
         self.main_layout.addWidget(self.status_label)
@@ -367,55 +372,76 @@ class GalleryPane(QWidget):
         self.main_layout.addWidget(self.progress_bar)
 
         self.select_group_button.clicked.connect(self.select_current_group)
-        self.delete_button.clicked.connect(self.slotDeleteSelect)
-        self.exif_button.clicked.connect(self.slotAddExif)
-        self.tags_button.clicked.connect(self.slotEditTags)
         self.selected_tags_button.clicked.connect(self.slotEditSelectedOnlyTags)
         self.open_folder_button.clicked.connect(self.slotOpenSelectedFolders)
-        self.copy_paths_button.clicked.connect(self.slotCopySelectedPaths)
-        self.export_paths_button.clicked.connect(self.slotExportSelectedPaths)
-        self.copy_button.clicked.connect(self.slotCopySelected)
-        self.move_button.clicked.connect(self.slotMoveSelected)
-        self.retry_failed_button.clicked.connect(self.retry_failed_visible)
-        self._add_menu_action(self.metadata_menu, "Write EXIF", GALLERY_HELP["write_exif"], self.slotAddExif)
-        self._add_menu_action(self.metadata_menu, "Tags: Checked/Group", GALLERY_HELP["tags"], self.slotEditTags)
-        self.export_sidecars_action = self._add_menu_action(self.metadata_menu, "Export Sidecars", GALLERY_HELP["metadata_menu"], self.slotExportMetadataSidecars)
-        self.import_sidecars_action = self._add_menu_action(self.metadata_menu, "Import Sidecars", GALLERY_HELP["metadata_menu"], self.slotImportMetadataSidecars)
-        self._add_menu_action(self.file_ops_menu, "Copy Selection", GALLERY_HELP["copy_selection"], self.slotCopySelected)
-        self._add_menu_action(self.file_ops_menu, "Move Selection", GALLERY_HELP["move_selection"], self.slotMoveSelected)
-        self._add_menu_action(self.file_ops_menu, "Delete Selection", GALLERY_HELP["delete_selection"], self.slotDeleteSelect)
-        self._add_menu_action(self.more_menu, "Copy Paths", GALLERY_HELP["copy_paths"], self.slotCopySelectedPaths)
-        self._add_menu_action(self.more_menu, "Export Paths", GALLERY_HELP["export_paths"], self.slotExportSelectedPaths)
-        self._add_menu_action(self.more_menu, "Retry Failed Thumbnails", GALLERY_HELP["retry_failed"], self.retry_failed_visible)
+        self.write_exif_action = self._add_menu_action(self.metadata_menu, "Write EXIF to current target", GALLERY_HELP["write_exif"], self.slotAddExif)
+        self.tags_checked_group_action = self._add_menu_action(self.metadata_menu, "Tag current target", GALLERY_HELP["tags"], self.slotEditTags)
+        self.export_sidecars_action = self._add_menu_action(self.metadata_menu, "Export sidecars", GALLERY_HELP["metadata_menu"], self.slotExportMetadataSidecars)
+        self.import_sidecars_action = self._add_menu_action(self.metadata_menu, "Import sidecars", GALLERY_HELP["metadata_menu"], self.slotImportMetadataSidecars)
+        self.copy_selection_action = self._add_menu_action(self.file_ops_menu, "Copy current target", GALLERY_HELP["copy_selection"], self.slotCopySelected)
+        self.move_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target", GALLERY_HELP["move_selection"], self.slotMoveSelected)
+        self.delete_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target to ClusterLens Trash", GALLERY_HELP["delete_selection"], self.slotDeleteSelect)
+        self.delete_selection_action.setIcon(themed_icon("delete", color="#FFAAA6"))
+        self.copy_paths_action = self._add_menu_action(self.more_menu, "Copy paths", GALLERY_HELP["copy_paths"], self.slotCopySelectedPaths)
+        self.export_paths_action = self._add_menu_action(self.more_menu, "Export paths", GALLERY_HELP["export_paths"], self.slotExportSelectedPaths)
+        self.retry_failed_action = self._add_menu_action(self.more_menu, "Retry failed thumbnails", GALLERY_HELP["retry_failed"], self.retry_failed_visible)
+        self.actions_menu.addMenu(self.metadata_menu)
+        self.actions_menu.addMenu(self.file_ops_menu)
+        for action in self.more_menu.actions():
+            self.actions_menu.addAction(action)
         self._group_action_widgets = [
             self.target_hint_label,
             self.select_group_button,
         ]
         self._metadata_action_widgets = [
             self.selected_tags_button,
-            self.metadata_menu_button,
         ]
         self._file_action_widgets = [
             self.open_folder_button,
-            self.file_ops_menu_button,
-            self.more_menu_button,
+            self.actions_menu_button,
         ]
         self._busy_action_widgets = [
             self.select_group_button,
             self.selected_tags_button,
             self.open_folder_button,
-            self.metadata_menu_button,
-            self.file_ops_menu_button,
-            self.more_menu_button,
-            *self._legacy_action_buttons,
+            self.actions_menu_button,
         ]
+        self._mutation_widgets = [
+            self.selected_tags_button,
+        ]
+        self._mutation_actions = [
+            self.write_exif_action,
+            self.tags_checked_group_action,
+            self.copy_selection_action,
+            self.move_selection_action,
+            self.delete_selection_action,
+            self.import_sidecars_action,
+        ]
+        self._base_mutation_tooltips = {widget: widget.toolTip() or "" for widget in self._mutation_widgets}
+        self._apply_read_only_state()
+
+    def set_empty_state(
+        self,
+        title: str,
+        description: str,
+        *,
+        show_select_folder: bool = False,
+        show_run: bool = False,
+    ) -> None:
+        self.empty_state_title.setText(str(title or "No photos to show"))
+        self.empty_state_description.setText(str(description or ""))
+        self.empty_select_folder_button.setVisible(bool(show_select_folder))
+        self.empty_run_button.setVisible(bool(show_run))
+        if not self.images:
+            self.empty_state.show()
 
     @staticmethod
-    def _add_menu_action(menu: QMenu, text: str, tooltip: str, callback) -> None:
+    def _add_menu_action(menu: QMenu, text: str, tooltip: str, callback):
         action = menu.addAction(text)
         action.setToolTip(str(tooltip or ""))
         action.setStatusTip(str(tooltip or "").splitlines()[0] if tooltip else "")
         action.triggered.connect(lambda _checked=False, cb=callback: cb())
+        return action
 
     def on_context_menu(self, pos) -> None:
         index = self.list_view.indexAt(pos)
@@ -426,6 +452,8 @@ class GalleryPane(QWidget):
             return
         inspector_context = self._inspector_context_for_path(str(image_path))
         can_edit_faces = bool(
+            not self.read_only_mode
+            and
             isinstance(inspector_context.get("face_review"), dict)
             and self._active_face_edit_service() is not None
         )
@@ -449,8 +477,10 @@ class GalleryPane(QWidget):
         elif self.review_action_mode == "add":
             review_action = menu.addAction("Add To Review")
         menu.addSeparator()
-        move_to_trash = menu.addAction("Move To Trash (Selection)")
+        move_to_trash = menu.addAction("Move to ClusterLens Trash (selection)")
         move_to_dir = menu.addAction("Move To... (Selection)")
+        move_to_trash.setEnabled(not self.read_only_mode)
+        move_to_dir.setEnabled(not self.read_only_mode)
         action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
         if action == open_inspector:
             self.on_item_double_clicked(index)
@@ -556,14 +586,23 @@ class GalleryPane(QWidget):
 
         job = AsyncJob(fn)
         job.progress.connect(self._on_action_progress)
+        job_id: int | None = None
         if self.job_manager is not None:
-            self._active_action_job_id = self.job_manager.register_job(label, cancel_fn=job.cancel)
-            job.progress.connect(lambda value, text: self.job_manager.update(self._active_action_job_id or -1, progress=value, text=text))
+            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel)
+            self._active_action_job_id = job_id
+            job.progress.connect(
+                lambda value, text, job_id=job_id: self.job_manager.update(
+                    job_id,
+                    progress=value,
+                    text=text,
+                )
+            )
 
         def _finish(status: str, error: str = "") -> None:
-            if self.job_manager is not None and self._active_action_job_id is not None:
-                self.job_manager.finish(self._active_action_job_id, status=status, error=error)
-            self._active_action_job_id = None
+            if self.job_manager is not None and job_id is not None:
+                self.job_manager.finish(job_id, status=status, error=error)
+            if self._active_action_job_id == job_id:
+                self._active_action_job_id = None
 
         def _on_failed(message: str) -> None:
             self._set_action_busy(False)
@@ -619,11 +658,14 @@ class GalleryPane(QWidget):
         failures = list(getattr(result, "failures", []))
         success_count = len(changed) if changed else len(affected)
         audit_log_path = str(getattr(result, "audit_log_path", "") or "")
+        journal_path = str(getattr(result, "journal_path", "") or "")
         lines = [
             f"{verb} {success_count} item(s) from {target_label}.",
             f"Successful {changed_label}: {success_count}",
             f"Failures: {len(failures)}",
         ]
+        if journal_path:
+            lines.append(f"Operation journal: {journal_path}")
         if audit_log_path:
             lines.append(f"Audit log: {audit_log_path}")
         if failures:
@@ -642,16 +684,21 @@ class GalleryPane(QWidget):
             infoBox(title, summary)
 
     def slotDeleteSelect(self):
+        if not self._require_write_enabled("move photos to ClusterLens Trash"):
+            return
         target = self._selection_for_actions()
         if target is None:
             return
         source_paths = target.as_list()
-        if not confirmBox(
-            "Delete Selection?",
-            f"{target.label}\n\nImages: {len(source_paths)}\nDestination: local TrashImages folder",
-            parent=self,
+        if not self._confirm_write_operation(
+            "Move photos to ClusterLens Trash?",
+            "Move to the local ClusterLens Trash folder",
+            target,
+            source_paths,
+            destination=f"{CLUSTERLENS_TRASH_DIR_NAME} beside each source folder",
+            recoverability="Recoverable from Safety & Recovery while the moved files remain available.",
         ):
-            self.status_label.setText("Delete cancelled.")
+            self.status_label.setText("Move to ClusterLens Trash cancelled.")
             return
 
         def _run(progress, cancel_check):
@@ -667,11 +714,19 @@ class GalleryPane(QWidget):
             if moved:
                 self.remove_images(list(moved))
                 self.paths_removed.emit(sorted(moved))
-            self._show_action_result("Delete complete", result, verb="Deleted", target_label=target.label, changed_label="trash moves")
+            self._show_action_result(
+                "Move to ClusterLens Trash complete",
+                result,
+                verb="Moved",
+                target_label=target.label,
+                changed_label="ClusterLens Trash moves",
+            )
 
-        self._start_action_job("Deleting images", _run, _done)
+        self._start_action_job("Moving images to ClusterLens Trash", _run, _done)
 
     def slotMoveSelected(self):
+        if not self._require_write_enabled("move photos"):
+            return
         target = self._selection_for_actions()
         if target is None:
             return
@@ -679,6 +734,16 @@ class GalleryPane(QWidget):
         if not destination:
             return
         source_paths = target.as_list()
+        if not self._confirm_write_operation(
+            "Move photos?",
+            "Move",
+            target,
+            source_paths,
+            destination=destination,
+            recoverability="Journaled and recoverable when destination files remain available and original paths are free.",
+        ):
+            self.status_label.setText("Move cancelled.")
+            return
 
         def _run(progress, cancel_check):
             return self.action_service.move_to_directory(
@@ -703,6 +768,8 @@ class GalleryPane(QWidget):
         self._start_action_job("Moving images", _run, _done)
 
     def slotAddExif(self):
+        if not self._require_write_enabled("write EXIF metadata"):
+            return
         dialog = ExifMetadataDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -714,6 +781,15 @@ class GalleryPane(QWidget):
         if target is None:
             return
         source_paths = target.as_list()
+        if not self._confirm_write_operation(
+            "Write EXIF metadata?",
+            f"Write EXIF field {key}",
+            target,
+            source_paths,
+            recoverability="The operation is journaled, but in-place metadata edits are not automatically restorable.",
+        ):
+            self.status_label.setText("EXIF write cancelled.")
+            return
 
         def _run(progress, cancel_check):
             return self.action_service.write_exif_metadata_pairs(
@@ -749,6 +825,8 @@ class GalleryPane(QWidget):
         self._edit_tags_for_target(target)
 
     def _edit_tags_for_target(self, target: SelectionTarget) -> None:
+        if not self._require_write_enabled("edit tags"):
+            return
         if self.image_tag_service is None:
             errorBox("Tags unavailable", "Image tag service is not configured.")
             return
@@ -763,6 +841,16 @@ class GalleryPane(QWidget):
         source_paths = target.as_list()
         add_tags = tags if mode.casefold() == "add" else []
         remove_tags = tags if mode.casefold() == "remove" else []
+        if not self._confirm_write_operation(
+            "Update photo tags?",
+            "Add tags" if add_tags else "Remove tags",
+            target,
+            source_paths,
+            recoverability="Database changes are audited. EXIF changes are not automatically restorable.",
+            details=[f"Tags: {', '.join(tags)}", f"Mirror to EXIF: {'yes' if mirror_to_exif else 'no'}"],
+        ):
+            self.status_label.setText("Tag update cancelled.")
+            return
 
         def _run(progress, cancel_check):
             return self.image_tag_service.apply_tag_edit(
@@ -816,6 +904,8 @@ class GalleryPane(QWidget):
         self._start_action_job("Exporting metadata sidecars", _run, _done)
 
     def slotImportMetadataSidecars(self) -> None:
+        if not self._require_write_enabled("import metadata sidecars"):
+            return
         if self.image_tag_service is None:
             errorBox("Sidecar import unavailable", "Image tag service is not configured.")
             return
@@ -914,6 +1004,8 @@ class GalleryPane(QWidget):
             errorBox("Path export failed", str(exc))
 
     def slotCopySelected(self) -> None:
+        if not self._require_write_enabled("copy photos"):
+            return
         target = self._selection_for_actions()
         if target is None:
             return
@@ -921,6 +1013,16 @@ class GalleryPane(QWidget):
         if not destination:
             return
         source_paths = target.as_list()
+        if not self._confirm_write_operation(
+            "Copy photos?",
+            "Copy",
+            target,
+            source_paths,
+            destination=destination,
+            recoverability="Original files are unchanged. Created copies are recorded in the operation journal.",
+        ):
+            self.status_label.setText("Copy cancelled.")
+            return
 
         def _run(progress, cancel_check):
             return self.action_service.copy_to_directory(
@@ -962,6 +1064,8 @@ class GalleryPane(QWidget):
             self.refresh_selection_target_hint()
             if not self.images:
                 self.status_label.setText("No images in the current selection.")
+                self.empty_state.show()
+                self.list_view.hide()
             return
         if self._last_visible_paths:
             self._last_visible_paths = ()
@@ -971,7 +1075,11 @@ class GalleryPane(QWidget):
         self.refresh_selection_target_hint()
         if not self.images:
             self.status_label.setText("No images in the current selection.")
+            self.empty_state.show()
+            self.list_view.hide()
             return
+        self.empty_state.hide()
+        self.list_view.show()
         self.first_paint_start = perf_counter()
         self.first_paint_emitted = False
         self.status_label.setText(f"Loading {len(self.images)} images...")
@@ -991,6 +1099,7 @@ class GalleryPane(QWidget):
         if thumbnail_size is not None and int(thumbnail_size) != self.image_size:
             self.image_size = int(thumbnail_size)
             self.delegate = GalleryItemDelegate(self.image_size, self)
+            self.delegate.copy_requested.connect(self._copy_image_to_clipboard)
             self.list_view.setItemDelegate(self.delegate)
             self.list_view.setGridSize(QSize(self.delegate.card_width + self._item_spacing, self.delegate.card_height + self._item_spacing))
         if worker_count is not None:
@@ -1000,6 +1109,8 @@ class GalleryPane(QWidget):
         cache_size = qimage_cache_size if qimage_cache_size is not None else pixmap_cache_size
         if cache_size is not None:
             self.thumbnail_service.set_qimage_cache_size(int(cache_size))
+            evicted = self.model.set_image_cache_capacity(int(cache_size))
+            self.loaded_indexes.difference_update(evicted)
         if self.images:
             self.update_gallery_with_options(images=self.images, clear_pixmaps=True, reset_scroll=False)
 
@@ -1017,8 +1128,10 @@ class GalleryPane(QWidget):
             widget.setVisible(visible and bool(show_metadata_actions))
         for widget in self._file_action_widgets:
             widget.setVisible(visible and bool(show_file_actions))
-        for widget in getattr(self, "_legacy_action_buttons", []):
-            widget.setVisible(False)
+        self.metadata_menu.menuAction().setVisible(visible and bool(show_metadata_actions))
+        self.file_ops_menu.menuAction().setVisible(visible and bool(show_file_actions))
+        self.actions_menu_button.setVisible(visible and bool(show_metadata_actions or show_file_actions))
+        self._apply_read_only_state()
 
     def set_action_bar_visible(self, visible: bool) -> None:
         self.set_action_visibility(
@@ -1026,6 +1139,57 @@ class GalleryPane(QWidget):
             show_metadata_actions=bool(visible),
             show_file_actions=bool(visible),
         )
+
+    def set_read_only_mode(self, enabled: bool) -> None:
+        self.read_only_mode = bool(enabled)
+        self._apply_read_only_state()
+        if self.read_only_mode:
+            self.status_label.setText(
+                "Read-only mode is on. File, tag, face-editing, and EXIF changes are disabled."
+            )
+
+    def _apply_read_only_state(self) -> None:
+        enabled = not bool(getattr(self, "read_only_mode", False))
+        for widget in getattr(self, "_mutation_widgets", []):
+            widget.setEnabled(enabled)
+        for action in getattr(self, "_mutation_actions", []):
+            action.setEnabled(enabled)
+        note = "Disabled while read-only mode is on."
+        for widget in getattr(self, "_mutation_widgets", []):
+            base = getattr(self, "_base_mutation_tooltips", {}).get(widget, widget.toolTip() or "")
+            widget.setToolTip(f"{base}\n\n{note}" if (base and not enabled) else (note if not enabled else base))
+        self._update_action_enabled_state()
+
+    def _require_write_enabled(self, action_label: str) -> bool:
+        if not self.read_only_mode:
+            return True
+        message = f"Read-only mode is on. Turn it off in Settings > Safety & Recovery to {action_label}."
+        self.status_label.setText(message)
+        errorBox("Read-only mode", message)
+        return False
+
+    def _confirm_write_operation(
+        self,
+        title: str,
+        operation: str,
+        target: SelectionTarget,
+        source_paths: list[str],
+        *,
+        destination: str = "",
+        recoverability: str,
+        details: list[str] | None = None,
+    ) -> bool:
+        lines = [
+            f"Action: {operation}",
+            f"Target: {target.label}",
+            f"Photos affected: {len(source_paths)}",
+        ]
+        if destination:
+            lines.append(f"Destination: {destination}")
+        if details:
+            lines.extend(str(item) for item in details if str(item).strip())
+        lines.extend(["", f"Recovery: {recoverability}", "", "Continue?"])
+        return bool(confirmBox(title, "\n".join(lines), parent=self))
 
     def clear_memory_caches(self, *, reload_visible: bool = True) -> None:
         if self._shutting_down:
@@ -1066,21 +1230,37 @@ class GalleryPane(QWidget):
         removed = {str(path) for path in image_paths if path}
         if not removed:
             return
-        self.images = [path for path in self.images if path not in removed]
-        self.model.remove_paths(removed)
-        self.reset_gallery_state(clear_pixmaps=False, reset_scroll=False)
+        self.request_generation += 1
+        self.pending_indexes.clear()
+        self.pending_ui_items.clear()
+        self._active_thumbnail_indexes.clear()
+        cached_rows = self.model.remove_paths(removed)
+        self.images = self.model.image_paths()
+        self.loaded_indexes = set(cached_rows)
+        self.failed_indexes = self.model.failed_rows()
+        self.loader_queue.configure(self.request_generation, self.images, self.image_size)
         self.schedule_visible_refresh()
         self.refresh_selection_target_hint()
 
     def append_images(self, image_paths: list[str]) -> None:
         if not image_paths:
             return
+        was_empty = not self.images
         existing = set(self.images)
         appended = [path for path in image_paths if path and path not in existing]
         if not appended:
             return
         self.images.extend(appended)
         self.model.append_images(appended)
+        if was_empty:
+            # Large result sets are published in batches.  The initial reset to
+            # an empty model shows the empty-state overlay, so the first batch
+            # must perform the same empty -> populated transition as a regular
+            # gallery update.
+            self.empty_state.hide()
+            self.list_view.show()
+            self.first_paint_start = perf_counter()
+            self.first_paint_emitted = False
         self.loader_queue.configure(self.request_generation, self.images, self.image_size)
         self.refresh_selection_target_hint()
         self.status_label.setText(f"Loading {len(self.images)} images...")
@@ -1094,6 +1274,7 @@ class GalleryPane(QWidget):
         self.loaded_indexes.clear()
         self.failed_indexes.clear()
         self.pending_indexes.clear()
+        self._active_thumbnail_indexes.clear()
         self.pending_ui_items.clear()
         if reset_scroll:
             self.list_view.scrollToTop()
@@ -1126,14 +1307,50 @@ class GalleryPane(QWidget):
     def refresh_selection_target_hint(self) -> None:
         target = self.current_group_target()
         if target is None:
-            self.target_hint_label.setText("Current Group: None")
+            self.target_hint_label.setText("Current group: none")
+            self._update_action_enabled_state()
             return
-        self.target_hint_label.setText(f"Current Group: {target.label} ({len(target.paths)})")
+        self.target_hint_label.setText(f"Current group: {target.label} ({len(target.paths)})")
+        self.select_group_button.setText(f"Select current group ({len(target.paths)})")
+        self._update_action_enabled_state()
+
+    def _update_action_enabled_state(self) -> None:
+        target = self.current_group_target()
+        has_target = target is not None
+        explicit_count = len(self._selected_gallery_paths() or self.model.checked_paths())
+        target_count = len(target.paths) if target is not None else 0
+        self.selected_tags_button.setText(f"Tag selected photos ({explicit_count})")
+        self.open_folder_button.setText(f"Reveal folder ({target_count})")
+        self.actions_menu_button.setText(f"More actions ({target_count})")
+        action_target_count = explicit_count or target_count
+        for action, label in (
+            (self.write_exif_action, "Write EXIF to current target"),
+            (self.tags_checked_group_action, "Tag current target"),
+            (self.copy_selection_action, "Copy current target"),
+            (self.move_selection_action, "Move current target"),
+            (self.delete_selection_action, "Move current target to ClusterLens Trash"),
+            (self.copy_paths_action, "Copy paths"),
+            (self.export_paths_action, "Export paths"),
+        ):
+            action.setText(f"{label} ({action_target_count})")
+            is_mutation = action in getattr(self, "_mutation_actions", [])
+            action.setEnabled(bool(has_target and not (is_mutation and self.read_only_mode)))
+        self.retry_failed_action.setText(f"Retry failed thumbnails ({len(self.failed_indexes)})")
+        self.retry_failed_action.setEnabled(bool(self.failed_indexes))
+        for widget in (
+            self.select_group_button,
+            self.selected_tags_button,
+            self.open_folder_button,
+            self.actions_menu_button,
+        ):
+            mutation = widget in getattr(self, "_mutation_widgets", [])
+            requires_explicit = widget is self.selected_tags_button
+            widget.setEnabled(bool(has_target and (not requires_explicit or explicit_count > 0) and not (mutation and self.read_only_mode)))
 
     def _selection_for_actions(self) -> SelectionTarget | None:
         checked = tuple(self.model.checked_paths())
         if checked:
-            return SelectionTarget(paths=checked, kind="checked_images", label=f"Checked Photos ({len(checked)})")
+            return SelectionTarget(paths=checked, kind="selected_images", label=f"Selected photos ({len(checked)})")
         target = self.current_group_target()
         if target is None or not target.paths:
             self.status_label.setText("Select photos or a cluster first.")
@@ -1146,7 +1363,7 @@ class GalleryPane(QWidget):
             return SelectionTarget(paths=selected, kind="selected_gallery_images", label=f"Selected Gallery Photos ({len(selected)})")
         checked = tuple(self.model.checked_paths())
         if checked:
-            return SelectionTarget(paths=checked, kind="checked_images", label=f"Checked Photos ({len(checked)})")
+            return SelectionTarget(paths=checked, kind="selected_images", label=f"Selected photos ({len(checked)})")
         self.status_label.setText("Select or check one or more photos first. This tag action will not use the current cluster.")
         return None
 
@@ -1223,6 +1440,19 @@ class GalleryPane(QWidget):
         dialog.exec()
 
     def eventFilter(self, watched, event):
+        if watched is self.list_view.viewport() and event.type() == QEvent.Type.KeyPress:
+            index = self.list_view.currentIndex()
+            if event.key() == Qt.Key.Key_Space and index.isValid():
+                current = index.data(Qt.ItemDataRole.CheckStateRole)
+                next_state = Qt.CheckState.Unchecked if current == Qt.CheckState.Checked else Qt.CheckState.Checked
+                self.model.setData(index, next_state, Qt.ItemDataRole.CheckStateRole)
+                self.refresh_selection_target_hint()
+                event.accept()
+                return True
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and index.isValid():
+                self.on_item_double_clicked(index)
+                event.accept()
+                return True
         if watched is self.list_view.viewport() and self._face_box_drag_enabled():
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 drag_state = self._face_box_drag_hit_state(event.position())
@@ -1565,7 +1795,11 @@ class GalleryPane(QWidget):
             return
         visible_indexes, prefetch_indexes = self._visible_and_prefetch_indexes()
         self._emit_visible_paths(visible_indexes)
+        self._active_thumbnail_indexes = set(visible_indexes).union(prefetch_indexes)
+        evicted = self.model.evict_images_except(self._active_thumbnail_indexes)
+        self.loaded_indexes.difference_update(evicted)
         if not visible_indexes and not prefetch_indexes:
+            self.update_status()
             return
         visible_missing = [
             index
@@ -1596,6 +1830,8 @@ class GalleryPane(QWidget):
         if generation != self.request_generation:
             return
         self.pending_indexes.discard(index)
+        if self._active_thumbnail_indexes and index not in self._active_thumbnail_indexes:
+            return
         self.pending_ui_items.append((index, image_path, qimage))
         if not self.flush_timer.isActive():
             self.flush_timer.start(self.settings.gallery_flush_interval_ms)
@@ -1611,12 +1847,6 @@ class GalleryPane(QWidget):
         LOGGER.warning("Thumbnail load failed for %s: %s", image_path, message)
         self.update_status(last_error=f"{image_path}: {message}")
 
-    def closeEvent(self, event) -> None:
-        if not self.shutdown_jobs():
-            event.ignore()
-            return
-        return super().closeEvent(event)
-
     def flush_pending_ui_items(self):
         if not self.pending_ui_items:
             self.update_status()
@@ -1625,7 +1855,10 @@ class GalleryPane(QWidget):
         batch = self.pending_ui_items[:MAX_PENDING_UI_ITEMS_PER_FLUSH]
         self.pending_ui_items = self.pending_ui_items[MAX_PENDING_UI_ITEMS_PER_FLUSH:]
         for index, image_path, qimage in batch:
-            self.model.set_image(index, qimage)
+            if self._active_thumbnail_indexes and index not in self._active_thumbnail_indexes:
+                continue
+            evicted = self.model.set_image(index, qimage)
+            self.loaded_indexes.difference_update(evicted)
             self.loaded_indexes.add(index)
             if not self.first_paint_emitted:
                 self.first_paint_emitted = True
@@ -1642,22 +1875,52 @@ class GalleryPane(QWidget):
         if not self.images:
             self.status_label.setText("No images in selected cluster.")
             return
-        loaded = len(self.loaded_indexes)
-        failed = len(self.failed_indexes)
-        if loaded + failed >= len(self.images):
-            message = f"Loaded {loaded} / {len(self.images)} images."
-            if failed:
-                message += f" Failed: {failed}."
+        active = set(self._active_thumbnail_indexes)
+        if not active:
+            message = f"Ready · {len(self.images)} photos."
             if last_error:
                 message += f" Last error: {last_error}"
             self.status_label.setText(message)
             return
-        message = f"Loading {loaded} / {len(self.images)} images... Pending: {len(self.pending_indexes)}"
+        loaded = len(self.loaded_indexes.intersection(active))
+        failed = len(self.failed_indexes.intersection(active))
+        pending = len(self.pending_indexes.intersection(active)) + sum(
+            1 for index, _path, _image in self.pending_ui_items if index in active
+        )
+        ready = loaded + failed
+        if ready >= len(active) and pending == 0:
+            message = f"Ready · {len(self.images)} photos · {loaded} nearby thumbnails loaded."
+        else:
+            message = f"Loading nearby thumbnails: {ready} / {len(active)} ready. Pending: {pending}."
         if failed:
-            message += f" Failed: {failed}."
+            message += f" Failed nearby: {failed}."
         if last_error:
             message += f" Last error: {last_error}"
         self.status_label.setText(message)
+
+    def _copy_image_to_clipboard(self, image_path: str) -> None:
+        path = str(image_path or "").strip()
+        if not path:
+            return
+
+        def _run(progress, cancel_check):
+            progress(-1, f"Preparing {Path(path).name} for the clipboard...")
+            if cancel_check():
+                raise RuntimeError("Cancelled")
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if image.isNull():
+                raise ValueError(reader.errorString() or "Image decode returned no data.")
+            return image
+
+        def _done(image: QImage) -> None:
+            if not isinstance(image, QImage) or image.isNull():
+                raise ValueError("Image decode returned no data.")
+            QGuiApplication.clipboard().setImage(image)
+            self.status_label.setText(f"Copied {Path(path).name} to the clipboard.")
+
+        self._start_action_job("Copying image to clipboard", _run, _done)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

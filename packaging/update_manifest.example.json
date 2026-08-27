@@ -1,30 +1,41 @@
 {
+  "manifest_version": "UpdateManifestV2",
   "app_id": "ClusterLens",
-  "channel": "stable",
-  "version": "0.4.0a1",
   "published_utc": "2026-05-15T00:00:00Z",
   "artifacts": [
     {
-      "name": "ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "channel": "stable",
+      "version": "0.4.0a1",
+      "minimum_supported_version": "0.4.0a1",
+      "os": "windows",
+      "architecture": "x64",
       "variant": "cpu",
-      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "cuda_runtime": "",
+      "name": "ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "size_bytes": 0,
       "sha256": "replace-with-release-sha256",
-      "signature": "replace-with-detached-signature-or-signed-binary-proof",
-      "size_bytes": 0
+      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-cpu.exe",
+      "ed25519_signature": "replace-with-ed25519-signature"
     },
     {
-      "name": "ClusterLens-0.4.0a1-windows-x64-gpu-cu121.zip",
+      "channel": "stable",
+      "version": "0.4.0a1",
+      "minimum_supported_version": "0.4.0a1",
+      "os": "windows",
+      "architecture": "x64",
       "variant": "gpu-cu121",
-      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-gpu-cu121.zip",
+      "cuda_runtime": "12.1",
+      "name": "ClusterLens-0.4.0a1-windows-x64-gpu-cu121.exe",
+      "size_bytes": 0,
       "sha256": "replace-with-release-sha256",
-      "signature": "replace-with-detached-signature-or-signed-binary-proof",
-      "size_bytes": 0
+      "url": "https://example.invalid/releases/ClusterLens-0.4.0a1-windows-x64-gpu-cu121.exe",
+      "ed25519_signature": "replace-with-ed25519-signature"
     }
   ],
-  "minimum_supported_version": "0.4.0a1",
   "notes": [
-    "Updates must preserve the platform runtime root: %LOCALAPPDATA% on Windows, XDG user-data on Linux, and ~/Library/Application Support on macOS.",
-    "The updater must verify sha256 and code signature before replacing binaries.",
+    "Update checks default to off.",
+    "The updater must verify the manifest signature, artifact sha256, OS signature, architecture, and CPU/CUDA variant before installer handoff.",
+    "The updater must never switch variants silently.",
     "The app must run release gates before a public update is published."
   ]
 }

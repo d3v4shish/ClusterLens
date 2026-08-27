@@ -36,14 +36,19 @@ except Exception:  # pragma: no cover
     faiss = None
 
 from infra.logging_config import get_logger
+from infra.cancel import raise_if_cancelled
+from infra.atomic_io import atomic_write_text, atomic_write_with
 from infra.runtime import ExecutionPolicy, RuntimeCapabilityService, preload_onnx_cuda_runtime_libraries
 from infra.settings import get_settings
+from app.path_scope import folder_scope_sql, normalize_scoped_path, path_is_within_scope
 from app.services.cluster_explanations import ClusterExplanation
 from app.services.clustering_options import backend_tooltip, clustering_backend_names
+from app.services.model_assets import ModelAssetService
 from ml.clustering import ClusteringService
 
 from .discovery import ImageDiscoveryService
 from .face_model_installer import face_model_runtime_root_dir
+from .face_types import EditableFaceInput
 
 
 LOGGER = get_logger(__name__)
@@ -59,10 +64,13 @@ FACE_MODE_LABELS: dict[str, str] = {
 ANIMAL_FACE_MODES: tuple[FaceMode, ...] = ("dog", "cat")
 BUILTIN_HUMAN_DETECTOR_ID = "mtcnn_builtin"
 BUILTIN_HUMAN_EMBEDDER_ID = "vggface2_builtin"
+DEFAULT_HUMAN_FACE_PROFILE_ID = "latest_gpu"
+DEFAULT_HUMAN_FACE_DETECTOR_ID = "scrfd_10g_kps"
+DEFAULT_HUMAN_FACE_EMBEDDER_ID = "arcface_r100_glint360k"
 LEGACY_DEFAULT_BUNDLE_ID = "default_bundle"
 DEFAULT_FACE_MAX_DETECTIONS = 50
 DEFAULT_FACE_SCORE_THRESHOLD = 0.0
-DEFAULT_BUNDLED_FACE_PROFILE = "balanced"
+DEFAULT_BUNDLED_FACE_PROFILE = DEFAULT_HUMAN_FACE_PROFILE_ID
 MAX_FACE_INDEX_PROGRESS_UPDATES = 32
 FACE_INDEX_PROGRESS_MIN_INTERVAL_S = 0.15
 FACE_SCAN_ROW_PREFETCH_CHUNK = 500
@@ -671,7 +679,12 @@ def _load_face_detector_bundle(bundle_dir: Path, mode: FaceMode, detector_id: st
         availability_message=(
             f"Ready at {bundle_dir}."
             if available
-            else f"Install detector.onnx in {bundle_dir} to enable this detector."
+            else (
+                f"{bundle_dir.name} is not installed. Use Settings > Models > Install Selected Face Pack. "
+                f"Managed cache: {face_model_runtime_root_dir()}."
+                if source_kind in {"bundled", "managed"}
+                else f"Missing detector.onnx in the configured external face-model bundle: {bundle_dir}."
+            )
         ),
     )
 
@@ -716,7 +729,12 @@ def _load_face_embedder_bundle(bundle_dir: Path, mode: FaceMode, embedder_id: st
         availability_message=(
             f"Ready at {bundle_dir}."
             if available
-            else f"Install embedder.onnx in {bundle_dir} to enable this embedder."
+            else (
+                f"{bundle_dir.name} is not installed. Use Settings > Models > Install Selected Face Pack. "
+                f"Managed cache: {face_model_runtime_root_dir()}."
+                if source_kind in {"bundled", "managed"}
+                else f"Missing embedder.onnx in the configured external face-model bundle: {bundle_dir}."
+            )
         ),
     )
 
@@ -786,6 +804,7 @@ def list_face_embedder_bundles(model_root: str | Path | None, mode: str | None) 
     mode_id = normalize_face_mode(mode)
     bundles: list[FaceEmbedderBundle] = []
     if mode_id == "human":
+        builtin_ready = ModelAssetService().local_cache_present("facenet")
         bundles.append(
             FaceEmbedderBundle(
                 mode="human",
@@ -795,8 +814,12 @@ def list_face_embedder_bundles(model_root: str | Path | None, mode: str | None) 
                 profile="builtin",
                 summary="Built-in Torch FaceNet embedder trained on VGGFace2.",
                 hardware_class="CPU or CUDA",
-                available=True,
-                availability_message="Built-in human embedder is ready.",
+                available=builtin_ready,
+                availability_message=(
+                    "Built-in human embedder is ready."
+                    if builtin_ready
+                    else "FaceNet weights are not installed. Open Settings > Models and install FaceNet."
+                ),
             )
         )
     for root_kind, embedder_root in _component_bundle_roots(model_root, mode_id, "embedder"):
@@ -847,6 +870,9 @@ def default_face_detector_id(model_root: str | Path | None, mode: str | None) ->
 def default_face_embedder_id(model_root: str | Path | None, mode: str | None) -> str:
     mode_id = normalize_face_mode(mode)
     bundles = list_face_embedder_bundles(model_root, mode_id)
+    for bundle in bundles:
+        if bundle.available:
+            return str(bundle.embedder_id)
     if bundles:
         return str(bundles[0].embedder_id)
     if mode_id == "human":
@@ -854,12 +880,88 @@ def default_face_embedder_id(model_root: str | Path | None, mode: str | None) ->
     return LEGACY_DEFAULT_BUNDLE_ID
 
 
+def resolve_ready_face_pipeline_ids(
+    model_root: str | Path | None,
+    mode: str | None,
+    detector_id: str | None,
+    embedder_id: str | None,
+) -> tuple[str, str]:
+    """Resolve a detector/embedder preference as one ready, atomic pipeline.
+
+    A detector from a partially installed pack must never be paired silently
+    with a missing embedder (or vice versa). When either requested component
+    is unavailable, another complete managed pair or the built-in safety pair
+    is returned.
+    """
+
+    mode_id = normalize_face_mode(mode)
+    detector_bundles = list_face_detector_bundles(model_root, mode_id)
+    embedder_bundles = list_face_embedder_bundles(model_root, mode_id)
+    fallback_detector = default_face_detector_id(model_root, mode_id)
+    fallback_embedder = default_face_embedder_id(model_root, mode_id)
+    requested_detector = normalize_face_component_id(detector_id, fallback_detector)
+    requested_embedder = normalize_face_component_id(embedder_id, fallback_embedder)
+    detectors = {str(bundle.detector_id): bundle for bundle in detector_bundles}
+    embedders = {str(bundle.embedder_id): bundle for bundle in embedder_bundles}
+
+    def _ready_pair(candidate_detector: str, candidate_embedder: str) -> bool:
+        detector_bundle = detectors.get(str(candidate_detector))
+        embedder_bundle = embedders.get(str(candidate_embedder))
+        return bool(
+            detector_bundle is not None
+            and detector_bundle.available
+            and embedder_bundle is not None
+            and embedder_bundle.available
+        )
+
+    candidates: list[tuple[str, str]] = [(requested_detector, requested_embedder)]
+    requested_detector_bundle = detectors.get(requested_detector)
+    requested_embedder_bundle = embedders.get(requested_embedder)
+    if requested_detector_bundle is not None and requested_detector_bundle.available:
+        candidates.append((requested_detector, str(requested_detector_bundle.recommended_pair_id or "")))
+    if requested_embedder_bundle is not None and requested_embedder_bundle.available:
+        candidates.append((str(requested_embedder_bundle.recommended_pair_id or ""), requested_embedder))
+
+    # Prefer a complete installed pack before the built-in safety pipeline.
+    # This preserves acceleration when a saved component disappears but its
+    # matching managed pair is already available.
+    for bundle in detector_bundles:
+        if bundle.available and bundle.recommended_pair_id:
+            candidates.append((str(bundle.detector_id), str(bundle.recommended_pair_id)))
+    for bundle in embedder_bundles:
+        if bundle.available and bundle.recommended_pair_id:
+            candidates.append((str(bundle.recommended_pair_id), str(bundle.embedder_id)))
+    if mode_id == "human":
+        candidates.append((BUILTIN_HUMAN_DETECTOR_ID, BUILTIN_HUMAN_EMBEDDER_ID))
+    candidates.append((fallback_detector, fallback_embedder))
+    candidates.extend(
+        (str(detector_bundle.detector_id), str(embedder_bundle.embedder_id))
+        for detector_bundle in detector_bundles
+        if detector_bundle.available
+        for embedder_bundle in embedder_bundles
+        if embedder_bundle.available
+    )
+
+    seen: set[tuple[str, str]] = set()
+    for candidate_detector, candidate_embedder in candidates:
+        pair = (
+            normalize_face_component_id(candidate_detector, fallback_detector),
+            normalize_face_component_id(candidate_embedder, fallback_embedder),
+        )
+        if pair in seen:
+            continue
+        seen.add(pair)
+        if _ready_pair(*pair):
+            return pair
+    return fallback_detector, fallback_embedder
+
+
 def _hardware_execution_tag(hardware_class: str | None) -> str:
     text = str(hardware_class or "").strip().lower()
     if not text:
         return ""
     has_cpu = "cpu" in text
-    has_gpu = any(token in text for token in ("gpu", "cuda", "directml", "mps"))
+    has_gpu = any(token in text for token in ("gpu", "cuda"))
     if has_cpu and has_gpu:
         return "CPU/GPU"
     if has_gpu:
@@ -897,7 +999,7 @@ def face_embedder_choices(model_root: str | Path | None, mode: str | None) -> li
         label = _face_choice_label(
             bundle.display_name,
             bundle.hardware_class,
-            install_required=bool(not bundle.available and bundle.source_kind != "builtin"),
+            install_required=bool(not bundle.available),
         )
         choices.append((str(bundle.embedder_id), label))
     return choices
@@ -1018,7 +1120,12 @@ def _session_output_names(session) -> list[str]:
     return [str(item.name or "").strip() for item in session.get_outputs()]
 
 
-def _create_onnx_session(model_path: Path, providers: list[str]):
+def _create_onnx_session(
+    model_path: Path,
+    providers: list[str],
+    *,
+    allow_cpu_fallback: bool = True,
+):
     if ort is None:
         raise RuntimeError("onnxruntime is not installed.")
     ordered: list[str] = []
@@ -1033,7 +1140,11 @@ def _create_onnx_session(model_path: Path, providers: list[str]):
     try:
         return ort.InferenceSession(str(model_path), providers=ordered)
     except Exception as exc:
-        if ordered == ["CPUExecutionProvider"] or (ordered and ordered[0] == "CPUExecutionProvider"):
+        if (
+            not allow_cpu_fallback
+            or ordered == ["CPUExecutionProvider"]
+            or (ordered and ordered[0] == "CPUExecutionProvider")
+        ):
             raise
         LOGGER.warning(
             "Falling back to CPU ONNX session for %s after provider %s failed: %s",
@@ -1357,18 +1468,29 @@ class FaceAlbumGroupSummary:
 
 
 @dataclass(frozen=True)
+class FaceAlbumGroupPage:
+    items: tuple[FaceAlbumGroupSummary, ...]
+    total_count: int
+    offset: int
+    next_offset: int | None
+
+
+@dataclass(frozen=True)
+class FaceAlbumMemberPage:
+    group_id: str
+    items: tuple[FaceAlbumRecord, ...]
+    total_count: int
+    offset: int
+    next_offset: int | None
+
+
+@dataclass(frozen=True)
 class OrientedImageInfo:
     raw_width: int
     raw_height: int
     display_width: int
     display_height: int
     orientation: int = 1
-
-
-@dataclass(frozen=True)
-class EditableFaceInput:
-    bbox: tuple[int, int, int, int]
-    confidence: float = 1.0
 
 
 MIN_INDEXED_FACE_SIDE_PX = 20
@@ -1858,6 +1980,9 @@ class FaceEmbeddingService:
         settings = get_settings()
         self.runtime_service = runtime_service or RuntimeCapabilityService()
         self.execution_policy = execution_policy or self.runtime_service.select_policy(settings.preferred_execution_mode)
+        torch_home = Path(settings.cache_dir) / "torch"
+        torch_home.mkdir(parents=True, exist_ok=True)
+        os.environ["TORCH_HOME"] = str(torch_home)
         self.device = torch.device(self.execution_policy.torch_device if self.execution_policy.uses_cuda else "cpu")
         self._model: InceptionResnetV1 | None = None
         self.mode: FaceMode = "human"
@@ -1885,14 +2010,21 @@ class FaceEmbeddingService:
 
     def _get_model(self) -> InceptionResnetV1:
         if self._model is None:
+            if not ModelAssetService().local_cache_present("facenet"):
+                raise RuntimeError(
+                    "FaceNet VGGFace2 weights are not installed. Open Settings > Models, select FaceNet, "
+                    "and choose Download / Install Selected. The download will appear in Jobs and can be cancelled."
+                )
             self._model = InceptionResnetV1(pretrained="vggface2").eval().to(self.device)
         return self._model
 
     def is_ready(self) -> bool:
-        return True
+        return ModelAssetService().local_cache_present("facenet")
 
     def readiness_message(self) -> str:
-        return f"Embedder: {self.display_name}."
+        if self.is_ready():
+            return f"Embedder: {self.display_name}."
+        return "FaceNet weights are not installed. Open Settings > Models and install FaceNet."
 
 
 class AnimalFaceDetectionService:
@@ -2283,8 +2415,18 @@ class AnimalFaceDetectionService:
             bundle = self._get_bundle()
             if not bundle.available or bundle.detector_path is None:
                 raise RuntimeError(bundle.availability_message or "Detector bundle is not installed.")
-            providers = [str(self.execution_policy.onnx_provider or "CPUExecutionProvider"), "CPUExecutionProvider"]
-            self._session = _create_onnx_session(Path(bundle.detector_path), providers)
+            provider = str(self.execution_policy.onnx_provider or "CPUExecutionProvider")
+            if self.execution_policy.preferred_mode == "cuda" and provider != "CUDAExecutionProvider":
+                raise RuntimeError(
+                    self.execution_policy.error
+                    or "CUDA was explicitly requested, but the face detector has no verified CUDA provider."
+                )
+            providers = [provider, "CPUExecutionProvider"]
+            self._session = _create_onnx_session(
+                Path(bundle.detector_path),
+                providers,
+                allow_cpu_fallback=self.execution_policy.preferred_mode == "auto",
+            )
         return self._session
 
 
@@ -2370,8 +2512,18 @@ class AnimalFaceEmbeddingService:
             bundle = self._get_bundle()
             if not bundle.available or bundle.embedder_path is None:
                 raise RuntimeError(bundle.availability_message or "Embedder bundle is not installed.")
-            providers = [str(self.execution_policy.onnx_provider or "CPUExecutionProvider"), "CPUExecutionProvider"]
-            self._session = _create_onnx_session(Path(bundle.embedder_path), providers)
+            provider = str(self.execution_policy.onnx_provider or "CPUExecutionProvider")
+            if self.execution_policy.preferred_mode == "cuda" and provider != "CUDAExecutionProvider":
+                raise RuntimeError(
+                    self.execution_policy.error
+                    or "CUDA was explicitly requested, but the face embedder has no verified CUDA provider."
+                )
+            providers = [provider, "CPUExecutionProvider"]
+            self._session = _create_onnx_session(
+                Path(bundle.embedder_path),
+                providers,
+                allow_cpu_fallback=self.execution_policy.preferred_mode == "auto",
+            )
         return self._session
 
 
@@ -3349,10 +3501,7 @@ class FaceIndexService:
 
     @staticmethod
     def _normalize_path_for_match(value: str) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        return os.path.normcase(os.path.normpath(text))
+        return normalize_scoped_path(value)
 
     @classmethod
     def _candidate_path_query_values(cls, candidate_paths: list[str] | None) -> list[str]:
@@ -3415,13 +3564,9 @@ class FaceIndexService:
 
     @classmethod
     def _matches_folder_prefix(cls, image_path: str, folder_prefix: str) -> bool:
-        prefix = cls._normalize_path_for_match(folder_prefix)
-        if not prefix:
+        if not str(folder_prefix or "").strip():
             return True
-        candidate = cls._normalize_path_for_match(image_path)
-        if candidate == prefix:
-            return True
-        return candidate.startswith(prefix + os.sep)
+        return path_is_within_scope(image_path, folder_prefix)
 
     @classmethod
     def _normalized_path_set(cls, candidate_paths: list[str] | None) -> set[str]:
@@ -4072,8 +4217,14 @@ class FaceIndexService:
         refs = [(str(row[0]), int(row[1])) for row in rows]
         fingerprint = self._db_fingerprint()
         try:
-            faiss.write_index(index, str(self._ann_index_path()))
-            self._ann_meta_path().write_text(
+            raise_if_cancelled(cancel_check)
+            atomic_write_with(
+                self._ann_index_path(),
+                lambda temporary: faiss.write_index(index, str(temporary)),
+            )
+            raise_if_cancelled(cancel_check)
+            atomic_write_text(
+                self._ann_meta_path(),
                 json.dumps(
                     {
                         "fingerprint": [int(fingerprint[0]), int(fingerprint[1])],
@@ -4082,7 +4233,6 @@ class FaceIndexService:
                     indent=2,
                     sort_keys=True,
                 ),
-                encoding="utf-8",
             )
         except Exception:
             pass
@@ -4112,6 +4262,8 @@ class FaceIndexService:
                 ]
                 if saved_fingerprint == fingerprint and refs:
                     index = faiss.read_index(str(index_path))
+                    if int(getattr(index, "ntotal", -1)) != len(refs):
+                        raise ValueError("Face ANN index record count does not match its metadata.")
                     if hasattr(index, "hnsw"):
                         index.hnsw.efSearch = 128
                     self._ann_index = index
@@ -4135,6 +4287,7 @@ class FaceIndexService:
         candidate_paths: list[str] | None = None,
         exclude: set[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceSearchResult]:
         hits: list[tuple[FaceSearchResult, IndexedFaceRecord]] = []
         exclude = exclude or set()
@@ -4144,6 +4297,7 @@ class FaceIndexService:
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
         ):
+            raise_if_cancelled(cancel_check)
             if (record.image_path, int(record.face_index)) in exclude:
                 continue
             if not self._quality_allows(record.quality_status, self.search_quality_min):
@@ -4424,8 +4578,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE i.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         query += " ORDER BY i.image_path, i.face_index"
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
@@ -4471,56 +4626,91 @@ class FaceIndexService:
         folder_prefix: str = "",
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceAlbumRecord]:
+        raise_if_cancelled(cancel_check)
         folder_prefix = str(folder_prefix or "").strip()
         allowed_paths = self._normalized_path_set(candidate_paths)
-        records = self.load_all_records(
-            folder_prefix=folder_prefix,
-            candidate_paths=candidate_paths,
-            include_tiny_faces=include_tiny_faces,
-            include_hidden=True,
-        )
+        query = """
+            SELECT
+                i.image_path,
+                i.face_index,
+                i.bbox_json,
+                i.face_confidence,
+                i.quality_status,
+                i.quality_score,
+                i.quality_reasons_json,
+                COALESCE(l.person_name, ''),
+                COALESCE(l.confidence, 0.0),
+                COALESCE(i.hidden, 0),
+                COALESCE(pp.hidden, 0)
+            FROM face_index i
+            LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+            LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+        """
+        args: list[object] = []
+        if folder_prefix:
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+        if not include_tiny_faces:
+            query = self._append_sql_condition(query, "COALESCE(i.is_tiny, 0)=0")
+        query += " ORDER BY i.image_path, i.face_index"
+        with self._connect() as connection:
+            rows = self._execute_scoped_query(
+                connection,
+                query,
+                args,
+                image_column="i.image_path",
+                candidate_paths=candidate_paths,
+            )
         album_records: list[FaceAlbumRecord] = []
-        record_by_ref: dict[tuple[str, int], IndexedFaceRecord] = {}
-        for record in records:
-            ref = (str(record.image_path), int(record.face_index))
-            record_by_ref[ref] = record
-            person_name = str(record.person_name or "").strip()
-            if bool(record.hidden):
+        record_by_ref: dict[tuple[str, int], FaceAlbumRecord] = {}
+        for row in rows:
+            raise_if_cancelled(cancel_check)
+            image_path = str(row[0] or "")
+            face_index = int(row[1] or 0)
+            face_bbox = tuple(json.loads(row[2] or "[]"))
+            if not self._path_in_scope(image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths):
+                continue
+            if not self._face_is_visible(face_bbox, include_tiny_faces=include_tiny_faces):
+                continue
+            person_name = str(row[7] or "").strip()
+            hidden = bool(row[9] or row[10])
+            if hidden:
                 group_kind = "hidden"
             elif person_name:
                 group_kind = "named"
             else:
                 group_kind = "unlabeled"
-            album_records.append(
-                FaceAlbumRecord(
-                    group_id=self._face_album_group_id(group_kind, person_name),
-                    group_kind=group_kind,
-                    image_path=str(record.image_path),
-                    face_index=int(record.face_index),
-                    face_bbox=tuple(record.face_bbox),
-                    face_confidence=float(record.face_confidence),
-                    person_name=person_name,
-                    label_confidence=float(record.label_confidence),
-                    quality_status=str(record.quality_status or "clean"),
-                    quality_score=float(record.quality_score),
-                    quality_reasons=tuple(str(value) for value in record.quality_reasons or ()),
-                    hidden=bool(record.hidden),
-                    display_name=person_name or "Unlabeled",
-                )
+            album_record = FaceAlbumRecord(
+                group_id=self._face_album_group_id(group_kind, person_name),
+                group_kind=group_kind,
+                image_path=image_path,
+                face_index=face_index,
+                face_bbox=face_bbox,
+                face_confidence=float(row[3] or 0.0),
+                person_name=person_name,
+                label_confidence=float(row[8] or 0.0),
+                quality_status=str(row[4] or "clean"),
+                quality_score=float(row[5] or 1.0),
+                quality_reasons=tuple(str(value) for value in json.loads(row[6] or "[]")),
+                hidden=hidden,
+                display_name=person_name or "Unlabeled",
             )
+            record_by_ref[(image_path, face_index)] = album_record
+            album_records.append(album_record)
         for assignment in self.load_pending_face_labels(
             folder_prefix=folder_prefix,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
             include_hidden=True,
         ):
+            raise_if_cancelled(cancel_check)
             ref = (str(assignment.image_path), int(assignment.face_index))
             record = record_by_ref.get(ref)
             if record is None:
-                record = self.load_face_record(str(assignment.image_path), int(assignment.face_index), include_hidden=True)
-                if record is None:
-                    continue
+                continue
             if not self._path_in_scope(str(record.image_path), folder_prefix=folder_prefix, candidate_paths=allowed_paths):
                 continue
             if bool(record.hidden):
@@ -4546,18 +4736,330 @@ class FaceIndexService:
             )
         return album_records
 
+    def load_face_album_snapshot(
+        self,
+        *,
+        folder_prefix: str = "",
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        cancel_check=None,
+    ) -> tuple[list[FaceAlbumGroupSummary], list[FaceAlbumRecord]]:
+        members = self.load_face_album_members(
+            folder_prefix=folder_prefix,
+            candidate_paths=candidate_paths,
+            include_tiny_faces=include_tiny_faces,
+            cancel_check=cancel_check,
+        )
+        raise_if_cancelled(cancel_check)
+        groups = self._summarize_face_album_members(
+            members,
+            folder_prefix=folder_prefix,
+            candidate_paths=candidate_paths,
+            include_tiny_faces=include_tiny_faces,
+        )
+        return groups, members
+
+    def _prepare_face_album_scope_table(
+        self,
+        connection: sqlite3.Connection,
+        candidate_paths: list[str] | None,
+    ) -> bool:
+        values = self._candidate_path_query_values(candidate_paths)
+        if not values:
+            return False
+        connection.execute("CREATE TEMP TABLE IF NOT EXISTS face_album_scope_paths (image_path TEXT PRIMARY KEY)")
+        connection.execute("DELETE FROM face_album_scope_paths")
+        connection.executemany(
+            "INSERT OR IGNORE INTO face_album_scope_paths(image_path) VALUES (?)",
+            [(value,) for value in values],
+        )
+        return True
+
+    @staticmethod
+    def _face_album_scope_sql(
+        column: str,
+        *,
+        folder_prefix: str,
+        candidate_scope: bool,
+        include_tiny_faces: bool,
+    ) -> tuple[str, list[object]]:
+        conditions: list[str] = []
+        args: list[object] = []
+        if str(folder_prefix or "").strip():
+            scope_clause, scope_args = folder_scope_sql(column, folder_prefix)
+            conditions.append(scope_clause)
+            args.extend(scope_args)
+        if candidate_scope:
+            conditions.append(f"{column} IN (SELECT image_path FROM face_album_scope_paths)")
+        if not include_tiny_faces:
+            conditions.append("COALESCE(i.is_tiny, 0)=0")
+        return (" AND ".join(conditions) if conditions else "1=1"), args
+
+    def load_face_album_group_page(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        folder_prefix: str = "",
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        cancel_check=None,
+    ) -> FaceAlbumGroupPage:
+        raise_if_cancelled(cancel_check)
+        page_offset = max(0, int(offset))
+        page_limit = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            candidate_scope = self._prepare_face_album_scope_table(connection, candidate_paths)
+            base_scope, base_args = self._face_album_scope_sql(
+                "i.image_path",
+                folder_prefix=folder_prefix,
+                candidate_scope=candidate_scope,
+                include_tiny_faces=include_tiny_faces,
+            )
+            pending_scope, pending_args = self._face_album_scope_sql(
+                "p.image_path",
+                folder_prefix=folder_prefix,
+                candidate_scope=candidate_scope,
+                include_tiny_faces=include_tiny_faces,
+            )
+            member_rows_sql = f"""
+                SELECT
+                    CASE
+                        WHEN COALESCE(i.hidden, 0)=1 OR COALESCE(pp.hidden, 0)=1 THEN 'hidden'
+                        WHEN TRIM(COALESCE(l.person_name, '')) <> '' THEN 'named'
+                        ELSE 'unlabeled'
+                    END AS group_kind,
+                    CASE
+                        WHEN COALESCE(i.hidden, 0)=1 OR COALESCE(pp.hidden, 0)=1 THEN 'hidden'
+                        WHEN TRIM(COALESCE(l.person_name, '')) <> '' THEN 'person:' || TRIM(l.person_name)
+                        ELSE 'unlabeled'
+                    END AS group_id,
+                    CASE
+                        WHEN COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0 THEN TRIM(COALESCE(l.person_name, ''))
+                        ELSE ''
+                    END AS person_name,
+                    i.image_path,
+                    COALESCE(pp.favorite, 0) AS favorite,
+                    COALESCE(pp.notes, '') AS notes
+                FROM face_index i
+                LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                WHERE {base_scope}
+
+                UNION ALL
+
+                SELECT
+                    'pending' AS group_kind,
+                    'pending' AS group_id,
+                    '' AS person_name,
+                    p.image_path,
+                    0 AS favorite,
+                    '' AS notes
+                FROM pending_face_labels p
+                JOIN face_index i ON i.image_path=p.image_path AND i.face_index=p.face_index
+                LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                WHERE {pending_scope}
+                    AND COALESCE(i.hidden, 0)=0
+                    AND COALESCE(pp.hidden, 0)=0
+            """
+            grouped_sql = f"""
+                SELECT
+                    group_id,
+                    group_kind,
+                    person_name,
+                    COUNT(*) AS face_count,
+                    COUNT(DISTINCT image_path) AS photo_count,
+                    MAX(favorite) AS favorite,
+                    MAX(notes) AS notes
+                FROM ({member_rows_sql}) album_members
+                GROUP BY group_id, group_kind, person_name
+            """
+            params = [*base_args, *pending_args]
+            total_count = int(
+                connection.execute(f"SELECT COUNT(*) FROM ({grouped_sql}) grouped", params).fetchone()[0] or 0
+            )
+            rows = connection.execute(
+                f"""
+                {grouped_sql}
+                ORDER BY
+                    CASE group_kind WHEN 'named' THEN 0 WHEN 'unlabeled' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
+                    CASE WHEN group_kind='named' THEN favorite ELSE 0 END DESC,
+                    LOWER(person_name),
+                    group_id
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_limit, page_offset],
+            ).fetchall()
+        summaries: list[FaceAlbumGroupSummary] = []
+        for group_id, group_kind, person_name, face_count, photo_count, favorite, notes in rows:
+            raise_if_cancelled(cancel_check)
+            kind = str(group_kind or "unlabeled")
+            name = str(person_name or "").strip()
+            count = int(face_count or 0)
+            photos = int(photo_count or 0)
+            if kind == "named":
+                title = f"{'[Favorite] ' if bool(favorite) else ''}{name} | {count} face(s)"
+                summary = f"{name}: {count} face(s) across {photos} photo(s)."
+                if str(notes or "").strip():
+                    summary += f" {str(notes).strip()[:120]}"
+            elif kind == "pending":
+                title = f"Pending Labels | {count} face(s)"
+                summary = f"{count} pending face assignment(s) across {photos} photo(s)."
+            elif kind == "hidden":
+                title = f"Hidden / Rejected | {count} face(s)"
+                summary = f"{count} hidden face(s) across {photos} photo(s)."
+            else:
+                title = f"Unlabeled | {count} face(s)"
+                summary = f"{count} unlabeled face(s) across {photos} photo(s)."
+            summaries.append(
+                FaceAlbumGroupSummary(
+                    group_id=str(group_id),
+                    group_kind=kind,
+                    title=title,
+                    summary=summary,
+                    face_count=count,
+                    photo_count=photos,
+                    person_name=name,
+                )
+            )
+        next_offset = page_offset + len(summaries)
+        return FaceAlbumGroupPage(
+            items=tuple(summaries),
+            total_count=total_count,
+            offset=page_offset,
+            next_offset=next_offset if next_offset < total_count else None,
+        )
+
+    def load_face_album_member_page(
+        self,
+        group_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 200,
+        folder_prefix: str = "",
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        cancel_check=None,
+    ) -> FaceAlbumMemberPage:
+        raise_if_cancelled(cancel_check)
+        normalized_group_id = str(group_id or "").strip()
+        page_offset = max(0, int(offset))
+        page_limit = max(1, min(1000, int(limit)))
+        with self._connect() as connection:
+            candidate_scope = self._prepare_face_album_scope_table(connection, candidate_paths)
+            path_column = "p.image_path" if normalized_group_id == "pending" else "i.image_path"
+            scope_clause, scope_args = self._face_album_scope_sql(
+                path_column,
+                folder_prefix=folder_prefix,
+                candidate_scope=candidate_scope,
+                include_tiny_faces=include_tiny_faces,
+            )
+            args: list[object] = list(scope_args)
+            if normalized_group_id == "pending":
+                from_sql = """
+                    FROM pending_face_labels p
+                    JOIN face_index i ON i.image_path=p.image_path AND i.face_index=p.face_index
+                    LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                    LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                """
+                condition = f"{scope_clause} AND COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0"
+                select_sql = """
+                    SELECT p.image_path, p.face_index, i.bbox_json, i.face_confidence,
+                           i.quality_status, i.quality_score, i.quality_reasons_json,
+                           COALESCE(p.person_name, ''), COALESCE(p.confidence, 0.0),
+                           COALESCE(p.source, ''), COALESCE(p.created_at, '')
+                """
+                group_kind = "pending"
+            else:
+                from_sql = """
+                    FROM face_index i
+                    LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                    LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                """
+                hidden_expression = "(COALESCE(i.hidden, 0)=1 OR COALESCE(pp.hidden, 0)=1)"
+                if normalized_group_id.startswith("person:"):
+                    group_kind = "named"
+                    condition = f"{scope_clause} AND NOT {hidden_expression} AND TRIM(COALESCE(l.person_name, ''))=?"
+                    args.append(normalized_group_id.split(":", 1)[1])
+                elif normalized_group_id == "hidden":
+                    group_kind = "hidden"
+                    condition = f"{scope_clause} AND {hidden_expression}"
+                else:
+                    group_kind = "unlabeled"
+                    condition = f"{scope_clause} AND NOT {hidden_expression} AND TRIM(COALESCE(l.person_name, ''))=''"
+                select_sql = """
+                    SELECT i.image_path, i.face_index, i.bbox_json, i.face_confidence,
+                           i.quality_status, i.quality_score, i.quality_reasons_json,
+                           COALESCE(l.person_name, ''), COALESCE(l.confidence, 0.0),
+                           '', ''
+                """
+            total_count = int(
+                connection.execute(f"SELECT COUNT(*) {from_sql} WHERE {condition}", args).fetchone()[0] or 0
+            )
+            rows = connection.execute(
+                f"{select_sql} {from_sql} WHERE {condition} ORDER BY 1, 2 LIMIT ? OFFSET ?",
+                [*args, page_limit, page_offset],
+            ).fetchall()
+        items = tuple(
+            FaceAlbumRecord(
+                group_id=normalized_group_id,
+                group_kind=group_kind,
+                image_path=str(row[0] or ""),
+                face_index=int(row[1] or 0),
+                face_bbox=tuple(json.loads(row[2] or "[]")),
+                face_confidence=float(row[3] or 0.0),
+                quality_status=str(row[4] or "clean"),
+                quality_score=float(row[5] or 1.0),
+                quality_reasons=tuple(str(value) for value in json.loads(row[6] or "[]")),
+                person_name=str(row[7] or "").strip(),
+                label_confidence=float(row[8] or 0.0),
+                hidden=group_kind == "hidden",
+                display_name=str(row[7] or "").strip() or ("Pending label" if group_kind == "pending" else "Unlabeled"),
+                source=str(row[9] or ""),
+                created_at=str(row[10] or ""),
+            )
+            for row in rows
+        )
+        raise_if_cancelled(cancel_check)
+        next_offset = page_offset + len(items)
+        return FaceAlbumMemberPage(
+            group_id=normalized_group_id,
+            items=items,
+            total_count=total_count,
+            offset=page_offset,
+            next_offset=next_offset if next_offset < total_count else None,
+        )
+
     def load_face_album_groups(
         self,
         *,
         folder_prefix: str = "",
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceAlbumGroupSummary]:
         members = self.load_face_album_members(
             folder_prefix=folder_prefix,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
+            cancel_check=cancel_check,
         )
+        return self._summarize_face_album_members(
+            members,
+            folder_prefix=folder_prefix,
+            candidate_paths=candidate_paths,
+            include_tiny_faces=include_tiny_faces,
+        )
+
+    def _summarize_face_album_members(
+        self,
+        members: list[FaceAlbumRecord],
+        *,
+        folder_prefix: str = "",
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+    ) -> list[FaceAlbumGroupSummary]:
         members_by_group: dict[str, list[FaceAlbumRecord]] = defaultdict(list)
         for item in members:
             members_by_group[str(item.group_id)].append(item)
@@ -4805,8 +5307,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         query += " ORDER BY image_path"
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
@@ -4836,7 +5339,9 @@ class FaceIndexService:
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
+        cancel_check=None,
     ) -> list[FaceFolderReviewImage]:
+        raise_if_cancelled(cancel_check)
         directory = str(directory or "").strip()
         if not directory:
             return []
@@ -4856,7 +5361,12 @@ class FaceIndexService:
                 if self._path_in_scope(str(path), folder_prefix=directory)
             ]
         else:
-            discovered_paths = self.discovery_service.discover(directory, recursive=recursive)
+            discovered_paths = self.discovery_service.discover_result(
+                directory,
+                recursive=recursive,
+                cancel_check=cancel_check,
+            ).paths
+        raise_if_cancelled(cancel_check)
         allowed_paths = self._normalized_path_set(candidate_paths)
         if allowed_paths:
             discovered_paths = [
@@ -4874,6 +5384,7 @@ class FaceIndexService:
                 len(discovered_paths),
             )
         self._backfill_quality_metadata_for_paths(discovered_paths)
+        raise_if_cancelled(cancel_check)
         query = """
             SELECT
                 i.image_path,
@@ -4893,8 +5404,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if directory:
-            query += " WHERE i.image_path LIKE ?"
-            args.append(f"{directory}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", directory)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         query += """
             ORDER BY
                 CASE WHEN COALESCE(l.person_name, '') = '' THEN 1 ELSE 0 END,
@@ -4911,6 +5423,7 @@ class FaceIndexService:
         records_by_path: dict[str, list[IndexedFaceRecord]] = {}
         empty_embedding = np.empty(0, dtype=np.float32)
         for row in rows:
+            raise_if_cancelled(cancel_check)
             image_path = str(row[0])
             if not self._path_in_scope(image_path, folder_prefix=directory, candidate_paths=allowed_paths):
                 continue
@@ -4938,6 +5451,7 @@ class FaceIndexService:
 
         review_images: list[FaceFolderReviewImage] = []
         for image_path in discovered_paths:
+            raise_if_cancelled(cancel_check)
             image_records = list(records_by_path.get(image_path, ()))
             visible_records = [
                 record
@@ -4996,8 +5510,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE i.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         query += " ORDER BY i.image_path, i.face_index"
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
@@ -5048,8 +5563,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE i.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         query += """
             ORDER BY
                 CASE WHEN COALESCE(l.person_name, '') = '' THEN 1 ELSE 0 END,
@@ -5338,17 +5854,20 @@ class FaceIndexService:
         )
         return saved
 
-    def search_faces(self, request: FaceSearchRequest) -> list[FaceSearchResult]:
+    def search_faces(self, request: FaceSearchRequest, *, cancel_check=None) -> list[FaceSearchResult]:
+        raise_if_cancelled(cancel_check)
         query_face = self.detect_query_face(request.query_face_image, request.query_face_bbox)
         if query_face is None:
             raise ValueError(f"No {self.mode_label.lower()} face found in query image.")
         query_embedding = self.embedding_service.embed_faces([query_face.crop])[0]
+        raise_if_cancelled(cancel_check)
         return self._search_by_embedding(
             query_embedding,
             min_face_score=max(float(request.min_face_score), float(self.recognition_min_score)),
             top_k=request.top_k,
             candidate_paths=request.candidate_paths,
             include_tiny_faces=request.include_tiny_faces,
+            cancel_check=cancel_check,
         )
 
     @staticmethod
@@ -5371,21 +5890,25 @@ class FaceIndexService:
         min_face_score: float = 0.35,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceSearchResult]:
         faces: list[DetectedFace] = []
         for bbox in list(query_face_bboxes or []):
+            raise_if_cancelled(cancel_check)
             face = self.detect_query_face(query_face_image, bbox)
             if face is not None:
                 faces.append(face)
         if not faces:
             raise ValueError(f"No {self.mode_label.lower()} faces found in the selected query photo.")
         query_embedding = self._mean_face_embedding(self.embedding_service.embed_faces([face.crop for face in faces]))
+        raise_if_cancelled(cancel_check)
         return self._search_by_embedding(
             query_embedding,
             min_face_score=max(float(min_face_score), float(self.recognition_min_score)),
             top_k=top_k,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
+            cancel_check=cancel_check,
         )
 
     def search_similar_face(
@@ -5398,6 +5921,7 @@ class FaceIndexService:
         folder_prefix: str = "",
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceSearchResult]:
         LOGGER.info(
             "FaceIndexService search_similar_face mode=%s db=%s image=%s face_index=%s top_k=%s min_score=%s folder_prefix=%s include_tiny=%s",
@@ -5410,6 +5934,7 @@ class FaceIndexService:
             folder_prefix,
             include_tiny_faces,
         )
+        raise_if_cancelled(cancel_check)
         record = self.load_face_record(image_path, face_index)
         if record is None:
             raise ValueError("The selected indexed face was not found.")
@@ -5421,6 +5946,7 @@ class FaceIndexService:
             candidate_paths=candidate_paths,
             exclude={(record.image_path, record.face_index)},
             include_tiny_faces=include_tiny_faces,
+            cancel_check=cancel_check,
         )
         LOGGER.info(
             "FaceIndexService search_similar_face_complete mode=%s db=%s image=%s face_index=%s results=%s",
@@ -5441,6 +5967,7 @@ class FaceIndexService:
         folder_prefix: str = "",
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceSearchResult]:
         refs = list(dict.fromkeys((str(image_path), int(face_index)) for image_path, face_index in (face_refs or []) if str(image_path or "").strip()))
         if not refs:
@@ -5448,6 +5975,7 @@ class FaceIndexService:
         embeddings: list[np.ndarray] = []
         exclude: set[tuple[str, int]] = set()
         for image_path, face_index in refs:
+            raise_if_cancelled(cancel_check)
             record = self.load_face_record(image_path, face_index)
             if record is None:
                 continue
@@ -5464,6 +5992,7 @@ class FaceIndexService:
             candidate_paths=candidate_paths,
             exclude=exclude,
             include_tiny_faces=include_tiny_faces,
+            cancel_check=cancel_check,
         )
 
     def _search_by_embedding(
@@ -5476,7 +6005,9 @@ class FaceIndexService:
         candidate_paths: list[str] | None = None,
         exclude: set[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> list[FaceSearchResult]:
+        raise_if_cancelled(cancel_check)
         exclude = exclude or set()
         folder_prefix = str(folder_prefix or "").strip()
         query_vector = np.asarray(query_embedding, dtype=np.float32).reshape(1, -1)
@@ -5492,6 +6023,7 @@ class FaceIndexService:
                 candidate_paths=candidate_paths,
                 exclude=exclude,
                 include_tiny_faces=include_tiny_faces,
+                cancel_check=cancel_check,
             )
         allowed_paths = self._normalized_path_set(candidate_paths)
         cached_records: dict[tuple[str, int], IndexedFaceRecord | None] = {}
@@ -5499,6 +6031,7 @@ class FaceIndexService:
         total = len(ann_refs)
         search_k = min(total, max(int(top_k) * 8, 128))
         while search_k > 0:
+            raise_if_cancelled(cancel_check)
             try:
                 scores, indices = ann_index.search(query_vector.astype(np.float32, copy=False), search_k)
             except Exception:
@@ -5511,10 +6044,12 @@ class FaceIndexService:
                     candidate_paths=candidate_paths,
                     exclude=exclude,
                     include_tiny_faces=include_tiny_faces,
+                    cancel_check=cancel_check,
                 )
             hits.clear()
             seen: set[tuple[str, int]] = set()
             for score, raw_index in zip(scores[0], indices[0]):
+                raise_if_cancelled(cancel_check)
                 index_id = int(raw_index)
                 if index_id < 0 or index_id >= total:
                     continue
@@ -5572,6 +6107,7 @@ class FaceIndexService:
                 candidate_paths=candidate_paths,
                 exclude=exclude,
                 include_tiny_faces=include_tiny_faces,
+                cancel_check=cancel_check,
             )
         return self._finalize_search_hits(hits, top_k=top_k)
 
@@ -5642,7 +6178,9 @@ class FaceIndexService:
         candidate_paths: list[str] | None = None,
         face_refs: list[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
+        cancel_check=None,
     ) -> FaceClusteringComparisonResult:
+        raise_if_cancelled(cancel_check)
         records = self._clusterable_face_records(
             min_face_score=min_face_score,
             folder_prefix=folder_prefix,
@@ -5653,16 +6191,19 @@ class FaceIndexService:
         normalized_backends = self._normalized_face_cluster_backends(backends)
         if len(records) < 2 or not normalized_backends:
             return FaceClusteringComparisonResult({}, {}, {}, {}, {})
+        raise_if_cancelled(cancel_check)
         cluster_count = min(max(2, int(num_clusters)), len(records))
         embeddings = [record.embedding for record in records]
         prepared_matrix, prepared_info = self.clustering_service.prepare_matrix_with_info(embeddings, similarity_mode="cosine")
         prototypes = self.load_person_prototypes()
+        raise_if_cancelled(cancel_check)
         clusters_by_key: dict[str, dict[int, list[FaceClusterMember]]] = {}
         membership_by_face_ref: dict[tuple[str, int], dict[str, dict[str, object]]] = {}
         metrics_by_key: dict[str, dict[str, object]] = {}
         explanations_by_key: dict[str, dict[int, ClusterExplanation]] = {}
         suggestions_by_key: dict[str, dict[int, FaceClusterIdentitySuggestion]] = {}
         for backend_id in normalized_backends:
+            raise_if_cancelled(cancel_check)
             clusters, metrics = self._cluster_prepared_faces_for_backend(
                 prepared_matrix,
                 cluster_count,
@@ -5684,9 +6225,11 @@ class FaceIndexService:
             )
             suggestions_by_key[backend_id] = self._cluster_identity_suggestions(records, clusters, prototypes)
             for cluster_id, indices in clusters.items():
+                raise_if_cancelled(cancel_check)
                 cluster_size = len(indices)
                 cluster_quality = metrics.get("cluster_quality_score")
                 for rank, record_index in enumerate(indices, start=1):
+                    raise_if_cancelled(cancel_check)
                     record = records[int(record_index)]
                     membership_by_face_ref.setdefault((record.image_path, int(record.face_index)), {})[backend_id] = {
                         "backend": backend_id,
@@ -5696,6 +6239,7 @@ class FaceIndexService:
                         "outlier": int(cluster_id) == -1,
                         "cluster_quality_score": cluster_quality,
                     }
+        raise_if_cancelled(cancel_check)
         return FaceClusteringComparisonResult(
             clusters_by_key=clusters_by_key,
             membership_by_face_ref=membership_by_face_ref,
@@ -6604,8 +7148,9 @@ class FaceIndexService:
         """
         args: list[object] = [name]
         if folder_prefix:
-            query += " AND i.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" AND {scope_clause}"
+            args.extend(scope_args)
         query += " ORDER BY l.confidence DESC, i.image_path, i.face_index"
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
@@ -6641,7 +7186,9 @@ class FaceIndexService:
         limit: int = 200,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
+        cancel_check=None,
     ) -> list[PersonProfile]:
+        raise_if_cancelled(cancel_check)
         folder_prefix = str(folder_prefix or "").strip()
         prototypes = {profile.person_name: profile for profile in self.load_person_prototypes()}
         labeled_counts = self.label_counts()
@@ -6654,8 +7201,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE i.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         if not include_tiny_faces:
             query = self._append_sql_condition(query, "COALESCE(i.is_tiny, 0)=0")
         if not include_hidden:
@@ -6670,6 +7218,7 @@ class FaceIndexService:
                 candidate_paths=candidate_paths,
             )
         for row in rows:
+            raise_if_cancelled(cancel_check)
             person_name = str(row[0] or "")
             visible_counts[person_name] += int(row[1] or 0)
         with self._connect() as connection:
@@ -6693,6 +7242,7 @@ class FaceIndexService:
             prototypes.items(),
             key=lambda item: (not bool(profile_meta.get(item[0], {}).get("favorite", False)), item[0].lower()),
         ):
+            raise_if_cancelled(cancel_check)
             meta = profile_meta.get(name, {})
             if bool(meta.get("hidden", False)) and not include_hidden:
                 continue
@@ -6991,7 +7541,7 @@ class FaceIndexService:
             "face_refs": unique_refs,
         }
         if output_path is not None:
-            Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            atomic_write_text(Path(output_path), json.dumps(payload, indent=2, sort_keys=True))
         return payload
 
     def export_identity_data(self) -> dict[str, object]:
@@ -7147,7 +7697,7 @@ class FaceIndexService:
 
     def export_identity_data_to_file(self, output_path: str | Path) -> dict[str, object]:
         payload = self.export_identity_data()
-        Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_text(Path(output_path), json.dumps(payload, indent=2, sort_keys=True))
         return payload
 
     def preview_identity_import(self, payload: dict[str, object]) -> dict[str, object]:
@@ -7603,8 +8153,9 @@ class FaceIndexService:
         """
         args: list[object] = []
         if folder_prefix:
-            query += " WHERE p.image_path LIKE ?"
-            args.append(f"{folder_prefix}%")
+            scope_clause, scope_args = folder_scope_sql("p.image_path", folder_prefix)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
         if not include_tiny_faces:
             query = self._append_sql_condition(query, "COALESCE(i.is_tiny, 0)=0")
         if not include_hidden:

@@ -21,7 +21,7 @@ install_crash_handlers(RUNTIME_LAYOUT)
 
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest  # noqa: E402
 from app.services.image_tags import ClusterTagSummary, ImageTagService  # noqa: E402
-from infra.performance import select_performance_profile  # noqa: E402
+from infra.performance import apply_performance_overrides, select_performance_profile  # noqa: E402
 from infra.runtime import RuntimeCapabilityService  # noqa: E402
 from ml.embeddings import EmbeddingService, ModelManager  # noqa: E402
 
@@ -49,14 +49,18 @@ def _emit_event(event_type: str, payload: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Production PyQt clustering worker")
     parser.add_argument("--request-json", help="Path to a JSON request file.")
+    parser.add_argument("--model-request-json", help="Path to a model download request file.")
     parser.add_argument("--daemon", action="store_true", help="Keep the worker process alive and accept request JSON lines on stdin.")
     args = parser.parse_args(argv)
 
     if args.daemon:
         LOGGER.info("persistent worker startup begin | app_log=%s", RUNTIME_LAYOUT.app_log)
         return _run_daemon()
+    if args.model_request_json:
+        LOGGER.info("model worker startup begin | request_json=%s app_log=%s", args.model_request_json, RUNTIME_LAYOUT.app_log)
+        return _run_model_download_request(Path(args.model_request_json))
     if not args.request_json:
-        parser.error("--request-json is required unless --daemon is used")
+        parser.error("--request-json or --model-request-json is required unless --daemon is used")
 
     LOGGER.info("worker startup begin | request_json=%s app_log=%s", args.request_json, RUNTIME_LAYOUT.app_log)
     request_payload = json.loads(Path(args.request_json).read_text(encoding="utf-8"))
@@ -64,9 +68,41 @@ def main(argv: list[str] | None = None) -> int:
     return _run_cluster_request(request)
 
 
+def _run_model_download_request(request_path: Path) -> int:
+    from app.services.model_downloads import ModelDownloadItem, ModelDownloadService
+
+    try:
+        payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
+        raw_items = list(payload.get("items") or []) if isinstance(payload, dict) else []
+        items = [
+            ModelDownloadItem(
+                model_name=str(item.get("model_name") or ""),
+                require_text=bool(item.get("require_text")),
+            )
+            for item in raw_items
+            if isinstance(item, dict)
+        ]
+        if not items:
+            raise ValueError("The model download request is empty.")
+
+        result = ModelDownloadService().acquire(
+            items,
+            progress_callback=lambda value, status: _emit_event(
+                "progress",
+                {"value": int(value), "status": str(status)},
+            ),
+        )
+        _emit_event("result", result.as_dict())
+        return 0
+    except Exception as exc:
+        LOGGER.exception("Model download worker failed")
+        _emit_event("error", {"message": str(exc), "traceback": traceback.format_exc()})
+        return 1
+
+
 @dataclass
 class WorkerStack:
-    key: tuple[str, str, bool, bool]
+    key: tuple[object, ...]
     pipeline: ClusteringPipelineService
     tag_service: ImageTagService
 
@@ -82,11 +118,17 @@ class PersistentWorkerRuntime:
             str(request.performance_profile or "balanced"),
             bool(request.use_onnx),
             bool(request.allow_model_downloads),
+            int(request.batch_size_cpu),
+            int(request.batch_size_gpu),
+            int(request.preprocess_workers),
+            int(request.vram_headroom_mb),
         )
         if self._stack is not None and self._stack.key == key:
             return self._stack
         execution_policy = self._runtime_service.select_policy(request.preferred_execution_mode)
-        performance_profile = select_performance_profile(request.performance_profile)
+        if execution_policy.cuda_required_unavailable:
+            raise RuntimeError(execution_policy.error or execution_policy.reason)
+        performance_profile = _performance_profile_for_request(request)
         model_manager = ModelManager(
             use_onnx=request.use_onnx,
             execution_policy=execution_policy,
@@ -142,7 +184,9 @@ def _run_daemon() -> int:
 def _build_one_shot_stack(request: ProductionClusterRequest) -> WorkerStack:
     runtime_service = RuntimeCapabilityService()
     execution_policy = runtime_service.select_policy(request.preferred_execution_mode)
-    performance_profile = select_performance_profile(request.performance_profile)
+    if execution_policy.cuda_required_unavailable:
+        raise RuntimeError(execution_policy.error or execution_policy.reason)
+    performance_profile = _performance_profile_for_request(request)
     model_manager = ModelManager(
         use_onnx=request.use_onnx,
         execution_policy=execution_policy,
@@ -157,9 +201,23 @@ def _build_one_shot_stack(request: ProductionClusterRequest) -> WorkerStack:
             request.performance_profile,
             bool(request.use_onnx),
             bool(request.allow_model_downloads),
+            int(request.batch_size_cpu),
+            int(request.batch_size_gpu),
+            int(request.preprocess_workers),
+            int(request.vram_headroom_mb),
         ),
         pipeline=ClusteringPipelineService(embedding_service=embedding_service),
         tag_service=ImageTagService(),
+    )
+
+
+def _performance_profile_for_request(request: ProductionClusterRequest):
+    return apply_performance_overrides(
+        select_performance_profile(request.performance_profile),
+        cpu_batch_size=request.batch_size_cpu or None,
+        gpu_batch_size=request.batch_size_gpu or None,
+        embedding_preprocess_workers=request.preprocess_workers or None,
+        vram_headroom_mb=request.vram_headroom_mb or None,
     )
 
 
@@ -185,6 +243,8 @@ def _run_cluster_request(request: ProductionClusterRequest, *, runtime: Persiste
                 reuse_result_cache=bool(request.reuse_result_cache),
                 use_embedding_cache_lookup=bool(request.use_embedding_cache_lookup),
                 source_paths=list(request.source_paths) if request.source_paths else None,
+                source_fingerprints=list(request.source_fingerprints) if request.source_fingerprints else None,
+                source_snapshot_key=str(request.source_snapshot_key or ""),
                 performance_profile=request.performance_profile,
                 generate_cluster_meanings=bool(request.generate_cluster_meanings),
                 generate_cluster_explanations=bool(request.generate_cluster_explanations),

@@ -32,6 +32,7 @@ from ui.error_mbox import errorBox, infoBox
 from ui.footer_bar import WorkspaceFooter
 from ui.job_manager import JobManager
 from ui.job_widgets import JobIndicatorWidget
+from ui.recent_folders import RecentFolderHistory
 from ui.mode_panes import ClusteringOptionsPane, SourcePane
 from ui.runtime_widgets import RuntimeBadge
 from ui.theme import apply_ultra_dark
@@ -119,6 +120,7 @@ class ClusterGalleryApp(QMainWindow):
         super().__init__()
         self.settings = get_settings()
         self.settings_store = QSettings(self.settings.app_name, self.settings.app_name)
+        self.recent_folder_history = RecentFolderHistory(self.settings_store)
         self.runtime_service = RuntimeCapabilityService()
         self.job_manager = JobManager(self)
         self.performance_dashboard_service = PerformanceDashboardService()
@@ -245,6 +247,8 @@ class ClusterGalleryApp(QMainWindow):
 
         self.source_pane = SourcePane(self)
         self.source_pane.directory_changed.connect(self.on_directory_changed)
+        self.source_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
+        self.source_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.source_pane.hide_requested.connect(lambda: self._set_pane_visible("source", False))
 
         clustering_feature = self.feature_modules["clustering"]
@@ -298,7 +302,7 @@ class ClusterGalleryApp(QMainWindow):
             face_service_session=self.face_service_session,
             face_services_global=self.face_services_global,
             face_services_session=self.face_services_session,
-            enabled_tabs=["All Faces", "Faces In Folder", "Face Search"],
+            enabled_tabs=["All Faces", "Faces In Folder", "Face Search", "Identities"],
             saved_search_service=self.saved_search_service,
         )
         self.faces_pane.set_face_service_provider(self._face_service_for_pipeline)
@@ -314,12 +318,16 @@ class ClusterGalleryApp(QMainWindow):
         self.faces_pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
         self.faces_pane.saved_clustering_filter_requested.connect(self._run_saved_clustering_filter)
         self.faces_pane.open_face_model_settings_requested.connect(self.open_settings_dialog)
+        self.faces_pane.source_folder_changed.connect(self._set_shared_source_folder)
+        self.faces_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
+        self.faces_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.faces_pane.configure_face_pipeline_options(
             self._face_model_root(),
             self._preferred_face_pipeline_defaults(),
             refresh=False,
         )
         self.faces_pane.set_active_face_mode(self._preferred_face_mode(), refresh=False)
+        self._refresh_recent_folder_menus()
 
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_pane)
@@ -471,24 +479,36 @@ class ClusterGalleryApp(QMainWindow):
         return self._face_model_root()
 
     def _preferred_face_detector(self, mode: str) -> str:
-        face_search = _face_search_api()
-        mode_id = face_search.normalize_face_mode(mode)
-        configured = str(self.settings_store.value(f"faces/default_detector/{mode_id}", "", str) or "").strip()
-        if configured:
-            return face_search.normalize_face_component_id(configured)
-        return face_search.default_face_detector_id(self._face_model_root(), mode_id)
+        return self._preferred_face_pipeline_ids(mode)[0]
 
     def _preferred_face_embedder(self, mode: str) -> str:
+        return self._preferred_face_pipeline_ids(mode)[1]
+
+    def _preferred_face_pipeline_ids(self, mode: str) -> tuple[str, str]:
         face_search = _face_search_api()
         mode_id = face_search.normalize_face_mode(mode)
-        configured = str(self.settings_store.value(f"faces/default_embedder/{mode_id}", "", str) or "").strip()
-        if configured:
-            return face_search.normalize_face_component_id(configured)
-        return face_search.default_face_embedder_id(self._face_model_root(), mode_id)
+        configured_detector = str(
+            self.settings_store.value(f"faces/default_detector/{mode_id}", "", str) or ""
+        ).strip()
+        configured_embedder = str(
+            self.settings_store.value(f"faces/default_embedder/{mode_id}", "", str) or ""
+        ).strip()
+        if mode_id == "human":
+            configured_detector = configured_detector or face_search.DEFAULT_HUMAN_FACE_DETECTOR_ID
+            configured_embedder = configured_embedder or face_search.DEFAULT_HUMAN_FACE_EMBEDDER_ID
+        return face_search.resolve_ready_face_pipeline_ids(
+            self._face_model_root(),
+            mode_id,
+            configured_detector,
+            configured_embedder,
+        )
 
     def _preferred_face_detector_score_threshold(self, mode: str) -> float:
         face_search = _face_search_api()
         mode_id = face_search.normalize_face_mode(mode)
+        if mode_id == "human" and not self.settings_store.contains(f"faces/detector_score_threshold/{mode_id}"):
+            default_profile = face_search.face_model_profile_config(mode_id, face_search.DEFAULT_HUMAN_FACE_PROFILE_ID)
+            return float((default_profile or {}).get("score_threshold", 0.35))
         return float(self.settings_store.value(f"faces/detector_score_threshold/{mode_id}", face_search.DEFAULT_FACE_SCORE_THRESHOLD, float))
 
     def _preferred_face_max_detections(self, mode: str) -> int:
@@ -497,15 +517,16 @@ class ClusterGalleryApp(QMainWindow):
         return max(1, int(self.settings_store.value(f"faces/max_detections/{mode_id}", face_search.DEFAULT_FACE_MAX_DETECTIONS, int)))
 
     def _preferred_face_pipeline_defaults(self) -> dict[str, dict[str, object]]:
-        return {
-            mode: {
-                "detector_id": self._preferred_face_detector(mode),
-                "embedder_id": self._preferred_face_embedder(mode),
+        defaults: dict[str, dict[str, object]] = {}
+        for mode in ("human", "dog", "cat"):
+            detector_id, embedder_id = self._preferred_face_pipeline_ids(mode)
+            defaults[mode] = {
+                "detector_id": detector_id,
+                "embedder_id": embedder_id,
                 "score_threshold": self._preferred_face_detector_score_threshold(mode),
                 "max_detections": self._preferred_face_max_detections(mode),
             }
-            for mode in ("human", "dog", "cat")
-        }
+        return defaults
 
     def _face_pipeline_settings_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {
@@ -559,8 +580,28 @@ class ClusterGalleryApp(QMainWindow):
         face_search = _face_search_api()
         scope_id = "session" if str(scope or "").strip().lower() == "session" else "global"
         mode_id = face_search.normalize_face_mode(mode)
-        detector = face_search.normalize_face_component_id(detector_id, face_search.default_face_detector_id(self._face_model_root(), mode_id))
-        embedder = face_search.normalize_face_component_id(embedder_id, face_search.default_face_embedder_id(self._face_model_root(), mode_id))
+        requested_detector = face_search.normalize_face_component_id(
+            detector_id,
+            face_search.default_face_detector_id(self._face_model_root(), mode_id),
+        )
+        requested_embedder = face_search.normalize_face_component_id(
+            embedder_id,
+            face_search.default_face_embedder_id(self._face_model_root(), mode_id),
+        )
+        detector, embedder = face_search.resolve_ready_face_pipeline_ids(
+            self._face_model_root(),
+            mode_id,
+            requested_detector,
+            requested_embedder,
+        )
+        if (detector, embedder) != (requested_detector, requested_embedder):
+            LOGGER.info(
+                "Face pipeline %s/%s is not ready; using ready pipeline %s/%s.",
+                requested_detector,
+                requested_embedder,
+                detector,
+                embedder,
+            )
         key = (scope_id, mode_id, detector, embedder)
         service = self._face_service_cache.get(key)
         if service is None:
@@ -1225,6 +1266,8 @@ class ClusterGalleryApp(QMainWindow):
 
     def on_directory_changed(self, directory: str) -> None:
         directory = str(directory or "").strip()
+        if directory and self.recent_folder_history.record(directory):
+            self._refresh_recent_folder_menus()
         append_qt_diagnostic(f"[Main] on_directory_changed pid={os.getpid()} directory={directory or '<empty>'}")
         if not directory:
             self.current_folder_label.setText("No folder selected")
@@ -1243,6 +1286,26 @@ class ClusterGalleryApp(QMainWindow):
         ):
             self.faces_pane.refresh_face_library(refresh_people=True)
         self.maybe_warm_runtime()
+
+    def _set_shared_source_folder(self, directory: str) -> None:
+        path = str(directory or "").strip()
+        if path and Path(path).is_dir() and path != self.source_pane.selected_directory:
+            self.source_pane.set_selected_directory(path)
+
+    def _refresh_recent_folder_menus(self) -> None:
+        paths = self.recent_folder_history.paths()
+        if hasattr(self, "source_pane"):
+            self.source_pane.set_recent_directories(paths)
+        if hasattr(self, "faces_pane"):
+            self.faces_pane.set_recent_directories(paths)
+
+    def _remove_recent_folder(self, directory: str) -> None:
+        if self.recent_folder_history.remove(directory):
+            self._refresh_recent_folder_menus()
+
+    def _clear_recent_folders(self) -> None:
+        if self.recent_folder_history.clear():
+            self._refresh_recent_folder_menus()
 
     def _current_scope_paths(self) -> list[str] | None:
         target = self.cluster_pane.current_selection_target()
@@ -1308,13 +1371,6 @@ class ClusterGalleryApp(QMainWindow):
             f"models={','.join(request.embedding_models)} backends={','.join(request.clustering_backends)} "
             f"recursive={request.recursive} onnx={request.use_onnx}"
         )
-        if self.execution_policy.effective_mode == "directml" and request.use_onnx:
-            onnx_ready = {"fast_preview", "convnext", "resnet"}
-            unsupported = [model for model in request.embedding_models if model not in onnx_ready]
-            if unsupported:
-                self.footer_bar.set_status(
-                    "DirectML is enabled, but these models are Torch-only and will run on CPU: " + ", ".join(unsupported)
-                )
         self.current_run_origin = str(run_origin or "folder")
         self.current_tag_filter = tuple(str(tag).strip() for tag in (tag_filter or ()) if str(tag).strip())
         self.current_tag_match = str(tag_match or "").strip() if self.current_tag_filter else ""
@@ -1810,12 +1866,9 @@ class ClusterGalleryApp(QMainWindow):
         return context
 
 if __name__ == "__main__":
-    configure_logging()
-    install_qt_message_handler()
-    append_qt_diagnostic(f"[Main] app_boot pid={os.getpid()}")
-    _configure_linux_dialog_fallback()
-    app = QApplication([])
-    apply_ultra_dark(app)
-    window = ClusterGalleryApp()
-    window.show()
-    app.exec()
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from apps.pyqt_production.__main__ import main as production_main
+
+    raise SystemExit(production_main(sys.argv[1:]))

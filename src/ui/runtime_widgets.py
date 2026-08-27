@@ -1,37 +1,36 @@
 ﻿from __future__ import annotations
 
-import sys
-
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QPushButton
 
 from infra.runtime import ExecutionPolicy, RuntimeCapabilities
 
 
-class RuntimeBadge(QLabel):
+class RuntimeBadge(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumWidth(120)
-        self.setContentsMargins(8, 2, 8, 2)
+        self.setAccessibleName("Runtime and application health")
+        self.setProperty("kind", "quiet")
+        self._runtime_label = "Runtime"
+        self._runtime_tooltip: list[str] = []
+        self._health_state = "checking"
+        self._health_notes: list[str] = []
         self.update_runtime(None, None)
 
     def update_runtime(self, capabilities: RuntimeCapabilities | None, policy: ExecutionPolicy | None) -> None:
         if capabilities is None or policy is None:
-            self.setText("Runtime")
-            self.setToolTip("")
-            self.setStyleSheet("padding: 4px 10px; border-radius: 10px; background: #E9ECEF; color: #333;")
+            self._runtime_label = "Runtime checking…"
+            self._runtime_tooltip = ["Checking CPU and CUDA runtime availability."]
+            self._render()
             return
 
         label = policy.effective_mode.upper()
         if policy.effective_mode == "cuda" and capabilities.cuda_device_name:
             label = f"CUDA | {capabilities.cuda_device_name}"
-        elif policy.effective_mode == "directml":
-            label = "DIRECTML"
         elif policy.effective_mode == "cpu":
             label = "CPU"
 
-        self.setText(label)
+        self._runtime_label = label
 
         tooltip = [
             f"Preferred: {policy.preferred_mode}",
@@ -45,28 +44,32 @@ class RuntimeBadge(QLabel):
         if not capabilities.torch_cuda_build and policy.preferred_mode in {"auto", "cuda"}:
             tooltip.append("CUDA requires a CUDA-enabled Torch build (current Torch is CPU-only).")
 
-        if policy.effective_mode == "directml":
-            tooltip.append("DirectML GPU applies only to ONNX torchvision models (fast_preview/convnext/resnet).")
-            tooltip.append("ONNX export requires the python package 'onnx'.")
+        if policy.cuda_required_unavailable and policy.error:
+            tooltip.append(policy.error)
 
-        if (
-            sys.platform == "win32"
-            and policy.effective_mode == "cpu"
-            and capabilities.onnx_providers
-            and "DmlExecutionProvider" not in capabilities.onnx_providers
-        ):
-            tooltip.append("For Windows GPU without CUDA: install onnxruntime-directml and enable ONNX for supported models.")
+        self._runtime_tooltip = [item for item in tooltip if item]
+        if policy.preferred_mode == "auto" and policy.effective_mode == "cpu" and policy.reason:
+            self._runtime_label = "CPU fallback"
+        self._render()
 
-        self.setToolTip("\n".join(item for item in tooltip if item))
+    def set_health(self, state: str, notes: list[str] | tuple[str, ...] | None = None) -> None:
+        normalized = str(state or "checking").strip().lower()
+        self._health_state = normalized if normalized in {"ok", "warning", "error", "checking"} else "warning"
+        self._health_notes = [str(note) for note in (notes or ()) if str(note).strip()]
+        self._render()
 
-        if policy.effective_mode == "cuda":
-            color = "#0B6E4F"
-        elif policy.effective_mode == "directml":
-            color = "#1F6FEB"
-        else:
-            color = "#6C757D"
-
-        self.setStyleSheet(
-            f"padding: 4px 10px; border-radius: 10px; background: {color}; color: white; font-weight: 600;"
-        )
+    def _render(self) -> None:
+        suffix = {
+            "ok": "Ready",
+            "warning": "Attention",
+            "error": "Unavailable",
+            "checking": "Checking",
+        }.get(self._health_state, "Attention")
+        self.setText(f"{self._runtime_label} · {suffix}")
+        self.setAccessibleDescription(". ".join([*self._runtime_tooltip, *self._health_notes]))
+        self.setToolTip("\n".join([*self._runtime_tooltip, *self._health_notes]))
+        state = "success" if self._health_state == "ok" else "error" if self._health_state == "error" else "warning"
+        self.setProperty("state", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
 

@@ -5,7 +5,7 @@ These are the remaining production-grade items that should become release gates 
 ## Release Packaging
 
 - Build final signed installers/packages with version metadata for Windows, Linux, and macOS.
-- Bundle required model assets and optional accelerators such as `hf_xet`, CUDA/DirectML/MPS-relevant runtimes, ONNX Runtime providers, and any chosen Flash Attention stack where the target OS supports them.
+- Bundle required model assets and optional accelerators such as `hf_xet`, CUDA-relevant runtimes, ONNX Runtime providers, and any chosen Flash Attention stack where the target OS supports them.
 - Define uninstall behavior for the runtime root, including whether logs, cache, tags, support bundles, and model assets are deleted or preserved.
 
 ## Validation Gates
@@ -16,24 +16,18 @@ These are the remaining production-grade items that should become release gates 
 
 ## Data Safety
 
-- Implemented: gallery copy/move/delete/EXIF operations write `logs/file_operations.jsonl` with source path, destination/trash path, timestamps, and partial-failure details.
+- Implemented: gallery copy/move/delete/EXIF operations write a durable SQLite operation journal before file mutation, with JSONL retained for compatibility export/import.
 - Implemented: copy/move/trash/EXIF writes use safer temp-then-atomic-finish paths where the platform allows it, and operation temp files are cleaned in `finally` blocks.
-- Improve recovery UX for move/delete workflows so users can locate or restore files after an operation.
+- Implemented: the operation journal exposes reveal, refresh/retry, skip-conflict restore, and unique-name restore actions for move/delete recovery.
 - Implemented: file-operation result summaries show success/failure counts and the audit log path.
 
 ## Runtime Migration
 
 - Implemented: runtime temp files under `cache/tmp/` are reported separately in the footer and cleared automatically on production startup.
-- Implemented: `Clear Caches / Temp` removes rebuildable caches, runtime temp files, support bundles, benchmark artifacts, and in-memory gallery caches while preserving tags, logs, crash records, and model assets.
-- Version settings, cache, and tag database schemas.
-- Add migrations for schema changes instead of relying on manual cache clears.
+- Implemented: **Clear rebuildable data** removes rebuildable caches, runtime temp files, support bundles, benchmark artifacts, and in-memory gallery caches while preserving identities, face labels, tags, settings, operation history, logs, crash records, and model assets.
+- Implemented: runtime migrations use an ordered state store, transactionally record successful versions, keep a JSON compatibility state file, and back up user-authored tag and face databases before schema work.
+- Remaining: add per-database schema migrations as future cache/tag/face schemas change.
 - Record runtime schema/app versions in support bundles.
-
-## Rust Mirror Parity
-
-- Complete cold native inference parity for production models.
-- Remove remaining Python-worker fallback paths only when native Rust can populate equivalent caches, metrics, and failure reports.
-- Keep benchmark reports explicit about native-vs-fallback execution until parity is complete.
 
 ## Accessibility And Polish
 

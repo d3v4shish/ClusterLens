@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from apps.pyqt_production.identity import LEGACY_PRODUCTION_APP_ID, PRODUCTION_APP_ID
 from apps.shared.runtime_support import activate_runtime_root
+from infra import settings as settings_mod
 
 
 def test_clusterlens_runtime_root_copies_missing_legacy_runtime_files(tmp_path: Path) -> None:
@@ -24,3 +25,23 @@ def test_clusterlens_runtime_root_copies_missing_legacy_runtime_files(tmp_path: 
     assert (layout.cache_dir / "image_tags.sqlite3").read_bytes() == b"legacy"
     assert (layout.model_assets_dir / "fast_preview" / "model.onnx").read_bytes() == b"legacy"
     assert (layout.root / "runtime_identity_migration.json").exists()
+
+
+def test_clusterlens_runtime_override_is_shared_by_local_and_packaged_processes(tmp_path: Path) -> None:
+    canonical_root = tmp_path / "canonical-runtime"
+    legacy_root = tmp_path / "legacy-runtime"
+    with patch.dict(
+        os.environ,
+        {
+            "CLUSTERLENS_RUNTIME_ROOT": str(canonical_root),
+            "IMAGE_CLUSTERING_APP_DIR": str(legacy_root),
+        },
+        clear=False,
+    ):
+        settings_mod._RUNTIME_BASE_DIR = None
+        layout = activate_runtime_root(PRODUCTION_APP_ID)
+        assert layout.root == canonical_root
+        assert settings_mod.get_runtime_base_dir() == canonical_root
+        assert os.environ["CLUSTERLENS_RUNTIME_ROOT"] == str(canonical_root)
+        assert os.environ["IMAGE_CLUSTERING_APP_DIR"] == str(canonical_root)
+    settings_mod._RUNTIME_BASE_DIR = None

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 from PIL import ExifTags, Image
 
+from infra.atomic_io import atomic_write_text
+
 if TYPE_CHECKING:
     from .face_search import FaceDetectionService
 
@@ -143,7 +145,7 @@ class MetadataSidecarService:
                 "people_labels": list(people.get(image_path, people.get(str(Path(image_path)), [])) or []),
                 "profile_refs": list(profile_refs.get(image_path, profile_refs.get(str(Path(image_path)), [])) or []),
             }
-            sidecar_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            atomic_write_text(sidecar_path, json.dumps(payload, indent=2, sort_keys=True))
             written[image_path] = str(sidecar_path)
         return written
 

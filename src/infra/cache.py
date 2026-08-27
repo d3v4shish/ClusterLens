@@ -69,7 +69,7 @@ class CacheService:
     def build_embedding_key(image_path: str, model_name: str, signature: str) -> str:
         path = Path(image_path)
         stat = path.stat()
-        payload = f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{model_name}|{signature}"
+        payload = f"{_canonical_cache_path(path)}|{stat.st_mtime_ns}|{stat.st_size}|{model_name}|{signature}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -80,7 +80,7 @@ class CacheService:
         model_name: str,
         signature: str,
     ) -> str:
-        payload = f"{os.path.abspath(str(image_path))}|{int(mtime_ns)}|{int(file_size)}|{model_name}|{signature}"
+        payload = f"{_canonical_cache_path(Path(image_path))}|{int(mtime_ns)}|{int(file_size)}|{model_name}|{signature}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def build_embedding_keys(
@@ -180,3 +180,11 @@ class CacheService:
         self._memory_cache.move_to_end(cache_key)
         while len(self._memory_cache) > self.memory_cache_size:
             self._memory_cache.popitem(last=False)
+
+
+def _canonical_cache_path(path: Path) -> str:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = Path(os.path.abspath(str(path)))
+    return os.path.normcase(str(resolved))

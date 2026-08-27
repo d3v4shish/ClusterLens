@@ -14,27 +14,15 @@ from PIL import Image
 
 from app.services.model_assets import BUNDLED_ONNX_INPUT_SIZES, ModelAssetService
 from app.services.onnx_models import OnnxModelService
+from infra.cancel import raise_if_cancelled
 from infra.cache import CacheService
 from infra.logging_config import get_logger
 from infra.performance import PerformanceProfile, select_performance_profile
 from infra.runtime import ExecutionPolicy, RuntimeCapabilityService
-from infra.settings import get_settings
+from infra.settings import configure_model_cache_environment, get_settings
 
-# Ensure model download caches and temp dirs are writable in this environment.
 _RUNTIME_CACHE = get_settings().cache_dir
-_HF_HOME = _RUNTIME_CACHE / "huggingface"
-_TORCH_HOME = _RUNTIME_CACHE / "torch"
-_TMP_HOME = _RUNTIME_CACHE / "tmp"
-for _p in (_HF_HOME, _TORCH_HOME, _TMP_HOME):
-    _p.mkdir(parents=True, exist_ok=True)
-os.environ["HF_HOME"] = str(_HF_HOME)
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(_HF_HOME / "hub")
-os.environ["HF_HUB_CACHE"] = str(_HF_HOME / "hub")
-os.environ.pop("TRANSFORMERS_CACHE", None)
-os.environ["TORCH_HOME"] = str(_TORCH_HOME)
-os.environ.setdefault("HOME", str(_RUNTIME_CACHE))
-os.environ["TEMP"] = str(_TMP_HOME)
-os.environ["TMP"] = str(_TMP_HOME)
+configure_model_cache_environment()
 
 # Torch compat: some deps (e.g. newer transformers) call torch.compiler.is_compiling(),
 # which does not exist on older torch builds like 2.2.x.
@@ -112,6 +100,7 @@ class ModelManager:
         runtime_service: RuntimeCapabilityService | None = None,
         performance_profile: PerformanceProfile | None = None,
         allow_model_downloads: bool = True,
+        load_text_tokenizer: bool = True,
     ) -> None:
         self.settings = get_settings()
         hf_home = self.settings.cache_dir / "huggingface"
@@ -124,6 +113,7 @@ class ModelManager:
         self.device = torch.device(self.execution_policy.torch_device)
         self.use_onnx = use_onnx
         self.allow_model_downloads = bool(allow_model_downloads)
+        self.load_text_tokenizer = bool(load_text_tokenizer)
         self.model_asset_service = ModelAssetService()
         self.onnx_service = OnnxModelService(execution_policy=self.execution_policy, runtime_service=self.runtime_service)
         self._models: dict[tuple[str, bool], ModelBundle] = {}
@@ -135,32 +125,49 @@ class ModelManager:
             self._models[cache_key] = self._load_bundle(model_name, bool(use_onnx))
         return self._models[cache_key]
 
-    @staticmethod
-    def static_signature(model_name: str, use_onnx: bool | None = None) -> str | None:
+    def static_signature(self, model_name: str, use_onnx: bool | None = None) -> str | None:
+        normalized = str(model_name or "").strip().lower()
+        base_model_name = "convnext" if normalized == "phash_embedding" else normalized
         if bool(use_onnx):
-            return None
+            asset_bundle = self.model_asset_service.find_bundle(base_model_name)
+            return str(asset_bundle.signature) if asset_bundle is not None else None
         signatures = {
             "fast_preview": "fast_preview:224x224:torchvision:onnx=False",
             "resnet": "resnet:224x224:torchvision:onnx=False",
+            "vgg": "vgg:224x224:torchvision:onnx=False",
+            "convnext": "convnext:224x224:torchvision:onnx=False",
+            "vit": "vit:224x224:hf-vision:onnx=False",
             "clip": "clip:224x224:clip:onnx=False",
             "openclip": "openclip:224x224:openclip:onnx=False",
             "siglip": "siglip:224x224:siglip:onnx=False",
+            "facenet": "facenet:160x160:facenet:onnx=False",
             "dino": "dino:224x224:timm:onnx=False",
             "dinov2_base": "dinov2_base:518x518:timm:onnx=False",
             "dino_large": "dino_large:518x518:timm:onnx=False",
             "mobileclip": "mobileclip:256x256:timm:onnx=False",
         }
-        return signatures.get(str(model_name or "").strip().lower())
+        base_signature = signatures.get(base_model_name)
+        if base_signature is None:
+            return None
+        revision = self.model_asset_service.local_cache_revision(base_model_name)
+        return f"{base_signature}:asset={revision or 'unresolved'}"
 
     def _load_bundle(self, model_name: str, use_onnx: bool) -> ModelBundle:
         base_model_name = "convnext" if model_name == "phash_embedding" else model_name
+        attempt_onnx = self._should_attempt_onnx(use_onnx)
+        if use_onnx and not attempt_onnx:
+            LOGGER.warning(
+                "ONNX was requested for '%s', but ONNX CUDA is unavailable while Torch CUDA is ready; "
+                "using CUDA Torch so inference does not fall back to the CPU.",
+                model_name,
+            )
         input_size = (224, 224)
         family = "torchvision"
         input_mode = "tensor"
         text_tokenizer = None
 
         asset_bundle = self.model_asset_service.find_bundle(base_model_name)
-        if use_onnx and asset_bundle is not None and base_model_name in BUNDLED_ONNX_INPUT_SIZES:
+        if attempt_onnx and asset_bundle is not None and base_model_name in BUNDLED_ONNX_INPUT_SIZES:
             onnx_session = self.onnx_service.session_from_asset(
                 base_model_name,
                 asset_bundle.model_path,
@@ -241,11 +248,16 @@ class ModelManager:
                 use_fast=True,
                 local_files_only=not self.allow_model_downloads,
             )
-            text_tokenizer = AutoTokenizer.from_pretrained(
-                "openai/clip-vit-base-patch32",
-                use_fast=True,
-                local_files_only=not self.allow_model_downloads,
-            )
+            try:
+                if not self.load_text_tokenizer:
+                    raise LookupError("Text tokenizer not requested")
+                text_tokenizer = AutoTokenizer.from_pretrained(
+                    "openai/clip-vit-base-patch32",
+                    use_fast=True,
+                    local_files_only=not self.allow_model_downloads,
+                )
+            except Exception:
+                text_tokenizer = None
             family = "clip"
             input_mode = "processor"
         elif base_model_name == "openclip":
@@ -254,7 +266,16 @@ class ModelManager:
             model_id = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
             model = CLIPModel.from_pretrained(model_id, use_safetensors=True, local_files_only=not self.allow_model_downloads)
             preprocess = AutoImageProcessor.from_pretrained(model_id, use_fast=True, local_files_only=not self.allow_model_downloads)
-            text_tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, local_files_only=not self.allow_model_downloads)
+            try:
+                if not self.load_text_tokenizer:
+                    raise LookupError("Text tokenizer not requested")
+                text_tokenizer = AutoTokenizer.from_pretrained(
+                    model_id,
+                    use_fast=True,
+                    local_files_only=not self.allow_model_downloads,
+                )
+            except Exception:
+                text_tokenizer = None
             family = "openclip"
             input_mode = "processor"
         elif base_model_name == "siglip":
@@ -271,6 +292,8 @@ class ModelManager:
                 local_files_only=not self.allow_model_downloads,
             )
             try:
+                if not self.load_text_tokenizer:
+                    raise LookupError("Text tokenizer not requested")
                 from transformers import AutoTokenizer
 
                 text_tokenizer = AutoTokenizer.from_pretrained(
@@ -323,7 +346,7 @@ class ModelManager:
 
         model = model.eval()
         onnx_session = None
-        if use_onnx and family == "torchvision":
+        if attempt_onnx and family == "torchvision":
             onnx_session = self.onnx_service.session_for(base_model_name, model, input_size, self.execution_policy.onnx_provider)
         if onnx_session is None:
             model = model.to(self.device).eval()
@@ -331,9 +354,23 @@ class ModelManager:
         else:
             model = model.to("cpu").eval()
             device_label = f"onnx:{self.execution_policy.onnx_provider}"
-        signature = f"{model_name}:{input_size[0]}x{input_size[1]}:{family}:onnx={bool(onnx_session)}"
+        signature = self.static_signature(model_name, use_onnx=bool(onnx_session)) or (
+            f"{model_name}:{input_size[0]}x{input_size[1]}:{family}:onnx={bool(onnx_session)}"
+        )
         LOGGER.info("Loaded model '%s' on %s (onnx=%s)", model_name, device_label, bool(onnx_session))
         return ModelBundle(model_name, model, preprocess, input_size, signature, family, input_mode, onnx_session, text_tokenizer)
+
+    def _should_attempt_onnx(self, requested: bool) -> bool:
+        if not requested:
+            return False
+        # Never trade a working CUDA Torch path for CPU ONNX. This was the
+        # main cause of GPU-selected runs executing inference on the CPU when
+        # the optional ONNX CUDA provider could not initialize.
+        return not (
+            self.execution_policy.effective_mode == "cuda"
+            and self.execution_policy.torch_device == "cuda"
+            and self.execution_policy.onnx_provider != "CUDAExecutionProvider"
+        )
 
     def suggested_batch_size(self, model_name: str) -> int:
         if self.device.type != "cuda":
@@ -351,7 +388,9 @@ class ModelManager:
             "mobileclip": 12 * 1024 * 1024,
             "vit": 48 * 1024 * 1024,
         }.get(model_name, 24 * 1024 * 1024)
-        return max(1, min(self._gpu_batch_size(model_name), int((free_bytes * 0.65) // per_image_bytes)))
+        headroom_bytes = max(0, int(self.performance_profile.vram_headroom_mb)) * 1024 * 1024
+        usable_bytes = max(per_image_bytes, int(free_bytes) - headroom_bytes)
+        return max(1, min(self._gpu_batch_size(model_name), int(usable_bytes // per_image_bytes)))
 
     def _cpu_batch_size(self, model_name: str) -> int:
         base = self.performance_profile.cpu_batch_size
@@ -429,8 +468,10 @@ class EmbeddingService:
         use_onnx: bool = False,
         use_cache_lookup: bool = True,
         path_fingerprints: dict[str, tuple[int, int]] | None = None,
+        cancel_check=None,
     ) -> tuple[list[tuple[str, np.ndarray]], dict]:
         image_paths = list(image_paths)
+        raise_if_cancelled(cancel_check)
         static_signature_fn = getattr(self.model_manager, "static_signature", None)
         static_signature = static_signature_fn(model_name, use_onnx) if callable(static_signature_fn) else None
         if use_cache_lookup and static_signature:
@@ -442,6 +483,7 @@ class EmbeddingService:
             )
             cache_lookup_start = time.perf_counter()
             static_cached_vectors = self.cache_service.get_embeddings_many(static_cache_keys)
+            raise_if_cancelled(cancel_check)
             cache_lookup_time_s = round(time.perf_counter() - cache_lookup_start, 3)
             if len(static_cached_vectors) == len(image_paths):
                 finalized = [
@@ -467,7 +509,9 @@ class EmbeddingService:
                 }
 
         model_load_start = time.perf_counter()
+        raise_if_cancelled(cancel_check)
         bundle = self.model_manager.get_bundle(model_name, use_onnx=use_onnx)
+        raise_if_cancelled(cancel_check)
         model_load_time_s = round(time.perf_counter() - model_load_start, 3)
         batch_size = max(1, self.model_manager.suggested_batch_size(model_name))
         progress = ProgressThrottler(progress_callback, self.settings.progress_emit_interval_s)
@@ -483,6 +527,7 @@ class EmbeddingService:
         if use_cache_lookup:
             cache_lookup_start = time.perf_counter()
             cached_vectors = self.cache_service.get_embeddings_many(cache_keys)
+            raise_if_cancelled(cancel_check)
             cache_lookup_time_s = round(time.perf_counter() - cache_lookup_start, 3)
 
         results: list[tuple[str, np.ndarray] | None] = [None] * len(image_paths)
@@ -522,16 +567,20 @@ class EmbeddingService:
                 _submit_next()
 
             while pending:
+                raise_if_cancelled(cancel_check)
                 _batch, future = pending.popleft()
                 prepared, kept, prep_elapsed = future.result()
+                raise_if_cancelled(cancel_check)
                 preprocess_time_s += prep_elapsed
                 infer_start = time.perf_counter()
                 embeddings, used_backoff = self._run_model_with_backoff(bundle, prepared)
+                raise_if_cancelled(cancel_check)
                 inference_time_s += time.perf_counter() - infer_start
                 oom_backoff = oom_backoff or used_backoff
                 done = self._store_batch_results(kept, embeddings, model_name, results, pending_writes, done, total, progress)
                 _submit_next()
 
+        raise_if_cancelled(cancel_check)
         self.cache_service.put_embeddings_many(pending_writes)
         finalized = [item for item in results if item is not None]
         return finalized, {
@@ -630,7 +679,7 @@ class EmbeddingService:
             return self._run_model(bundle, prepared_batch), False
         except RuntimeError as exc:
             message = str(exc).lower()
-            if "out of memory" not in message or self.model_manager.device.type != "cuda" or self.performance_profile.name != "max_speed":
+            if "out of memory" not in message or self.model_manager.device.type != "cuda":
                 raise
             split = self._split_prepared_batch(bundle, prepared_batch)
             if split is None:
@@ -638,7 +687,8 @@ class EmbeddingService:
             torch.cuda.empty_cache()
             outputs: list[np.ndarray] = []
             for batch in split:
-                outputs.extend(self._run_model(bundle, batch))
+                batch_outputs, _nested_backoff = self._run_model_with_backoff(bundle, batch)
+                outputs.extend(batch_outputs)
             return outputs, True
 
     def _split_prepared_batch(self, bundle: ModelBundle, prepared_batch):

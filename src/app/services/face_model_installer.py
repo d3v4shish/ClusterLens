@@ -4,17 +4,22 @@ import hashlib
 import importlib.machinery
 import importlib
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import types
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from infra.cancel import raise_if_cancelled
+from infra.atomic_io import atomic_write_text, atomic_write_with
 from infra.settings import AppSettings, get_settings
+from app.services.model_downloads import SharedDownloadLease
 
 
 RECOMMENDED_MODEL_ARCHIVE_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_m.zip"
@@ -79,6 +84,9 @@ _CATALOG_METADATA_PATHS: dict[str, str] = {
     "yunet_2023mar_int8bq": "human/detectors/yunet_2023mar_int8bq/metadata.json",
 }
 
+DOWNLOAD_IO_TIMEOUT_SECONDS = 15
+DOWNLOAD_RETRY_ATTEMPTS = 4
+
 
 @dataclass(frozen=True)
 class FaceModelInventoryItem:
@@ -107,6 +115,48 @@ class FaceModelInstaller:
         root.mkdir(parents=True, exist_ok=True)
         return root
 
+    def download_cache_dir(self) -> Path:
+        root = Path(self.settings.cache_dir) / "face_model_downloads"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def clear_download_cache(self, progress=None, cancel_check=None) -> tuple[tuple[str, ...], int, tuple[str, ...]]:
+        """Clear reusable face archives without racing another app process."""
+        cache_root = self.download_cache_dir()
+        lease = SharedDownloadLease(
+            Path(self.settings.cache_dir) / "model_download_locks",
+            "face-cache-maintenance",
+            wait_message="Waiting for another ClusterLens process to finish its face-model download...",
+        )
+        lease.acquire(progress_callback=progress, cancel_check=cancel_check)
+        removed: list[str] = []
+        failures: list[str] = []
+        freed_bytes = 0
+        try:
+            entries = tuple(sorted(cache_root.iterdir(), key=lambda path: path.name.casefold()))
+            total = max(1, len(entries))
+            for index, path in enumerate(entries):
+                raise_if_cancelled(cancel_check)
+                if progress is not None:
+                    progress(int(index * 100 / total), f"Deleting cached face download {path.name}")
+                try:
+                    if path.is_symlink() or path.is_file():
+                        try:
+                            freed_bytes += max(0, int(path.stat().st_size))
+                        except OSError:
+                            pass
+                        path.unlink(missing_ok=True)
+                        removed.append(str(path))
+                    else:
+                        failures.append(f"Unexpected directory was preserved: {path}")
+                except OSError as exc:
+                    failures.append(f"{path}: {exc}")
+            if progress is not None:
+                progress(100, "Reusable face download cache cleared")
+        finally:
+            lease.release()
+        return tuple(removed), int(freed_bytes), tuple(failures)
+
     def bundle_dir(self, bundle_id: str) -> Path:
         mode, plural_kind, _label = self._bundle_layout(bundle_id)
         return self.runtime_root() / mode / plural_kind / bundle_id
@@ -118,9 +168,10 @@ class FaceModelInstaller:
             filename = "detector.onnx" if plural_kind == "detectors" else "embedder.onnx"
             payload_path = bundle_dir / filename
             metadata = self._catalog_metadata(bundle_id)
-            installed = payload_path.exists()
+            payload_installed, verified = self._installed_payload_state(payload_path)
+            installed = payload_installed and (bundle_dir / "metadata.json").is_file()
             size_bytes = self._path_size(payload_path)
-            status = "ready" if installed else "install required"
+            status = "ready (verified)" if installed and verified else ("ready" if installed else "install required")
             items.append(
                 FaceModelInventoryItem(
                     bundle_id=bundle_id,
@@ -137,6 +188,10 @@ class FaceModelInstaller:
         return tuple(items)
 
     def install_recommended(self, progress=None, cancel_check=None) -> tuple[str, ...]:
+        target_ids = ("scrfd_2.5g_kps", "arcface_r50")
+        if all(self._bundle_installed(bundle_id) for bundle_id in target_ids):
+            progress and progress(100, "Recommended face models already installed; reused managed cache")
+            return target_ids
         archive_path, temp_root = self._download_to_temp(
             RECOMMENDED_MODEL_ARCHIVE_URL,
             RECOMMENDED_MODEL_ARCHIVE_SHA256,
@@ -149,21 +204,23 @@ class FaceModelInstaller:
         try:
             raise_if_cancelled(cancel_check)
             progress and progress(65, "Installing SCRFD 2.5G detector")
-            self._install_zip_member(
-                archive_path,
-                member_name="det_2.5g.onnx",
-                bundle_id="scrfd_2.5g_kps",
-                output_name="detector.onnx",
-            )
+            if not self._bundle_installed("scrfd_2.5g_kps"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="det_2.5g.onnx",
+                    bundle_id="scrfd_2.5g_kps",
+                    output_name="detector.onnx",
+                )
             installed.append("scrfd_2.5g_kps")
             raise_if_cancelled(cancel_check)
             progress and progress(82, "Installing ArcFace R50 embedder")
-            self._install_zip_member(
-                archive_path,
-                member_name="w600k_r50.onnx",
-                bundle_id="arcface_r50",
-                output_name="embedder.onnx",
-            )
+            if not self._bundle_installed("arcface_r50"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="w600k_r50.onnx",
+                    bundle_id="arcface_r50",
+                    output_name="embedder.onnx",
+                )
             installed.append("arcface_r50")
             progress and progress(100, "Installed SCRFD 2.5G and ArcFace R50")
             return tuple(installed)
@@ -171,6 +228,10 @@ class FaceModelInstaller:
             shutil.rmtree(temp_root, ignore_errors=True)
 
     def install_edge(self, progress=None, cancel_check=None) -> tuple[str, ...]:
+        target_ids = ("scrfd_500m_kps", "mobilefacenet_arcface")
+        if all(self._bundle_installed(bundle_id) for bundle_id in target_ids):
+            progress and progress(100, "Edge face models already installed; reused managed cache")
+            return target_ids
         archive_path, temp_root = self._download_to_temp(
             EDGE_MODEL_ARCHIVE_URL,
             EDGE_MODEL_ARCHIVE_SHA256,
@@ -183,21 +244,23 @@ class FaceModelInstaller:
         try:
             raise_if_cancelled(cancel_check)
             progress and progress(65, "Installing SCRFD 500M detector")
-            self._install_zip_member(
-                archive_path,
-                member_name="det_500m.onnx",
-                bundle_id="scrfd_500m_kps",
-                output_name="detector.onnx",
-            )
+            if not self._bundle_installed("scrfd_500m_kps"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="det_500m.onnx",
+                    bundle_id="scrfd_500m_kps",
+                    output_name="detector.onnx",
+                )
             installed.append("scrfd_500m_kps")
             raise_if_cancelled(cancel_check)
             progress and progress(82, "Installing MobileFaceNet ArcFace embedder")
-            self._install_zip_member(
-                archive_path,
-                member_name="w600k_mbf.onnx",
-                bundle_id="mobilefacenet_arcface",
-                output_name="embedder.onnx",
-            )
+            if not self._bundle_installed("mobilefacenet_arcface"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="w600k_mbf.onnx",
+                    bundle_id="mobilefacenet_arcface",
+                    output_name="embedder.onnx",
+                )
             installed.append("mobilefacenet_arcface")
             progress and progress(100, "Installed SCRFD 500M and MobileFaceNet ArcFace")
             return tuple(installed)
@@ -205,6 +268,9 @@ class FaceModelInstaller:
             shutil.rmtree(temp_root, ignore_errors=True)
 
     def install_yolo(self, progress=None, cancel_check=None) -> tuple[str, ...]:
+        if self._bundle_installed("yolo5face_n"):
+            progress and progress(100, "YOLO5Face Nano already installed; reused managed cache")
+            return ("yolo5face_n",)
         weights_path, weights_temp_root = self._download_to_temp(
             YOLO_WEIGHTS_URL,
             YOLO_WEIGHTS_SHA256,
@@ -249,6 +315,13 @@ class FaceModelInstaller:
         installed: list[str] = []
         for index, (bundle_id, url, sha256, filename, label) in enumerate(downloads, start=1):
             raise_if_cancelled(cancel_check)
+            if self._bundle_installed(bundle_id):
+                installed.append(bundle_id)
+                progress and progress(
+                    max(1, int((index / max(1, len(downloads))) * 100)),
+                    f"Using installed {label}",
+                )
+                continue
             progress and progress(max(1, int(((index - 1) / max(1, len(downloads))) * 100)), f"Downloading {label}")
             payload_path, temp_root = self._download_to_temp(
                 url,
@@ -291,6 +364,10 @@ class FaceModelInstaller:
         )
 
     def install_latest_gpu(self, progress=None, cancel_check=None) -> tuple[str, ...]:
+        target_ids = ("scrfd_10g_kps", "arcface_r100_glint360k")
+        if all(self._bundle_installed(bundle_id) for bundle_id in target_ids):
+            progress and progress(100, "Latest GPU face models already installed; reused managed cache")
+            return target_ids
         archive_path, temp_root = self._download_to_temp(
             LATEST_GPU_MODEL_ARCHIVE_URL,
             LATEST_GPU_MODEL_ARCHIVE_SHA256,
@@ -303,21 +380,23 @@ class FaceModelInstaller:
         try:
             raise_if_cancelled(cancel_check)
             progress and progress(65, "Installing SCRFD 10G detector")
-            self._install_zip_member(
-                archive_path,
-                member_name="scrfd_10g_bnkps.onnx",
-                bundle_id="scrfd_10g_kps",
-                output_name="detector.onnx",
-            )
+            if not self._bundle_installed("scrfd_10g_kps"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="scrfd_10g_bnkps.onnx",
+                    bundle_id="scrfd_10g_kps",
+                    output_name="detector.onnx",
+                )
             installed.append("scrfd_10g_kps")
             raise_if_cancelled(cancel_check)
             progress and progress(82, "Installing ArcFace R100 Glint360K embedder")
-            self._install_zip_member(
-                archive_path,
-                member_name="glintr100.onnx",
-                bundle_id="arcface_r100_glint360k",
-                output_name="embedder.onnx",
-            )
+            if not self._bundle_installed("arcface_r100_glint360k"):
+                self._install_zip_member(
+                    archive_path,
+                    member_name="glintr100.onnx",
+                    bundle_id="arcface_r100_glint360k",
+                    output_name="embedder.onnx",
+                )
             installed.append("arcface_r100_glint360k")
             progress and progress(100, "Installed SCRFD 10G and ArcFace R100 Glint360K")
             return tuple(installed)
@@ -349,6 +428,21 @@ class FaceModelInstaller:
             completion_label="Installed SFace 2021 Dec embedders",
         )
 
+    def install_opencv_cpu(self, progress=None, cancel_check=None) -> tuple[str, ...]:
+        def _mapped(start: int, span: int):
+            if progress is None:
+                return None
+            return lambda value, status: progress(
+                start + int(max(0, min(100, int(value))) * span / 100),
+                status,
+            )
+
+        detectors = self.install_yunet(_mapped(0, 50), cancel_check)
+        raise_if_cancelled(cancel_check)
+        embedders = self.install_sface(_mapped(50, 50), cancel_check)
+        progress and progress(100, "Installed OpenCV CPU face detector and embedder family")
+        return tuple(dict.fromkeys((*detectors, *embedders)))
+
     def delete_installed_model(self, bundle_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         bundle_dir = self.bundle_dir(bundle_id)
         if not bundle_dir.exists():
@@ -360,6 +454,12 @@ class FaceModelInstaller:
         return (str(bundle_dir),), ()
 
     def bundled_catalog_root(self) -> Path:
+        # PyInstaller extracts/collects data files under sys._MEIPASS. In an
+        # onedir build this is the executable's `_internal` directory, while
+        # walking up from this module reaches the directory beside `_internal`.
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            return Path(meipass) / "face_model_assets"
         return Path(__file__).resolve().parents[3] / "face_model_assets"
 
     def _catalog_metadata(self, bundle_id: str) -> dict[str, object]:
@@ -388,35 +488,186 @@ class FaceModelInstaller:
         cancel_check=None,
         progress_prefix: str,
     ) -> tuple[Path, Path]:
-        tmp_dir = Path(self.settings.cache_dir) / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        temp_root = Path(tempfile.mkdtemp(prefix="face-model-download-", dir=str(tmp_dir)))
-        target_path = temp_root / filename
-        request = urllib.request.Request(url, headers={"User-Agent": "ClusterLens/1.0"})
+        expected_sha = str(sha256 or "").strip().lower()
+        safe_filename = Path(filename).name
+        cache_key = expected_sha or hashlib.sha256(str(url).encode("utf-8")).hexdigest()
+        download_cache = self.download_cache_dir()
+        cache_path = download_cache / f"{cache_key[:16]}-{safe_filename}"
+        partial_path = cache_path.with_name(f"{cache_path.name}.partial")
+        verification_path = cache_path.with_name(f"{cache_path.name}.verified.json")
+        lock_root = Path(self.settings.cache_dir) / "model_download_locks"
+        maintenance_lease = SharedDownloadLease(
+            lock_root,
+            "face-cache-maintenance",
+            wait_message="Waiting for face-model cache maintenance to finish...",
+        )
+        lease = SharedDownloadLease(
+            lock_root,
+            f"face-{cache_key}",
+            wait_message=f"Waiting for another process to finish {safe_filename}...",
+        )
+        maintenance_lease.acquire(progress_callback=progress, cancel_check=cancel_check)
+        try:
+            lease.acquire(progress_callback=progress, cancel_check=cancel_check)
+            try:
+                raise_if_cancelled(cancel_check)
+                if not self._verified_download_cache_entry(cache_path, verification_path, expected_sha):
+                    cache_path.unlink(missing_ok=True)
+                    verification_path.unlink(missing_ok=True)
+                    self._download_resumable(
+                        url,
+                        partial_path,
+                        progress=progress,
+                        cancel_check=cancel_check,
+                        progress_prefix=progress_prefix,
+                    )
+                    raise_if_cancelled(cancel_check)
+                    actual_sha = self._sha256_path(partial_path, cancel_check=cancel_check)
+                    if expected_sha and actual_sha != expected_sha:
+                        partial_path.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Checksum mismatch for {safe_filename}: expected {expected_sha}, got {actual_sha}."
+                        )
+                    atomic_write_with(cache_path, lambda temporary: shutil.copyfile(partial_path, temporary))
+                    partial_path.unlink(missing_ok=True)
+                    stat = cache_path.stat()
+                    atomic_write_text(
+                        verification_path,
+                        json.dumps(
+                            {
+                                "sha256": actual_sha,
+                                "size_bytes": int(stat.st_size),
+                                "mtime_ns": int(stat.st_mtime_ns),
+                                "source_url": str(url),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        ),
+                    )
+                elif progress is not None:
+                    progress(60, f"Using cached {safe_filename}")
+
+                raise_if_cancelled(cancel_check)
+                tmp_dir = Path(self.settings.cache_dir) / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                temp_root = Path(tempfile.mkdtemp(prefix="face-model-download-", dir=str(tmp_dir)))
+                target_path = temp_root / safe_filename
+                try:
+                    try:
+                        os.link(cache_path, target_path)
+                    except OSError:
+                        shutil.copyfile(cache_path, target_path)
+                except Exception:
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                    raise
+                return target_path, temp_root
+            finally:
+                lease.release()
+        finally:
+            maintenance_lease.release()
+
+    def _download_resumable(
+        self,
+        url: str,
+        partial_path: Path,
+        *,
+        progress=None,
+        cancel_check=None,
+        progress_prefix: str,
+    ) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+            raise_if_cancelled(cancel_check)
+            resume_bytes = self._path_size(partial_path)
+            headers = {"User-Agent": "ClusterLens/1.0"}
+            if resume_bytes > 0:
+                headers["Range"] = f"bytes={resume_bytes}-"
+            request = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=DOWNLOAD_IO_TIMEOUT_SECONDS) as response:
+                    status = int(
+                        getattr(response, "status", 0)
+                        or getattr(response, "getcode", lambda: 200)()
+                        or 200
+                    )
+                    append = resume_bytes > 0 and status == 206
+                    if not append:
+                        resume_bytes = 0
+                    content_bytes = int(response.headers.get("Content-Length") or 0)
+                    total_bytes = resume_bytes + content_bytes if content_bytes > 0 else 0
+                    received = resume_bytes
+                    mode = "ab" if append else "wb"
+                    with partial_path.open(mode) as handle:
+                        while True:
+                            raise_if_cancelled(cancel_check)
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            received += len(chunk)
+                            if progress is not None:
+                                if total_bytes > 0:
+                                    percent = min(60, max(1, int((received / total_bytes) * 60.0)))
+                                    progress(percent, f"{progress_prefix} ({received // (1024 * 1024)} MB)")
+                                else:
+                                    progress(10, f"{progress_prefix} ({received // (1024 * 1024)} MB)")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                return
+            except urllib.error.HTTPError as exc:
+                # A completed partial can receive 416 when the previous run
+                # ended after its last byte but before checksum publication.
+                if int(getattr(exc, "code", 0) or 0) == 416 and partial_path.is_file():
+                    return
+                last_error = exc
+            except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+                last_error = exc
+
+            if attempt >= DOWNLOAD_RETRY_ATTEMPTS:
+                break
+            if progress is not None:
+                progress(
+                    -1,
+                    f"{progress_prefix}: connection interrupted; resuming "
+                    f"(attempt {attempt + 1}/{DOWNLOAD_RETRY_ATTEMPTS})",
+                )
+            # Check cancellation during retry backoff instead of blocking the
+            # worker thread in one long sleep.
+            for _step in range(4):
+                raise_if_cancelled(cancel_check)
+                time.sleep(0.25)
+
+        raise RuntimeError(
+            f"{progress_prefix} failed after {DOWNLOAD_RETRY_ATTEMPTS} attempts; "
+            f"the partial download was kept for resume: {last_error}"
+        )
+
+    @staticmethod
+    def _sha256_path(path: Path, *, cancel_check=None) -> str:
         digest = hashlib.sha256()
-        with urllib.request.urlopen(request, timeout=300) as response, target_path.open("wb") as handle:
-            total_bytes = int(response.headers.get("Content-Length") or 0)
-            received = 0
+        with path.open("rb") as handle:
             while True:
                 raise_if_cancelled(cancel_check)
-                chunk = response.read(1024 * 1024)
+                chunk = handle.read(1024 * 1024)
                 if not chunk:
                     break
-                handle.write(chunk)
                 digest.update(chunk)
-                received += len(chunk)
-                if progress is not None:
-                    if total_bytes > 0:
-                        percent = min(60, max(1, int((received / total_bytes) * 60.0)))
-                        progress(percent, f"{progress_prefix} ({received // (1024 * 1024)} MB)")
-                    else:
-                        progress(10, progress_prefix)
-        actual_sha = digest.hexdigest().lower()
-        expected_sha = str(sha256 or "").strip().lower()
-        if expected_sha and actual_sha != expected_sha:
-            target_path.unlink(missing_ok=True)
-            raise RuntimeError(f"Checksum mismatch for {filename}: expected {expected_sha}, got {actual_sha}.")
-        return target_path, temp_root
+        return digest.hexdigest().lower()
+
+    def _verified_download_cache_entry(self, path: Path, metadata_path: Path, expected_sha: str) -> bool:
+        try:
+            stat = path.stat()
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if int(stat.st_size) <= 0:
+                return False
+            if int(payload.get("size_bytes") or -1) != int(stat.st_size):
+                return False
+            if int(payload.get("mtime_ns") or -1) != int(stat.st_mtime_ns):
+                return False
+            saved_sha = str(payload.get("sha256") or "").strip().lower()
+            return bool(saved_sha and (not expected_sha or saved_sha == expected_sha))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
 
     def _install_zip_member(self, archive_path: Path, *, member_name: str, bundle_id: str, output_name: str) -> None:
         with zipfile.ZipFile(archive_path) as archive:
@@ -425,28 +676,28 @@ class FaceModelInstaller:
                 raise RuntimeError(f"{archive_path.name} does not contain {member_name}.")
             bundle_dir = self.bundle_dir(bundle_id)
             bundle_dir.mkdir(parents=True, exist_ok=True)
-            temp_output = bundle_dir / f"{output_name}.part"
-            with archive.open(member, "r") as source, temp_output.open("wb") as target:
-                shutil.copyfileobj(source, target)
-            final_output = bundle_dir / output_name
-            temp_output.replace(final_output)
             self._copy_catalog_metadata(bundle_id, bundle_dir)
+            final_output = bundle_dir / output_name
+            atomic_write_with(
+                final_output,
+                lambda temporary: self._copy_zip_member(archive, member, temporary),
+            )
+            self._write_install_record(final_output)
 
     def _install_payload_file(self, payload_path: Path, *, bundle_id: str, output_name: str) -> None:
         bundle_dir = self.bundle_dir(bundle_id)
         bundle_dir.mkdir(parents=True, exist_ok=True)
-        temp_output = bundle_dir / f"{output_name}.part"
-        shutil.copyfile(payload_path, temp_output)
-        final_output = bundle_dir / output_name
-        temp_output.replace(final_output)
         self._copy_catalog_metadata(bundle_id, bundle_dir)
+        final_output = bundle_dir / output_name
+        atomic_write_with(final_output, lambda temporary: shutil.copyfile(payload_path, temporary))
+        self._write_install_record(final_output)
 
     def _copy_catalog_metadata(self, bundle_id: str, bundle_dir: Path) -> None:
         relative_path = _CATALOG_METADATA_PATHS[bundle_id]
         source_path = self.bundled_catalog_root() / relative_path
         if not source_path.exists():
             raise RuntimeError(f"Bundled metadata is missing for {bundle_id}: {source_path}")
-        shutil.copyfile(source_path, bundle_dir / "metadata.json")
+        atomic_write_text(bundle_dir / "metadata.json", source_path.read_text(encoding="utf-8"))
 
     def _install_direct_face_bundles(
         self,
@@ -460,6 +711,13 @@ class FaceModelInstaller:
         total = max(1, len(bundles))
         for index, (bundle_id, url, sha256, filename, output_name, label) in enumerate(bundles, start=1):
             raise_if_cancelled(cancel_check)
+            if self._bundle_installed(bundle_id):
+                installed.append(bundle_id)
+                progress and progress(
+                    max(1, int((index / total) * 100)),
+                    f"Using installed {label}",
+                )
+                continue
             start_progress = max(1, int(((index - 1) / total) * 100))
             progress and progress(start_progress, f"Downloading {label}")
             payload_path, temp_root = self._download_to_temp(
@@ -481,6 +739,62 @@ class FaceModelInstaller:
         progress and progress(100, completion_label)
         return tuple(installed)
 
+    def _bundle_installed(self, bundle_id: str) -> bool:
+        _mode, plural_kind, _label = self._bundle_layout(bundle_id)
+        filename = "detector.onnx" if plural_kind == "detectors" else "embedder.onnx"
+        bundle_dir = self.bundle_dir(bundle_id)
+        if not (bundle_dir / "metadata.json").is_file():
+            return False
+        installed, _verified = self._installed_payload_state(bundle_dir / filename)
+        return installed
+
+    @staticmethod
+    def _copy_zip_member(archive: zipfile.ZipFile, member: str, output_path: Path) -> None:
+        with archive.open(member, "r") as source, output_path.open("wb") as target:
+            shutil.copyfileobj(source, target)
+
+    def _write_install_record(self, payload_path: Path) -> None:
+        stat = payload_path.stat()
+        record_path = payload_path.with_name("install.json")
+        atomic_write_text(
+            record_path,
+            json.dumps(
+                {
+                    "payload": payload_path.name,
+                    "sha256": self._sha256_path(payload_path),
+                    "size_bytes": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+
+    @staticmethod
+    def _installed_payload_state(payload_path: Path) -> tuple[bool, bool]:
+        try:
+            stat = payload_path.stat()
+            if not payload_path.is_file() or int(stat.st_size) <= 0:
+                return False, False
+        except OSError:
+            return False, False
+        record_path = payload_path.with_name("install.json")
+        if not record_path.exists():
+            # Preserve compatibility with manually installed and older managed
+            # bundles. New installs always receive a verified record.
+            return True, False
+        try:
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            verified = bool(
+                str(payload.get("payload") or "") == payload_path.name
+                and str(payload.get("sha256") or "")
+                and int(payload.get("size_bytes") or -1) == int(stat.st_size)
+                and int(payload.get("mtime_ns") or -1) == int(stat.st_mtime_ns)
+            )
+            return verified, verified
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False, False
+
     @staticmethod
     def _find_zip_member(archive: zipfile.ZipFile, member_name: str) -> str | None:
         target = str(member_name).strip().lower()
@@ -492,7 +806,17 @@ class FaceModelInstaller:
     @staticmethod
     def _extract_source_archive(source_archive: Path, install_root: Path) -> Path:
         with zipfile.ZipFile(source_archive) as archive:
-            archive.extractall(install_root)
+            resolved_root = install_root.resolve()
+            for member in archive.infolist():
+                target = (install_root / member.filename).resolve()
+                try:
+                    target.relative_to(resolved_root)
+                except ValueError as exc:
+                    raise RuntimeError(f"Unsafe path in face model source archive: {member.filename}") from exc
+                unix_mode = int(member.external_attr >> 16)
+                if (unix_mode & 0o170000) == 0o120000:
+                    raise RuntimeError(f"Symlinks are not allowed in face model source archives: {member.filename}")
+                archive.extract(member, install_root)
         for child in install_root.iterdir():
             if child.is_dir() and (child / "export.py").exists():
                 return child

@@ -1,4 +1,6 @@
 import gc
+import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -44,6 +46,7 @@ from app.services.face_search import (
 from app.services.gallery_actions import GalleryActionService
 from app.services.image_tags import ImageTagService
 from app.services.model_assets import ModelAssetService, sha256_file
+from app.services.model_downloads import ModelDownloadItem, ModelDownloadService, normalize_model_download_items
 from app.services.onnx_models import OnnxModelService
 from app.services.perceptual_hash import PerceptualHashIndexService
 from app.services.performance_dashboard import PerformanceDashboardService
@@ -58,7 +61,7 @@ from infra.cancel import Cancelled
 from infra.performance import select_performance_profile
 from infra.runtime import ExecutionPolicy, RuntimeCapabilities, RuntimeCapabilityService
 from ml.clustering import ClusteringService
-from ml.embeddings import EmbeddingService
+from ml.embeddings import EmbeddingService, ModelManager
 
 
 class FakeEmbeddingService:
@@ -727,11 +730,19 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), copied_path.read_bytes())
             self.assertEqual([], list(target_dir.glob("*.ic_tmp*")))
             self.assertTrue(audit_log.exists())
+            self.assertTrue(Path(result.journal_path).exists())
             audit = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(result.operation_id, audit["operation_id"])
             self.assertEqual("copy", audit["operation"])
             self.assertEqual(1, audit["requested_count"])
             self.assertEqual(0, audit["failure_count"])
+            entries = action_service.read_audit_entries(limit=10)
+            self.assertEqual("copy", entries[-1]["operation"])
+            self.assertEqual("not_applicable", entries[-1]["recovery_status"])
+            with sqlite3.connect(result.journal_path) as db:
+                status, recovery = db.execute("select status, recovery_status from operation_files").fetchone()
+            self.assertEqual("completed", status)
+            self.assertEqual("not_applicable", recovery)
 
     def test_gallery_file_operation_audit_records_missing_sources(self):
         with TemporaryDirectory() as tmp:
@@ -743,9 +754,12 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(1, len(result.failures))
             self.assertIn("source file does not exist", result.failures[0])
+            self.assertTrue(Path(result.journal_path).exists())
             audit = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(1, audit["failure_count"])
             self.assertIn("missing.jpg", audit["failures"][0])
+            entries = action_service.read_audit_entries(limit=10)
+            self.assertEqual(1, entries[-1]["failure_count"])
 
     def test_exif_metadata_pair_writes_and_replaces_user_comment_key(self):
         with TemporaryDirectory() as tmp:
@@ -986,9 +1000,12 @@ class ServiceTests(unittest.TestCase):
 
     def test_embedding_index_reuses_existing_artifacts_for_same_snapshot(self):
         with TemporaryDirectory() as tmp:
+            root = Path(tmp)
             image_path = Path(tmp) / "image.jpg"
             image_path.write_bytes(b"123")
             index = EmbeddingIndexService()
+            index.index_dir = root / "embedding_indexes"
+            index.index_dir.mkdir(parents=True)
             snapshot = EmbeddingIndexService.build_snapshot_key([str(image_path)])
             embeddings = [(str(image_path), np.asarray([0.1, 0.2], dtype=np.float32))]
             _paths, reused = index.ensure_index(snapshot, "clip", embeddings)
@@ -996,25 +1013,99 @@ class ServiceTests(unittest.TestCase):
             _paths, reused = index.ensure_index(snapshot, "clip", embeddings)
             self.assertTrue(reused)
 
+    def test_embedding_index_invalidates_by_model_revision_and_repairs_corruption(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            image_path.write_bytes(b"123")
+            index = EmbeddingIndexService()
+            index.index_dir = root / "embedding_indexes"
+            index.index_dir.mkdir(parents=True)
+            snapshot = EmbeddingIndexService.build_snapshot_key([str(image_path)])
+            embeddings = [(str(image_path), np.asarray([0.1, 0.2], dtype=np.float32))]
+
+            revision_one_paths, reused = index.ensure_index(
+                snapshot,
+                "clip",
+                embeddings,
+                embedding_signature="clip:revision-one",
+            )
+            self.assertFalse(reused)
+            _same_paths, reused = index.ensure_index(
+                snapshot,
+                "clip",
+                embeddings,
+                embedding_signature="clip:revision-one",
+            )
+            self.assertTrue(reused)
+
+            revision_two_paths, reused = index.ensure_index(
+                snapshot,
+                "clip",
+                embeddings,
+                embedding_signature="clip:revision-two",
+            )
+            self.assertFalse(reused)
+            self.assertNotEqual(revision_one_paths["vector_path"], revision_two_paths["vector_path"])
+
+            Path(revision_one_paths["path_map_path"]).write_text("{broken", encoding="utf-8")
+            _repaired_paths, reused = index.ensure_index(
+                snapshot,
+                "clip",
+                embeddings,
+                embedding_signature="clip:revision-one",
+            )
+            self.assertFalse(reused)
+            self.assertEqual([str(image_path)], json.loads(Path(revision_one_paths["path_map_path"]).read_text(encoding="utf-8")))
+
+            with Path(revision_one_paths["vector_path"]).open("wb") as handle:
+                np.save(handle, np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32), allow_pickle=False)
+            _dimension_repaired_paths, reused = index.ensure_index(
+                snapshot,
+                "clip",
+                embeddings,
+                embedding_signature="clip:revision-one",
+            )
+            self.assertFalse(reused)
+            repaired = np.load(revision_one_paths["vector_path"], allow_pickle=False)
+            self.assertEqual((1, 2), repaired.shape)
+
     def test_result_cache_roundtrip(self):
-        service = ResultCacheService()
-        result_key = service.build_result_key(
-            snapshot_key="abc",
-            embedding_model="clip",
-            similarity_mode="semantic",
-            clustering_backend="cosine-kmeans",
-            num_clusters=3,
-            outlier_policy="assign",
-            use_onnx=False,
-        )
-        clusters = {0: ["a.jpg"], 1: ["b.jpg"]}
-        metrics = {"cluster_quality_score": 0.5}
-        service.save(result_key, clusters, metrics)
-        loaded = service.load(result_key)
-        self.assertIsNotNone(loaded)
-        loaded_clusters, loaded_metrics = loaded
-        self.assertEqual(clusters, loaded_clusters)
-        self.assertEqual(metrics["cluster_quality_score"], loaded_metrics["cluster_quality_score"])
+        with TemporaryDirectory() as tmp:
+            service = ResultCacheService()
+            service.cache_dir = Path(tmp)
+            result_key = service.build_result_key(
+                snapshot_key="abc",
+                embedding_model="clip",
+                similarity_mode="semantic",
+                clustering_backend="cosine-kmeans",
+                num_clusters=3,
+                outlier_policy="assign",
+                use_onnx=False,
+            )
+            clusters = {0: ["a.jpg"], 1: ["b.jpg"]}
+            metrics = {"cluster_quality_score": 0.5}
+            service.save(result_key, clusters, metrics)
+            loaded = service.load(result_key)
+            self.assertIsNotNone(loaded)
+            loaded_clusters, loaded_metrics = loaded
+            self.assertEqual(clusters, loaded_clusters)
+            self.assertEqual(metrics["cluster_quality_score"], loaded_metrics["cluster_quality_score"])
+
+            (service.cache_dir / f"{result_key}.json").write_text("{truncated", encoding="utf-8")
+            self.assertIsNone(service.load(result_key))
+
+            (service.cache_dir / f"{result_key}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "clusters": {"0": "not-a-path-list"},
+                        "metrics": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertIsNone(service.load(result_key))
 
     def test_result_cache_key_includes_similarity_space_version(self):
         service = ResultCacheService()
@@ -1029,7 +1120,9 @@ class ServiceTests(unittest.TestCase):
         }
         current_key = service.build_result_key(**common)
         old_key = service.build_result_key(**common, similarity_space_version="old-semantic-cosine")
+        revised_key = service.build_result_key(**common, embedding_signature="clip:revision-two")
         self.assertNotEqual(current_key, old_key)
+        self.assertNotEqual(current_key, revised_key)
 
     def test_cache_maintenance_clears_only_rebuildable_targets_and_recreates_directories(self):
         with TemporaryDirectory() as tmp:
@@ -1151,12 +1244,11 @@ class ServiceTests(unittest.TestCase):
             cleared, failures = CacheMaintenanceService(settings=settings).clear_runtime_temp_files()
 
             self.assertIn("tmp/", cleared)
-            self.assertTrue(any("download.incomplete" in item for item in cleared))
             self.assertEqual((), failures)
             self.assertTrue(tmp_dir.exists())
             self.assertEqual([], list(tmp_dir.iterdir()))
             self.assertTrue((thumbnails_dir / "thumb.bin").exists())
-            self.assertFalse((partial_dir / "download.incomplete").exists())
+            self.assertTrue((partial_dir / "download.incomplete").exists())
 
     def test_cache_maintenance_reports_generated_storage_categories(self):
         with TemporaryDirectory() as tmp:
@@ -1212,6 +1304,7 @@ class ServiceTests(unittest.TestCase):
             temp_dir = cache_root / "tmp"
             model_dirs = [
                 cache_root / "face_model_assets",
+                cache_root / "face_model_downloads",
                 cache_root / "onnx_models",
                 cache_root / "huggingface",
                 cache_root / "torch",
@@ -1219,6 +1312,8 @@ class ServiceTests(unittest.TestCase):
             for path in [log_dir, thumbnails_dir, temp_dir, *model_dirs]:
                 path.mkdir(parents=True, exist_ok=True)
                 (path / "payload.bin").write_bytes(b"1234")
+            (log_dir / "file_operations.sqlite3").write_bytes(b"journal")
+            (log_dir / "file_operations.jsonl").write_bytes(b"journal")
             partial_dir = cache_root / "huggingface" / "hub" / "models--demo"
             partial_dir.mkdir(parents=True, exist_ok=True)
             (partial_dir / "download.incomplete").write_bytes(b"partial")
@@ -1246,6 +1341,7 @@ class ServiceTests(unittest.TestCase):
             cleared_models, model_failures = service.clear_model_cache_targets()
             self.assertEqual((), model_failures)
             self.assertTrue((cache_root / "face_model_assets").exists())
+            self.assertTrue((cache_root / "face_model_downloads").exists())
             self.assertTrue((cache_root / "onnx_models").exists())
             self.assertFalse((cache_root / "huggingface").exists())
             self.assertFalse((cache_root / "torch").exists())
@@ -1254,7 +1350,10 @@ class ServiceTests(unittest.TestCase):
             cleared_logs, log_failures = service.clear_log_files()
             self.assertEqual((), log_failures)
             self.assertTrue(log_dir.exists())
-            self.assertEqual([], list(log_dir.iterdir()))
+            self.assertEqual(
+                {"file_operations.sqlite3", "file_operations.jsonl"},
+                {path.name for path in log_dir.iterdir()},
+            )
             self.assertTrue(cleared_logs)
 
             cleared_temp, temp_failures = service.clear_runtime_temp_files()
@@ -1363,6 +1462,217 @@ class ServiceTests(unittest.TestCase):
 
             self.assertTrue(service.local_cache_present("mobileclip"))
             self.assertTrue(service.model_available_without_download("mobileclip"))
+
+    def test_model_asset_service_separates_siglip_image_and_text_cache_readiness(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelAssetService(settings=settings, extra_roots=())
+
+            missing_plan = service.build_download_plan(
+                ["siglip"],
+                generate_cluster_meanings=True,
+                requested_meaning_model="auto",
+            )
+            self.assertEqual(("siglip",), missing_plan.unavailable_items)
+
+            snapshot_dir = (
+                root
+                / "cache"
+                / "huggingface"
+                / "hub"
+                / "models--google--siglip-base-patch16-224"
+                / "snapshots"
+                / "snapshot-id"
+            )
+            snapshot_dir.mkdir(parents=True)
+            for filename in ("config.json", "preprocessor_config.json", "model.safetensors"):
+                (snapshot_dir / filename).write_text("cached", encoding="utf-8")
+
+            self.assertTrue(service.local_cache_present("siglip"))
+            self.assertFalse(service.local_cache_present("siglip", require_text=True))
+            image_plan = service.build_download_plan(
+                ["siglip"],
+                generate_cluster_meanings=False,
+                requested_meaning_model="auto",
+            )
+            self.assertFalse(image_plan.requires_download)
+
+            naming_plan = service.build_download_plan(
+                ["siglip"],
+                generate_cluster_meanings=True,
+                requested_meaning_model="auto",
+            )
+            self.assertEqual((), naming_plan.models_requiring_download)
+            self.assertTrue(naming_plan.meaning_requires_download)
+            self.assertEqual(("siglip (advanced cluster naming sidecar)",), naming_plan.unavailable_items)
+
+            (snapshot_dir / "spiece.model").write_text("tokenizer", encoding="utf-8")
+            self.assertTrue(service.local_cache_present("siglip", require_text=True))
+            complete_plan = service.build_download_plan(
+                ["siglip"],
+                generate_cluster_meanings=True,
+                requested_meaning_model="auto",
+            )
+            self.assertFalse(complete_plan.requires_download)
+
+    def test_model_asset_service_rejects_clip_assets_split_across_revisions(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelAssetService(settings=settings, extra_roots=())
+            repo_dir = root / "cache" / "huggingface" / "hub" / "models--openai--clip-vit-base-patch32"
+            tokenizer_snapshot = repo_dir / "snapshots" / "tokenizer-revision"
+            weight_snapshot = repo_dir / "snapshots" / "weight-revision"
+            tokenizer_snapshot.mkdir(parents=True)
+            weight_snapshot.mkdir(parents=True)
+            (repo_dir / "refs").mkdir(parents=True)
+            (repo_dir / "refs" / "main").write_text("tokenizer-revision", encoding="utf-8")
+            for filename in ("config.json", "preprocessor_config.json", "tokenizer.json"):
+                (tokenizer_snapshot / filename).write_text("cached", encoding="utf-8")
+            (weight_snapshot / "model.safetensors").write_text("weights", encoding="utf-8")
+
+            self.assertFalse(service.local_cache_present("clip", require_text=True))
+
+            complete_snapshot = repo_dir / "snapshots" / "complete-revision"
+            complete_snapshot.mkdir()
+            for filename in ("config.json", "preprocessor_config.json", "model.safetensors", "tokenizer.json"):
+                (complete_snapshot / filename).write_text("cached", encoding="utf-8")
+
+            self.assertTrue(service.local_cache_present("clip", require_text=True))
+
+    def test_model_asset_service_uses_complete_dino_huggingface_revision(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelAssetService(settings=settings, extra_roots=())
+            repo_dir = (
+                root
+                / "cache"
+                / "huggingface"
+                / "hub"
+                / "models--timm--vit_small_patch16_224.dino"
+            )
+            snapshot_dir = repo_dir / "snapshots" / "dino-revision"
+            snapshot_dir.mkdir(parents=True)
+            (repo_dir / "refs").mkdir(parents=True)
+            (repo_dir / "refs" / "main").write_text("dino-revision", encoding="utf-8")
+
+            self.assertFalse(service.local_cache_present("dino"))
+            (snapshot_dir / "model.safetensors").write_bytes(b"")
+            self.assertFalse(service.local_cache_present("dino"))
+            (snapshot_dir / "model.safetensors").write_bytes(b"weights")
+
+            self.assertTrue(service.local_cache_present("dino"))
+            self.assertEqual(
+                "hf:models--timm--vit_small_patch16_224.dino:dino-revision",
+                service.local_cache_revision("dino"),
+            )
+
+    def test_model_download_requests_are_deduplicated_and_upgrade_text_requirement(self):
+        normalized = normalize_model_download_items(
+            [
+                ModelDownloadItem("SigLIP", require_text=False),
+                ModelDownloadItem("siglip", require_text=True),
+                ModelDownloadItem("DINO", require_text=False),
+                ModelDownloadItem("dino", require_text=False),
+            ]
+        )
+
+        self.assertEqual(
+            (
+                ModelDownloadItem("siglip", require_text=True),
+                ModelDownloadItem("dino", require_text=False),
+            ),
+            normalized,
+        )
+
+    def test_model_download_rechecks_cache_after_acquiring_shared_lease(self):
+        class _Assets:
+            def __init__(self):
+                self.readiness_checks = 0
+
+            @staticmethod
+            def local_cache_size(model_name):
+                _ = model_name
+                return 7
+
+            def model_available_without_download(self, model_name, *, require_text=False):
+                _ = (model_name, require_text)
+                self.readiness_checks += 1
+                return self.readiness_checks >= 2
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelDownloadService(settings=settings)
+            assets = _Assets()
+            service.assets = assets
+            with patch.object(
+                service,
+                "_load_and_verify",
+                side_effect=AssertionError("a second process already populated the cache"),
+            ):
+                result = service.acquire([ModelDownloadItem("siglip", require_text=True)])
+
+            self.assertEqual(("siglip:text=1",), result.requested)
+            self.assertEqual((), result.downloaded)
+            self.assertEqual(("siglip:text=1",), result.reused)
+            self.assertEqual(2, assets.readiness_checks)
+            self.assertFalse((root / "cache" / "model_download_locks" / "siglip.lock").exists())
+
+    def test_model_download_prepares_a_complete_huggingface_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelDownloadService(settings=settings)
+
+            with patch("huggingface_hub.snapshot_download") as download:
+                service._download_huggingface_snapshot(ModelDownloadItem("clip", require_text=True))
+
+            download.assert_called_once_with(
+                repo_id="openai/clip-vit-base-patch32",
+                cache_dir=str(root / "cache" / "huggingface" / "hub"),
+                allow_patterns=("*.json", "*.txt", "*.model", "*.safetensors"),
+            )
+
+    def test_model_download_consolidates_split_clip_revisions_for_offline_use(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            service = ModelDownloadService(settings=settings)
+            repo_dir = root / "cache" / "huggingface" / "hub" / "models--openai--clip-vit-base-patch32"
+            tokenizer_snapshot = repo_dir / "snapshots" / "tokenizer-revision"
+            weight_snapshot = repo_dir / "snapshots" / "weight-revision"
+            tokenizer_snapshot.mkdir(parents=True)
+            weight_snapshot.mkdir(parents=True)
+            (repo_dir / "refs").mkdir(parents=True)
+            (repo_dir / "refs" / "main").write_text("tokenizer-revision", encoding="utf-8")
+            for filename in ("config.json", "preprocessor_config.json", "tokenizer.json"):
+                (tokenizer_snapshot / filename).write_text("cached", encoding="utf-8")
+            (weight_snapshot / "model.safetensors").write_text("weights", encoding="utf-8")
+
+            service._consolidate_huggingface_snapshot(ModelDownloadItem("clip", require_text=True))
+
+            current_revision = (repo_dir / "refs" / "main").read_text(encoding="utf-8").strip()
+            self.assertTrue(current_revision.startswith("clusterlens-complete-"))
+            self.assertTrue((repo_dir / "snapshots" / current_revision / "model.safetensors").is_file())
+            self.assertTrue(service.assets.local_cache_present("clip", require_text=True))
+
+    def test_phash_embedding_static_signature_uses_convnext_revision(self):
+        manager = object.__new__(ModelManager)
+        requested_revisions: list[str] = []
+        manager.model_asset_service = SimpleNamespace(
+            find_bundle=lambda model_name: None,
+            local_cache_revision=lambda model_name: (
+                requested_revisions.append(model_name) or "convnext-revision"
+            ),
+        )
+
+        signature = manager.static_signature("phash_embedding", use_onnx=False)
+
+        self.assertIn("convnext-revision", signature)
+        self.assertEqual(["convnext"], requested_revisions)
 
     def test_similarity_graph_clusters_connected_points(self):
         vectors = np.array(
@@ -2482,6 +2792,61 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("YOLO5Face Nano", resolve_face_detector_bundle("", "human", "yolo5face_n").display_name)
         self.assertEqual("ArcFace R50", resolve_face_embedder_bundle("", "human", "arcface_r50").display_name)
 
+    def test_default_gpu_face_pipeline_activates_only_when_both_components_are_ready(self):
+        with TemporaryDirectory() as tmp, patch.object(
+            face_search_module,
+            "face_model_runtime_root_dir",
+            return_value=Path(tmp),
+        ), patch.object(ModelAssetService, "local_cache_present", return_value=True):
+            desired = (
+                face_search_module.DEFAULT_HUMAN_FACE_DETECTOR_ID,
+                face_search_module.DEFAULT_HUMAN_FACE_EMBEDDER_ID,
+            )
+            self.assertEqual("latest_gpu", face_search_module.DEFAULT_HUMAN_FACE_PROFILE_ID)
+            self.assertEqual(
+                (BUILTIN_HUMAN_DETECTOR_ID, BUILTIN_HUMAN_EMBEDDER_ID),
+                face_search_module.resolve_ready_face_pipeline_ids("", "human", *desired),
+            )
+
+            catalog_root = Path(__file__).resolve().parents[1] / "face_model_assets" / "human"
+            detector_dir = Path(tmp) / "human" / "detectors" / desired[0]
+            detector_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(catalog_root / "detectors" / desired[0] / "metadata.json", detector_dir / "metadata.json")
+            (detector_dir / "detector.onnx").write_bytes(b"detector")
+
+            # A partial pack never becomes the active pipeline.
+            self.assertEqual(
+                (BUILTIN_HUMAN_DETECTOR_ID, BUILTIN_HUMAN_EMBEDDER_ID),
+                face_search_module.resolve_ready_face_pipeline_ids("", "human", *desired),
+            )
+
+            embedder_dir = Path(tmp) / "human" / "embedders" / desired[1]
+            embedder_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(catalog_root / "embedders" / desired[1] / "metadata.json", embedder_dir / "metadata.json")
+            (embedder_dir / "embedder.onnx").write_bytes(b"embedder")
+            self.assertEqual(
+                desired,
+                face_search_module.resolve_ready_face_pipeline_ids("", "human", *desired),
+            )
+
+    def test_missing_bundled_face_models_route_to_managed_installer_without_internal_paths(self):
+        with TemporaryDirectory() as tmp, patch.object(
+            face_search_module,
+            "face_model_runtime_root_dir",
+            return_value=Path(tmp) / "managed-face-models",
+        ):
+            detector = resolve_face_detector_bundle("", "human", "scrfd_10g_kps")
+            embedder = resolve_face_embedder_bundle("", "human", "arcface_r100_glint360k")
+
+        self.assertFalse(detector.available)
+        self.assertFalse(embedder.available)
+        for message in (detector.availability_message, embedder.availability_message):
+            self.assertIn("Settings > Models", message)
+            self.assertIn("managed-face-models", message)
+            self.assertNotIn("_internal", message)
+            self.assertNotIn("detector.onnx in", message)
+            self.assertNotIn("embedder.onnx in", message)
+
     def test_face_choice_labels_include_cpu_gpu_tags(self):
         detector_labels = {item_id: label for item_id, label in face_detector_choices("", "human")}
         embedder_labels = {item_id: label for item_id, label in face_embedder_choices("", "human")}
@@ -2578,6 +2943,35 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(refreshed["yunet_2026may"].installed)
             self.assertGreater(refreshed["yunet_2026may"].size_bytes, 0)
 
+    def test_face_model_installer_uses_pyinstaller_bundle_root_for_catalog(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meipass = root / "_internal"
+            source = meipass / "face_model_assets" / "human" / "embedders" / "arcface_r100_glint360k" / "metadata.json"
+            source.parent.mkdir(parents=True)
+            source.write_text('{"display_name": "Packaged ArcFace"}', encoding="utf-8")
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=root / "cache"))
+
+            with patch.object(sys, "_MEIPASS", str(meipass), create=True):
+                self.assertEqual(meipass / "face_model_assets", installer.bundled_catalog_root())
+                target = installer.bundle_dir("arcface_r100_glint360k")
+                target.mkdir(parents=True)
+                installer._copy_catalog_metadata("arcface_r100_glint360k", target)
+
+            self.assertEqual(source.read_text(encoding="utf-8"), (target / "metadata.json").read_text(encoding="utf-8"))
+
+    def test_face_model_installer_rejects_incomplete_payload_only_bundle(self):
+        with TemporaryDirectory() as tmp:
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            bundle_dir = installer.bundle_dir("arcface_r100_glint360k")
+            bundle_dir.mkdir(parents=True)
+            (bundle_dir / "embedder.onnx").write_bytes(b"embedder")
+
+            self.assertFalse(installer._bundle_installed("arcface_r100_glint360k"))
+            inventory = {item.bundle_id: item for item in installer.inventory()}
+            self.assertFalse(inventory["arcface_r100_glint360k"].installed)
+            self.assertEqual("install required", inventory["arcface_r100_glint360k"].status)
+
     def test_face_model_installer_install_edge_installs_all_variants(self):
         with TemporaryDirectory() as tmp:
             fake_settings = SimpleNamespace(cache_dir=Path(tmp))
@@ -2661,6 +3055,7 @@ class ServiceTests(unittest.TestCase):
                 bundle_dir = installer.bundle_dir(bundle_id)
                 bundle_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(payload_path, bundle_dir / output_name)
+                installer._copy_catalog_metadata(bundle_id, bundle_dir)
 
             with patch.object(installer, "_download_to_temp", side_effect=fake_download), patch.object(
                 installer,
@@ -2673,9 +3068,133 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(("scrfd_10g_kps", "adaface_r100"), accuracy)
             self.assertEqual(("scrfd_34gf_kps", "adaface_r100"), max_accuracy)
             self.assertEqual(
-                ["scrfd_10g_kps", "adaface_r100", "scrfd_34gf_kps", "adaface_r100"],
+                ["scrfd_10g_kps", "adaface_r100", "scrfd_34gf_kps"],
                 installed,
             )
+
+    def test_face_model_download_cache_prevents_duplicate_network_fetch(self):
+        class _Response:
+            def __init__(self, payload: bytes):
+                self._stream = io.BytesIO(payload)
+                self.headers = {"Content-Length": str(len(payload))}
+                self.status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                return self._stream.read(size)
+
+        with TemporaryDirectory() as tmp:
+            payload = b"verified face model archive"
+            expected_sha = hashlib.sha256(payload).hexdigest()
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            with patch(
+                "app.services.face_model_installer.urllib.request.urlopen",
+                return_value=_Response(payload),
+            ) as urlopen:
+                first_path, first_temp = installer._download_to_temp(
+                    "https://example.invalid/model.bin",
+                    expected_sha,
+                    "model.bin",
+                    progress_prefix="Downloading test model",
+                )
+                second_path, second_temp = installer._download_to_temp(
+                    "https://example.invalid/model.bin",
+                    expected_sha,
+                    "model.bin",
+                    progress_prefix="Downloading test model",
+                )
+
+            self.assertEqual(payload, first_path.read_bytes())
+            self.assertEqual(payload, second_path.read_bytes())
+            self.assertEqual(1, urlopen.call_count)
+            self.assertTrue(list((Path(tmp) / "face_model_downloads").glob("*.verified.json")))
+            shutil.rmtree(first_temp)
+            shutil.rmtree(second_temp)
+
+    def test_face_model_download_cache_clear_is_scoped_and_reports_freed_bytes(self):
+        with TemporaryDirectory() as tmp:
+            cache_root = Path(tmp)
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=cache_root))
+            download_cache = installer.download_cache_dir()
+            first = download_cache / "archive.bin"
+            second = download_cache / "archive.bin.verified.json"
+            first.write_bytes(b"archive")
+            second.write_bytes(b"metadata")
+            installed = installer.bundle_dir("scrfd_500m_kps") / "detector.onnx"
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            installed.write_bytes(b"installed")
+
+            removed, freed_bytes, failures = installer.clear_download_cache()
+
+            self.assertEqual((), failures)
+            self.assertEqual(2, len(removed))
+            self.assertEqual(len(b"archive") + len(b"metadata"), freed_bytes)
+            self.assertEqual([], list(download_cache.iterdir()))
+            self.assertEqual(b"installed", installed.read_bytes())
+
+    def test_facenet_cache_readiness_rejects_zero_byte_checkpoint(self):
+        for relative_dir in (Path("torch/checkpoints"), Path("torch/hub/checkpoints")):
+            with self.subTest(relative_dir=relative_dir), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                service = ModelAssetService(
+                    settings=SimpleNamespace(cache_dir=root / "cache", base_dir=root),
+                    extra_roots=(),
+                )
+                checkpoint = root / "cache" / relative_dir / "20180402-114759-vggface2.pt"
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_bytes(b"")
+                self.assertFalse(service.local_cache_present("facenet"))
+                checkpoint.write_bytes(b"weights")
+                self.assertTrue(service.local_cache_present("facenet"))
+
+    def test_facenet_pytorch_checkpoint_is_reused_without_a_second_download(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(cache_dir=root / "cache", base_dir=root)
+            checkpoint = root / "cache" / "torch" / "checkpoints" / "20180402-114759-vggface2.pt"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"cached-facenet-weights")
+            service = ModelDownloadService(settings=settings)
+
+            with patch.object(
+                service,
+                "_load_and_verify",
+                side_effect=AssertionError("the existing facenet-pytorch checkpoint must be reused"),
+            ):
+                result = service.acquire([ModelDownloadItem("facenet")])
+
+            self.assertEqual((), result.downloaded)
+            self.assertEqual(("facenet:text=0",), result.reused)
+            self.assertEqual(len(b"cached-facenet-weights"), result.cache_bytes_before)
+            self.assertEqual(result.cache_bytes_before, result.cache_bytes_after)
+
+    def test_face_embedder_never_downloads_weights_implicitly(self):
+        fake_assets = SimpleNamespace(local_cache_present=lambda _name: False)
+        policy = ExecutionPolicy(
+            preferred_mode="cpu",
+            effective_mode="cpu",
+            torch_device="cpu",
+            onnx_provider="CPUExecutionProvider",
+        )
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False), patch.object(
+            face_search_module,
+            "get_settings",
+            return_value=SimpleNamespace(cache_dir=Path(tmp)),
+        ), patch.object(face_search_module, "ModelAssetService", return_value=fake_assets), patch.object(
+            face_search_module,
+            "InceptionResnetV1",
+        ) as inception:
+            service = face_search_module.FaceEmbeddingService(execution_policy=policy)
+            self.assertFalse(service.is_ready())
+            self.assertIn("Settings > Models", service.readiness_message())
+            with self.assertRaisesRegex(RuntimeError, "Settings > Models"):
+                service._get_model()
+            inception.assert_not_called()
 
     def test_face_model_installer_install_latest_gpu_and_sface(self):
         with TemporaryDirectory() as tmp:
@@ -2908,7 +3427,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(1, len(profiles))
             self.assertEqual(1, profiles[0].visible_face_count)
 
-    def test_runtime_policy_uses_directml_when_available_without_cuda(self):
+    def test_runtime_policy_ignores_directml_provider_and_uses_cpu_without_cuda(self):
         service = RuntimeCapabilityService()
         service._cached = RuntimeCapabilities(
             torch_version="2.2.2+cpu",
@@ -2920,9 +3439,31 @@ class ServiceTests(unittest.TestCase):
         )
         with patch.object(service, "_onnx_provider_usable", return_value=True):
             policy = service.select_policy("auto")
-        self.assertEqual("directml", policy.effective_mode)
+        self.assertEqual("cpu", policy.effective_mode)
         self.assertEqual("cpu", policy.torch_device)
-        self.assertEqual("DmlExecutionProvider", policy.onnx_provider)
+        self.assertEqual("CPUExecutionProvider", policy.onnx_provider)
+
+    def test_runtime_policy_cpu_request_does_not_probe_cuda_provider(self):
+        service = RuntimeCapabilityService()
+        service._cached = RuntimeCapabilities(
+            torch_version="2.2.2+cu121",
+            torch_cuda_build=True,
+            torch_cuda_available=True,
+            cuda_device_count=1,
+            cuda_device_name="Test GPU",
+            onnx_available=True,
+            onnx_version="1.24.4",
+            onnx_providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
+        )
+        with patch.object(
+            service,
+            "_onnx_provider_usable",
+            side_effect=AssertionError("CPU policy must not initialize CUDA"),
+        ):
+            policy = service.select_policy("cpu")
+
+        self.assertEqual("cpu", policy.effective_mode)
+        self.assertEqual("CPUExecutionProvider", policy.onnx_provider)
 
     def test_runtime_policy_uses_onnx_cuda_when_torch_cuda_is_unavailable(self):
         service = RuntimeCapabilityService()
@@ -2957,6 +3498,32 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("CPUExecutionProvider", policy.onnx_provider)
         self.assertFalse(policy.uses_onnx_cuda)
 
+    def test_gpu_policy_uses_torch_instead_of_cpu_onnx(self):
+        manager = object.__new__(ModelManager)
+        manager.execution_policy = ExecutionPolicy(
+            preferred_mode="cuda",
+            effective_mode="cuda",
+            torch_device="cuda",
+            onnx_provider="CPUExecutionProvider",
+        )
+        self.assertFalse(manager._should_attempt_onnx(True))
+
+        manager.execution_policy = ExecutionPolicy(
+            preferred_mode="cuda",
+            effective_mode="cuda",
+            torch_device="cpu",
+            onnx_provider="CUDAExecutionProvider",
+        )
+        self.assertTrue(manager._should_attempt_onnx(True))
+
+        manager.execution_policy = ExecutionPolicy(
+            preferred_mode="cpu",
+            effective_mode="cpu",
+            torch_device="cpu",
+            onnx_provider="CPUExecutionProvider",
+        )
+        self.assertTrue(manager._should_attempt_onnx(True))
+
     def test_runtime_policy_falls_back_to_cpu_when_cuda_requested_but_unavailable(self):
         service = RuntimeCapabilityService()
         service._cached = RuntimeCapabilities(
@@ -2971,8 +3538,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("cpu", policy.effective_mode)
         self.assertEqual("CPUExecutionProvider", policy.onnx_provider)
         self.assertIn("CUDA requested", policy.reason)
+        self.assertTrue(policy.cuda_required_unavailable)
+        self.assertIn("explicitly requested", policy.error)
 
-    def test_onnx_model_service_session_from_asset_falls_back_to_cpu(self):
+    def test_onnx_model_service_does_not_fall_back_when_cuda_is_explicit(self):
         calls: list[list[str]] = []
 
         class _FakeOrt:
@@ -2998,9 +3567,9 @@ class ServiceTests(unittest.TestCase):
                 "app.services.onnx_models.preload_onnx_cuda_runtime_libraries",
                 return_value=True,
             ):
-                session = service.session_from_asset("fast_preview", asset_path, "CUDAExecutionProvider")
-        self.assertEqual([["CUDAExecutionProvider", "CPUExecutionProvider"], ["CPUExecutionProvider"]], calls)
-        self.assertEqual(["CPUExecutionProvider"], session["providers"])
+                with self.assertRaisesRegex(RuntimeError, "CUDA was explicitly requested"):
+                    service.session_from_asset("fast_preview", asset_path, "CUDAExecutionProvider")
+        self.assertEqual([], calls)
 
     def test_face_onnx_session_creation_falls_back_to_cpu(self):
         calls: list[list[str]] = []
@@ -3016,6 +3585,24 @@ class ServiceTests(unittest.TestCase):
             session = face_search_module._create_onnx_session(Path("/tmp/model.onnx"), ["CUDAExecutionProvider", "CPUExecutionProvider"])
         self.assertEqual([["CUDAExecutionProvider", "CPUExecutionProvider"], ["CPUExecutionProvider"]], calls)
         self.assertEqual(["CPUExecutionProvider"], session["providers"])
+
+    def test_face_onnx_session_does_not_fall_back_when_cuda_is_explicit(self):
+        calls: list[list[str]] = []
+
+        class _FakeOrt:
+            def InferenceSession(self, path, providers):
+                _ = path
+                calls.append(list(providers))
+                raise RuntimeError("cuda init failed")
+
+        with patch.object(face_search_module, "ort", _FakeOrt()):
+            with self.assertRaisesRegex(RuntimeError, "cuda init failed"):
+                face_search_module._create_onnx_session(
+                    Path("/tmp/model.onnx"),
+                    ["CUDAExecutionProvider"],
+                    allow_cpu_fallback=False,
+                )
+        self.assertEqual([["CUDAExecutionProvider"]], calls)
 
     def test_label_indexed_faces_creates_pending_queue_before_acceptance(self):
         with TemporaryDirectory() as tmp:

@@ -5,12 +5,13 @@ import json
 from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QItemSelectionModel, QSize, Qt, pyqtSlot
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QSize, Qt, pyqtSlot
 from PyQt6.QtGui import QIcon, QImageReader, QKeyEvent, QKeySequence, QPixmap, QShortcut
-from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QLabel, QListView, QPushButton, QSplitter, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QLabel, QListView, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
 
-from app.services.face_search import EditableFaceInput, FaceIndexService, IndexedFaceRecord
+from app.services.face_types import EditableFaceInput
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from ui.error_mbox import confirmBox, errorBox
@@ -18,6 +19,9 @@ from ui.list_models import ListEntry, ListEntryModel
 from ui.zoomable_image import ZoomableImageView
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
+
+if TYPE_CHECKING:
+    from app.services.face_search import FaceIndexService, IndexedFaceRecord
 
 
 @dataclass(frozen=True)
@@ -164,8 +168,10 @@ class PhotoInspectorDialog(QDialog):
         self.face_editor_summary_label.setWordWrap(True)
         face_editor_layout.addWidget(self.face_editor_summary_label)
 
-        face_action_row = QHBoxLayout()
-        face_action_row.setContentsMargins(0, 0, 0, 0)
+        face_action_grid = QGridLayout()
+        face_action_grid.setContentsMargins(0, 0, 0, 0)
+        face_action_grid.setHorizontalSpacing(6)
+        face_action_grid.setVerticalSpacing(6)
         self.face_rescan_button = QPushButton("Auto-Scan This Image")
         self.face_draw_button = QPushButton("Draw Face Box")
         self.face_remove_button = QPushButton("Remove Selected Faces")
@@ -177,7 +183,7 @@ class PhotoInspectorDialog(QDialog):
         self.face_auto_clean_button = QPushButton("Auto-Clean This Image")
         self.face_reset_button = QPushButton("Reset")
         self.face_save_button = QPushButton("Save Face Edits")
-        for button in [
+        face_action_buttons = [
             self.face_rescan_button,
             self.face_draw_button,
             self.face_remove_button,
@@ -189,9 +195,11 @@ class PhotoInspectorDialog(QDialog):
             self.face_auto_clean_button,
             self.face_reset_button,
             self.face_save_button,
-        ]:
-            face_action_row.addWidget(button)
-        face_editor_layout.addLayout(face_action_row)
+        ]
+        for button_index, button in enumerate(face_action_buttons):
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            face_action_grid.addWidget(button, button_index // 2, button_index % 2)
+        face_editor_layout.addLayout(face_action_grid)
 
         self.face_editor_helper_label = QLabel(
             "Use Auto-Scan for this image only, or draw a box directly on the photo when a face was missed. "
@@ -229,6 +237,7 @@ class PhotoInspectorDialog(QDialog):
 
         self.info_text = QTextBrowser()
         self.info_text.setReadOnly(True)
+        self.info_text.installEventFilter(self)
         self.info_text.document().setDefaultStyleSheet(
             """
             h3 { margin: 8px 0 4px 0; }
@@ -1273,6 +1282,18 @@ class PhotoInspectorDialog(QDialog):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         return super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "info_text", None) and event.type() == QEvent.Type.KeyPress:
+            modifiers = event.modifiers()
+            if modifiers in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier):
+                if event.key() == Qt.Key.Key_Left:
+                    self._step(-1)
+                    return True
+                if event.key() == Qt.Key.Key_Right:
+                    self._step(1)
+                    return True
+        return super().eventFilter(watched, event)
 
     def _step(self, delta: int) -> None:
         if not self._image_paths:

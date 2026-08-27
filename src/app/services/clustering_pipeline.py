@@ -65,6 +65,8 @@ class ClusteringRequest:
     reuse_result_cache: bool
     use_embedding_cache_lookup: bool = True
     source_paths: list[str] | None = None
+    source_fingerprints: list[tuple[str, int, int]] | None = None
+    source_snapshot_key: str = ""
     performance_profile: str = "balanced"
     similarity_modes: list[str] | None = None
     generate_cluster_meanings: bool = False
@@ -138,10 +140,26 @@ class ClusteringPipelineService:
             if progress_callback:
                 progress_callback(-1, f"Preparing {len(request.source_paths)} selected image(s)...")
             image_paths = sorted({str(path) for path in request.source_paths if path})
-            fingerprints = self.discovery_service.collect_fingerprints(image_paths)
+            image_path_set = set(image_paths)
+            provided_fingerprints = {
+                str(path): (str(path), int(mtime_ns), int(size))
+                for path, mtime_ns, size in (request.source_fingerprints or [])
+                if str(path) in image_path_set
+            }
+            fingerprints = tuple(
+                provided_fingerprints[path]
+                for path in image_paths
+                if path in provided_fingerprints
+            )
+            if len(fingerprints) != len(image_paths):
+                fingerprints = self.discovery_service.collect_fingerprints(image_paths)
             discovery = DiscoveryResult(
                 paths=tuple(path for path, _mtime_ns, _size in fingerprints),
-                snapshot_key=self.embedding_index_service.build_snapshot_key_from_fingerprints(fingerprints),
+                snapshot_key=(
+                    str(request.source_snapshot_key)
+                    if request.source_snapshot_key and len(fingerprints) == len(image_paths)
+                    else self.embedding_index_service.build_snapshot_key_from_fingerprints(fingerprints)
+                ),
                 image_count=len(fingerprints),
                 fingerprints=fingerprints,
             )
@@ -153,6 +171,7 @@ class ClusteringPipelineService:
                 request.directory,
                 recursive=request.recursive,
                 progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
             image_paths = list(discovery.paths)
         discovery_time_s = round(time.perf_counter() - scan_start, 3)
@@ -223,13 +242,22 @@ class ClusteringPipelineService:
                 progress_callback(0, f"Embedding {model_name} ({model_index}/{len(models)})")
 
             embed_start = time.perf_counter()
+            embed_kwargs = {
+                "use_onnx": request.use_onnx,
+                "progress_callback": embedding_progress,
+                "use_cache_lookup": request.use_embedding_cache_lookup,
+                "path_fingerprints": path_fingerprint_map,
+            }
+            try:
+                embed_parameters = inspect.signature(self.embedding_service.embed_paths).parameters
+            except (TypeError, ValueError):
+                embed_parameters = {}
+            if "cancel_check" in embed_parameters:
+                embed_kwargs["cancel_check"] = cancel_check
             ordered_embeddings, embed_metrics = self.embedding_service.embed_paths(
                 image_paths,
                 model_name,
-                use_onnx=request.use_onnx,
-                progress_callback=embedding_progress,
-                use_cache_lookup=request.use_embedding_cache_lookup,
-                path_fingerprints=path_fingerprint_map,
+                **embed_kwargs,
             )
             embed_elapsed_s = round(time.perf_counter() - embed_start, 3)
             total_embedding_stage_s += embed_elapsed_s
@@ -263,6 +291,7 @@ class ClusteringPipelineService:
             oom_backoff_used = oom_backoff_used or bool(embed_metrics.get("oom_backoff"))
 
             paths_by_index = [image_path for image_path, _ in ordered_embeddings]
+            embedding_signature = self._embedding_signature(model_name, request.use_onnx)
             cache_plan: dict[str, dict[str, tuple[dict[int, list[str]], dict[str, object]]]] = {}
             any_backend_compute = False
             for similarity_mode in similarity_modes:
@@ -277,6 +306,7 @@ class ClusteringPipelineService:
                         num_clusters=request.num_clusters,
                         outlier_policy=request.outlier_policy,
                         use_onnx=request.use_onnx,
+                        embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
                     )
                     if request.reuse_result_cache:
@@ -290,7 +320,21 @@ class ClusteringPipelineService:
 
             if any_backend_compute:
                 persist_start = time.perf_counter()
-                index_paths, index_reused = self.embedding_index_service.ensure_index(snapshot_key, model_name, ordered_embeddings)
+                ensure_index_kwargs: dict[str, object] = {}
+                try:
+                    ensure_index_parameters = inspect.signature(
+                        self.embedding_index_service.ensure_index
+                    ).parameters
+                except (TypeError, ValueError):
+                    ensure_index_parameters = {}
+                if "embedding_signature" in ensure_index_parameters:
+                    ensure_index_kwargs["embedding_signature"] = embedding_signature
+                index_paths, index_reused = self.embedding_index_service.ensure_index(
+                    snapshot_key,
+                    model_name,
+                    ordered_embeddings,
+                    **ensure_index_kwargs,
+                )
                 index_persist_time_s = round(time.perf_counter() - persist_start, 3)
                 total_index_persist_s += index_persist_time_s
                 index_reuse_flags[model_name] = index_reused
@@ -356,6 +400,7 @@ class ClusteringPipelineService:
                         num_clusters=request.num_clusters,
                         outlier_policy=request.outlier_policy,
                         use_onnx=request.use_onnx,
+                        embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
                     )
                     self.result_cache_service.save(result_key, clustered_images, backend_metrics)
@@ -495,15 +540,35 @@ class ClusteringPipelineService:
         LOGGER.info("Run metrics: %s", metrics)
         return result, metrics
 
-    def _discover_result(self, directory: str, *, recursive: bool, progress_callback=None) -> DiscoveryResult:
+    def _discover_result(
+        self,
+        directory: str,
+        *,
+        recursive: bool,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> DiscoveryResult:
         discover_result = self.discovery_service.discover_result
         try:
             parameters = inspect.signature(discover_result).parameters
         except (TypeError, ValueError):
             parameters = {}
+        kwargs = {"recursive": recursive}
         if "progress_callback" in parameters:
-            return discover_result(directory, recursive=recursive, progress_callback=progress_callback)
-        return discover_result(directory, recursive=recursive)
+            kwargs["progress_callback"] = progress_callback
+        if "cancel_check" in parameters:
+            kwargs["cancel_check"] = cancel_check
+        return discover_result(directory, **kwargs)
+
+    def _embedding_signature(self, model_name: str, use_onnx: bool) -> str:
+        manager = getattr(self.embedding_service, "model_manager", None)
+        signature_fn = getattr(manager, "static_signature", None)
+        if not callable(signature_fn):
+            return ""
+        try:
+            return str(signature_fn(model_name, use_onnx) or "")
+        except Exception:
+            return ""
 
     def _try_result_cache_only(
         self,
@@ -524,6 +589,7 @@ class ClusteringPipelineService:
 
         cached_items: list[tuple[str, str, str, str, dict[int, list[str]], dict[str, object]]] = []
         for model_name in models:
+            embedding_signature = self._embedding_signature(model_name, request.use_onnx)
             for similarity_mode in similarity_modes:
                 for backend in backends:
                     result_key = self.result_cache_service.build_result_key(
@@ -534,6 +600,7 @@ class ClusteringPipelineService:
                         num_clusters=request.num_clusters,
                         outlier_policy=request.outlier_policy,
                         use_onnx=request.use_onnx,
+                        embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
                     )
                     cached = self.result_cache_service.load(result_key)

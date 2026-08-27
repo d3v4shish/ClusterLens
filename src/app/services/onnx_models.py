@@ -69,7 +69,11 @@ class OnnxModelService:
                 return None
 
         try:
-            self._sessions[cache_key] = self._create_session_with_fallback(onnx_path, selected_provider)
+            self._sessions[cache_key] = self._create_session_with_fallback(
+                onnx_path,
+                selected_provider,
+                allow_cpu_fallback=self.execution_policy.preferred_mode == "auto",
+            )
         except Exception:
             return None
         return self._sessions[cache_key]
@@ -82,7 +86,11 @@ class OnnxModelService:
         if cache_key in self._sessions:
             return self._sessions[cache_key]
         try:
-            self._sessions[cache_key] = self._create_session_with_fallback(onnx_path, selected_provider)
+            self._sessions[cache_key] = self._create_session_with_fallback(
+                onnx_path,
+                selected_provider,
+                allow_cpu_fallback=self.execution_policy.preferred_mode == "auto",
+            )
         except Exception:
             return None
         return self._sessions[cache_key]
@@ -93,18 +101,31 @@ class OnnxModelService:
         return torch.from_numpy(np.asarray(outputs[0]))
 
     def _select_provider(self, preferred_provider: str | None = None) -> str:
-        providers = set(self.available_providers())
+        capabilities = self.runtime_service.detect()
+        providers = set(capabilities.onnx_providers)
         preferred = str(preferred_provider or self.execution_policy.onnx_provider or "CPUExecutionProvider")
+        if self.execution_policy.preferred_mode == "cuda" and preferred != "CUDAExecutionProvider":
+            raise RuntimeError(
+                self.execution_policy.error
+                or "CUDA was explicitly requested, but the ONNX CUDA provider is unavailable."
+            )
+        if preferred == "CUDAExecutionProvider":
+            verified_policy = self.runtime_service.select_policy(self.execution_policy.preferred_mode)
+            if verified_policy.onnx_provider != "CUDAExecutionProvider":
+                if self.execution_policy.preferred_mode == "cuda":
+                    raise RuntimeError(
+                        verified_policy.error
+                        or "CUDA was explicitly requested, but the ONNX CUDA provider failed verification."
+                    )
+                return "CPUExecutionProvider"
         if preferred in providers:
             return preferred
         if self.execution_policy.uses_cuda and "CUDAExecutionProvider" in providers:
             return "CUDAExecutionProvider"
-        if self.execution_policy.uses_directml and "DmlExecutionProvider" in providers:
-            return "DmlExecutionProvider"
         return "CPUExecutionProvider"
 
     @staticmethod
-    def _create_session_with_fallback(onnx_path: Path, provider: str):
+    def _create_session_with_fallback(onnx_path: Path, provider: str, *, allow_cpu_fallback: bool = True):
         selected = str(provider or "CPUExecutionProvider")
         ordered = [selected, "CPUExecutionProvider"] if selected != "CPUExecutionProvider" else ["CPUExecutionProvider"]
         if selected == "CUDAExecutionProvider":
@@ -112,7 +133,7 @@ class OnnxModelService:
         try:
             return ort.InferenceSession(str(onnx_path), providers=ordered)
         except Exception:
-            if selected == "CPUExecutionProvider":
+            if selected == "CPUExecutionProvider" or not allow_cpu_fallback:
                 raise
             return ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 

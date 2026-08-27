@@ -7,6 +7,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image
 
+from app.path_scope import folder_scope_sql, path_is_within_scope
 from infra.cancel import raise_if_cancelled
 from infra.settings import get_settings
 
@@ -167,14 +168,13 @@ class PerceptualHashIndexService:
         updated = self.ensure_index(image_paths, cancel_check=cancel_check)
         removed = 0
         if prune_missing:
-            prefix = str(Path(directory))
-            like = f"{prefix}%"
+            scope_clause, scope_args = folder_scope_sql("image_path", str(Path(directory)))
             with self._connect() as connection:
                 rows = connection.execute(
-                    "SELECT image_path FROM phash_index WHERE image_path LIKE ?",
-                    (like,),
+                    f"SELECT image_path FROM phash_index WHERE {scope_clause}",
+                    scope_args,
                 ).fetchall()
-            existing = {row[0] for row in rows}
+            existing = {row[0] for row in rows if path_is_within_scope(str(row[0]), directory)}
             current = {str(Path(p)) for p in image_paths if p}
             to_remove = sorted(existing - current)
             if to_remove:

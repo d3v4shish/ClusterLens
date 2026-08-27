@@ -30,6 +30,7 @@ from app.services.image_tags import ClusterTagSummary
 from app.services.thumbnails import ThumbnailService
 from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from .common import build_help_inline
+from .theme import COLORS
 
 
 CLUSTER_PANE_HELP = {
@@ -447,15 +448,15 @@ class ClusterHoverPreviewPopup(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("clusterHoverPreviewPopup")
         self.setStyleSheet(
-            """
-            QFrame#clusterHoverPreviewPopup {
-                background: #FBFCFE;
-                border: 1px solid #CBD5E1;
+            f"""
+            QFrame#clusterHoverPreviewPopup {{
+                background: {COLORS["surface_raised"]};
+                border: 1px solid {COLORS["border_strong"]};
                 border-radius: 8px;
-            }
-            QLabel {
-                color: #0F172A;
-            }
+            }}
+            QLabel {{
+                color: {COLORS["text"]};
+            }}
             """
         )
         layout = QVBoxLayout(self)
@@ -473,7 +474,9 @@ class ClusterHoverPreviewPopup(QFrame):
         self.image_label = QLabel("Loading preview...")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setFixedSize(HOVER_PREVIEW_IMAGE_SIZE)
-        self.image_label.setStyleSheet("background: #E2E8F0; border: 1px solid #CBD5E1;")
+        self.image_label.setStyleSheet(
+            f'background: {COLORS["surface_sunken"]}; border: 1px solid {COLORS["border"]};'
+        )
         layout.addWidget(self.image_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.summary_label = QLabel("")
@@ -483,7 +486,7 @@ class ClusterHoverPreviewPopup(QFrame):
 
         self.note_label = QLabel("")
         self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("color: #475569;")
+        self.note_label.setStyleSheet(f'color: {COLORS["text_muted"]};')
         layout.addWidget(self.note_label)
 
         self.setFixedWidth(320)
@@ -565,12 +568,12 @@ class ClusterShapeWidget(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect().adjusted(1, 1, -2, -2)
-        painter.fillRect(rect, QColor("#F8FAFC"))
-        painter.setPen(QPen(QColor("#CBD5E1"), 1))
+        painter.fillRect(rect, QColor(COLORS["surface_raised"]))
+        painter.setPen(QPen(QColor(COLORS["border"]), 1))
         painter.drawRoundedRect(rect, 6, 6)
 
         text_rect = QRect(rect.left() + 10, rect.top() + 8, rect.width() - 20, 18)
-        painter.setPen(QColor("#0F172A"))
+        painter.setPen(QColor(COLORS["text"]))
         title_font = QFont(self.font())
         title_font.setBold(True)
         painter.setFont(title_font)
@@ -578,17 +581,17 @@ class ClusterShapeWidget(QFrame):
 
         detail_rect = QRect(rect.left() + 10, rect.top() + 28, rect.width() - 20, 18)
         painter.setFont(self.font())
-        painter.setPen(QColor("#475569"))
+        painter.setPen(QColor(COLORS["text_muted"]))
         painter.drawText(detail_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._details)
 
         chart_rect = QRect(rect.left() + 10, rect.top() + 52, rect.width() - 20, max(34, rect.height() - 64))
         if not self._scores:
-            painter.setPen(QColor("#64748B"))
+            painter.setPen(QColor(COLORS["text_muted"]))
             painter.drawText(chart_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._details or CLUSTER_SHAPE_EMPTY_TEXT)
             painter.end()
             return
 
-        painter.setPen(QPen(QColor("#CBD5E1"), 1))
+        painter.setPen(QPen(QColor(COLORS["border"]), 1))
         baseline_y = chart_rect.bottom() - 2
         painter.drawLine(chart_rect.left(), baseline_y, chart_rect.right(), baseline_y)
 
@@ -600,7 +603,13 @@ class ClusterShapeWidget(QFrame):
             bar_height = max(2, int((chart_rect.height() - 6) * height_ratio))
             x = chart_rect.left() + index * (bar_width + gap)
             y = baseline_y - bar_height
-            color = QColor("#16A34A") if score >= 0.80 else QColor("#D97706") if score >= 0.60 else QColor("#DC2626")
+            color = (
+                QColor(COLORS["success"])
+                if score >= 0.80
+                else QColor(COLORS["warning"])
+                if score >= 0.60
+                else QColor(COLORS["danger"])
+            )
             painter.fillRect(QRect(x, y, bar_width, bar_height), color)
 
         painter.end()

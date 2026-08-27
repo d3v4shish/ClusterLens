@@ -1,0 +1,1 @@
+This file keeps the physical facenet_pytorch/models directory in PyInstaller builds.

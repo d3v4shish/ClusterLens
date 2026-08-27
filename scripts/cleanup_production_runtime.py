@@ -133,7 +133,7 @@ def resolve_runtime_root(runtime_root_arg: str | None) -> Path:
     if runtime_root_arg:
         return Path(runtime_root_arg).expanduser().absolute()
 
-    env_root = os.environ.get("IMAGE_CLUSTERING_APP_DIR")
+    env_root = os.environ.get("CLUSTERLENS_RUNTIME_ROOT") or os.environ.get("IMAGE_CLUSTERING_APP_DIR")
     if env_root:
         return Path(env_root).expanduser().absolute()
 
@@ -213,8 +213,20 @@ def build_cleanup_plan(runtime_root: Path, args: argparse.Namespace) -> CleanupP
 
     add_target(cache_dir / "huggingface" / ".locks", "Hugging Face download locks", targets, skipped_symlinks)
 
+    if args.logs:
+        protected_logs = {
+            "file_operations.jsonl",
+            "file_operations.sqlite3",
+            "file_operations.sqlite3-shm",
+            "file_operations.sqlite3-wal",
+        }
+        logs_dir = runtime_root / "logs"
+        for path in tuple(logs_dir.iterdir()) if logs_dir.exists() else ():
+            if path.name in protected_logs:
+                continue
+            add_target(path, "runtime logs", targets, skipped_symlinks)
+
     optional_dirs = (
-        ("logs", args.logs, "runtime logs"),
         ("crash", args.crash, "crash records"),
         ("support", args.support, "support bundles"),
         ("benchmarks", args.benchmarks, "benchmark output"),

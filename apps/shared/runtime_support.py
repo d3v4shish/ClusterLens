@@ -14,6 +14,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+CLUSTERLENS_RUNTIME_ROOT_ENV = "CLUSTERLENS_RUNTIME_ROOT"
+LEGACY_RUNTIME_ROOT_ENV = "IMAGE_CLUSTERING_APP_DIR"
+
+
+def runtime_root_override() -> str:
+    return str(
+        os.environ.get(CLUSTERLENS_RUNTIME_ROOT_ENV)
+        or os.environ.get(LEGACY_RUNTIME_ROOT_ENV)
+        or ""
+    ).strip()
+
+
 @dataclass(frozen=True)
 class RuntimeLayout:
     app_name: str
@@ -32,7 +44,7 @@ class RuntimeLayout:
 
 def candidate_runtime_roots(app_name: str) -> list[Path]:
     roots: list[Path] = []
-    override = os.environ.get("IMAGE_CLUSTERING_APP_DIR")
+    override = runtime_root_override()
     if override:
         roots.append(Path(override))
     roots.extend(_platform_runtime_roots(app_name))
@@ -99,6 +111,7 @@ def resolve_runtime_root(app_name: str) -> Path:
 def activate_runtime_root(app_name: str, *, legacy_app_names: tuple[str, ...] = ()) -> RuntimeLayout:
     root = resolve_runtime_root(app_name)
     migrate_legacy_runtime_roots(root, legacy_runtime_roots(legacy_app_names))
+    os.environ[CLUSTERLENS_RUNTIME_ROOT_ENV] = str(root)
     os.environ["IMAGE_CLUSTERING_APP_DIR"] = str(root)
     logs_dir = root / "logs"
     cache_dir = root / "cache"

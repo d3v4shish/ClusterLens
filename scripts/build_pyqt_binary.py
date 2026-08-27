@@ -14,6 +14,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLED_MODEL_ASSETS = ("fast_preview", "resnet", "convnext")
 DEFAULT_MODEL_ASSET_OUTPUT_DIR = REPO_ROOT / "build" / "model_assets"
+REQUIRED_FACENET_DETECTOR_ASSETS = ("pnet.pt", "rnet.pt", "onet.pt")
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,7 @@ BUILD_VARIANTS = {
     "cpu": BuildVariant(
         name="cpu",
         requirements=REPO_ROOT / "packaging" / "requirements-build-cpu.txt",
-        default_package_mode="onefile",
+        default_package_mode="onedir",
         description="CPU-only Torch runtime. This is the default public build.",
     ),
     "gpu-cu121": BuildVariant(
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         "--package-mode",
         choices=["auto", "onefile", "onedir"],
         default="auto",
-        help="auto uses onefile for CPU and onedir for GPU.",
+        help="auto uses one-folder PyInstaller output for every production variant.",
     )
     parser.add_argument("--recreate-venv", action="store_true", help="Delete and recreate the variant build venv.")
     parser.add_argument("--skip-install", action="store_true", help="Reuse the existing variant build venv as-is.")
@@ -136,6 +137,12 @@ def build_variant(
         str(REPO_ROOT / "packaging" / "pyqt_production.spec"),
     ]
     run(command, env=env, dry_run=dry_run)
+    verify_packaged_runtime_assets(
+        dist_dir,
+        package_mode=package_mode,
+        executable_name="ClusterLens",
+        dry_run=dry_run,
+    )
     return 0
 
 
@@ -156,6 +163,26 @@ print(f"torch={torch.__version__}")
 if sys.argv[1] == "cpu" and bad_cuda:
     print("CPU build environment contains CUDA packages: " + ", ".join(bad_cuda), file=sys.stderr)
     raise SystemExit(3)
+if sys.argv[1] == "gpu-cu121":
+    if not getattr(torch.version, "cuda", None):
+        print("GPU build environment contains a CPU-only Torch wheel.", file=sys.stderr)
+        raise SystemExit(4)
+    try:
+        import torchvision
+    except Exception as exc:
+        print(f"Unable to import CUDA torchvision: {exc}", file=sys.stderr)
+        raise SystemExit(5)
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        print(f"Unable to import GPU ONNX Runtime: {exc}", file=sys.stderr)
+        raise SystemExit(6)
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        print("GPU build environment does not advertise CUDAExecutionProvider.", file=sys.stderr)
+        raise SystemExit(7)
+    print(f"torch_cuda_build={torch.version.cuda}")
+    print(f"torchvision={torchvision.__version__}")
+    print(f"onnxruntime={ort.__version__} providers={ort.get_available_providers()}")
 """
     run([str(python), "-c", script, variant.name], dry_run=dry_run)
 
@@ -174,6 +201,46 @@ def prepare_bundled_model_assets(python: Path, *, output_dir: Path, dry_run: boo
         ],
         dry_run=dry_run,
     )
+
+
+def verify_packaged_runtime_assets(
+    dist_dir: Path,
+    *,
+    package_mode: str,
+    executable_name: str,
+    dry_run: bool,
+) -> None:
+    if dry_run or package_mode != "onedir":
+        return
+    package_dir = Path(dist_dir) / executable_name / "_internal" / "facenet_pytorch"
+    detector_data_dir = package_dir / "data"
+    missing = [name for name in REQUIRED_FACENET_DETECTOR_ASSETS if not (detector_data_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Packaged facenet-pytorch detector assets are missing: "
+            + ", ".join(missing)
+        )
+    models_dir = package_dir / "models"
+    if not models_dir.is_dir():
+        raise RuntimeError(
+            "Packaged facenet-pytorch models directory is missing; "
+            "runtime models/../data weight paths cannot be traversed."
+        )
+    unreadable = []
+    for name in REQUIRED_FACENET_DETECTOR_ASSETS:
+        runtime_path = models_dir / ".." / "data" / name
+        try:
+            with runtime_path.open("rb") as handle:
+                if not handle.read(1):
+                    unreadable.append(name)
+        except OSError:
+            unreadable.append(name)
+    if unreadable:
+        raise RuntimeError(
+            "Packaged facenet-pytorch detector assets cannot be opened through the runtime models/../data path: "
+            + ", ".join(unreadable)
+        )
+    print(f"Verified facenet-pytorch detector assets: {', '.join(REQUIRED_FACENET_DETECTOR_ASSETS)}")
 
 
 def platform_target() -> str:

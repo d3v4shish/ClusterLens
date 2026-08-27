@@ -4,22 +4,25 @@ from collections.abc import Callable
 from collections import deque
 import json
 from pathlib import Path
-import subprocess
 import sys
 
-from PyQt6.QtCore import QSettings, Qt, pyqtSlot
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QHeaderView,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -29,16 +32,118 @@ from PyQt6.QtWidgets import (
 
 from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary
 from app.services.clustering_options import clustering_model_names, model_label
-from app.services.gallery_actions import GalleryActionService
-from app.services.model_assets import BUNDLED_ONNX_INPUT_SIZES, ModelAssetService
-from apps.pyqt_production.ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
-from apps.pyqt_production.ui.error_mbox import confirmBox, errorBox, infoBox
+from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
+from app.services.face_model_installer import FaceModelInstaller
+from app.services.model_assets import TEXT_MODEL_ORDER, ModelAssetService
+from app.services.model_downloads import ModelDownloadItem
+from apps.pyqt_production.model_download_controller import ModelDownloadController
+from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
+from ui.error_mbox import confirmBox, errorBox, infoBox
+from ui.icons import apply_icon
+from ui.job_manager import JobManager
 from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME
 from apps.shared.runtime_support import RuntimeLayout, open_path_in_shell
 from apps.shared.support_bundle import export_support_bundle
 from infra.performance import detect_system_resources, select_performance_profile
 from infra.runtime import RuntimeCapabilityService, available_execution_modes
-from infra.settings import get_settings
+from infra.settings import get_production_settings_registry, get_settings
+
+
+class OperationJournalTableModel(QAbstractTableModel):
+    HEADERS = ("Date", "Action", "Files", "Results", "Recovery", "Destination")
+
+    def __init__(self, parent=None, *, page_size: int = 50) -> None:
+        super().__init__(parent)
+        self._entries: list[dict[str, object]] = []
+        self.page_size = max(1, int(page_size))
+        self._visible_count = 0
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else self._visible_count
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid():
+            return None
+        entry = self.entry_at(index.row())
+        if entry is None:
+            return None
+        values = (
+            str(entry.get("timestamp_utc") or ""),
+            self._operation_label(str(entry.get("operation") or "")),
+            str(entry.get("requested_count") or 0),
+            f"{max(0, int(entry.get('requested_count') or 0) - int(entry.get('failure_count') or 0))} succeeded, {int(entry.get('failure_count') or 0)} failed",
+            str(entry.get("recovery_status") or ("cancelled" if entry.get("cancelled") else "complete")),
+            str(entry.get("destination") or "—"),
+        )
+        if self._role_is(role, Qt.ItemDataRole.DisplayRole) or self._role_is(role, Qt.ItemDataRole.EditRole):
+            return values[index.column()]
+        if self._role_is(role, Qt.ItemDataRole.ToolTipRole):
+            if index.column() in {3, 4, 5}:
+                return json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            return values[index.column()]
+        if self._role_is(role, Qt.ItemDataRole.UserRole):
+            return entry
+        return None
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if orientation == Qt.Orientation.Horizontal and self._role_is(role, Qt.ItemDataRole.DisplayRole):
+            if 0 <= section < len(self.HEADERS):
+                return self.HEADERS[section]
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def set_entries(self, entries: list[dict[str, object]]) -> None:
+        self.beginResetModel()
+        self._entries = list(entries)
+        self._visible_count = min(self.page_size, len(self._entries))
+        self.endResetModel()
+
+    def canFetchMore(self, parent: QModelIndex = QModelIndex()) -> bool:
+        return not parent.isValid() and self._visible_count < len(self._entries)
+
+    def fetchMore(self, parent: QModelIndex = QModelIndex()) -> None:
+        if parent.isValid() or not self.canFetchMore(parent):
+            return
+        start = self._visible_count
+        end = min(start + self.page_size, len(self._entries))
+        self.beginInsertRows(QModelIndex(), start, end - 1)
+        self._visible_count = end
+        self.endInsertRows()
+
+    def entry_at(self, row: int) -> dict[str, object] | None:
+        if 0 <= row < self._visible_count:
+            return self._entries[row]
+        return None
+
+    @staticmethod
+    def _operation_label(operation: str) -> str:
+        return {
+            "delete_to_trash": "Moved to ClusterLens Trash",
+            "move": "Moved photos",
+            "copy": "Copied photos",
+            "restore": "Restored photos",
+            "write_exif_comment": "Updated photo metadata",
+            "write_exif_metadata": "Updated photo metadata",
+        }.get(str(operation), str(operation).replace("_", " ").strip().capitalize() or "File operation")
+
+    @staticmethod
+    def _role_is(role: object, target: object) -> bool:
+        if role == target:
+            return True
+        target_value = getattr(target, "value", target)
+        return role == target_value
 
 
 class ProductionSettingsDialog(QDialog):
@@ -52,10 +157,13 @@ class ProductionSettingsDialog(QDialog):
         can_clear_rebuildable_caches: Callable[[], bool] | None = None,
         runtime_layout: RuntimeLayout,
         support_metadata_provider,
+        model_download_controller: ModelDownloadController | None = None,
+        job_manager: JobManager | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.app_settings = get_settings()
+        self.settings_registry = get_production_settings_registry()
         self.settings_store = settings_store
         self.runtime_service = runtime_service
         self.describe_rebuildable_caches = describe_rebuildable_caches
@@ -63,7 +171,11 @@ class ProductionSettingsDialog(QDialog):
         self.can_clear_rebuildable_caches = can_clear_rebuildable_caches or (lambda: True)
         self.runtime_layout = runtime_layout
         self.support_metadata_provider = support_metadata_provider
+        self._owns_model_download_controller = model_download_controller is None
+        self.model_download_controller = model_download_controller or ModelDownloadController(runtime_layout, self)
+        self.job_manager = job_manager
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
+        self.face_model_installer = FaceModelInstaller(self.app_settings)
         self.system_resources = detect_system_resources()
         self._verify_job = None
         self._verify_thread = None
@@ -73,21 +185,40 @@ class ProductionSettingsDialog(QDialog):
         self._cache_clear_thread = None
         self._model_job = None
         self._model_thread = None
+        self._active_model_download_name: str | None = None
+        self._model_inventory_job = None
+        self._model_inventory_thread = None
+        self._face_model_job = None
+        self._face_model_thread = None
+        self._face_model_inventory_changed = False
         self._journal_restore_job = None
         self._journal_restore_thread = None
-        self._release_gate_job = None
-        self._release_gate_thread = None
+        self._journal_refresh_job = None
+        self._journal_refresh_thread = None
         self._thread_roles: dict[object, tuple[str, object | None]] = {}
+        self._settings_job_ids: dict[object, int] = {}
         self._last_verify: dict[str, object] | None = None
         self.gallery_action_service = GalleryActionService()
 
         self.setWindowTitle(f"{PRODUCTION_DISPLAY_NAME} Settings")
-        self.resize(900, 640)
+        target_width, target_height = 900, 720
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target_width = min(target_width, max(640, available.width() - 48))
+            target_height = min(target_height, max(480, available.height() - 48))
+        self.resize(target_width, target_height)
         self._build_ui()
+        self.model_download_controller.progress.connect(self._on_model_download_progress)
+        self.model_download_controller.completed.connect(self._on_model_download_completed)
+        self.model_download_controller.failed.connect(self._on_model_download_failed)
+        self.model_download_controller.cancelled.connect(self._on_model_download_cancelled)
+        self.model_download_controller.running_changed.connect(self._on_model_download_running_changed)
         self._load_values()
         self.refresh_runtime_diagnostics()
         self.refresh_cache_usage()
         self.refresh_model_inventory()
+        self._refresh_face_model_inventory()
         self.refresh_operation_journal()
         self.refresh_log_viewer()
 
@@ -95,71 +226,109 @@ class ProductionSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
         layout.addWidget(self.tabs)
+        self._build_general_tab()
         self._build_runtime_tab()
         self._build_models_tab()
         self._build_storage_tab()
         self._build_safety_tab()
+        self._build_updates_tab()
         self._build_diagnostics_tab()
-        self._build_about_tab()
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=self)
+        self.cancel_settings_tasks_button = buttons.addButton(
+            "Cancel Active Tasks",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.cancel_settings_tasks_button.setToolTip(
+            "Cancel active scans, verification, cache maintenance, model maintenance, and model downloads."
+        )
+        self.cancel_settings_tasks_button.clicked.connect(self._cancel_active_settings_tasks)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._update_settings_cancel_state()
+
+    def _build_general_tab(self) -> None:
+        tab = QWidget(self)
+        form = QFormLayout(tab)
+        self.thumbnail_size = QSpinBox()
+        self.thumbnail_size.setRange(96, 512)
+        self.runtime_badge = QCheckBox("Show runtime status in the application header")
+        self.dense_ui = QCheckBox("Use compact spacing")
+        form.addRow("Photo thumbnail size", self.thumbnail_size)
+        form.addRow(self.runtime_badge)
+        form.addRow(self.dense_ui)
+        note = QLabel("Common appearance and workspace preferences apply after you choose OK.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.tabs.addTab(tab, "General")
 
     def _build_runtime_tab(self) -> None:
         tab = QWidget(self)
         form = QFormLayout(tab)
         self.execution_mode = QComboBox()
-        self.execution_mode.addItems(list(available_execution_modes()))
+        for mode in available_execution_modes():
+            self.execution_mode.addItem(str(mode).upper() if mode != "auto" else "Auto (prefer CUDA)", mode)
+        self.precision_mode = QComboBox()
+        self.precision_mode.addItem("Automatic", "auto")
+        self.precision_mode.addItem("Full precision (FP32)", "fp32")
+        self.precision_mode.addItem("Mixed precision (FP16 with fallback)", "fp16")
         self.performance_profile = QComboBox()
-        self.performance_profile.addItems(["low_memory", "balanced", "max_speed"])
+        self.performance_profile.addItem("Low memory", "low_memory")
+        self.performance_profile.addItem("Balanced", "balanced")
+        self.performance_profile.addItem("Maximum speed", "max_speed")
         self.performance_profile.setToolTip(
-            "low_memory limits worker counts and caches; balanced is the default; max_speed uses larger caches, unbounded backend parallelism, and faster KMeans on larger folders."
+            "Choose a validated balance of throughput and memory use. Advanced values remain available below."
         )
-        self.thumbnail_size = QSpinBox()
-        self.thumbnail_size.setRange(96, 512)
         self.thumbnail_workers = QSpinBox()
         self.thumbnail_workers.setRange(1, max(8, self.system_resources.logical_cpu_count))
         self.thumbnail_workers.setEnabled(False)
         self.prefetch_rows = QSpinBox()
         self.prefetch_rows.setRange(0, max(16, self.system_resources.logical_cpu_count * 2))
         self.prefetch_rows.setEnabled(False)
+        self.batch_size_cpu = QSpinBox()
+        self.batch_size_cpu.setRange(1, 512)
+        self.batch_size_gpu = QSpinBox()
+        self.batch_size_gpu.setRange(1, 1024)
+        self.decode_workers = QSpinBox()
+        self.decode_workers.setRange(1, max(8, self.system_resources.logical_cpu_count * 2))
+        self.vram_headroom_mb = QSpinBox()
+        self.vram_headroom_mb.setRange(256, 65536)
+        self.vram_headroom_mb.setSingleStep(256)
+        self.vram_headroom_mb.setSuffix(" MB")
         self.gpu_warmup = QCheckBox("Warm selected embedding model after folder change")
         self.keep_worker_warm = QCheckBox("Keep clustering worker warm between runs")
         self.keep_worker_warm.setToolTip(
             "Keeps Python, Torch, and loaded models alive after a run. Faster repeated runs, but uses more RAM/VRAM while idle."
         )
-        self.runtime_badge = QCheckBox("Show runtime badge in toolbar")
-        self.dense_ui = QCheckBox("Use dense desktop spacing")
+        form.addRow("Compute device", self.execution_mode)
+        form.addRow("Performance preset", self.performance_profile)
+        note = QLabel(
+            "Auto prefers a compatible NVIDIA CUDA device and visibly falls back to CPU. "
+            "Choosing CUDA explicitly never falls back silently."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
 
-        form.addRow("Preferred execution mode", self.execution_mode)
-        form.addRow("Performance profile", self.performance_profile)
-        form.addRow("Thumbnail size", self.thumbnail_size)
-        form.addRow("Thumbnail workers", self.thumbnail_workers)
-        form.addRow("Thumbnail prefetch rows", self.prefetch_rows)
-        form.addRow(self.gpu_warmup)
-        form.addRow(self.keep_worker_warm)
-        form.addRow(self.runtime_badge)
-        form.addRow(self.dense_ui)
+        self.advanced_performance_group = QGroupBox("Advanced performance", tab)
+        self.advanced_performance_group.setCheckable(True)
+        self.advanced_performance_group.setChecked(False)
+        advanced_form = QFormLayout(self.advanced_performance_group)
+        advanced_form.addRow("Precision", self.precision_mode)
+        advanced_form.addRow("CPU batch size", self.batch_size_cpu)
+        advanced_form.addRow("CUDA batch size", self.batch_size_gpu)
+        advanced_form.addRow("Decode workers", self.decode_workers)
+        advanced_form.addRow("CUDA memory reserve", self.vram_headroom_mb)
+        advanced_form.addRow("Thumbnail workers", self.thumbnail_workers)
+        advanced_form.addRow("Thumbnail prefetch rows", self.prefetch_rows)
+        advanced_form.addRow(self.gpu_warmup)
+        advanced_form.addRow(self.keep_worker_warm)
+        form.addRow(self.advanced_performance_group)
+        self.tabs.addTab(tab, "Performance")
 
-        actions = QHBoxLayout()
-        self.refresh_runtime_button = QPushButton("Refresh Diagnostics")
-        self.verify_runtime_button = QPushButton("Run Runtime Verify")
-        actions.addWidget(self.refresh_runtime_button)
-        actions.addWidget(self.verify_runtime_button)
-        form.addRow(actions)
-
-        self.runtime_text = QTextEdit()
-        self.runtime_text.setReadOnly(True)
-        form.addRow(QLabel("Runtime diagnostics"), self.runtime_text)
-        self.tabs.addTab(tab, "Runtime")
-
-        self.refresh_runtime_button.clicked.connect(self.refresh_runtime_diagnostics)
-        self.verify_runtime_button.clicked.connect(self._verify_gpu)
-        self.performance_profile.currentIndexChanged.connect(self._apply_profile_preview)
-        self.execution_mode.currentIndexChanged.connect(self.refresh_runtime_diagnostics)
-        self.keep_worker_warm.toggled.connect(self.refresh_runtime_diagnostics)
+        self.performance_profile.currentIndexChanged.connect(
+            lambda _index: self._apply_profile_preview(update_tuning=True)
+        )
 
     def _build_models_tab(self) -> None:
         tab = QWidget(self)
@@ -182,20 +351,22 @@ class ProductionSettingsDialog(QDialog):
         self.model_inventory_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.model_inventory_table, stretch=1)
 
-        actions = QHBoxLayout()
+        actions = QGridLayout()
         self.refresh_models_button = QPushButton("Refresh Models")
         self.install_model_button = QPushButton("Download / Install Selected")
+        self.cancel_model_download_button = QPushButton("Cancel Download")
         self.delete_model_cache_button = QPushButton("Delete Cached Download")
         self.open_model_assets_button = QPushButton("Open Model Assets")
         self.open_download_cache_button = QPushButton("Open Download Cache")
-        for button in (
+        for index, button in enumerate((
             self.refresh_models_button,
             self.install_model_button,
+            self.cancel_model_download_button,
             self.delete_model_cache_button,
             self.open_model_assets_button,
             self.open_download_cache_button,
-        ):
-            actions.addWidget(button)
+        )):
+            actions.addWidget(button, index // 3, index % 3)
         layout.addLayout(actions)
 
         self.model_status_label = QLabel(
@@ -209,14 +380,69 @@ class ProductionSettingsDialog(QDialog):
         self.license_text.setReadOnly(True)
         self.license_text.setMaximumHeight(140)
         layout.addWidget(self.license_text)
-        self.tabs.addTab(tab, "Models")
+
+        self.face_model_group = QGroupBox("Face inference packs", tab)
+        face_layout = QGridLayout(self.face_model_group)
+        face_note = QLabel(
+            "Default GPU pipeline: SCRFD 10G detector + ArcFace R100 embedder. "
+            "Install optional ONNX detector/embedder packs for Advanced Faces. Downloads are checksum-verified, "
+            "resumable, shared in the runtime cache, shown in Jobs, and cancellable."
+        )
+        face_note.setWordWrap(True)
+        face_layout.addWidget(face_note, 0, 0, 1, 2)
+        self.face_model_pack_combo = QComboBox(self.face_model_group)
+        for label, profile_id in (
+            ("Default GPU — SCRFD 10G + ArcFace R100", "latest_gpu"),
+            ("Balanced — SCRFD 2.5G + ArcFace R50", "recommended"),
+            ("Edge — SCRFD 500M + MobileFaceNet", "edge"),
+            ("Accuracy — SCRFD 10G + AdaFace R100", "accuracy"),
+            ("Maximum Accuracy — SCRFD 34GF + AdaFace R100", "max_accuracy"),
+            ("OpenCV CPU — YuNet + SFace", "opencv_cpu"),
+            ("SFace embedders only", "sface"),
+            ("YuNet detectors only", "yunet"),
+            ("YOLO5Face detector only", "yolo"),
+        ):
+            self.face_model_pack_combo.addItem(label, profile_id)
+        self.install_face_model_pack_button = QPushButton("Install Selected Face Pack")
+        self.open_face_model_cache_button = QPushButton("Open Face Model Cache")
+        self.clear_face_download_cache_button = QPushButton("Clear Face Download Cache")
+        face_layout.addWidget(self.face_model_pack_combo, 1, 0)
+        face_layout.addWidget(self.install_face_model_pack_button, 1, 1)
+        self.installed_face_model_combo = QComboBox(self.face_model_group)
+        self.delete_face_model_button = QPushButton("Delete Installed Face Component")
+        face_layout.addWidget(self.installed_face_model_combo, 2, 0)
+        face_layout.addWidget(self.delete_face_model_button, 2, 1)
+        face_layout.addWidget(self.open_face_model_cache_button, 3, 0)
+        face_layout.addWidget(self.clear_face_download_cache_button, 3, 1)
+        face_layout.setColumnStretch(0, 1)
+        self.face_model_status_label = QLabel()
+        self.face_model_status_label.setWordWrap(True)
+        face_layout.addWidget(self.face_model_status_label, 4, 0, 1, 2)
+        layout.addWidget(self.face_model_group)
+
+        # The model inventory and optional face-pack controls must remain
+        # reachable on laptop-height and portrait displays. Scrolling the
+        # whole page also avoids nesting a second horizontal scroll region.
+        models_scroll = QScrollArea(self)
+        models_scroll.setObjectName("models_scroll_area")
+        models_scroll.setWidgetResizable(True)
+        models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        models_scroll.setWidget(tab)
+        self.tabs.addTab(models_scroll, "Models")
 
         self.refresh_models_button.clicked.connect(self.refresh_model_inventory)
         self.install_model_button.clicked.connect(self._download_selected_model)
+        self.cancel_model_download_button.clicked.connect(self.model_download_controller.cancel)
         self.delete_model_cache_button.clicked.connect(self._delete_selected_model_cache)
         self.open_model_assets_button.clicked.connect(lambda: self._open_path(self.runtime_layout.model_assets_dir))
         self.open_download_cache_button.clicked.connect(lambda: self._open_path(self.app_settings.cache_dir))
         self.model_inventory_table.itemSelectionChanged.connect(self._update_model_action_state)
+        self.install_face_model_pack_button.clicked.connect(self._install_selected_face_model_pack)
+        self.delete_face_model_button.clicked.connect(self._delete_selected_face_model)
+        self.open_face_model_cache_button.clicked.connect(
+            lambda: self._open_path(self.face_model_installer.runtime_root())
+        )
+        self.clear_face_download_cache_button.clicked.connect(self._clear_face_download_cache)
 
     def _build_storage_tab(self) -> None:
         tab = QWidget(self)
@@ -248,6 +474,22 @@ class ProductionSettingsDialog(QDialog):
         self.refresh_cache_usage_button.clicked.connect(self.refresh_cache_usage)
         self.clear_cache_button.clicked.connect(self._clear_rebuildable_caches)
 
+    def _build_updates_tab(self) -> None:
+        tab = QWidget(self)
+        form = QFormLayout(tab)
+        self.update_checks_enabled = QCheckBox("Check for signed updates")
+        self.update_checks_enabled.setToolTip(
+            "Default is off. When enabled, update manifests and artifacts must pass signature, checksum, OS, architecture, and variant checks."
+        )
+        self.update_channel = QComboBox()
+        self.update_channel.addItems(["stable", "beta", "nightly"])
+        form.addRow(self.update_checks_enabled)
+        form.addRow("Update channel", self.update_channel)
+        note = QLabel("Updates never switch between CPU and CUDA variants silently.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.tabs.addTab(tab, "Updates")
+
     def _build_safety_tab(self) -> None:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
@@ -265,8 +507,14 @@ class ProductionSettingsDialog(QDialog):
         journal_note.setWordWrap(True)
         layout.addWidget(journal_note)
 
-        self.operation_journal_table = QTableWidget(0, 6, self)
-        self.operation_journal_table.setHorizontalHeaderLabels(["Time", "Operation", "Requested", "Failures", "Cancelled", "Operation Id"])
+        self.operation_journal_model = OperationJournalTableModel(self, page_size=50)
+        self.operation_journal_table = QTableView(self)
+        self.operation_journal_table.setModel(self.operation_journal_model)
+        self.operation_journal_model.rowsInserted.connect(
+            lambda *_args: self.journal_status_label.setText(
+                f"Showing {self.operation_journal_model.rowCount()} of {len(getattr(self, '_journal_entries', []))} recovery operations."
+            )
+        )
         self.operation_journal_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.operation_journal_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.operation_journal_table.verticalHeader().setVisible(False)
@@ -278,24 +526,39 @@ class ProductionSettingsDialog(QDialog):
         self.operation_journal_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.operation_journal_table, stretch=1)
 
-        actions = QHBoxLayout()
-        self.refresh_journal_button = QPushButton("Refresh Journal")
-        self.open_journal_button = QPushButton("Open Audit Log")
-        self.restore_journal_button = QPushButton("Restore Selected Move/Trash")
-        actions.addWidget(self.refresh_journal_button)
-        actions.addWidget(self.open_journal_button)
-        actions.addWidget(self.restore_journal_button)
+        actions = QGridLayout()
+        self.refresh_journal_button = QPushButton("Refresh history")
+        self.reveal_journal_target_button = QPushButton("Reveal target")
+        self.retry_journal_button = QPushButton("Retry failed files")
+        self.restore_journal_button = QPushButton("Restore (skip conflicts)")
+        self.restore_unique_journal_button = QPushButton("Restore with unique names")
+        apply_icon(self.reveal_journal_target_button, "reveal")
+        apply_icon(self.retry_journal_button, "retry")
+        apply_icon(self.restore_journal_button, "restore")
+        apply_icon(self.restore_unique_journal_button, "recovery")
+        actions.addWidget(self.refresh_journal_button, 0, 0)
+        actions.addWidget(self.reveal_journal_target_button, 0, 1)
+        actions.addWidget(self.retry_journal_button, 0, 2)
+        actions.addWidget(self.restore_journal_button, 1, 0)
+        actions.addWidget(self.restore_unique_journal_button, 1, 1, 1, 2)
         layout.addLayout(actions)
 
         self.journal_status_label = QLabel("")
         self.journal_status_label.setWordWrap(True)
         layout.addWidget(self.journal_status_label)
-        self.tabs.addTab(tab, "Safety")
+        self.journal_file_results = QTextEdit(self)
+        self.journal_file_results.setReadOnly(True)
+        self.journal_file_results.setMaximumHeight(120)
+        self.journal_file_results.setPlaceholderText("Select an operation to see per-file results.")
+        layout.addWidget(self.journal_file_results)
+        self.tabs.addTab(tab, "Safety & Recovery")
 
         self.refresh_journal_button.clicked.connect(self.refresh_operation_journal)
-        self.open_journal_button.clicked.connect(lambda: self._open_path(self.gallery_action_service.audit_log_path))
-        self.restore_journal_button.clicked.connect(self._restore_selected_journal_operation)
-        self.operation_journal_table.itemSelectionChanged.connect(self._update_journal_action_state)
+        self.reveal_journal_target_button.clicked.connect(self._reveal_selected_journal_target)
+        self.retry_journal_button.clicked.connect(self._retry_selected_journal_operation)
+        self.restore_journal_button.clicked.connect(lambda: self._restore_selected_journal_operation(conflict_policy="skip"))
+        self.restore_unique_journal_button.clicked.connect(lambda: self._restore_selected_journal_operation(conflict_policy="unique_name"))
+        self.operation_journal_table.selectionModel().selectionChanged.connect(lambda *_args: self._on_journal_selection_changed())
         self.read_only_mode.toggled.connect(self._update_journal_action_state)
 
     def _build_diagnostics_tab(self) -> None:
@@ -310,27 +573,32 @@ class ProductionSettingsDialog(QDialog):
         form.addRow("Support bundles", QLabel(str(self.runtime_layout.support_dir)))
         layout.addLayout(form)
 
-        note = QLabel(
-            "Use Run Runtime Verify, then review the Runtime tab for install and final-exe bundling guidance. "
-            "Optional accelerators such as hf_xet and Flash Attention are reported there."
-        )
+        note = QLabel("Runtime details, verification output, logs, and paths are provided here for troubleshooting and support.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
         buttons = QHBoxLayout()
         open_logs = QPushButton("Open Logs")
         open_cache = QPushButton("Open Cache")
+        open_journal = QPushButton("Open operation journal")
         export_bundle = QPushButton("Export Support Bundle")
         view_crash = QPushButton("View Last Crash")
-        run_verify = QPushButton("Run Runtime Verify")
-        self.run_release_gates_button = QPushButton("Run Release Gates")
+        self.refresh_runtime_button = QPushButton("Refresh Diagnostics")
+        self.verify_runtime_button = QPushButton("Verify Runtime")
         buttons.addWidget(open_logs)
         buttons.addWidget(open_cache)
+        buttons.addWidget(open_journal)
         buttons.addWidget(export_bundle)
         buttons.addWidget(view_crash)
-        buttons.addWidget(run_verify)
-        buttons.addWidget(self.run_release_gates_button)
+        buttons.addWidget(self.refresh_runtime_button)
+        buttons.addWidget(self.verify_runtime_button)
         layout.addLayout(buttons)
+
+        self.runtime_text = QTextEdit(self)
+        self.runtime_text.setReadOnly(True)
+        self.runtime_text.setMaximumHeight(220)
+        self.runtime_text.setPlaceholderText("Runtime diagnostics")
+        layout.addWidget(self.runtime_text)
 
         log_actions = QHBoxLayout()
         self.refresh_log_button = QPushButton("Refresh App Log")
@@ -343,17 +611,15 @@ class ProductionSettingsDialog(QDialog):
         self.log_viewer.setMaximumHeight(180)
         self.log_viewer.setPlaceholderText("Latest app.log lines will appear here.")
         layout.addWidget(self.log_viewer)
-        self.release_gate_status_label = QLabel("")
-        self.release_gate_status_label.setWordWrap(True)
-        layout.addWidget(self.release_gate_status_label)
-        self.tabs.addTab(tab, "Diagnostics")
+        self.tabs.addTab(tab, "Support")
 
         open_logs.clicked.connect(lambda: self._open_path(self.runtime_layout.logs_dir))
         open_cache.clicked.connect(lambda: self._open_path(self.runtime_layout.cache_dir))
+        open_journal.clicked.connect(lambda: self._open_path(self.gallery_action_service.journal_path))
         export_bundle.clicked.connect(self._export_support_bundle)
         view_crash.clicked.connect(self._view_last_crash)
-        run_verify.clicked.connect(self._verify_gpu)
-        self.run_release_gates_button.clicked.connect(self._run_release_gates)
+        self.refresh_runtime_button.clicked.connect(self.refresh_runtime_diagnostics)
+        self.verify_runtime_button.clicked.connect(self._verify_gpu)
         self.refresh_log_button.clicked.connect(self.refresh_log_viewer)
         self.open_app_log_button.clicked.connect(lambda: self._open_path(self.runtime_layout.app_log))
 
@@ -376,25 +642,38 @@ class ProductionSettingsDialog(QDialog):
         open_settings.clicked.connect(lambda: self._open_path(Path(self.settings_store.fileName()).parent))
 
     def _load_values(self) -> None:
-        self.execution_mode.setCurrentText(self.settings_store.value("runtime/preferred_mode", self.app_settings.preferred_execution_mode, str))
-        self.performance_profile.setCurrentText(self.settings_store.value("performance/profile", self.app_settings.default_performance_profile, str))
-        self.thumbnail_size.setValue(int(self.settings_store.value("gallery/thumbnail_size", self.app_settings.thumbnail_size, int)))
-        self.gpu_warmup.setChecked(self.settings_store.value("runtime/allow_gpu_warmup", self.app_settings.allow_gpu_warmup, bool))
-        self.keep_worker_warm.setChecked(self.settings_store.value("performance/keep_worker_warm", False, bool))
-        self.runtime_badge.setChecked(self.settings_store.value("runtime/show_badge", self.app_settings.show_runtime_badge, bool))
-        self.dense_ui.setChecked(self.settings_store.value("workspace/dense_ui", self.app_settings.default_dense_ui, bool))
+        registry = self.settings_registry
+        self._set_combo_data(self.execution_mode, registry.get(self.settings_store, "runtime/preferred_mode", self.app_settings.preferred_execution_mode))
+        self._set_combo_data(self.precision_mode, registry.get(self.settings_store, "runtime/precision", "auto"))
+        self._set_combo_data(self.performance_profile, registry.get(self.settings_store, "performance/profile", self.app_settings.default_performance_profile))
+        self.batch_size_cpu.setValue(int(registry.get(self.settings_store, "performance/batch_size_cpu", self.app_settings.batch_size_cpu)))
+        self.batch_size_gpu.setValue(int(registry.get(self.settings_store, "performance/batch_size_gpu", self.app_settings.batch_size_gpu)))
+        self.decode_workers.setValue(int(registry.get(self.settings_store, "performance/decode_workers", self.system_resources.logical_cpu_count)))
+        self.vram_headroom_mb.setValue(int(registry.get(self.settings_store, "performance/vram_headroom_mb", 1024)))
+        self.thumbnail_size.setValue(int(registry.get(self.settings_store, "gallery/thumbnail_size", self.app_settings.thumbnail_size)))
+        self.gpu_warmup.setChecked(bool(registry.get(self.settings_store, "runtime/allow_gpu_warmup", self.app_settings.allow_gpu_warmup)))
+        self.keep_worker_warm.setChecked(bool(registry.get(self.settings_store, "performance/keep_worker_warm", False)))
+        self.runtime_badge.setChecked(bool(registry.get(self.settings_store, "runtime/show_badge", self.app_settings.show_runtime_badge)))
+        self.dense_ui.setChecked(bool(registry.get(self.settings_store, "workspace/dense_ui", self.app_settings.default_dense_ui)))
         self.offline_model_downloads.setChecked(
-            self.settings_store.value("models/offline_mode", bool(getattr(sys, "frozen", False)), bool)
+            bool(registry.get(self.settings_store, "models/offline_mode", bool(getattr(sys, "frozen", False))))
         )
-        self.read_only_mode.setChecked(self.settings_store.value("safety/read_only_mode", False, bool))
-        self._apply_profile_preview()
+        self.read_only_mode.setChecked(bool(registry.get(self.settings_store, "safety/read_only_mode", False)))
+        self.update_checks_enabled.setChecked(bool(registry.get(self.settings_store, "updates/checks_enabled", False)))
+        self.update_channel.setCurrentText(str(registry.get(self.settings_store, "updates/channel", "stable")))
+        self._apply_profile_preview(update_tuning=False)
 
     def values(self) -> dict[str, object]:
-        return {
-            "runtime/preferred_mode": self.execution_mode.currentText(),
-            "performance/profile": self.performance_profile.currentText(),
+        return self.settings_registry.validate_values({
+            "runtime/preferred_mode": str(self.execution_mode.currentData() or "auto"),
+            "runtime/precision": str(self.precision_mode.currentData() or "auto"),
+            "performance/profile": str(self.performance_profile.currentData() or "balanced"),
             "runtime/allow_gpu_warmup": bool(self.gpu_warmup.isChecked()),
             "performance/keep_worker_warm": bool(self.keep_worker_warm.isChecked()),
+            "performance/batch_size_cpu": int(self.batch_size_cpu.value()),
+            "performance/batch_size_gpu": int(self.batch_size_gpu.value()),
+            "performance/decode_workers": int(self.decode_workers.value()),
+            "performance/vram_headroom_mb": int(self.vram_headroom_mb.value()),
             "runtime/show_badge": bool(self.runtime_badge.isChecked()),
             "workspace/default_view": "clustering",
             "gallery/thumbnail_size": int(self.thumbnail_size.value()),
@@ -403,10 +682,46 @@ class ProductionSettingsDialog(QDialog):
             "workspace/dense_ui": bool(self.dense_ui.isChecked()),
             "models/offline_mode": bool(self.offline_model_downloads.isChecked()),
             "safety/read_only_mode": bool(self.read_only_mode.isChecked()),
-        }
+            "updates/checks_enabled": bool(self.update_checks_enabled.isChecked()),
+            "updates/channel": self.update_channel.currentText(),
+        })
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value: object) -> None:
+        index = combo.findData(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     def refresh_model_inventory(self) -> None:
-        items = self.model_asset_service.model_inventory(clustering_model_names(scope="production"))
+        if self._thread_is_running(self._model_inventory_thread):
+            return
+        self.model_status_label.setText("Loading model inventory...")
+        inventory_models = tuple(clustering_model_names(scope="production")) + ("facenet",)
+        job = AsyncJob(
+            lambda progress, cancel_check: self.model_asset_service.model_inventory(
+                inventory_models,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
+        )
+        self._model_inventory_job = job
+
+        def _done(result: object) -> None:
+            self._populate_model_inventory(list(result) if isinstance(result, (list, tuple)) else [])
+            self.model_status_label.setText("Model inventory is up to date.")
+
+        def _failed(message: str) -> None:
+            self.model_status_label.setText(f"Model inventory could not be loaded: {message}")
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(lambda: self.model_status_label.setText("Model inventory refresh cancelled."))
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="model_inventory")
+        self._model_inventory_thread = thread
+        self._update_model_action_state()
+
+    def _populate_model_inventory(self, items: list[object]) -> None:
         self.model_inventory_table.setRowCount(len(items))
         license_lines: list[str] = []
         for row, item in enumerate(items):
@@ -452,79 +767,106 @@ class ProductionSettingsDialog(QDialog):
         return str(model_name or "").strip().lower() or None
 
     def _model_actions_busy(self) -> bool:
-        return self._thread_is_running(self._model_thread)
+        return (
+            self.model_download_controller.is_running()
+            or self._thread_is_running(self._model_inventory_thread)
+            or self._thread_is_running(self._model_thread)
+            or self._thread_is_running(self._face_model_thread)
+        )
 
     def _update_model_action_state(self) -> None:
         busy = self._model_actions_busy()
         has_selection = self._selected_model_name() is not None
+        mutation_allowed = bool(self.can_clear_rebuildable_caches())
         self.refresh_models_button.setEnabled(not busy)
-        self.install_model_button.setEnabled((not busy) and has_selection)
-        self.delete_model_cache_button.setEnabled((not busy) and has_selection)
+        self.install_model_button.setEnabled((not busy) and mutation_allowed and has_selection)
+        self.cancel_model_download_button.setEnabled(self.model_download_controller.is_running())
+        self.delete_model_cache_button.setEnabled((not busy) and mutation_allowed and has_selection)
         self.open_model_assets_button.setEnabled(not busy)
         self.open_download_cache_button.setEnabled(not busy)
+        self._update_face_model_action_state()
+        self._update_settings_cancel_state()
 
     def _download_selected_model(self) -> None:
         model_name = self._selected_model_name()
         if not model_name:
             return
+        if self.model_download_controller.is_running():
+            self.model_status_label.setText("A model download is already active. Monitor or cancel it from Jobs.")
+            return
+        if not self.can_clear_rebuildable_caches():
+            self.model_status_label.setText("Wait for the active production task before installing another model.")
+            return
         if not confirmBox(
             "Download selected model?",
             (
-                f"This will download or initialize model files for {model_label(model_name)} into:\n"
+                f"This will download and verify model files for {model_label(model_name)} into:\n"
                 f"{self.app_settings.cache_dir}\n\n"
+                "The download is shared, cached, resumable, visible in Jobs, and cancellable.\n\n"
                 "Continue?"
             ),
             parent=self,
         ):
             return
         self.model_status_label.setText(f"Downloading or initializing {model_label(model_name)}...")
+        self._active_model_download_name = model_name
+        require_text = model_name in TEXT_MODEL_ORDER
+        if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
+            self._active_model_download_name = None
+            self.model_status_label.setText("The model download could not start.")
         self._update_model_action_state()
 
-        def _run(progress, cancel_check):
-            _ = cancel_check
-            progress(-1, f"Downloading or initializing {model_name}...")
-            from infra.performance import select_performance_profile
-            from infra.runtime import RuntimeCapabilityService
-            from ml.embeddings import ModelManager
+    def _on_model_download_progress(self, value: int, status: str) -> None:
+        progress_text = "" if int(value) < 0 else f" ({int(value)}%)"
+        self.model_status_label.setText(f"{status}{progress_text}")
 
-            runtime_service = RuntimeCapabilityService()
-            execution_policy = runtime_service.select_policy(self.execution_mode.currentText())
-            profile = select_performance_profile(self.performance_profile.currentText(), self.system_resources)
-            manager = ModelManager(
-                use_onnx=model_name in BUNDLED_ONNX_INPUT_SIZES,
-                execution_policy=execution_policy,
-                runtime_service=runtime_service,
-                performance_profile=profile,
-                allow_model_downloads=True,
-            )
-            bundle = manager.get_bundle(model_name, use_onnx=model_name in BUNDLED_ONNX_INPUT_SIZES)
-            return {"model": model_name, "signature": bundle.signature}
+    def _on_model_download_running_changed(self, _running: bool) -> None:
+        self._update_model_action_state()
+        self._update_settings_cancel_state()
 
-        job = AsyncJob(_run)
-        self._model_job = job
-
-        def _done(result: object) -> None:
-            self.model_status_label.setText(f"Model install complete: {result}")
-            infoBox("Model installed", f"{model_label(model_name)} is now available in the runtime cache.")
-            self._update_model_action_state()
+    def _on_model_download_completed(self, result: dict) -> None:
+        model_name = self._active_model_download_name
+        if model_name is None:
+            self.model_status_label.setText("Shared model download completed and verified.")
             self.refresh_model_inventory()
+            return
+        self._active_model_download_name = None
+        downloaded = len(result.get("downloaded") or ())
+        reused = len(result.get("reused") or ())
+        self.model_status_label.setText(
+            f"{model_label(model_name)} is ready. Downloaded: {downloaded}; reused from cache: {reused}."
+        )
+        self._update_model_action_state()
+        infoBox("Model installed", f"{model_label(model_name)} is now available in the runtime cache.")
+        self.refresh_model_inventory()
 
-        def _failed(message: str) -> None:
-            self.model_status_label.setText(f"Model install failed: {message}")
-            errorBox("Model install failed", message)
-            self._update_model_action_state()
+    def _on_model_download_failed(self, message: str) -> None:
+        if self._active_model_download_name is None:
+            self.model_status_label.setText(f"Shared model download failed: {message}")
             self.refresh_model_inventory()
+            return
+        self._active_model_download_name = None
+        self.model_status_label.setText(f"Model install failed: {message}")
+        self._update_model_action_state()
+        errorBox("Model install failed", message)
+        self.refresh_model_inventory()
 
-        job.completed.connect(_done)
-        job.failed.connect(_failed)
-        job.cancelled.connect(lambda: _failed("cancelled"))
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="model")
-        self._model_thread = thread
+    def _on_model_download_cancelled(self) -> None:
+        if self._active_model_download_name is None:
+            self.model_status_label.setText("Shared model download cancelled. Partial cache files were retained.")
+            self.refresh_model_inventory()
+            return
+        self._active_model_download_name = None
+        self.model_status_label.setText("Model download cancelled. Cached partial files will be reused on retry.")
+        self._update_model_action_state()
+        self.refresh_model_inventory()
 
     def _delete_selected_model_cache(self) -> None:
         model_name = self._selected_model_name()
         if not model_name:
+            return
+        if self._model_actions_busy() or not self.can_clear_rebuildable_caches():
+            self.model_status_label.setText("Wait for active production and model tasks before deleting cached files.")
             return
         if not confirmBox(
             "Delete cached model download?",
@@ -535,54 +877,273 @@ class ProductionSettingsDialog(QDialog):
             parent=self,
         ):
             return
-        removed, failures = self.model_asset_service.delete_cached_model(model_name)
-        if failures:
-            errorBox("Model cache delete completed with errors", "\n".join(failures[:8]))
-        else:
-            infoBox("Model cache deleted", f"Removed {len(removed)} cached item(s) for {model_label(model_name)}.")
-        self.refresh_model_inventory()
+        self.model_status_label.setText(f"Deleting cached files for {model_label(model_name)}...")
 
-    def refresh_operation_journal(self) -> None:
-        entries = list(reversed(self.gallery_action_service.read_audit_entries(limit=300)))
-        self._journal_entries = entries
-        self.operation_journal_table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            values = [
-                str(entry.get("timestamp_utc") or ""),
-                str(entry.get("operation") or ""),
-                str(entry.get("requested_count") or 0),
-                str(entry.get("failure_count") or 0),
-                "yes" if entry.get("cancelled") else "no",
-                str(entry.get("operation_id") or ""),
-            ]
-            payload = json.dumps(entry, ensure_ascii=False, sort_keys=True)
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setData(Qt.ItemDataRole.UserRole, payload)
-                item.setToolTip(payload if column == 5 else value)
-                self.operation_journal_table.setItem(row, column, item)
-        self.operation_journal_table.resizeRowsToContents()
-        if entries:
-            self.journal_status_label.setText(
-                f"Showing latest {len(entries)} operation journal entries from {self.gallery_action_service.audit_log_path}."
+        def _run(progress, cancel_check):
+            return self.model_asset_service.delete_cached_model(
+                model_name,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
+
+        job = AsyncJob(_run)
+        self._model_job = job
+
+        def _done(result: object) -> None:
+            removed, failures = result if isinstance(result, tuple) and len(result) == 2 else ((), ("Invalid result",))
+            if failures:
+                errorBox("Model cache delete completed with errors", "\n".join(list(failures)[:8]))
+            else:
+                infoBox("Model cache deleted", f"Removed {len(removed)} cached item(s) for {model_label(model_name)}.")
+            self.refresh_model_inventory()
+
+        def _failed(message: str) -> None:
+            self.model_status_label.setText(f"Model cache delete failed: {message}")
+            errorBox("Model cache delete failed", message)
+
+        job.progress.connect(lambda _value, text: self.model_status_label.setText(str(text)))
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(
+            lambda: self.model_status_label.setText("Model cache deletion cancelled. Already removed files remain removed.")
+        )
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="model_delete")
+        self._model_thread = thread
+        self._update_model_action_state()
+
+    def _refresh_face_model_inventory(self) -> None:
+        items = list(self.face_model_installer.inventory())
+        current_id = str(self.installed_face_model_combo.currentData() or "")
+        self.installed_face_model_combo.blockSignals(True)
+        self.installed_face_model_combo.clear()
+        installed = [item for item in items if bool(item.installed)]
+        for item in installed:
+            size_text = self._format_bytes(int(item.size_bytes))
+            self.installed_face_model_combo.addItem(
+                f"{item.display_name} — {item.status}, {size_text}",
+                item.bundle_id,
+            )
+        if current_id:
+            index = self.installed_face_model_combo.findData(current_id)
+            if index >= 0:
+                self.installed_face_model_combo.setCurrentIndex(index)
+        self.installed_face_model_combo.blockSignals(False)
+        if installed:
+            verified = sum("verified" in str(item.status) for item in installed)
+            self.face_model_status_label.setText(
+                f"{len(installed)} face component(s) installed; {verified} managed component(s) verified. "
+                f"Cache: {self.face_model_installer.runtime_root()}"
             )
         else:
-            self.journal_status_label.setText(f"No file-operation journal entries found at {self.gallery_action_service.audit_log_path}.")
-        self._update_journal_action_state()
+            self.face_model_status_label.setText(
+                "No optional face pack is installed. The built-in FaceNet row above must also be installed "
+                "before using the built-in face embedder."
+            )
+        self._update_face_model_action_state()
+
+    def _update_face_model_action_state(self) -> None:
+        if not hasattr(self, "install_face_model_pack_button"):
+            return
+        busy = (
+            self._thread_is_running(self._face_model_thread)
+            or self._thread_is_running(self._model_thread)
+            or self.model_download_controller.is_running()
+        )
+        mutation_allowed = bool(self.can_clear_rebuildable_caches())
+        self.face_model_pack_combo.setEnabled(not busy)
+        self.install_face_model_pack_button.setEnabled((not busy) and mutation_allowed)
+        has_installed = self.installed_face_model_combo.count() > 0
+        self.installed_face_model_combo.setEnabled(not busy and has_installed)
+        self.delete_face_model_button.setEnabled((not busy) and mutation_allowed and has_installed)
+        self.open_face_model_cache_button.setEnabled(not busy)
+        self.clear_face_download_cache_button.setEnabled((not busy) and mutation_allowed)
+
+    def _install_selected_face_model_pack(self) -> None:
+        profile_id = str(self.face_model_pack_combo.currentData() or "latest_gpu")
+        label = self.face_model_pack_combo.currentText()
+        installers = {
+            "recommended": self.face_model_installer.install_recommended,
+            "edge": self.face_model_installer.install_edge,
+            "accuracy": self.face_model_installer.install_accuracy,
+            "latest_gpu": self.face_model_installer.install_latest_gpu,
+            "max_accuracy": self.face_model_installer.install_max_accuracy,
+            "opencv_cpu": self.face_model_installer.install_opencv_cpu,
+            "sface": self.face_model_installer.install_sface,
+            "yunet": self.face_model_installer.install_yunet,
+            "yolo": self.face_model_installer.install_yolo,
+        }
+        installer = installers.get(profile_id)
+        if installer is None:
+            self.face_model_status_label.setText("Unknown face model pack.")
+            return
+        if self._model_actions_busy() or not self.can_clear_rebuildable_caches():
+            self.face_model_status_label.setText("Wait for active production and model tasks before installing a face pack.")
+            return
+        if not confirmBox(
+            "Install face inference pack?",
+            (
+                f"Pack: {label}\n"
+                f"Managed model directory: {self.face_model_installer.runtime_root()}\n"
+                f"Reusable download cache: {Path(self.app_settings.cache_dir) / 'face_model_downloads'}\n\n"
+                "Downloads are checksum-verified, resumable, deduplicated across ClusterLens processes, "
+                "visible in Jobs, and cancellable.\n\nContinue?"
+            ),
+            parent=self,
+        ):
+            return
+        success_message = None
+        if profile_id == "latest_gpu":
+            success_message = lambda result: (
+                "Default GPU face pipeline ready: SCRFD 10G + ArcFace R100. "
+                f"Verified components: {', '.join(str(item) for item in (result or ())) or 'reused from cache'}."
+            )
+        self._start_face_model_job(label, installer, success_message=success_message)
+
+    def _start_face_model_job(
+        self,
+        label: str,
+        installer,
+        *,
+        success_message: Callable[[object], str] | None = None,
+        mark_inventory_changed: bool = True,
+        job_role: str = "face_model",
+    ) -> None:
+        if self._thread_is_running(self._face_model_thread):
+            return
+        job = AsyncJob(lambda progress, cancel_check: installer(progress, cancel_check))
+        self._face_model_job = job
+        self.face_model_status_label.setText(f"{label}: preparing shared cache...")
+
+        def _done(result: object) -> None:
+            bundle_ids = tuple(str(item) for item in result) if isinstance(result, (list, tuple)) else ()
+            if mark_inventory_changed:
+                self._face_model_inventory_changed = bool(bundle_ids) or self._face_model_inventory_changed
+            self._refresh_face_model_inventory()
+            if success_message is not None:
+                self.face_model_status_label.setText(str(success_message(result)))
+            else:
+                self.face_model_status_label.setText(
+                    f"{label} ready: {', '.join(bundle_ids) if bundle_ids else 'all files already present'}."
+                )
+
+        def _failed(message: str) -> None:
+            self.face_model_status_label.setText(f"{label} failed: {message}")
+            errorBox("Face model task failed", message)
+
+        job.progress.connect(lambda value, text: self.face_model_status_label.setText(
+            f"{text}{'' if int(value) < 0 else f' ({int(value)}%)'}"
+        ))
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(
+            lambda: self.face_model_status_label.setText(
+                f"{label} cancelled. Completed files and resumable partial downloads were retained."
+            )
+        )
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role=job_role)
+        self._face_model_thread = thread
+        self._update_model_action_state()
+
+    def _delete_selected_face_model(self) -> None:
+        bundle_id = str(self.installed_face_model_combo.currentData() or "").strip()
+        label = self.installed_face_model_combo.currentText()
+        if not bundle_id or self._model_actions_busy() or not self.can_clear_rebuildable_caches():
+            return
+        if not confirmBox(
+            "Delete installed face component?",
+            (
+                f"Delete {label} from the managed face-model directory?\n\n"
+                "The verified download cache is retained, so reinstalling does not download the same archive twice."
+            ),
+            parent=self,
+        ):
+            return
+
+        def _delete(_progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            removed, failures = self.face_model_installer.delete_installed_model(bundle_id)
+            if failures:
+                raise RuntimeError("\n".join(failures))
+            return (bundle_id,) if removed else ()
+
+        self._start_face_model_job("Delete face component", _delete, job_role="face_model_delete")
+
+    def _clear_face_download_cache(self) -> None:
+        if self._model_actions_busy() or not self.can_clear_rebuildable_caches():
+            self.face_model_status_label.setText("Wait for active production and model tasks before clearing downloads.")
+            return
+        cache_dir = self.face_model_installer.download_cache_dir()
+        if not confirmBox(
+            "Clear reusable face downloads?",
+            (
+                f"Delete verified archives and resumable partial downloads from:\n{cache_dir}\n\n"
+                "Installed face components remain available. A future reinstall may need to download its source archive again. "
+                "The action is shown in Jobs and can be cancelled between files."
+            ),
+            parent=self,
+        ):
+            return
+
+        def _clear(progress, cancel_check):
+            removed, freed_bytes, failures = self.face_model_installer.clear_download_cache(progress, cancel_check)
+            if failures:
+                raise RuntimeError("\n".join(failures[:8]))
+            return {"removed": len(removed), "freed_bytes": int(freed_bytes)}
+
+        self._start_face_model_job(
+            "Clear face download cache",
+            _clear,
+            success_message=lambda result: (
+                f"Face download cache cleared: {int(result.get('removed', 0))} file(s), "
+                f"{self._format_bytes(int(result.get('freed_bytes', 0)))} freed."
+                if isinstance(result, dict)
+                else "Face download cache cleared."
+            ),
+            mark_inventory_changed=False,
+            job_role="face_cache_clear",
+        )
+
+    def face_model_inventory_changed(self) -> bool:
+        return bool(self._face_model_inventory_changed)
+
+    def refresh_operation_journal(self) -> None:
+        if self._thread_is_running(self._journal_refresh_thread):
+            return
+        self.journal_status_label.setText("Loading recovery history...")
+        job = AsyncJob(lambda _progress, _cancel_check: list(reversed(self.gallery_action_service.read_audit_entries(limit=1000))))
+        self._journal_refresh_job = job
+
+        def _done(result: object) -> None:
+            entries = list(result) if isinstance(result, list) else []
+            self._journal_entries = entries
+            self.operation_journal_model.set_entries(entries)
+            self.operation_journal_table.resizeRowsToContents()
+            if entries:
+                self.journal_status_label.setText(
+                    f"Showing {self.operation_journal_model.rowCount()} of {len(entries)} recovery operations. Scroll to load more."
+                )
+            else:
+                self.journal_status_label.setText("No recoverable file operations have been recorded yet.")
+            self._update_journal_action_state()
+
+        def _failed(message: str) -> None:
+            self.journal_status_label.setText(f"Recovery history could not be loaded: {message}")
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(lambda: self.journal_status_label.setText("Recovery history refresh cancelled."))
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="journal_refresh")
+        self._journal_refresh_thread = thread
 
     def _selected_journal_entry(self) -> dict[str, object] | None:
-        row = self.operation_journal_table.currentRow()
+        current = self.operation_journal_table.selectionModel().currentIndex()
+        row = current.row() if current.isValid() else -1
         if row < 0:
             return None
-        item = self.operation_journal_table.item(row, 0)
-        if item is None:
-            return None
-        raw = item.data(Qt.ItemDataRole.UserRole)
-        try:
-            payload = json.loads(str(raw or "{}"))
-        except json.JSONDecodeError:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return self.operation_journal_model.entry_at(row)
 
     def _selected_restorable_paths(self) -> list[tuple[str, str]]:
         entry = self._selected_journal_entry()
@@ -597,27 +1158,144 @@ class ProductionSettingsDialog(QDialog):
                 pairs.append((str(pair[0]), str(pair[1])))
         return pairs
 
+    def _selected_retryable_paths(self) -> list[str]:
+        entry = self._selected_journal_entry()
+        if not entry or str(entry.get("operation") or "") not in {"copy", "move", "delete_to_trash"}:
+            return []
+        requested = [str(path) for path in list(entry.get("requested_paths") or []) if str(path)]
+        completed = {str(path) for path in list(entry.get("affected_paths") or []) if str(path)}
+        for pair in list(entry.get("changed_paths") or []):
+            if isinstance(pair, (list, tuple)) and pair:
+                completed.add(str(pair[0]))
+        return [path for path in requested if path not in completed]
+
     def _update_journal_action_state(self) -> None:
         restorable = bool(self._selected_restorable_paths())
         busy = self._thread_is_running(self._journal_restore_thread)
         self.refresh_journal_button.setEnabled(not busy)
-        self.open_journal_button.setEnabled(not busy)
+        self.reveal_journal_target_button.setEnabled((not busy) and restorable)
+        self.retry_journal_button.setEnabled((not busy) and bool(self._selected_retryable_paths()) and not bool(self.read_only_mode.isChecked()))
         self.restore_journal_button.setEnabled((not busy) and restorable and not bool(self.read_only_mode.isChecked()))
+        self.restore_unique_journal_button.setEnabled((not busy) and restorable and not bool(self.read_only_mode.isChecked()))
 
-    def _restore_selected_journal_operation(self) -> None:
+    def _on_journal_selection_changed(self) -> None:
+        self._update_journal_action_state()
+        entry = self._selected_journal_entry() or {}
+        results = list(entry.get("file_results") or [])
+        if not results:
+            self.journal_file_results.clear()
+            return
+        lines = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            source = str(result.get("source") or "")
+            target = str(result.get("target") or "")
+            status = str(result.get("status") or "unknown")
+            error = str(result.get("error") or "")
+            line = f"{status}: {source}"
+            if target and target != source:
+                line += f" → {target}"
+            if error:
+                line += f" — {error}"
+            lines.append(line)
+        self.journal_file_results.setPlainText("\n".join(lines))
+
+    def _retry_selected_journal_operation(self) -> None:
+        if self.read_only_mode.isChecked():
+            infoBox("Read-only mode", "Turn off read-only mode before retrying a file operation.")
+            return
+        entry = self._selected_journal_entry() or {}
+        paths = self._selected_retryable_paths()
+        operation = str(entry.get("operation") or "")
+        destination = str(entry.get("destination") or "")
+        if not paths:
+            self.journal_status_label.setText("The selected operation has no failed files that can be retried.")
+            return
+        if not confirmBox(
+            "Retry failed files?",
+            (
+                f"Action: {OperationJournalTableModel._operation_label(operation)}\n"
+                f"Files to retry: {len(paths)}\n"
+                f"Destination: {destination or f'{CLUSTERLENS_TRASH_DIR_NAME} beside each source folder'}\n"
+                "Recovery: moved files remain available from this Recovery view."
+            ),
+            parent=self,
+        ):
+            self.journal_status_label.setText("Retry cancelled. No files were changed.")
+            return
+
+        def _run(progress, cancel_check):
+            if operation == "copy":
+                return self.gallery_action_service.copy_to_directory(paths, destination, progress, cancel_check)
+            if operation == "move":
+                return self.gallery_action_service.move_to_directory(paths, destination, progress, cancel_check)
+            return self.gallery_action_service.move_to_trash(paths, progress, cancel_check)
+
+        self._start_recovery_job("Retrying failed files", _run)
+
+    def _start_recovery_job(self, label: str, fn) -> None:
+        self.journal_status_label.setText(f"{label}...")
+        job = AsyncJob(fn)
+        self._journal_restore_job = job
+
+        def _done(result: object) -> None:
+            failures = list(getattr(result, "failures", []))
+            changed = len(list(getattr(result, "changed_paths", []))) + len(list(getattr(result, "affected_paths", [])))
+            self.journal_status_label.setText(f"{label} complete: {changed} succeeded, {len(failures)} failed.")
+            self.refresh_operation_journal()
+            self._update_journal_action_state()
+
+        def _failed(message: str) -> None:
+            self.journal_status_label.setText(f"{label} failed: {message}")
+            errorBox(f"{label} failed", message)
+            self._update_journal_action_state()
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(lambda: self.journal_status_label.setText(f"{label} cancelled."))
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="journal_restore")
+        self._journal_restore_thread = thread
+        self._update_journal_action_state()
+
+    def _reveal_selected_journal_target(self) -> None:
+        pairs = self._selected_restorable_paths()
+        if not pairs:
+            self.journal_status_label.setText("Select a move or ClusterLens Trash operation with changed paths to reveal.")
+            return
+        _original, current = pairs[0]
+        target = Path(str(current))
+        self._open_path(target if target.exists() else target.parent)
+
+    def _restore_selected_journal_operation(self, *, conflict_policy: str = "skip") -> None:
         if self.read_only_mode.isChecked():
             infoBox("Read-only mode", "Turn off read-only safety mode before restoring files from the operation journal.")
             self._update_journal_action_state()
             return
         pairs = self._selected_restorable_paths()
         if not pairs:
-            self.journal_status_label.setText("Select a move or trash operation with changed paths to restore.")
+            self.journal_status_label.setText("Select a move or ClusterLens Trash operation with changed paths to restore.")
             return
+        conflict_preview = ""
+        if str(conflict_policy).lower() == "unique_name":
+            original = Path(pairs[0][0])
+            preview = self.gallery_action_service._unique_target(original.parent, original.name)
+            conflict_preview = f"\nExample restored path: {preview}"
         if not confirmBox(
             "Restore selected operation?",
             (
-                f"This will move {len(pairs)} file(s) back to their original paths when possible.\n\n"
-                "Restore is conservative: existing original paths are not overwritten, and missing moved files are reported as failures."
+                "Action: Restore files\n"
+                f"Target: original folders from the selected operation\n"
+                f"Files affected: {len(pairs)}\n"
+                "Result: available moved files return to their original folders.\n"
+                "Recovery: this restore is journaled, but is not automatically undone.\n\n"
+                "Missing moved files are reported as failures. "
+                + (
+                    f"Existing original paths get unique restored names.{conflict_preview}"
+                    if str(conflict_policy).lower() == "unique_name"
+                    else "Existing original paths are skipped, not overwritten."
+                )
             ),
             parent=self,
         ):
@@ -625,7 +1303,14 @@ class ProductionSettingsDialog(QDialog):
         self.journal_status_label.setText("Restoring selected operation...")
         self._update_journal_action_state()
 
-        job = AsyncJob(lambda progress, cancel_check: self.gallery_action_service.restore_changed_paths(pairs, progress, cancel_check))
+        job = AsyncJob(
+            lambda progress, cancel_check: self.gallery_action_service.restore_changed_paths(
+                pairs,
+                progress,
+                cancel_check,
+                conflict_policy=conflict_policy,
+            )
+        )
         self._journal_restore_job = job
 
         def _done(result: object) -> None:
@@ -663,25 +1348,29 @@ class ProductionSettingsDialog(QDialog):
         return f"{size_bytes} B"
 
     def refresh_runtime_diagnostics(self) -> None:
-        details = self.runtime_service.diagnostics(self.execution_mode.currentText())
+        details = self.runtime_service.diagnostics(str(self.execution_mode.currentData() or "auto"))
         capabilities = details["capabilities"]
         policy = details["policy"]
         packages = details.get("packages") or {}
         optional_details = details.get("optional_details") or {}
         remediation = list(details.get("remediation") or [])
-        profile = select_performance_profile(self.performance_profile.currentText(), self.system_resources)
+        profile = select_performance_profile(str(self.performance_profile.currentData() or "balanced"), self.system_resources)
 
         text = [
             f"Preferred mode: {policy.preferred_mode}",
             f"Effective mode: {policy.effective_mode}",
+            f"Precision: {self.precision_mode.currentData() or 'auto'}",
             f"Performance profile: {profile.name}",
             f"Warm worker between runs: {'enabled' if self.keep_worker_warm.isChecked() else 'disabled'}",
+            f"CPU batch size: {self.batch_size_cpu.value()}",
+            f"CUDA batch size: {self.batch_size_gpu.value()}",
+            f"Decode workers: {self.decode_workers.value()}",
+            f"CUDA VRAM headroom MB: {self.vram_headroom_mb.value()}",
             "",
             "Packages:",
             f"- torch: {packages.get('torch') or '-'}",
             f"- onnx: {packages.get('onnx') or '-'}",
             f"- onnxruntime: {packages.get('onnxruntime') or '-'}",
-            f"- onnxruntime-directml: {packages.get('onnxruntime-directml') or '-'}",
             f"- onnxruntime-gpu: {packages.get('onnxruntime-gpu') or '-'}",
             f"- hf_xet: {packages.get('hf_xet') or '-'}",
             f"- flash-attn: {packages.get('flash-attn') or '-'}",
@@ -729,7 +1418,6 @@ class ProductionSettingsDialog(QDialog):
             [
                 "",
                 "Production notes:",
-                "- DirectML GPU acceleration applies only on Windows and only to ONNX-enabled production models such as fast_preview and resnet.",
                 "- CUDA acceleration requires a CUDA-enabled Torch build plus NVIDIA drivers.",
                 "- Keep worker warm is fastest for repeated clustering, but leaves the worker process and loaded model memory resident until disabled or app exit.",
                 "- low_memory disables aggressive parallelism/caching; max_speed increases caches, allows all selected backends to run concurrently, and uses a faster, slightly less exact KMeans path on larger folders.",
@@ -740,8 +1428,13 @@ class ProductionSettingsDialog(QDialog):
         )
         self.runtime_text.setPlainText("\n".join(text))
 
-    def _apply_profile_preview(self) -> None:
-        profile = select_performance_profile(self.performance_profile.currentText(), self.system_resources)
+    def _apply_profile_preview(self, *, update_tuning: bool = True) -> None:
+        profile = select_performance_profile(str(self.performance_profile.currentData() or "balanced"), self.system_resources)
+        if update_tuning:
+            self.batch_size_cpu.setValue(profile.cpu_batch_size)
+            self.batch_size_gpu.setValue(profile.gpu_batch_size)
+            self.decode_workers.setValue(profile.embedding_preprocess_workers)
+            self.vram_headroom_mb.setValue(profile.vram_headroom_mb)
         self.thumbnail_workers.setValue(profile.thumbnail_workers)
         self.prefetch_rows.setValue(profile.thumbnail_prefetch_rows)
         if hasattr(self, "runtime_text"):
@@ -768,7 +1461,21 @@ class ProductionSettingsDialog(QDialog):
         self.cache_status_label.setText("Scanning rebuildable cache usage...")
         self._update_cache_action_state()
 
-        job = AsyncJob(lambda _progress, _cancel_check: self.describe_rebuildable_caches())
+        def _run_usage(progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            try:
+                result = self.describe_rebuildable_caches(
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                result = self.describe_rebuildable_caches()
+            raise_if_cancelled(cancel_check)
+            return result
+
+        job = AsyncJob(_run_usage)
         self._cache_usage_job = job
 
         def _done(result: object) -> None:
@@ -797,7 +1504,12 @@ class ProductionSettingsDialog(QDialog):
 
         job.completed.connect(_done)
         job.failed.connect(_failed)
-        job.cancelled.connect(lambda: _failed("cancelled"))
+        def _cancelled() -> None:
+            self.cache_usage_text.setPlainText("Cache usage scan cancelled.")
+            self.cache_status_label.setText("Cache usage scan cancelled.")
+            self._update_cache_action_state()
+
+        job.cancelled.connect(_cancelled)
         thread = start_job_in_thread(job)
         self._track_thread(thread, job, role="cache_usage")
         self._cache_usage_thread = thread
@@ -819,7 +1531,21 @@ class ProductionSettingsDialog(QDialog):
         self.cache_status_label.setText("Clearing rebuildable caches...")
         self._update_cache_action_state()
 
-        job = AsyncJob(lambda _progress, _cancel_check: self.clear_rebuildable_caches())
+        def _run_clear(progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            try:
+                result = self.clear_rebuildable_caches(
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                result = self.clear_rebuildable_caches()
+            raise_if_cancelled(cancel_check)
+            return result
+
+        job = AsyncJob(_run_clear)
         self._cache_clear_job = job
 
         def _done(result: object) -> None:
@@ -845,9 +1571,14 @@ class ProductionSettingsDialog(QDialog):
             errorBox("Cache clear failed", message)
             self.refresh_cache_usage()
 
+        def _cancelled() -> None:
+            self.cache_status_label.setText("Cache clear cancelled. Already removed rebuildable files remain removed.")
+            self._update_cache_action_state()
+            self.refresh_cache_usage()
+
         job.completed.connect(_done)
         job.failed.connect(_failed)
-        job.cancelled.connect(lambda: _failed("cancelled"))
+        job.cancelled.connect(_cancelled)
         thread = start_job_in_thread(job)
         self._track_thread(thread, job, role="cache_clear")
         self._cache_clear_thread = thread
@@ -857,9 +1588,11 @@ class ProductionSettingsDialog(QDialog):
             return
 
         def _run(progress, cancel_check):
-            _ = cancel_check
+            raise_if_cancelled(cancel_check)
             progress(-1, "Probing runtimes...")
-            return self.runtime_service.verify(self.execution_mode.currentText())
+            result = self.runtime_service.verify(str(self.execution_mode.currentData() or "auto"))
+            raise_if_cancelled(cancel_check)
+            return result
 
         job = AsyncJob(_run)
         self._verify_job = job
@@ -870,6 +1603,11 @@ class ProductionSettingsDialog(QDialog):
 
         job.completed.connect(_done)
         job.failed.connect(lambda message: errorBox("Runtime verify failed", str(message)))
+        job.cancelled.connect(
+            lambda: self.runtime_text.setPlainText(
+                "Runtime verification cancelled. No execution settings were changed."
+            )
+        )
         thread = start_job_in_thread(job)
         self._track_thread(thread, job, role="verify")
         self._verify_thread = thread
@@ -902,67 +1640,10 @@ class ProductionSettingsDialog(QDialog):
     def refresh_log_viewer(self) -> None:
         self.log_viewer.setPlainText("\n".join(self._read_tail(self.runtime_layout.app_log, limit=220)))
 
-    def _run_release_gates(self) -> None:
-        if self._thread_is_running(self._release_gate_thread):
-            return
-        report_dir = self.runtime_layout.benchmarks_dir / "release_gates"
-        self.release_gate_status_label.setText(f"Running release gates. Report directory: {report_dir}")
-        self.run_release_gates_button.setEnabled(False)
-
-        def _run(progress, cancel_check):
-            _ = cancel_check
-            progress(-1, "Running release gates...")
-            repo_root = Path(__file__).resolve().parents[2]
-            report_dir.mkdir(parents=True, exist_ok=True)
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "apps.pyqt_production.release_gates",
-                    "--report-dir",
-                    str(report_dir),
-                ],
-                cwd=str(repo_root),
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            return {
-                "returncode": int(completed.returncode),
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
-                "report_dir": str(report_dir),
-            }
-
-        job = AsyncJob(_run)
-        self._release_gate_job = job
-
-        def _done(result: object) -> None:
-            payload = dict(result) if isinstance(result, dict) else {}
-            code = int(payload.get("returncode", 1))
-            report_text = f"Release gates {'passed' if code == 0 else 'failed'} with exit code {code}.\nReport: {payload.get('report_dir')}"
-            if payload.get("stdout"):
-                report_text += f"\n\nOutput:\n{str(payload.get('stdout'))[-4000:]}"
-            if payload.get("stderr"):
-                report_text += f"\n\nErrors:\n{str(payload.get('stderr'))[-2000:]}"
-            self.release_gate_status_label.setText(report_text)
-            self.run_release_gates_button.setEnabled(True)
-
-        def _failed(message: str) -> None:
-            self.release_gate_status_label.setText(f"Release gates failed to run: {message}")
-            self.run_release_gates_button.setEnabled(True)
-            errorBox("Release gates failed", message)
-
-        job.completed.connect(_done)
-        job.failed.connect(_failed)
-        job.cancelled.connect(lambda: self.release_gate_status_label.setText("Release gates cancelled."))
-        job.cancelled.connect(lambda: self.run_release_gates_button.setEnabled(True))
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="release_gates")
-        self._release_gate_thread = thread
-
     def _about_text(self) -> str:
-        diagnostics = self.runtime_service.diagnostics(self.settings_store.value("runtime/preferred_mode", self.app_settings.preferred_execution_mode, str))
+        diagnostics = self.runtime_service.diagnostics(
+            str(self.settings_registry.get(self.settings_store, "runtime/preferred_mode", self.app_settings.preferred_execution_mode))
+        )
         packages = diagnostics.get("packages") or {}
         return "\n".join(
             [
@@ -1029,14 +1710,50 @@ class ProductionSettingsDialog(QDialog):
         if thread is None:
             return
         self._thread_roles[thread] = (str(role), job)
+        if self.job_manager is not None and job is not None:
+            label = {
+                "cache_usage": "Scanning cache usage",
+                "cache_clear": "Clearing rebuildable caches",
+                "verify": "Verifying runtime",
+                "model": "Installing model",
+                "model_delete": "Deleting cached model",
+                "model_inventory": "Refreshing model inventory",
+                "face_model": "Installing face inference pack",
+                "face_model_delete": "Deleting installed face component",
+                "face_cache_clear": "Clearing reusable face downloads",
+                "journal_restore": "Recovering files",
+                "journal_refresh": "Refreshing recovery history",
+            }.get(str(role), "Settings task")
+            job_id = self.job_manager.register_job(label, cancel_fn=getattr(job, "cancel", None))
+            self._settings_job_ids[thread] = job_id
+            progress_signal = getattr(job, "progress", None)
+            if progress_signal is not None:
+                progress_signal.connect(
+                    lambda value, text, job_id=job_id: self.job_manager.update(
+                        job_id,
+                        progress=value,
+                        text=text,
+                    )
+                )
+            getattr(job, "completed").connect(
+                lambda _result, job_id=job_id: self.job_manager.finish(job_id, status="finished")
+            )
+            getattr(job, "failed").connect(
+                lambda message, job_id=job_id: self.job_manager.finish(job_id, status="failed", error=message)
+            )
+            getattr(job, "cancelled").connect(
+                lambda job_id=job_id: self.job_manager.finish(job_id, status="cancelled")
+            )
         thread.finished.connect(
             lambda thread=thread: self._on_async_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
+        self._update_settings_cancel_state()
 
     def _release_finished_thread(self, thread) -> None:
         if thread is None:
             return
+        self._settings_job_ids.pop(thread, None)
         role, job = self._thread_roles.pop(thread, (None, None))
         if role == "cache_usage" and self._cache_usage_thread is thread:
             self._cache_usage_thread = None
@@ -1055,10 +1772,22 @@ class ProductionSettingsDialog(QDialog):
             if self._verify_job is job:
                 self._verify_job = None
             return
-        if role == "model" and self._model_thread is thread:
+        if role in {"model", "model_delete"} and self._model_thread is thread:
             self._model_thread = None
             if self._model_job is job:
                 self._model_job = None
+            self._update_model_action_state()
+            return
+        if role == "model_inventory" and self._model_inventory_thread is thread:
+            self._model_inventory_thread = None
+            if self._model_inventory_job is job:
+                self._model_inventory_job = None
+            self._update_model_action_state()
+            return
+        if role in {"face_model", "face_model_delete", "face_cache_clear"} and self._face_model_thread is thread:
+            self._face_model_thread = None
+            if self._face_model_job is job:
+                self._face_model_job = None
             self._update_model_action_state()
             return
         if role == "journal_restore" and self._journal_restore_thread is thread:
@@ -1067,25 +1796,69 @@ class ProductionSettingsDialog(QDialog):
                 self._journal_restore_job = None
             self._update_journal_action_state()
             return
-        if role == "release_gates" and self._release_gate_thread is thread:
-            self._release_gate_thread = None
-            if self._release_gate_job is job:
-                self._release_gate_job = None
-            self.run_release_gates_button.setEnabled(True)
+        if role == "journal_refresh" and self._journal_refresh_thread is thread:
+            self._journal_refresh_thread = None
+            if self._journal_refresh_job is job:
+                self._journal_refresh_job = None
+            return
 
     def _on_async_thread_finished(self, thread=None) -> None:
         self._release_finished_thread(thread)
+        self._update_settings_cancel_state()
+
+    def _active_settings_jobs(self) -> tuple[object, ...]:
+        jobs = (
+            self._cache_usage_job,
+            self._cache_clear_job,
+            self._verify_job,
+            self._model_job,
+            self._model_inventory_job,
+            self._face_model_job,
+            self._journal_restore_job,
+            self._journal_refresh_job,
+        )
+        return tuple(job for job in jobs if job is not None)
+
+    def _update_settings_cancel_state(self) -> None:
+        button = getattr(self, "cancel_settings_tasks_button", None)
+        if button is None:
+            return
+        button.setEnabled(bool(self._active_settings_jobs()) or self.model_download_controller.is_running())
+
+    def _cancel_active_settings_tasks(self) -> None:
+        cancelled_any = False
+        if self.model_download_controller.is_running():
+            self.model_download_controller.cancel()
+            cancelled_any = True
+        for job in self._active_settings_jobs():
+            try:
+                job.cancel()
+                cancelled_any = True
+            except (AttributeError, RuntimeError):
+                continue
+        if cancelled_any:
+            self.model_status_label.setText("Cancellation requested. Completed cache files remain reusable.")
+            if hasattr(self, "face_model_status_label"):
+                self.face_model_status_label.setText(
+                    "Cancellation requested. Verified face models and resumable partial downloads remain reusable."
+                )
+        self._update_settings_cancel_state()
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready_to_close = True
-        for job, thread in (
+        if self._owns_model_download_controller:
+            ready_to_close = self.model_download_controller.shutdown(timeout_ms) and ready_to_close
+        jobs = (
             (self._cache_usage_job, self._cache_usage_thread),
             (self._cache_clear_job, self._cache_clear_thread),
             (self._verify_job, self._verify_thread),
             (self._model_job, self._model_thread),
+            (self._model_inventory_job, self._model_inventory_thread),
+            (self._face_model_job, self._face_model_thread),
             (self._journal_restore_job, self._journal_restore_thread),
-            (self._release_gate_job, self._release_gate_thread),
-        ):
+            (self._journal_refresh_job, self._journal_refresh_thread),
+        )
+        for job, thread in jobs:
             if job is not None:
                 try:
                     job.cancel()
@@ -1094,6 +1867,18 @@ class ProductionSettingsDialog(QDialog):
             if not wait_for_thread_shutdown(thread, timeout_ms=timeout_ms):
                 ready_to_close = False
         if ready_to_close:
+            for job, thread in jobs:
+                dispose = getattr(job, "dispose", None)
+                if callable(dispose):
+                    try:
+                        dispose()
+                    except Exception:
+                        pass
+                try:
+                    if getattr(thread, "_job", None) is job:
+                        thread._job = None
+                except (AttributeError, RuntimeError):
+                    pass
             self._cache_usage_job = None
             self._cache_usage_thread = None
             self._cache_clear_job = None
@@ -1102,11 +1887,16 @@ class ProductionSettingsDialog(QDialog):
             self._verify_thread = None
             self._model_job = None
             self._model_thread = None
+            self._model_inventory_job = None
+            self._model_inventory_thread = None
+            self._face_model_job = None
+            self._face_model_thread = None
             self._journal_restore_job = None
             self._journal_restore_thread = None
-            self._release_gate_job = None
-            self._release_gate_thread = None
+            self._journal_refresh_job = None
+            self._journal_refresh_thread = None
             self._thread_roles = {}
+            self._settings_job_ids = {}
         return ready_to_close
 
     def closeEvent(self, event) -> None:
@@ -1114,3 +1904,8 @@ class ProductionSettingsDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        if not self.shutdown_jobs():
+            return
+        super().done(result)

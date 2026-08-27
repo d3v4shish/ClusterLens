@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections import OrderedDict
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QRect, QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QImage, QPainter, QPen
+from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionViewItem, QApplication
+
+from ui.theme import COLORS
 
 MAX_FACE_BOXES_PER_TILE = 16
 
@@ -12,7 +16,6 @@ MAX_FACE_BOXES_PER_TILE = 16
 @dataclass
 class GalleryItem:
     image_path: str
-    image: QImage | None = None
     checked: bool = False
     failed: bool = False
     error: str = ""
@@ -32,9 +35,11 @@ class GalleryImageModel(QAbstractListModel):
     FaceBoxesRole = Qt.ItemDataRole.UserRole + 7
     FaceBoxStateRole = Qt.ItemDataRole.UserRole + 8
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, image_cache_capacity: int = 256):
         super().__init__(parent)
         self.items: list[GalleryItem] = []
+        self._image_cache_capacity = max(32, int(image_cache_capacity))
+        self._images_by_row: OrderedDict[int, QImage] = OrderedDict()
         self._preview_face_boxes_by_path: dict[str, tuple[tuple[float, float, float, float], ...]] = {}
         self._rows_by_path: dict[str, list[int]] = {}
 
@@ -49,12 +54,21 @@ class GalleryImageModel(QAbstractListModel):
         item = self.items[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             return item.image_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            name = item.image_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            selection = "selected" if item.checked else "not selected"
+            state = "failed to load" if item.failed else ("loaded" if index.row() in self._images_by_row else "loading")
+            context = f", {item.overlay}" if item.overlay else ""
+            return f"{name}, {selection}, {state}, photo {index.row() + 1} of {len(self.items)}{context}"
         if role == Qt.ItemDataRole.CheckStateRole:
             return Qt.CheckState.Checked if item.checked else Qt.CheckState.Unchecked
         if role == self.PathRole:
             return item.image_path
         if role == self.PixmapRole:
-            return item.image
+            image = self._images_by_row.get(index.row())
+            if image is not None:
+                self._images_by_row.move_to_end(index.row())
+            return image
         if role == self.FailedRole:
             return item.failed
         if role == self.ErrorRole:
@@ -90,6 +104,7 @@ class GalleryImageModel(QAbstractListModel):
     def set_images(self, image_paths: list[str]) -> None:
         self.beginResetModel()
         self.items = [GalleryItem(image_path=path) for path in image_paths]
+        self._images_by_row.clear()
         self._preview_face_boxes_by_path = {}
         self._rows_by_path = self._build_rows_by_path(self.items)
         self.endResetModel()
@@ -153,14 +168,44 @@ class GalleryImageModel(QAbstractListModel):
             self._rows_by_path.setdefault(path, []).append(start_row + offset)
         self.endInsertRows()
 
-    def set_image(self, row: int, image: QImage) -> None:
+    def set_image(self, row: int, image: QImage) -> set[int]:
         if not (0 <= row < len(self.items)):
-            return
-        self.items[row].image = image
+            return set()
+        self._images_by_row[row] = QImage(image)
+        self._images_by_row.move_to_end(row)
         self.items[row].failed = False
         self.items[row].error = ""
+        evicted: set[int] = set()
+        while len(self._images_by_row) > self._image_cache_capacity:
+            evicted_row, _evicted_image = self._images_by_row.popitem(last=False)
+            evicted.add(int(evicted_row))
         index = self.index(row, 0)
         self.dataChanged.emit(index, index, [self.PixmapRole, self.FailedRole, self.ErrorRole])
+        self._emit_changed_rows(sorted(evicted - {row}), [self.PixmapRole])
+        return evicted
+
+    def set_image_cache_capacity(self, capacity: int) -> set[int]:
+        self._image_cache_capacity = max(32, int(capacity))
+        evicted: set[int] = set()
+        while len(self._images_by_row) > self._image_cache_capacity:
+            row, _image = self._images_by_row.popitem(last=False)
+            evicted.add(int(row))
+        self._emit_changed_rows(sorted(evicted), [self.PixmapRole])
+        return evicted
+
+    def cached_rows(self) -> set[int]:
+        return set(self._images_by_row)
+
+    def failed_rows(self) -> set[int]:
+        return {row for row, item in enumerate(self.items) if item.failed}
+
+    def evict_images_except(self, retained_rows: set[int]) -> set[int]:
+        retained = {int(row) for row in retained_rows if 0 <= int(row) < len(self.items)}
+        evicted = {row for row in self._images_by_row if row not in retained}
+        for row in evicted:
+            self._images_by_row.pop(row, None)
+        self._emit_changed_rows(sorted(evicted), [self.PixmapRole])
+        return evicted
 
     def set_failed(self, row: int, error: str) -> None:
         if not (0 <= row < len(self.items)):
@@ -171,10 +216,9 @@ class GalleryImageModel(QAbstractListModel):
         self.dataChanged.emit(index, index, [self.FailedRole, self.ErrorRole])
 
     def clear_pixmaps(self) -> None:
-        if not self.items:
+        if not self.items or not self._images_by_row:
             return
-        for item in self.items:
-            item.image = None
+        self._images_by_row.clear()
         top_left = self.index(0, 0)
         bottom_right = self.index(len(self.items) - 1, 0)
         self.dataChanged.emit(top_left, bottom_right, [self.PixmapRole])
@@ -186,7 +230,7 @@ class GalleryImageModel(QAbstractListModel):
         changed_rows: list[int] = []
         for row in self._target_rows(targets):
             item = self.items[row]
-            item.image = None
+            self._images_by_row.pop(row, None)
             item.failed = False
             item.error = ""
             changed_rows.append(int(row))
@@ -297,8 +341,36 @@ class GalleryImageModel(QAbstractListModel):
         bottom_right = self.index(len(self.items) - 1, 0)
         self.dataChanged.emit(top_left, bottom_right, [Qt.ItemDataRole.CheckStateRole])
 
-    def remove_paths(self, removed_paths: set[str]) -> None:
-        self.set_images([item.image_path for item in self.items if item.image_path not in removed_paths])
+    def remove_paths(self, removed_paths: set[str]) -> set[int]:
+        removed = {str(path) for path in removed_paths if str(path)}
+        removed_rows = [row for row, item in enumerate(self.items) if item.image_path in removed]
+        if not removed_rows:
+            return self.cached_rows()
+        old_images = OrderedDict(self._images_by_row)
+        removed_row_set = set(removed_rows)
+        ranges: list[tuple[int, int]] = []
+        start = end = removed_rows[0]
+        for row in removed_rows[1:]:
+            if row == end + 1:
+                end = row
+                continue
+            ranges.append((start, end))
+            start = end = row
+        ranges.append((start, end))
+        for start, end in reversed(ranges):
+            self.beginRemoveRows(QModelIndex(), start, end)
+            del self.items[start : end + 1]
+            self.endRemoveRows()
+        self._rows_by_path = self._build_rows_by_path(self.items)
+        self._preview_face_boxes_by_path = {
+            path: boxes for path, boxes in self._preview_face_boxes_by_path.items() if path not in removed
+        }
+        self._images_by_row.clear()
+        for old_row, image in old_images.items():
+            if old_row in removed_row_set:
+                continue
+            self._images_by_row[int(old_row) - bisect_left(removed_rows, int(old_row))] = image
+        return self.cached_rows()
 
     def set_preview_face_boxes(self, image_path: str, face_boxes: list[tuple[float, float, float, float]] | tuple[tuple[float, float, float, float], ...] | None) -> None:
         path = str(image_path or "")
@@ -328,31 +400,35 @@ class GalleryImageModel(QAbstractListModel):
 
 
 class GalleryItemDelegate(QStyledItemDelegate):
+    copy_requested = pyqtSignal(str)
+
     def __init__(self, image_size: int, parent=None):
         super().__init__(parent)
         self.image_size = image_size
         self.card_width = image_size + 32
         self.card_height = image_size + 74
         self._copy_icon_size = 18
-        # Matte black theme colors (custom paint bypasses QSS).
-        self._bg = QColor("#0B0B0B")
-        self._card = QColor("#111111")
-        self._card_checked = QColor("#111A14")
-        self._card_selected = QColor("#102238")
-        self._border = QColor("#2A2A2A")
-        self._border_checked = QColor("#22C55E")
-        self._border_selected = QColor("#38BDF8")
-        self._selected_accent = QColor("#38BDF8")
-        self._checked_accent = QColor("#22C55E")
-        self._text = QColor("#EDEDED")
-        self._muted = QColor("#B0B0B0")
-        self._danger = QColor("#3A1313")
-        self._danger_border = QColor("#6A2A2A")
-        self._copy_bg = QColor("#151515")
-        self._copy_border = QColor("#2A2A2A")
-        self._copy_glyph = QColor("#D0D0D0")
-        self._face_box = QColor("#22C55E")
-        self._face_box_draft = QColor("#EF4444")
+        # Custom painting bypasses QSS, so use the shared design tokens.
+        self._card = QColor(COLORS["surface"])
+        self._card_checked = QColor(COLORS["surface_checked"])
+        self._card_selected = QColor(COLORS["surface_selected"])
+        self._border = QColor(COLORS["border"])
+        self._border_checked = QColor(COLORS["success_bright"])
+        self._border_selected = QColor(COLORS["info"])
+        self._selected_accent = QColor(COLORS["info"])
+        self._checked_accent = QColor(COLORS["success_bright"])
+        self._text = QColor(COLORS["text"])
+        self._muted = QColor(COLORS["text_muted"])
+        self._danger = QColor(COLORS["danger_surface"])
+        self._danger_border = QColor(COLORS["danger"])
+        self._copy_bg = QColor(COLORS["surface_raised"])
+        self._copy_border = QColor(COLORS["border"])
+        self._copy_glyph = QColor(COLORS["text_muted"])
+        self._face_box = QColor(COLORS["success_bright"])
+        self._face_box_draft = QColor(COLORS["danger_hover"])
+        self._placeholder = QColor(COLORS["surface_sunken"])
+        self._danger_text = QColor(COLORS["danger_text"])
+        self._overlay = QColor(COLORS["overlay"])
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(self.card_width, self.card_height)
@@ -457,9 +533,9 @@ class GalleryItemDelegate(QStyledItemDelegate):
         # Simple "two sheets" glyph.
         back = copy_rect.adjusted(3, 2, -5, -6)
         front = copy_rect.adjusted(5, 5, -3, -3)
-        painter.setBrush(QColor("#1A1A1A"))
+        painter.setBrush(self._card)
         painter.drawRect(back)
-        painter.setBrush(QColor("#101010"))
+        painter.setBrush(self._placeholder)
         painter.drawRect(front)
         painter.setPen(self._copy_glyph)
         font = QFont(option.font)
@@ -497,8 +573,8 @@ class GalleryItemDelegate(QStyledItemDelegate):
                     painter.drawRect(*normalized_rect)
                 painter.restore()
         else:
-            painter.fillRect(image_rect, QColor("#0E0E0E" if not failed else self._danger))
-            painter.setPen(self._muted if not failed else QColor("#FFB4B4"))
+            painter.fillRect(image_rect, self._placeholder if not failed else self._danger)
+            painter.setPen(self._muted if not failed else self._danger_text)
             painter.drawText(
                 image_rect,
                 Qt.AlignmentFlag.AlignCenter,
@@ -510,7 +586,7 @@ class GalleryItemDelegate(QStyledItemDelegate):
             overlay = str(overlay)
             painter.save()
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 160))
+            painter.setBrush(self._overlay)
             pad_x = 6
             pad_y = 3
             font = QFont(option.font)
@@ -526,7 +602,7 @@ class GalleryItemDelegate(QStyledItemDelegate):
             bubble_x = image_rect.x() + 4
             bubble_y = image_rect.y() + image_rect.height() - bubble_h - 4
             painter.drawRoundedRect(bubble_x, bubble_y, bubble_w, bubble_h, 6, 6)
-            painter.setPen(QColor("#FFFFFF"))
+            painter.setPen(self._text)
             painter.drawText(
                 bubble_x + pad_x,
                 bubble_y + pad_y + metrics.ascent(),
@@ -562,20 +638,8 @@ class GalleryItemDelegate(QStyledItemDelegate):
         copy_rect = self._copy_rect(option)
         if copy_rect.contains(event.position().toPoint()):
             image_path = index.data(GalleryImageModel.PathRole)
-            image = index.data(GalleryImageModel.PixmapRole)
-            qimage: QImage | None = None
-            if isinstance(image, QImage) and not image.isNull():
-                qimage = image
-            if qimage is None or qimage.isNull():
-                qimage = QImage(str(image_path))
-            if qimage is not None and not qimage.isNull():
-                QGuiApplication.clipboard().setImage(qimage)
-                parent = self.parent()
-                if parent is not None and hasattr(parent, "status_label"):
-                    try:
-                        parent.status_label.setText("Copied image to clipboard.")
-                    except Exception:
-                        pass
+            if image_path:
+                self.copy_requested.emit(str(image_path))
             return True
         checkbox_rect = option.rect.adjusted(12, 12, -(option.rect.width() - 32), -(option.rect.height() - 32))
         if checkbox_rect.contains(event.position().toPoint()):

@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from apps.pyqt_production.bootstrap import bootstrap_runtime
-from apps.shared.runtime_migrations import RuntimeMigrationService
+from apps.shared.runtime_migrations import RUNTIME_SCHEMA_VERSION, RuntimeMigrationService
 from apps.shared.runtime_support import configure_rotating_logging, install_crash_handlers
 
 
@@ -25,6 +26,23 @@ class GateResult:
     name: str
     status: str
     details: str
+
+
+STARTUP_IMPORT_MAX_SECONDS = 1.0
+STARTUP_WINDOW_MAX_SECONDS = 1.5
+STARTUP_RSS_MAX_MIB = 256.0
+
+
+def _release_subprocess_environment(*, offscreen: bool = False) -> dict[str, str]:
+    environment = os.environ.copy()
+    existing_pythonpath = str(environment.get("PYTHONPATH") or "").strip()
+    python_paths = [str(REPO_ROOT), str(SRC_ROOT)]
+    if existing_pythonpath:
+        python_paths.append(existing_pythonpath)
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+    if offscreen:
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+    return environment
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,11 +67,14 @@ def main(argv: list[str] | None = None) -> int:
     gates.append(
         GateResult(
             "runtime_migrations",
-            "PASS" if not migrations.failures else "WARN",
+            "PASS" if not migrations.failures and migrations.current_version == RUNTIME_SCHEMA_VERSION else "FAIL",
             f"previous={migrations.previous_version} current={migrations.current_version} actions={len(migrations.actions)} failures={len(migrations.failures)}",
         )
     )
     gates.extend(_path_gates(layout))
+    gates.append(_authoritative_ui_gate())
+    gates.append(_ui_ux_acceptance_gate(report_dir))
+    gates.append(_startup_performance_gate(report_dir))
 
     asset_service = ModelAssetService(runtime_model_assets_dir=layout.model_assets_dir)
     inventory = asset_service.model_inventory(clustering_model_names(scope="production"))
@@ -148,6 +169,149 @@ def _benchmark_smoke_gate(folder: str, report_dir: Path, allow_downloads: bool, 
         )
     except Exception as exc:
         return GateResult("benchmark_smoke", "FAIL", str(exc))
+
+
+def _authoritative_ui_gate() -> GateResult:
+    production_source = (REPO_ROOT / "apps" / "pyqt_production" / "app.py").read_text(encoding="utf-8")
+    prohibited_imports = (
+        "apps.pyqt_production.ui",
+        "from .ui",
+    )
+    violations = [token for token in prohibited_imports if token in production_source]
+    compatibility_root = REPO_ROOT / "apps" / "pyqt_production" / "ui"
+    independent_copies = []
+    for path in compatibility_root.glob("*.py"):
+        if path.name == "__init__.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "from ui." not in text or len(text.splitlines()) > 5:
+            independent_copies.append(path.name)
+    passed = not violations and not independent_copies
+    return GateResult(
+        "authoritative_ui",
+        "PASS" if passed else "FAIL",
+        f"prohibited_imports={violations or '-'} independent_compatibility_widgets={independent_copies or '-'}",
+    )
+
+
+def _ui_ux_acceptance_gate(report_dir: Path) -> GateResult:
+    log_path = report_dir / "ui_ux_acceptance.log"
+    environment = _release_subprocess_environment(offscreen=True)
+    command = [
+        sys.executable,
+        "-m",
+        "unittest",
+        "-q",
+        "tests.test_ui_ux_acceptance",
+        "tests.test_production_safety",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            f"$ {' '.join(command)}\n\nSTDOUT\n{completed.stdout}\n\nSTDERR\n{completed.stderr}",
+            encoding="utf-8",
+        )
+        return GateResult(
+            "ui_ux_acceptance",
+            "PASS" if completed.returncode == 0 else "FAIL",
+            f"exit_code={completed.returncode} log={log_path}",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return GateResult("ui_ux_acceptance", "FAIL", str(exc))
+
+
+def _startup_performance_gate(report_dir: Path) -> GateResult:
+    report_path = report_dir / "startup_performance.json"
+    marker = "__CLUSTERLENS_STARTUP__="
+    script = f"""
+import json
+import os
+import resource
+import sys
+import time
+from pathlib import Path
+
+started = time.perf_counter()
+from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
+from PyQt6.QtWidgets import QApplication
+import_seconds = time.perf_counter() - started
+
+app = QApplication.instance() or QApplication([])
+window_started = time.perf_counter()
+window = ProductionClusterApp(RUNTIME_LAYOUT)
+window_seconds = time.perf_counter() - window_started
+try:
+    rss_pages = int(Path("/proc/self/statm").read_text(encoding="utf-8").split()[1])
+    rss_mib = float(rss_pages * int(os.sysconf("SC_PAGE_SIZE"))) / (1024.0 * 1024.0)
+except (OSError, ValueError, IndexError):
+    rss_mib = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+heavy_modules = [
+    name for name in ("torch", "onnxruntime", "app.services.face_search", "ui.search_pane")
+    if name in sys.modules
+]
+window.close()
+app.processEvents()
+print({marker!r} + json.dumps({{
+    "import_seconds": import_seconds,
+    "window_seconds": window_seconds,
+    "rss_mib": rss_mib,
+    "eager_heavy_modules": heavy_modules,
+}}))
+"""
+    environment = _release_subprocess_environment(offscreen=True)
+    environment["PYTHONHASHSEED"] = "0"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        marker_line = next(
+            (line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)),
+            "",
+        )
+        if completed.returncode != 0 or not marker_line:
+            details = (completed.stderr or completed.stdout or "startup probe produced no result").strip()[-1000:]
+            return GateResult("startup_performance", "FAIL", details)
+        metrics = json.loads(marker_line[len(marker) :])
+        metrics["thresholds"] = {
+            "import_seconds": STARTUP_IMPORT_MAX_SECONDS,
+            "window_seconds": STARTUP_WINDOW_MAX_SECONDS,
+            "rss_mib": STARTUP_RSS_MAX_MIB,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        passed = bool(
+            float(metrics["import_seconds"]) <= STARTUP_IMPORT_MAX_SECONDS
+            and float(metrics["window_seconds"]) <= STARTUP_WINDOW_MAX_SECONDS
+            and float(metrics["rss_mib"]) <= STARTUP_RSS_MAX_MIB
+            and not list(metrics["eager_heavy_modules"])
+        )
+        return GateResult(
+            "startup_performance",
+            "PASS" if passed else "FAIL",
+            (
+                f"import={float(metrics['import_seconds']):.3f}s/{STARTUP_IMPORT_MAX_SECONDS:.1f}s "
+                f"window={float(metrics['window_seconds']):.3f}s/{STARTUP_WINDOW_MAX_SECONDS:.1f}s "
+                f"rss={float(metrics['rss_mib']):.1f}MiB/{STARTUP_RSS_MAX_MIB:.0f}MiB "
+                f"eager={list(metrics['eager_heavy_modules']) or '-'} report={report_path}"
+            ),
+        )
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        return GateResult("startup_performance", "FAIL", str(exc))
 
 
 def _markdown(payload: dict[str, object]) -> str:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from functools import partial
 from collections.abc import Callable
 from itertools import count
 from time import monotonic, sleep
+from weakref import ref
 
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 
@@ -16,11 +18,17 @@ _DETACHED_ASYNC_REFS: list[tuple[object | None, object | None]] = []
 class _AsyncJobSignalRelay(QObject):
     def __init__(self, job: "AsyncJob"):
         super().__init__()
-        self._job = job
+        # The job owns its relay. Keeping a strong reference back to the job
+        # creates a QObject cycle whose eventual garbage-collection order is
+        # unsafe after the worker thread has exited.
+        self._job_ref = ref(job)
 
     def _emit_safe(self, signal_name: str, *args) -> None:
+        job = self._job_ref()
+        if job is None:
+            return
         try:
-            signal = getattr(self._job, signal_name)
+            signal = getattr(job, signal_name)
             signal.emit(*args)
         except RuntimeError:
             # The owning AsyncJob can be deleted during shutdown while queued
@@ -97,6 +105,25 @@ class AsyncJob(QObject):
     def cancel(self) -> None:
         self._cancel_requested = True
 
+    def dispose(self) -> None:
+        """Break signal callback cycles after a terminal event or shutdown."""
+        for signal_name in (
+            "started",
+            "progress",
+            "completed",
+            "failed",
+            "cancelled",
+            "_worker_started",
+            "_worker_progress",
+            "_worker_completed",
+            "_worker_failed",
+            "_worker_cancelled",
+        ):
+            try:
+                getattr(self, signal_name).disconnect()
+            except (TypeError, RuntimeError):
+                pass
+
     def run(self) -> None:
         if not self._emit_worker_signal("_worker_started"):
             return
@@ -109,10 +136,15 @@ class AsyncJob(QObject):
             append_qt_diagnostic(f"[JobFailed] {self._debug_name} error={exc}")
             self._emit_worker_signal("_worker_failed", str(exc))
         else:
+            if self._is_cancelled():
+                append_qt_diagnostic(f"[JobCancelledAfterReturn] {self._debug_name}")
+                self._emit_worker_signal("_worker_cancelled")
+                return
             append_qt_diagnostic(f"[JobCompleted] {self._debug_name}")
             self._emit_worker_signal("_worker_completed", result)
 
     def _emit_progress(self, value: int, status: str) -> None:
+        raise_if_cancelled(self._is_cancelled)
         if not self._emit_worker_signal("_worker_progress", int(value), str(status)):
             raise Cancelled()
 
@@ -268,9 +300,11 @@ def start_job_in_thread(job: AsyncJob) -> QThread:
     """
 
     thread = _AsyncJobThread(job)
-    job.moveToThread(thread)
+    # _AsyncJobThread invokes the plain Python run method directly. Keeping the
+    # QObject itself on the GUI thread makes its eventual destruction safe;
+    # worker-to-GUI delivery is already enforced by _AsyncJobSignalRelay.
     thread_name = thread.objectName()
-    thread.finished.connect(lambda name=thread_name: append_qt_diagnostic(f"[ThreadFinish] {name}"))
+    thread.finished.connect(partial(append_qt_diagnostic, f"[ThreadFinish] {thread_name}"))
     thread.finished.connect(thread.deleteLater)
     thread.start()
     return thread

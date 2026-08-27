@@ -8,13 +8,16 @@ import sys
 from typing import TYPE_CHECKING
 import uuid
 
+from PyQt6 import sip
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget
 
 from apps.pyqt_production.bootstrap import bootstrap_runtime
 from apps.pyqt_production.first_run import FirstRunSetupDialog
-from apps.pyqt_production.icon_assets import production_app_icon, production_icon_path
-from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME, production_settings_store
+from apps.pyqt_production.icon_assets import configure_linux_desktop_entry, production_app_icon, production_icon_path
+from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME, PRODUCTION_QSETTINGS_ORG, production_settings_store
+from apps.pyqt_production.model_download_controller import ModelDownloadController
 from apps.pyqt_production.session_controller import ClusteringSessionController
 from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
 from apps.pyqt_production.worker_protocol import ProductionClusterRequest
@@ -31,28 +34,34 @@ from app.services.cache_maintenance import CacheClearResult, CacheMaintenanceSer
 from app.services.cluster_explanations import ClusterExplanation  # noqa: E402
 from app.services.cluster_meanings import ClusterMeaning  # noqa: E402
 from app.services.clustering_options import model_label, normalize_clustering_backends, normalize_embedding_models  # noqa: E402
-from app.services.model_assets import BUNDLED_ONNX_INPUT_SIZES, MODEL_SOURCE_LABELS, ModelAssetService, ModelDownloadPlan  # noqa: E402
+from app.services.model_assets import MODEL_SOURCE_LABELS, TEXT_MODEL_ORDER, ModelAssetService, ModelDownloadPlan  # noqa: E402
+from app.services.model_downloads import ModelDownloadItem, normalize_model_download_items  # noqa: E402
 from app.services.image_tags import ClusterTagSummary, ImageTagService  # noqa: E402
 from app.services.saved_searches import SavedSearchService  # noqa: E402
 from app.services.photo_metadata import PhotoMetadataService  # noqa: E402
-from infra.performance import detect_system_resources, select_performance_profile  # noqa: E402
+from infra.performance import apply_performance_overrides, detect_system_resources, select_performance_profile  # noqa: E402
 from infra.qt_diagnostics import install_qt_message_handler  # noqa: E402
-from infra.runtime import RuntimeCapabilityService  # noqa: E402
-from infra.settings import get_settings  # noqa: E402
-from apps.pyqt_production.ui.cluster_pane import ClusterPane  # noqa: E402
-from apps.pyqt_production.ui.error_mbox import TagManagerDialog, confirmBox, errorBox, infoBox  # noqa: E402
-from apps.pyqt_production.ui.footer_bar import WorkspaceFooter  # noqa: E402
-from apps.pyqt_production.ui.gallery_pane import GalleryPane  # noqa: E402
-from apps.pyqt_production.ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
-from apps.pyqt_production.ui.job_manager import JobManager  # noqa: E402
-from apps.pyqt_production.ui.job_widgets import JobIndicatorWidget  # noqa: E402
-from apps.pyqt_production.ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
-from apps.pyqt_production.ui.runtime_widgets import RuntimeBadge  # noqa: E402
-from apps.pyqt_production.ui.theme import apply_ultra_dark  # noqa: E402
+from infra.runtime import ExecutionPolicy, RuntimeCapabilityService  # noqa: E402
+from infra.settings import get_production_settings_registry, get_settings  # noqa: E402
+from ui.cluster_pane import ClusterPane  # noqa: E402
+from ui.error_mbox import TagManagerDialog, confirmBox, errorBox, infoBox  # noqa: E402
+from ui.footer_bar import WorkspaceFooter  # noqa: E402
+from ui.gallery_pane import GalleryPane  # noqa: E402
+from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
+from ui.job_manager import JobManager  # noqa: E402
+from ui.job_widgets import JobIndicatorWidget  # noqa: E402
+from ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
+from ui.recent_folders import RecentFolderHistory  # noqa: E402
+from ui.runtime_widgets import RuntimeBadge  # noqa: E402
+from ui.icons import apply_icon  # noqa: E402
+from ui.theme import apply_ultra_dark  # noqa: E402
 
 
 configure_rotating_logging(RUNTIME_LAYOUT, force=True)
 LOGGER = logging.getLogger(__name__)
+MIN_SUPPORTED_SCREEN_WIDTH = 1920
+MIN_SUPPORTED_SCREEN_HEIGHT = 1080
+COMPACT_LAYOUT_WIDTH = 1440
 
 if TYPE_CHECKING:
     from app.services.face_search import FaceIndexService
@@ -85,9 +94,24 @@ class PreparedRunPayload:
     matched_count: int
 
 
+@dataclass(frozen=True)
+class FacesWorkspacePayload:
+    execution_policy: ExecutionPolicy
+    capabilities: object
+    service_cache: dict[tuple[str, str, str, str], object]
+    services_global: dict[str, object]
+    services_session: dict[str, object]
+
+
 class ProductionClusterApp(QMainWindow):
     def __init__(self, runtime_layout: RuntimeLayout):
         super().__init__()
+        self._is_shutting_down = False
+        self._screen_available_width = MIN_SUPPORTED_SCREEN_WIDTH
+        self._screen_available_height = MIN_SUPPORTED_SCREEN_HEIGHT
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._mark_shutting_down)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         app_icon = QApplication.windowIcon()
         if app_icon.isNull():
@@ -96,12 +120,17 @@ class ProductionClusterApp(QMainWindow):
             self.setWindowIcon(app_icon)
         self.runtime_layout = runtime_layout
         self.settings = get_settings()
+        self.settings_registry = get_production_settings_registry()
         self.settings_store = production_settings_store()
+        self.recent_folder_history = RecentFolderHistory(self.settings_store)
         self.runtime_service = RuntimeCapabilityService()
         self.job_manager = JobManager(self)
         self.system_resources = detect_system_resources()
-        self.performance_profile = select_performance_profile(self._preferred_performance_profile(), self.system_resources)
-        self.execution_policy = self.runtime_service.select_policy(self._preferred_execution_mode())
+        self.performance_profile = self._effective_performance_profile()
+        self.execution_policy = ExecutionPolicy(
+            preferred_mode=self._preferred_execution_mode(),
+            reason="Runtime verification starts when accelerated work is requested.",
+        )
         self.photo_metadata_service = PhotoMetadataService()
         self.image_tag_service = ImageTagService()
         self.saved_search_service = SavedSearchService()
@@ -111,6 +140,7 @@ class ProductionClusterApp(QMainWindow):
         self._cleanup_runtime_temp_on_startup()
         self.session_controller = ClusteringSessionController(runtime_layout, self)
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
+        self.model_download_controller = ModelDownloadController(runtime_layout, self)
         self.cluster_data: dict[str, dict[int, list[str]]] = {}
         self.membership_by_image: dict[str, dict[str, dict[str, object]]] = {}
         self.metrics_by_backend: dict[str, dict[str, object]] = {}
@@ -138,6 +168,14 @@ class ProductionClusterApp(QMainWindow):
         self._storage_clear_thread = None
         self._post_install_model_job = None
         self._post_install_model_thread = None
+        self._model_download_job_id: int | None = None
+        self._pending_model_download_run: tuple[ProductionClusterRequest, str] | None = None
+        self._active_post_install_model_name: str | None = None
+        self._faces_init_job = None
+        self._faces_init_thread = None
+        self._faces_init_job_id: int | None = None
+        self._faces_init_scheduled = False
+        self._faces_focus_search_pending = False
         self._pending_post_install_model_name: str | None = None
         self._last_storage_summary: RuntimeStorageSummary | None = None
         self._active_job_id: int | None = None
@@ -149,8 +187,14 @@ class ProductionClusterApp(QMainWindow):
         self._pane_restore_widths = {"source": 250, "controls": 420, "details": 440}
         self._advanced_cluster_splitter_sizes = [1]
         self._face_service_cache: dict[tuple[str, str, str, str], FaceIndexService] = {}
+        self.face_services_global = {}
+        self.face_services_session = {}
+        self.face_service_global = None
+        self.face_service_session = None
+        self.faces_pane = None
+        self.faces_placeholder = None
+        self._faces_session_reset_pending = True
         self._main_gallery_context_overrides: dict[str, dict[str, object]] = {}
-        self._build_face_services(reset_face_session=True)
         self._startup_check_timer = QTimer(self)
         self._startup_check_timer.setSingleShot(True)
         self._startup_check_timer.timeout.connect(self._post_startup_checks)
@@ -159,8 +203,14 @@ class ProductionClusterApp(QMainWindow):
         self._post_install_timer.timeout.connect(self._run_pending_post_install_model_download)
         self._build_ui()
         self._connect_signals()
+        self._refresh_recent_folder_menus()
+        restored_folder = str(self.settings_store.value("workspace/selected_folder", "") or "").strip()
+        if restored_folder and Path(restored_folder).is_dir():
+            self.source_pane.set_selected_directory(restored_folder)
+        else:
+            self._on_directory_changed("")
         self._apply_workspace_preferences()
-        self._apply_runtime_status()
+        self.runtime_badge.update_runtime(None, None)
         self._apply_safety_state()
         self.set_faces_mode(self._preferred_faces_ui_mode())
         self.set_active_workspace(self._preferred_workspace())
@@ -191,8 +241,6 @@ class ProductionClusterApp(QMainWindow):
             LOGGER.warning("Runtime migration completed with failures: %s", "; ".join(result.failures))
 
     def _build_ui(self) -> None:
-        from ui.search_pane import SearchPane
-
         self.setWindowTitle(PRODUCTION_DISPLAY_NAME)
         self.resize(1920, 1080)
         self.setMinimumSize(1440, 900)
@@ -234,6 +282,13 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.set_read_only_mode(self._read_only_mode())
         self.gallery_pane.set_action_target_provider(self.cluster_pane.current_selection_target)
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
+        self.gallery_pane.set_empty_state(
+            "Start clustering your photos",
+            "Choose a folder, then run clustering to organize its photos into visual groups.",
+            show_select_folder=True,
+            show_run=True,
+        )
+        self.gallery_pane.empty_run_button.setEnabled(False)
         self.clustering_pane.setMinimumWidth(380)
         self.clustering_pane.setMaximumWidth(460)
         self.gallery_pane.setMinimumWidth(760)
@@ -253,34 +308,10 @@ class ProductionClusterApp(QMainWindow):
         self.clustering_splitter.setStretchFactor(1, 8)
         self.clustering_splitter.setStretchFactor(2, 3)
 
-        self.faces_pane = SearchPane(
-            self.workspace_stack,
-            face_service_global=self.face_service_global,
-            face_service_session=self.face_service_session,
-            face_services_global=self.face_services_global,
-            face_services_session=self.face_services_session,
-            enabled_tabs=["All Faces", "Faces In Folder", "Face Search"],
-            saved_search_service=self.saved_search_service,
-        )
-        self.faces_pane.set_face_service_provider(self._face_service_for_pipeline)
-        self.faces_pane.current_directory_provider = lambda: self.source_pane.selected_directory
-        self.faces_pane.clustering_filter_state_provider = self._current_clustering_filter_state
-        self.faces_pane.search_only_current_folder.setText("Limit search to current folder")
-        self.faces_pane.use_onnx_provider = lambda: bool(self.clustering_pane.onnx_checkbox.isChecked())
-        self.faces_pane.job_manager = self.job_manager
-        self.faces_pane.results_gallery.job_manager = self.job_manager
-        self.faces_pane.results_gallery.metadata_service = self.photo_metadata_service
-        self.faces_pane.results_gallery.image_tag_service = self.image_tag_service
-        self.faces_pane.configure_face_pipeline_options(
-            self._face_model_root(),
-            self._preferred_face_pipeline_defaults(),
-            refresh=False,
-        )
-        self.faces_pane.set_active_face_mode(self._preferred_face_mode(), refresh=False)
-        self.faces_pane.setMinimumWidth(1040)
+        self.faces_placeholder = self._build_faces_placeholder()
 
         self.workspace_stack.addWidget(self.clustering_workspace)
-        self.workspace_stack.addWidget(self.faces_pane)
+        self.workspace_stack.addWidget(self.faces_placeholder)
         self.workspace_stack.setMinimumWidth(1040)
 
         self.main_splitter.addWidget(self.source_pane)
@@ -293,22 +324,343 @@ class ProductionClusterApp(QMainWindow):
         self.statusBar().hide()
         self.set_clustering_mode("basic")
 
+    def _build_faces_placeholder(self) -> QWidget:
+        panel = QWidget(self.workspace_stack)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        self.faces_placeholder_title = QLabel("Faces workspace")
+        self.faces_placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.faces_placeholder_title.setObjectName("facesLazyTitle")
+        self.faces_placeholder_detail = QLabel("Face indexing, search, review, and identity tools load when opened.")
+        self.faces_placeholder_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.faces_placeholder_detail.setWordWrap(True)
+        self.faces_placeholder_button = QPushButton("Load Faces")
+        self.faces_placeholder_button.setMinimumWidth(180)
+        self.faces_placeholder_button.clicked.connect(self._start_faces_workspace_load)
+        layout.addWidget(self.faces_placeholder_title)
+        layout.addWidget(self.faces_placeholder_detail)
+        layout.addWidget(self.faces_placeholder_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        return panel
+
+    def show_unsupported_resolution_view(self, screen_geometry: tuple[int, int]) -> None:
+        width, height = screen_geometry
+        panel = QWidget(self)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(32, 32, 32, 32)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        title = QLabel("Unsupported display resolution")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setObjectName("unsupportedResolutionTitle")
+        detail = QLabel(
+            f"ClusterLens requires a logical display of at least {MIN_SUPPORTED_SCREEN_WIDTH}x{MIN_SUPPORTED_SCREEN_HEIGHT} "
+            "in either landscape or portrait orientation. "
+            f"This display reports {int(width)}x{int(height)}."
+        )
+        detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detail.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(detail)
+        layout.addStretch(1)
+        self.setCentralWidget(panel)
+        self.setMinimumSize(640, 480)
+
+    def _ensure_faces_workspace(self):
+        if self.faces_pane is not None:
+            return self.faces_pane
+
+        # Keep the first window construction lightweight even when Faces is
+        # the saved workspace.  The placeholder paints first; model/runtime
+        # discovery begins on the next event-loop turn and remains cancellable.
+        if not self._faces_init_scheduled and not self._thread_is_running(self._faces_init_thread):
+            self._faces_init_scheduled = True
+            QTimer.singleShot(0, self._start_faces_workspace_load)
+        return self.faces_placeholder
+
+    def _start_faces_workspace_load(self) -> None:
+        self._faces_init_scheduled = False
+        if self.faces_pane is not None or self._is_shutting_down:
+            return
+        if self._thread_is_running(self._faces_init_thread):
+            return
+
+        model_root = str(self.settings_registry.get(self.settings_store, "faces/model_root", "") or "").strip()
+        configured_detector = str(
+            self.settings_registry.get(self.settings_store, "faces/default_detector/human") or ""
+        ).strip()
+        configured_embedder = str(
+            self.settings_registry.get(self.settings_store, "faces/default_embedder/human") or ""
+        ).strip()
+        detector_score = float(
+            self.settings_registry.get(self.settings_store, "faces/detector_score_threshold/human")
+        )
+        max_detections = max(
+            1,
+            int(self.settings_registry.get(self.settings_store, "faces/max_detections/human", 50)),
+        )
+        preferred_execution_mode = self._preferred_execution_mode()
+        reset_face_session = bool(self._faces_session_reset_pending)
+        cache_dir = Path(self.settings.cache_dir)
+        if getattr(self, "faces_placeholder_detail", None) is not None:
+            self.faces_placeholder_detail.setText("Checking runtime and opening the saved face library…")
+        if getattr(self, "faces_placeholder_button", None) is not None:
+            self.faces_placeholder_button.setEnabled(False)
+
+        def _run(progress, cancel_check):
+            progress(-1, "Checking CPU and CUDA runtime…")
+            policy = self.runtime_service.select_policy(preferred_execution_mode, refresh=True)
+            capabilities = self.runtime_service.detect()
+            if policy.cuda_required_unavailable:
+                raise RuntimeError(policy.error or policy.reason)
+            raise_if_cancelled(cancel_check)
+            progress(-1, "Opening face databases…")
+            face_search = _face_search_api()
+            mode = "human"
+            detector, embedder = face_search.resolve_ready_face_pipeline_ids(
+                model_root,
+                mode,
+                configured_detector or face_search.DEFAULT_HUMAN_FACE_DETECTOR_ID,
+                configured_embedder or face_search.DEFAULT_HUMAN_FACE_EMBEDDER_ID,
+            )
+            if reset_face_session:
+                for path in cache_dir.glob("face_search*_session*.db*"):
+                    raise_if_cancelled(cancel_check)
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        continue
+
+            def _db_path(scope: str) -> Path:
+                if detector == face_search.BUILTIN_HUMAN_DETECTOR_ID and embedder == face_search.BUILTIN_HUMAN_EMBEDDER_ID:
+                    return cache_dir / ("face_search_session.db" if scope == "session" else "face_search_index.db")
+                suffix = "_session" if scope == "session" else ""
+                slug = f"{detector}__{embedder}"
+                return cache_dir / f"face_search_human_{slug}{suffix}.db"
+
+            service_cache: dict[tuple[str, str, str, str], object] = {}
+            services: dict[str, object] = {}
+            for scope in ("global", "session"):
+                raise_if_cancelled(cancel_check)
+                service = face_search.FaceIndexService(
+                    mode=mode,
+                    execution_policy=policy,
+                    runtime_service=self.runtime_service,
+                    model_root=model_root,
+                    detector_id=detector,
+                    embedder_id=embedder,
+                    detector_score_threshold=detector_score,
+                    detector_max_detections=max_detections,
+                    db_path=_db_path(scope),
+                )
+                service_cache[(scope, mode, detector, embedder)] = service
+                services[scope] = service
+            return FacesWorkspacePayload(
+                execution_policy=policy,
+                capabilities=capabilities,
+                service_cache=service_cache,
+                services_global={mode: services["global"]},
+                services_session={mode: services["session"]},
+            )
+
+        job = AsyncJob(_run)
+        self._faces_init_job = job
+        self._faces_init_job_id = self.job_manager.register_job("Opening Faces", cancel_fn=job.cancel)
+        job.progress.connect(
+            lambda value, text: self.job_manager.update(
+                self._faces_init_job_id or -1,
+                progress=value,
+                text=text,
+            )
+        )
+        job.progress.connect(
+            lambda _value, text: self.faces_placeholder_detail.setText(str(text))
+            if self._can_update_widget(getattr(self, "faces_placeholder_detail", None))
+            else None
+        )
+
+        def _finish(status: str, error: str = "") -> None:
+            if self._faces_init_job_id is not None:
+                self.job_manager.finish(self._faces_init_job_id, status=status, error=error)
+            self._faces_init_job_id = None
+
+        def _completed(payload) -> None:
+            if self._is_shutting_down or not isinstance(payload, FacesWorkspacePayload):
+                _finish("cancelled")
+                return
+            self.execution_policy = payload.execution_policy
+            self.runtime_badge.update_runtime(payload.capabilities, payload.execution_policy)
+            self._face_service_cache = dict(payload.service_cache)
+            self.face_services_global = dict(payload.services_global)
+            self.face_services_session = dict(payload.services_session)
+            self.face_service_global = self.face_services_global["human"]
+            self.face_service_session = self.face_services_session["human"]
+            self._faces_session_reset_pending = False
+            self._build_faces_workspace_widget()
+            _finish("finished")
+
+        def _failed(message: str) -> None:
+            text = str(message or "").strip()
+            _finish("cancelled" if text.casefold() == "cancelled" else "failed", text)
+            if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
+                self.faces_placeholder_detail.setText(f"Faces could not open: {text}")
+                self.faces_placeholder_button.setText("Retry Faces")
+                self.faces_placeholder_button.setEnabled(True)
+
+        def _cancelled() -> None:
+            _finish("cancelled")
+            if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
+                self.faces_placeholder_detail.setText("Faces loading was cancelled.")
+                self.faces_placeholder_button.setEnabled(True)
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        thread = start_job_in_thread(job)
+        self._faces_init_thread = thread
+        self._retain_async_refs(job, thread)
+
+        def _cleanup() -> None:
+            self._release_async_refs(job, thread)
+            if self._faces_init_thread is thread:
+                self._faces_init_thread = None
+            if self._faces_init_job is job:
+                self._faces_init_job = None
+
+        thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
+
+    def _build_faces_workspace_widget(self) -> None:
+        if self.faces_pane is not None or self._is_shutting_down:
+            return
+
+        from ui.search_pane import SearchPane
+        pane = SearchPane(
+            self.workspace_stack,
+            face_service_global=self.face_service_global,
+            face_service_session=self.face_service_session,
+            face_services_global=self.face_services_global,
+            face_services_session=self.face_services_session,
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            saved_search_service=self.saved_search_service,
+            supported_face_modes=["human"],
+        )
+        pane.set_face_service_provider(self._face_service_for_pipeline)
+        pane.current_directory_provider = lambda: self.source_pane.selected_directory
+        pane.clustering_filter_state_provider = self._current_clustering_filter_state
+        pane.use_onnx_provider = lambda: bool(self.clustering_pane.onnx_checkbox.isChecked())
+        pane.job_manager = self.job_manager
+        pane.results_gallery.job_manager = self.job_manager
+        pane.results_gallery.metadata_service = self.photo_metadata_service
+        pane.results_gallery.image_tag_service = self.image_tag_service
+        pane.configure_face_pipeline_options(
+            self._face_model_root(),
+            self._preferred_face_pipeline_defaults(),
+            refresh=False,
+        )
+        pane.set_active_face_mode("human", refresh=False)
+        pane.set_read_only_mode(self._read_only_mode())
+        if self.source_pane.selected_directory:
+            pane.face_folder_path.setText(self.source_pane.selected_directory)
+        pane.setMinimumWidth(self._layout_widths()["faces"])
+        self.faces_pane = pane
+        self._connect_faces_signals(pane)
+        self._apply_workspace_preferences()
+        self._apply_safety_state()
+
+        placeholder = self.faces_placeholder
+        placeholder_index = self.workspace_stack.indexOf(placeholder) if placeholder is not None else -1
+        if placeholder_index >= 0:
+            self.workspace_stack.insertWidget(placeholder_index, pane)
+            self.workspace_stack.removeWidget(placeholder)
+            placeholder.deleteLater()
+            self.faces_placeholder = None
+        else:
+            self.workspace_stack.addWidget(pane)
+        if self._active_workspace == "faces":
+            self.workspace_stack.setCurrentWidget(pane)
+            pane.ensure_current_faces_tab_loaded()
+        if self._faces_focus_search_pending:
+            self._faces_focus_search_pending = False
+            target = getattr(pane, "face_identity_search", None) or getattr(pane, "face_query_path", None)
+            if target is not None:
+                target.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _connect_faces_signals(self, pane) -> None:
+        pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
+        pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
+        pane.saved_clustering_filter_requested.connect(self._run_saved_clustering_filter)
+        pane.open_face_model_settings_requested.connect(lambda: self.open_settings_dialog("Models"))
+        pane.face_pipeline_controls_requested.connect(self._show_face_pipeline_controls)
+        pane.install_face_model_requested.connect(self._request_face_model_download)
+        pane.source_folder_changed.connect(self._set_shared_source_folder)
+        pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
+        pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
+        pane.set_recent_directories(self.recent_folder_history.paths())
+
+    def _show_face_pipeline_controls(self) -> None:
+        self.set_active_workspace("faces")
+        self.set_faces_mode("advanced")
+        pane = self._ensure_faces_workspace()
+        pane.reveal_face_pipeline_controls()
+        self.footer_bar.set_status(
+            "Face pipeline editor opened. Install missing components in Settings > Models, then choose a detector and embedder."
+        )
+
+    def _set_shared_source_folder(self, directory: str) -> None:
+        directory = str(directory or "").strip()
+        if directory and Path(directory).is_dir() and directory != self.source_pane.selected_directory:
+            self.source_pane.set_selected_directory(directory)
+
+    def _refresh_recent_folder_menus(self) -> None:
+        paths = self.recent_folder_history.paths()
+        self.source_pane.set_recent_directories(paths)
+        if self.faces_pane is not None:
+            self.faces_pane.set_recent_directories(paths)
+
+    def _remove_recent_folder(self, directory: str) -> None:
+        if self.recent_folder_history.remove(directory):
+            self._refresh_recent_folder_menus()
+
+    def _clear_recent_folders(self) -> None:
+        if self.recent_folder_history.clear():
+            self._refresh_recent_folder_menus()
+
     def _build_toolbar(self) -> QWidget:
         bar = QWidget(self)
+        bar.setObjectName("applicationHeader")
+        bar.setAccessibleName("Application header")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(8, 5, 8, 5)
         row.setSpacing(8)
 
-        self.feature_label = QLabel(f"{PRODUCTION_DISPLAY_NAME} | Clustering")
+        self.feature_label = QLabel(PRODUCTION_DISPLAY_NAME)
+        self.feature_label.setProperty("role", "section")
+        self.feature_label.setAccessibleName("ClusterLens")
         self.clustering_workspace_button = QPushButton("Clustering")
         self.clustering_workspace_button.setCheckable(True)
+        self.clustering_workspace_button.setProperty("nav", True)
+        self.clustering_workspace_button.setAccessibleName("Open Clustering workspace")
+        apply_icon(self.clustering_workspace_button, "workspace")
         self.clustering_workspace_button.clicked.connect(lambda: self.set_active_workspace("clustering"))
         self.faces_workspace_button = QPushButton("Faces")
         self.faces_workspace_button.setCheckable(True)
+        self.faces_workspace_button.setProperty("nav", True)
+        self.faces_workspace_button.setAccessibleName("Open Faces workspace")
+        apply_icon(self.faces_workspace_button, "search")
         self.faces_workspace_button.clicked.connect(lambda: self.set_active_workspace("faces"))
         self.current_folder_label = QLabel("No folder selected")
-        self.activity_label = QLabel("Idle")
-        self.activity_label.setMinimumWidth(280)
+        self.current_folder_label.setAccessibleName("Current folder")
+        self.current_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.activity_label = self.current_folder_label
+
+        self.mode_selector = QComboBox(self)
+        self.mode_selector.addItem("Basic", "basic")
+        self.mode_selector.addItem("Advanced", "advanced")
+        self.mode_selector.setAccessibleName("Workspace mode")
+        self.mode_selector.currentIndexChanged.connect(self._on_mode_selector_changed)
+
         self.source_toggle = QPushButton("Folders")
         self.source_toggle.setCheckable(True)
         self.source_toggle.setChecked(True)
@@ -332,6 +684,42 @@ class ProductionClusterApp(QMainWindow):
             "Suggest tags for the selected cluster from Cluster Meaning. Suggestions write to the app tag database only."
         )
         self.suggest_tags_button.clicked.connect(self.apply_cluster_tag_suggestions)
+
+        self.view_menu = QMenu("View", self)
+        self.source_view_action = self.view_menu.addAction("Show folders")
+        self.source_view_action.setCheckable(True)
+        self.source_view_action.setChecked(True)
+        self.source_view_action.toggled.connect(lambda checked: self._set_pane_visible("source", checked))
+        self.controls_view_action = self.view_menu.addAction("Show clustering controls")
+        self.controls_view_action.setCheckable(True)
+        self.controls_view_action.setChecked(True)
+        self.controls_view_action.toggled.connect(lambda checked: self._set_pane_visible("controls", checked))
+        self.details_view_action = self.view_menu.addAction("Show comparison details")
+        self.details_view_action.setCheckable(True)
+        self.details_view_action.setChecked(True)
+        self.details_view_action.toggled.connect(lambda checked: self._set_pane_visible("details", checked))
+        self.view_button = QToolButton(self)
+        self.view_button.setText("View")
+        self.view_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.view_button.setMenu(self.view_menu)
+        self.view_button.setAccessibleName("Open view options")
+        self.view_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        apply_icon(self.view_button, "reveal")
+
+        self.cluster_actions_menu = QMenu("Cluster actions", self)
+        self.tag_manager_action = self.cluster_actions_menu.addAction("Manage tags")
+        self.tag_manager_action.triggered.connect(lambda _checked=False: self.open_tag_manager())
+        self.suggest_tags_action = self.cluster_actions_menu.addAction("Apply suggested tags")
+        self.suggest_tags_action.triggered.connect(lambda _checked=False: self.apply_cluster_tag_suggestions())
+        self.cluster_actions_menu_action = self.view_menu.addMenu(self.cluster_actions_menu)
+        self.cluster_actions_button = QToolButton(self)
+        self.cluster_actions_button.setText("Cluster actions")
+        self.cluster_actions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.cluster_actions_button.setMenu(self.cluster_actions_menu)
+        self.cluster_actions_button.setAccessibleName("Open cluster actions")
+        self.cluster_actions_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        apply_icon(self.cluster_actions_button, "jobs")
+
         self.basic_mode_button = QPushButton("Basic")
         self.basic_mode_button.setCheckable(True)
         self.basic_mode_button.clicked.connect(lambda: self.set_active_workspace_mode("basic"))
@@ -340,31 +728,50 @@ class ProductionClusterApp(QMainWindow):
         self.advanced_mode_button.clicked.connect(lambda: self.set_active_workspace_mode("advanced"))
         self.runtime_badge = RuntimeBadge(self)
         self.health_badge = QLabel("Health: checking")
-        self.health_badge.setMinimumWidth(130)
+        self.health_badge.hide()
         self.jobs_widget = JobIndicatorWidget(self.job_manager, self)
         self.settings_button = QPushButton("Settings")
+        self.settings_button.setAccessibleName("Open Settings")
+        self.settings_button.setToolTip("Open Settings (Ctrl+,)")
+        apply_icon(self.settings_button, "settings")
         self.settings_button.clicked.connect(self.open_settings_dialog)
 
         row.addWidget(self.feature_label)
         row.addWidget(self.clustering_workspace_button)
         row.addWidget(self.faces_workspace_button)
         row.addWidget(self.current_folder_label, stretch=1)
-        row.addWidget(self.activity_label)
-        row.addWidget(self.source_toggle)
-        row.addWidget(self.controls_toggle)
-        row.addWidget(self.details_toggle)
-        row.addWidget(self.tag_manager_button)
-        row.addWidget(self.suggest_tags_button)
-        row.addWidget(self.basic_mode_button)
-        row.addWidget(self.advanced_mode_button)
-        row.addWidget(self.runtime_badge)
-        row.addWidget(self.health_badge)
+        row.addWidget(self.mode_selector)
+        row.addWidget(self.view_button)
         row.addWidget(self.jobs_widget)
+        row.addWidget(self.runtime_badge)
         row.addWidget(self.settings_button)
+        for legacy_widget in (
+            self.source_toggle,
+            self.controls_toggle,
+            self.details_toggle,
+            self.tag_manager_button,
+            self.suggest_tags_button,
+            self.basic_mode_button,
+            self.advanced_mode_button,
+            self.cluster_actions_button,
+        ):
+            legacy_widget.hide()
+        QWidget.setTabOrder(self.clustering_workspace_button, self.faces_workspace_button)
+        QWidget.setTabOrder(self.faces_workspace_button, self.mode_selector)
+        QWidget.setTabOrder(self.mode_selector, self.view_button)
+        QWidget.setTabOrder(self.view_button, self.jobs_widget)
+        QWidget.setTabOrder(self.jobs_widget, self.runtime_badge)
+        QWidget.setTabOrder(self.runtime_badge, self.settings_button)
         return bar
+
+    def _on_mode_selector_changed(self, _index: int) -> None:
+        mode = str(self.mode_selector.currentData() or "basic")
+        self.set_active_workspace_mode(mode)
 
     def _connect_signals(self) -> None:
         self.source_pane.directory_changed.connect(self._on_directory_changed)
+        self.source_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
+        self.source_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.source_pane.run_requested.connect(self.run_clustering)
         self.source_pane.cancel_requested.connect(self.cancel_clustering)
         self.source_pane.hide_requested.connect(lambda: self._set_pane_visible("source", False))
@@ -377,12 +784,11 @@ class ProductionClusterApp(QMainWindow):
         self.cluster_pane.selection_target_changed.connect(lambda _target: self.gallery_pane.refresh_selection_target_hint())
         self.gallery_pane.first_paint_ready.connect(self._on_gallery_first_paint)
         self.gallery_pane.image_selected.connect(self._on_image_selected)
+        self.gallery_pane.empty_select_folder_requested.connect(self._focus_folder_picker)
+        self.gallery_pane.empty_run_requested.connect(self.run_clustering)
+        self.runtime_badge.clicked.connect(self._open_runtime_status_details)
         self.gallery_pane.paths_removed.connect(self._on_gallery_paths_removed)
         self.gallery_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
-        self.faces_pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
-        self.faces_pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
-        self.faces_pane.saved_clustering_filter_requested.connect(self._run_saved_clustering_filter)
-        self.faces_pane.open_face_model_settings_requested.connect(self.open_settings_dialog)
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
         self.session_controller.progress.connect(self._on_clustering_progress)
@@ -390,73 +796,198 @@ class ProductionClusterApp(QMainWindow):
         self.session_controller.failed.connect(self._on_clustering_failed)
         self.session_controller.cancelled.connect(self._on_clustering_cancelled)
         self.session_controller.running_changed.connect(self._set_running_state)
+        self.model_download_controller.started.connect(self._on_model_download_started)
+        self.model_download_controller.progress.connect(self._on_model_download_progress)
+        self.model_download_controller.completed.connect(self._on_model_download_completed)
+        self.model_download_controller.failed.connect(self._on_model_download_failed)
+        self.model_download_controller.cancelled.connect(self._on_model_download_cancelled)
+        self._install_shell_shortcuts()
+
+    def _install_shell_shortcuts(self) -> None:
+        self._shell_shortcuts: list[QShortcut] = []
+        shortcuts = (
+            ("Ctrl+1", lambda: self.set_active_workspace("clustering")),
+            ("Ctrl+2", lambda: self.set_active_workspace("faces")),
+            ("Ctrl+,", self.open_settings_dialog),
+            ("Ctrl+O", self._focus_folder_picker),
+            ("Ctrl+F", self._focus_workspace_search),
+            ("Ctrl+R", self.run_clustering),
+            ("Esc", self.cancel_clustering),
+            ("F1", self._show_keyboard_help),
+        )
+        for sequence, handler in shortcuts:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._shell_shortcuts.append(shortcut)
+
+    def _focus_folder_picker(self) -> None:
+        self._set_pane_visible("source", True)
+        self.source_pane.file_tree.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _focus_workspace_search(self) -> None:
+        if self._active_workspace != "faces":
+            self.set_active_workspace("faces")
+        pane = self._ensure_faces_workspace()
+        if self.faces_pane is None:
+            self._faces_focus_search_pending = True
+            button = getattr(self, "faces_placeholder_button", None)
+            if button is not None:
+                button.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            return
+        target = getattr(pane, "face_identity_search", None) or getattr(pane, "face_query_path", None)
+        if target is not None:
+            target.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _show_keyboard_help(self) -> None:
+        infoBox(
+            "Keyboard shortcuts",
+            "Ctrl+1 Clustering\nCtrl+2 Faces\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
+        )
+
+    def _open_runtime_status_details(self) -> None:
+        dialog = ProductionSettingsDialog(
+            self.settings_store,
+            self.runtime_service,
+            describe_rebuildable_caches=self.cache_maintenance_service.describe_rebuildable_caches,
+            clear_rebuildable_caches=self._clear_rebuildable_caches,
+            can_clear_rebuildable_caches=lambda: not self._background_runtime_work_active(),
+            runtime_layout=self.runtime_layout,
+            support_metadata_provider=self._support_metadata,
+            model_download_controller=self.model_download_controller,
+            job_manager=self.job_manager,
+            parent=self,
+        )
+        support_index = next(
+            (index for index in range(dialog.tabs.count()) if dialog.tabs.tabText(index) in {"Support", "Diagnostics"}),
+            0,
+        )
+        dialog.tabs.setCurrentIndex(support_index)
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            self._apply_settings_values(dialog.values())
 
     def _preferred_execution_mode(self) -> str:
-        return self.settings_store.value("runtime/preferred_mode", self.settings.preferred_execution_mode, str)
+        return str(self.settings_registry.get(self.settings_store, "runtime/preferred_mode", self.settings.preferred_execution_mode))
 
     def _preferred_performance_profile(self) -> str:
-        return self.settings_store.value("performance/profile", self.settings.default_performance_profile, str)
+        return str(self.settings_registry.get(self.settings_store, "performance/profile", self.settings.default_performance_profile))
+
+    def _effective_performance_profile(self):
+        base = select_performance_profile(self._preferred_performance_profile(), self.system_resources)
+        return apply_performance_overrides(
+            base,
+            cpu_batch_size=int(self.settings_registry.get(self.settings_store, "performance/batch_size_cpu", base.cpu_batch_size)),
+            gpu_batch_size=int(self.settings_registry.get(self.settings_store, "performance/batch_size_gpu", base.gpu_batch_size)),
+            embedding_preprocess_workers=int(
+                self.settings_registry.get(
+                    self.settings_store,
+                    "performance/decode_workers",
+                    base.embedding_preprocess_workers,
+                )
+            ),
+            thumbnail_workers=int(self.settings_registry.get(self.settings_store, "gallery/thumbnail_workers", base.thumbnail_workers)),
+            thumbnail_prefetch_rows=int(
+                self.settings_registry.get(self.settings_store, "gallery/prefetch_rows", base.thumbnail_prefetch_rows)
+            ),
+            vram_headroom_mb=int(
+                self.settings_registry.get(self.settings_store, "performance/vram_headroom_mb", base.vram_headroom_mb)
+            ),
+        )
 
     def _preferred_workspace(self) -> str:
-        return self._normalize_workspace_id(self.settings_store.value("workspace/default_view", "clustering", str))
+        return self._normalize_workspace_id(str(self.settings_registry.get(self.settings_store, "workspace/default_view", "clustering")))
 
     def _preferred_faces_ui_mode(self) -> str:
-        return self._normalize_ui_mode(self.settings_store.value("workspace/faces_mode", "basic", str))
+        return self._normalize_ui_mode(str(self.settings_registry.get(self.settings_store, "workspace/faces_mode", "basic")))
 
     def _preferred_face_mode(self) -> str:
-        return _face_search_api().normalize_face_mode(self.settings_store.value("faces/default_mode", "human", str))
+        return "human"
 
     def _face_model_root(self) -> str:
-        root = str(self.settings_store.value("faces/model_root", "", str) or "").strip()
-        if root:
-            return root
-        return str(self.settings_store.value("faces/animal_model_root", "", str) or "").strip()
+        return str(self.settings_registry.get(self.settings_store, "faces/model_root", "") or "").strip()
 
     def _preferred_face_detector(self, mode: str) -> str:
-        face_search = _face_search_api()
-        mode_id = face_search.normalize_face_mode(mode)
-        configured = str(self.settings_store.value(f"faces/default_detector/{mode_id}", "", str) or "").strip()
-        if configured:
-            return face_search.normalize_face_component_id(configured)
-        return face_search.default_face_detector_id(self._face_model_root(), mode_id)
+        return self._preferred_face_pipeline_ids(mode)[0]
 
     def _preferred_face_embedder(self, mode: str) -> str:
+        return self._preferred_face_pipeline_ids(mode)[1]
+
+    def _preferred_face_pipeline_request_ids(self, mode: str) -> tuple[str, str]:
         face_search = _face_search_api()
         mode_id = face_search.normalize_face_mode(mode)
-        configured = str(self.settings_store.value(f"faces/default_embedder/{mode_id}", "", str) or "").strip()
-        if configured:
-            return face_search.normalize_face_component_id(configured)
-        return face_search.default_face_embedder_id(self._face_model_root(), mode_id)
+        configured_detector = str(
+            self.settings_registry.get(self.settings_store, f"faces/default_detector/{mode_id}") or ""
+        ).strip()
+        configured_embedder = str(
+            self.settings_registry.get(self.settings_store, f"faces/default_embedder/{mode_id}") or ""
+        ).strip()
+        if mode_id == "human":
+            configured_detector = configured_detector or face_search.DEFAULT_HUMAN_FACE_DETECTOR_ID
+            configured_embedder = configured_embedder or face_search.DEFAULT_HUMAN_FACE_EMBEDDER_ID
+        return (
+            face_search.normalize_face_component_id(configured_detector),
+            face_search.normalize_face_component_id(configured_embedder),
+        )
+
+    def _preferred_face_pipeline_ids(self, mode: str) -> tuple[str, str]:
+        face_search = _face_search_api()
+        mode_id = face_search.normalize_face_mode(mode)
+        configured_detector, configured_embedder = self._preferred_face_pipeline_request_ids(mode_id)
+        return face_search.resolve_ready_face_pipeline_ids(
+            self._face_model_root(),
+            mode_id,
+            configured_detector,
+            configured_embedder,
+        )
 
     def _preferred_face_detector_score_threshold(self, mode: str) -> float:
         face_search = _face_search_api()
         mode_id = face_search.normalize_face_mode(mode)
-        return float(self.settings_store.value(f"faces/detector_score_threshold/{mode_id}", face_search.DEFAULT_FACE_SCORE_THRESHOLD, float))
+        return float(
+            self.settings_registry.get(
+                self.settings_store,
+                f"faces/detector_score_threshold/{mode_id}",
+                None,
+            )
+        )
 
     def _preferred_face_max_detections(self, mode: str) -> int:
         face_search = _face_search_api()
         mode_id = face_search.normalize_face_mode(mode)
-        return max(1, int(self.settings_store.value(f"faces/max_detections/{mode_id}", face_search.DEFAULT_FACE_MAX_DETECTIONS, int)))
+        return max(
+            1,
+            int(
+                self.settings_registry.get(
+                    self.settings_store,
+                    f"faces/max_detections/{mode_id}",
+                    face_search.DEFAULT_FACE_MAX_DETECTIONS,
+                )
+            ),
+        )
 
     def _preferred_face_pipeline_defaults(self) -> dict[str, dict[str, object]]:
-        return {
-            mode: {
-                "detector_id": self._preferred_face_detector(mode),
-                "embedder_id": self._preferred_face_embedder(mode),
+        defaults: dict[str, dict[str, object]] = {}
+        for mode in ("human",):
+            preferred_detector_id, preferred_embedder_id = self._preferred_face_pipeline_request_ids(mode)
+            detector_id, embedder_id = self._preferred_face_pipeline_ids(mode)
+            defaults[mode] = {
+                "detector_id": detector_id,
+                "embedder_id": embedder_id,
+                "preferred_detector_id": preferred_detector_id,
+                "preferred_embedder_id": preferred_embedder_id,
                 "score_threshold": self._preferred_face_detector_score_threshold(mode),
                 "max_detections": self._preferred_face_max_detections(mode),
             }
-            for mode in ("human", "dog", "cat")
-        }
+        return defaults
 
     def _keep_worker_warm(self) -> bool:
-        return bool(self.settings_store.value("performance/keep_worker_warm", False, bool))
+        return bool(self.settings_registry.get(self.settings_store, "performance/keep_worker_warm", False))
 
     def _offline_model_downloads(self) -> bool:
-        return bool(self.settings_store.value("models/offline_mode", bool(getattr(sys, "frozen", False)), bool))
+        return bool(self.settings_registry.get(self.settings_store, "models/offline_mode", bool(getattr(sys, "frozen", False))))
 
     def _read_only_mode(self) -> bool:
-        return bool(self.settings_store.value("safety/read_only_mode", False, bool))
+        return bool(self.settings_registry.get(self.settings_store, "safety/read_only_mode", False))
 
     def _clear_face_session_dbs(self) -> None:
         for path in self.settings.cache_dir.glob("face_search*_session*.db*"):
@@ -486,15 +1017,11 @@ class ProductionClusterApp(QMainWindow):
     def _face_db_path_for_pipeline(self, scope: str, mode: str, detector_id: str, embedder_id: str) -> Path:
         face_search = _face_search_api()
         scope_id = "session" if str(scope or "").strip().lower() == "session" else "global"
-        mode_id = face_search.normalize_face_mode(mode)
+        mode_id = "human"
         detector = face_search.normalize_face_component_id(detector_id, face_search.default_face_detector_id(self._face_model_root(), mode_id))
         embedder = face_search.normalize_face_component_id(embedder_id, face_search.default_face_embedder_id(self._face_model_root(), mode_id))
         if mode_id == "human" and detector == face_search.BUILTIN_HUMAN_DETECTOR_ID and embedder == face_search.BUILTIN_HUMAN_EMBEDDER_ID:
             return self.settings.cache_dir / ("face_search_session.db" if scope_id == "session" else "face_search_index.db")
-        if mode_id == "dog" and detector == face_search.LEGACY_DEFAULT_BUNDLE_ID and embedder == face_search.LEGACY_DEFAULT_BUNDLE_ID:
-            return self.settings.cache_dir / ("face_search_dog_session.db" if scope_id == "session" else "face_search_dog.db")
-        if mode_id == "cat" and detector == face_search.LEGACY_DEFAULT_BUNDLE_ID and embedder == face_search.LEGACY_DEFAULT_BUNDLE_ID:
-            return self.settings.cache_dir / ("face_search_cat_session.db" if scope_id == "session" else "face_search_cat.db")
         scope_suffix = "_session" if scope_id == "session" else ""
         pipeline_slug = self._face_pipeline_slug(detector, embedder)
         return self.settings.cache_dir / f"face_search_{mode_id}_{pipeline_slug}{scope_suffix}.db"
@@ -508,9 +1035,29 @@ class ProductionClusterApp(QMainWindow):
     ) -> FaceIndexService:
         face_search = _face_search_api()
         scope_id = "session" if str(scope or "").strip().lower() == "session" else "global"
-        mode_id = face_search.normalize_face_mode(mode)
-        detector = face_search.normalize_face_component_id(detector_id, face_search.default_face_detector_id(self._face_model_root(), mode_id))
-        embedder = face_search.normalize_face_component_id(embedder_id, face_search.default_face_embedder_id(self._face_model_root(), mode_id))
+        mode_id = "human"
+        requested_detector = face_search.normalize_face_component_id(
+            detector_id,
+            face_search.default_face_detector_id(self._face_model_root(), mode_id),
+        )
+        requested_embedder = face_search.normalize_face_component_id(
+            embedder_id,
+            face_search.default_face_embedder_id(self._face_model_root(), mode_id),
+        )
+        detector, embedder = face_search.resolve_ready_face_pipeline_ids(
+            self._face_model_root(),
+            mode_id,
+            requested_detector,
+            requested_embedder,
+        )
+        if (detector, embedder) != (requested_detector, requested_embedder):
+            LOGGER.info(
+                "Face pipeline %s/%s is not ready; using ready pipeline %s/%s.",
+                requested_detector,
+                requested_embedder,
+                detector,
+                embedder,
+            )
         key = (scope_id, mode_id, detector, embedder)
         service = self._face_service_cache.get(key)
         if service is None:
@@ -539,7 +1086,7 @@ class ProductionClusterApp(QMainWindow):
                 self._preferred_face_detector(mode),
                 self._preferred_face_embedder(mode),
             )
-            for mode in ("human", "dog", "cat")
+            for mode in ("human",)
         }
         self.face_services_session = {
             mode: self._face_service_for_pipeline(
@@ -548,14 +1095,14 @@ class ProductionClusterApp(QMainWindow):
                 self._preferred_face_detector(mode),
                 self._preferred_face_embedder(mode),
             )
-            for mode in ("human", "dog", "cat")
+            for mode in ("human",)
         }
         self.face_service_global = self.face_services_global["human"]
         self.face_service_session = self.face_services_session["human"]
 
     def _apply_workspace_preferences(self) -> None:
-        thumbnail_size = int(self.settings_store.value("gallery/thumbnail_size", self.settings.thumbnail_size, int))
-        self.performance_profile = select_performance_profile(self._preferred_performance_profile(), self.system_resources)
+        thumbnail_size = int(self.settings_registry.get(self.settings_store, "gallery/thumbnail_size", self.settings.thumbnail_size))
+        self.performance_profile = self._effective_performance_profile()
         self.gallery_pane.apply_view_preferences(
             thumbnail_size=thumbnail_size,
             worker_count=self.performance_profile.thumbnail_workers,
@@ -563,18 +1110,19 @@ class ProductionClusterApp(QMainWindow):
             pixmap_cache_size=self.performance_profile.pixmap_cache_size,
             qimage_cache_size=self.performance_profile.qimage_cache_size,
         )
-        self.faces_pane.results_gallery.apply_view_preferences(
-            thumbnail_size=thumbnail_size,
-            worker_count=self.performance_profile.thumbnail_workers,
-            prefetch_rows=self.performance_profile.thumbnail_prefetch_rows,
-            pixmap_cache_size=self.performance_profile.pixmap_cache_size,
-            qimage_cache_size=self.performance_profile.qimage_cache_size,
-        )
-        self.faces_pane.apply_face_tile_preferences(
-            worker_count=self.performance_profile.thumbnail_workers,
-            cache_size=self.performance_profile.pixmap_cache_size,
-        )
-        self.runtime_badge.setVisible(self.settings_store.value("runtime/show_badge", self.settings.show_runtime_badge, bool))
+        if self.faces_pane is not None:
+            self.faces_pane.results_gallery.apply_view_preferences(
+                thumbnail_size=thumbnail_size,
+                worker_count=self.performance_profile.thumbnail_workers,
+                prefetch_rows=self.performance_profile.thumbnail_prefetch_rows,
+                pixmap_cache_size=self.performance_profile.pixmap_cache_size,
+                qimage_cache_size=self.performance_profile.qimage_cache_size,
+            )
+            self.faces_pane.apply_face_tile_preferences(
+                worker_count=self.performance_profile.thumbnail_workers,
+                cache_size=self.performance_profile.pixmap_cache_size,
+            )
+        self.runtime_badge.setVisible(bool(self.settings_registry.get(self.settings_store, "runtime/show_badge", self.settings.show_runtime_badge)))
         self._reflow_main_splitter(force=False)
 
     def _sync_mode_buttons(self) -> None:
@@ -583,6 +1131,12 @@ class ProductionClusterApp(QMainWindow):
             button.blockSignals(True)
             button.setChecked(active_mode == key)
             button.blockSignals(False)
+        if hasattr(self, "mode_selector"):
+            target_index = self.mode_selector.findData(active_mode)
+            if target_index >= 0:
+                self.mode_selector.blockSignals(True)
+                self.mode_selector.setCurrentIndex(target_index)
+                self.mode_selector.blockSignals(False)
 
     def _sync_workspace_buttons(self) -> None:
         for key, button in {"clustering": self.clustering_workspace_button, "faces": self.faces_workspace_button}.items():
@@ -599,26 +1153,28 @@ class ProductionClusterApp(QMainWindow):
 
     def _refresh_workspace_ui(self) -> None:
         is_clustering = self._active_workspace == "clustering"
-        self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else self.faces_pane)
-        if not is_clustering:
+        faces_pane = None if is_clustering else self._ensure_faces_workspace()
+        self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
+        if not is_clustering and self.faces_pane is not None:
             self.faces_pane.ensure_current_faces_tab_loaded()
-        self.faces_pane.set_ui_mode(self._faces_mode)
+        if self.faces_pane is not None:
+            self.faces_pane.set_ui_mode(self._faces_mode)
         self.source_pane.set_basic_mode(
             is_clustering and self._clustering_mode == "basic",
             running=self.session_controller.is_running(),
         )
-        self.source_toggle.setVisible((not is_clustering) or self._clustering_mode == "advanced")
-        self.controls_toggle.setVisible(is_clustering and self._clustering_mode == "advanced")
-        self.details_toggle.setVisible(is_clustering and self._clustering_mode == "advanced")
+        self.source_toggle.setVisible(False)
+        self.controls_toggle.setVisible(False)
+        self.details_toggle.setVisible(False)
         show_cluster_actions = is_clustering and self._clustering_mode == "advanced"
-        self.tag_manager_button.setVisible(show_cluster_actions)
-        self.suggest_tags_button.setVisible(show_cluster_actions)
-        if is_clustering:
-            mode_label = "Advanced" if self._clustering_mode == "advanced" else "Basic"
-            self.feature_label.setText(f"{PRODUCTION_DISPLAY_NAME} | Clustering | {mode_label}")
-        else:
-            mode_label = "Advanced" if self._faces_mode == "advanced" else "Basic"
-            self.feature_label.setText(f"{PRODUCTION_DISPLAY_NAME} | Faces | {mode_label}")
+        self.tag_manager_button.setVisible(False)
+        self.suggest_tags_button.setVisible(False)
+        self.feature_label.setText(PRODUCTION_DISPLAY_NAME)
+        self.cluster_actions_button.setVisible(False)
+        self.cluster_actions_menu_action.setVisible(show_cluster_actions)
+        self.controls_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
+        self.details_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
+        self.source_view_action.setVisible((not is_clustering) or self._clustering_mode == "advanced")
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -638,7 +1194,7 @@ class ProductionClusterApp(QMainWindow):
     def set_faces_mode(self, mode: str) -> None:
         self._faces_mode = self._normalize_ui_mode(mode)
         self.settings_store.setValue("workspace/faces_mode", self._faces_mode)
-        if hasattr(self, "faces_pane"):
+        if self.faces_pane is not None:
             self.faces_pane.set_ui_mode(self._faces_mode)
         if self._active_workspace == "faces":
             self._refresh_workspace_ui()
@@ -670,6 +1226,10 @@ class ProductionClusterApp(QMainWindow):
             use_embedding_cache_lookup=bool(self.clustering_pane.embedding_cache_lookup_checkbox.isChecked()),
             source_paths=source_paths,
             performance_profile=self._preferred_performance_profile(),
+            batch_size_cpu=int(self.performance_profile.cpu_batch_size),
+            batch_size_gpu=int(self.performance_profile.gpu_batch_size),
+            preprocess_workers=int(self.performance_profile.embedding_preprocess_workers),
+            vram_headroom_mb=int(self.performance_profile.vram_headroom_mb),
             preferred_execution_mode=self._preferred_execution_mode(),
             tag_filter=self.clustering_pane.selected_tag_filters(),
             tag_match=self.clustering_pane.selected_tag_match_mode(),
@@ -679,15 +1239,13 @@ class ProductionClusterApp(QMainWindow):
         )
 
     def _confirm_large_folder_if_needed(self, request: ProductionClusterRequest) -> bool:
-        if request.source_paths:
-            estimated = len(request.source_paths)
-            capped = False
-        else:
-            estimated, capped = self._bounded_image_count(request.directory, recursive=bool(request.recursive), limit=100_001)
+        # Discovery is deliberately completed by the cancellable preflight job.
+        # Never enumerate the source folder from this UI-thread confirmation.
+        estimated = len(request.source_paths or ())
         if estimated < 50_000:
             return True
-        severity = "very large" if estimated >= 100_000 or capped else "large"
-        count_text = f"{estimated}+" if capped else str(estimated)
+        severity = "very large" if estimated >= 100_000 else "large"
+        count_text = str(estimated)
         message = (
             f"This looks like a {severity} run: about {count_text} image(s).\n\n"
             "Large runs can use substantial RAM, VRAM, disk cache, and time. "
@@ -697,35 +1255,6 @@ class ProductionClusterApp(QMainWindow):
             "Continue?"
         )
         return bool(confirmBox("Large folder guardrail", message, parent=self))
-
-    def _bounded_image_count(self, directory: str, *, recursive: bool, limit: int) -> tuple[int, bool]:
-        if not str(directory or "").strip():
-            return 0, False
-        root = Path(str(directory or ""))
-        if not root.exists() or not root.is_dir():
-            return 0, False
-        extensions = {str(ext).lower() for ext in self.settings.image_extensions}
-        count = 0
-        stack = [root]
-        while stack:
-            current = stack.pop()
-            try:
-                with os.scandir(current) as iterator:
-                    for entry in iterator:
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                if recursive:
-                                    stack.append(Path(entry.path))
-                                continue
-                            if entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in extensions:
-                                count += 1
-                                if count >= limit:
-                                    return count, True
-                        except OSError:
-                            continue
-            except OSError:
-                continue
-        return count, False
 
     def run_clustering(self) -> None:
         if self._run_request_active():
@@ -740,17 +1269,7 @@ class ProductionClusterApp(QMainWindow):
             LOGGER.exception("Failed to build clustering request")
             errorBox("Clustering could not start", str(exc))
             return
-        if not self._confirm_large_folder_if_needed(request):
-            return
-        request = self._prepare_request_model_downloads(request)
-        if request is None:
-            return
-        if request.tag_filter:
-            self._start_request_preflight(request)
-            return
-        run_origin = "folder"
-        if not self._start_request(request, run_origin=run_origin):
-            errorBox("Busy", "A production clustering run is already active.")
+        self._start_request_preflight(request)
 
     def recluster_selected_cluster(self) -> None:
         if self._run_request_active():
@@ -767,7 +1286,7 @@ class ProductionClusterApp(QMainWindow):
         request = self._prepare_request_model_downloads(request)
         if request is None:
             return
-        if not self._start_request(request, run_origin="recluster"):
+        if not self._start_request_with_assets(request, run_origin="recluster"):
             errorBox("Busy", "A production clustering run is already active.")
 
     def _prepare_request_model_downloads(self, request: ProductionClusterRequest) -> ProductionClusterRequest | None:
@@ -785,7 +1304,7 @@ class ProductionClusterApp(QMainWindow):
             self.footer_bar.set_status("Offline model mode enabled. Using bundled/local fallback.")
             self._set_activity("Offline model fallback")
         elif confirmBox("Model download required", self._model_download_prompt_text(plan), parent=self):
-            self.footer_bar.set_status("Model download approved. The worker will save model files under the runtime cache.")
+            self.footer_bar.set_status("Model download approved. It will appear in Jobs and can be cancelled safely.")
             self._set_activity("Model download approved")
             return replace(request, allow_model_downloads=True)
 
@@ -832,10 +1351,10 @@ class ProductionClusterApp(QMainWindow):
             "",
             "Required downloads:",
         ]
-        for model_name in plan.unavailable_items:
-            base_name = str(model_name).split(" ", 1)[0]
-            source = MODEL_SOURCE_LABELS.get(base_name, "external model weights")
-            lines.append(f"- {model_name}: {source}")
+        for item in self._model_download_items_for_plan(plan):
+            source = MODEL_SOURCE_LABELS.get(item.model_name, "external model weights")
+            asset_kind = "image weights + text tokenizer" if item.require_text else "image weights"
+            lines.append(f"- {item.model_name} ({asset_kind}): {source}")
         lines.extend(
             [
                 "",
@@ -849,18 +1368,65 @@ class ProductionClusterApp(QMainWindow):
             lines.append(f"Bundled fallback: {model_label(plan.bundled_fallback_model)}")
         else:
             lines.append("Bundled fallback: none found")
+        lines.append("Downloads are deduplicated, resumable in the shared cache, visible in Jobs, and cancellable.")
         lines.append("Fallback policy: declining uses available local/bundled models and disables unavailable advanced naming.")
         lines.append("")
         lines.append("Allow the download now?")
         return "\n".join(lines)
 
+    @staticmethod
+    def _model_download_items_for_plan(plan: ModelDownloadPlan) -> tuple[ModelDownloadItem, ...]:
+        items = [ModelDownloadItem(model_name, False) for model_name in plan.models_requiring_download]
+        if plan.meaning_requires_download and plan.meaning_model:
+            items.append(ModelDownloadItem(plan.meaning_model, True))
+        return normalize_model_download_items(items)
+
     def cancel_clustering(self) -> None:
         if self._preflight_job is not None:
             self._cancel_request_preflight()
             return
+        if self._pending_model_download_run is not None and self.model_download_controller.is_running():
+            self.model_download_controller.cancel()
+            return
         self.session_controller.cancel()
 
+    def _start_request_with_assets(self, request: ProductionClusterRequest, *, run_origin: str) -> bool:
+        if not request.allow_model_downloads:
+            return self._start_request(request, run_origin=run_origin)
+
+        plan = self.model_asset_service.build_download_plan(
+            request.embedding_models,
+            generate_cluster_meanings=bool(request.generate_cluster_meanings),
+            requested_meaning_model=request.cluster_meaning_model,
+        )
+        items = self._model_download_items_for_plan(plan)
+        if not items:
+            return self._start_request(replace(request, allow_model_downloads=False), run_origin=run_origin)
+        if self.model_download_controller.is_running():
+            return False
+
+        # Network access and model initialization are deliberately completed in
+        # a separate killable process. The clustering worker itself is offline.
+        self._pending_model_download_run = (replace(request, allow_model_downloads=False), str(run_origin))
+        self._set_running_state(True)
+        self.footer_bar.set_progress(-1, "Preparing model download...")
+        if self.model_download_controller.start(items):
+            return True
+        self._pending_model_download_run = None
+        self._set_running_state(False)
+        return False
+
     def _start_request(self, request: ProductionClusterRequest, *, run_origin: str) -> bool:
+        policy = self.runtime_service.select_policy(request.preferred_execution_mode, refresh=True)
+        self.execution_policy = policy
+        self.runtime_badge.update_runtime(self.runtime_service.detect(), policy)
+        if policy.cuda_required_unavailable:
+            message = policy.error or policy.reason or "CUDA was requested, but no compatible CUDA runtime is available."
+            self.footer_bar.set_progress(None)
+            self.footer_bar.set_status(message)
+            self._set_activity("CUDA unavailable")
+            errorBox("CUDA unavailable", message)
+            return False
         self.current_run_origin = str(run_origin or "folder")
         self.current_tag_filter = tuple(request.tag_filter)
         self.current_tag_match = request.tag_match or "Any"
@@ -893,7 +1459,11 @@ class ProductionClusterApp(QMainWindow):
         return self.session_controller.start(request)
 
     def _run_request_active(self) -> bool:
-        return self.session_controller.is_running() or self._thread_is_running(self._preflight_thread)
+        return (
+            self.session_controller.is_running()
+            or self._thread_is_running(self._preflight_thread)
+            or self.model_download_controller.is_running()
+        )
 
     def _background_runtime_work_active(self) -> bool:
         return any(
@@ -902,11 +1472,13 @@ class ProductionClusterApp(QMainWindow):
                 self._thread_is_running(self._tag_context_thread),
                 self._thread_is_running(self._storage_usage_thread),
                 self._thread_is_running(self._storage_clear_thread),
-                self._thread_is_running(self._post_install_model_thread),
+                self.model_download_controller.is_running(),
             )
         )
 
     def _update_footer_storage_state(self) -> None:
+        if not self._can_update_widget(getattr(self, "footer_bar", None)):
+            return
         reason = (
             "Unavailable while clustering, tag refresh, or another background runtime task is active."
             if self._background_runtime_work_active()
@@ -919,9 +1491,9 @@ class ProductionClusterApp(QMainWindow):
         self._preflight_generation += 1
         generation = self._preflight_generation
         self._set_running_state(True)
-        self.footer_bar.set_progress(-1, "Scanning folder for tag filter...")
-        self.footer_bar.set_status("Scanning folder for tag filter...")
-        self._set_activity("Preparing tag-filtered run...")
+        self.footer_bar.set_progress(-1, "Scanning selected folder...")
+        self.footer_bar.set_status("Scanning selected folder...")
+        self._set_activity("Preparing clustering run...")
         self._update_footer_storage_state()
         job_id = self.job_manager.register_job("Preparing clustering run", cancel_fn=self.cancel_clustering)
         self._preflight_job_id = job_id
@@ -929,17 +1501,33 @@ class ProductionClusterApp(QMainWindow):
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
+            from app.services.embedding_index import EmbeddingIndexService
 
-            progress(-1, "Scanning folder for tag filter...")
+            progress(-1, "Scanning selected folder...")
             discovered = ImageDiscoveryService().discover_result(
                 request_copy.directory,
                 recursive=bool(request_copy.recursive),
+                progress_callback=progress,
+                cancel_check=cancel_check,
             )
             raise_if_cancelled(cancel_check)
             discovered_count = int(discovered.image_count)
             if discovered_count == 0:
                 raise ValueError("No images were discovered in the selected folder.")
             progress(10, f"Folder scan complete: {discovered_count} image(s) discovered.")
+
+            if not request_copy.tag_filter:
+                return PreparedRunPayload(
+                    request=replace(
+                        request_copy,
+                        source_paths=list(discovered.paths),
+                        source_fingerprints=list(discovered.fingerprints),
+                        source_snapshot_key=discovered.snapshot_key,
+                    ),
+                    run_origin="folder",
+                    discovered_count=discovered_count,
+                    matched_count=discovered_count,
+                )
 
             def _tag_progress(value: int, status: str) -> None:
                 mapped = 10 + int(max(0, min(100, value)) * 0.65)
@@ -967,8 +1555,18 @@ class ProductionClusterApp(QMainWindow):
             if matched_count < 2:
                 raise ValueError("Not enough tagged images match the current tag filter.")
             progress(100, f"Tag filter ready: {matched_count} of {discovered_count} image(s) matched.")
+            source_set = set(source_paths)
+            source_fingerprints = [
+                fingerprint for fingerprint in discovered.fingerprints if fingerprint[0] in source_set
+            ]
+            snapshot_key = EmbeddingIndexService.build_snapshot_key_from_fingerprints(source_fingerprints)
             return PreparedRunPayload(
-                request=replace(request_copy, source_paths=source_paths),
+                request=replace(
+                    request_copy,
+                    source_paths=source_paths,
+                    source_fingerprints=source_fingerprints,
+                    source_snapshot_key=snapshot_key,
+                ),
                 run_origin="tag_filter",
                 discovered_count=discovered_count,
                 matched_count=matched_count,
@@ -999,11 +1597,29 @@ class ProductionClusterApp(QMainWindow):
             self._preflight_job_id = None
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="finished")
-            self.footer_bar.set_status(
-                f"Tag filter ready: {payload.matched_count} of {payload.discovered_count} image(s) matched. Starting clustering..."
-            )
+            if not self._confirm_large_folder_if_needed(payload.request):
+                self.footer_bar.set_progress(None)
+                self.footer_bar.set_status("Clustering cancelled before inference.")
+                self._set_activity("Cancelled")
+                self._set_running_state(False)
+                _cleanup()
+                return
+            prepared_request = self._prepare_request_model_downloads(payload.request)
+            if prepared_request is None:
+                self.footer_bar.set_progress(None)
+                self._set_running_state(False)
+                _cleanup()
+                return
+            if payload.run_origin == "tag_filter":
+                self.footer_bar.set_status(
+                    f"Tag filter ready: {payload.matched_count} of {payload.discovered_count} image(s) matched. Starting clustering..."
+                )
+            else:
+                self.footer_bar.set_status(
+                    f"Folder ready: {payload.discovered_count} image(s). Starting clustering..."
+                )
             self._set_activity("Starting worker...")
-            started = self._start_request(payload.request, run_origin=payload.run_origin)
+            started = self._start_request_with_assets(prepared_request, run_origin=payload.run_origin)
             if not started:
                 self.footer_bar.set_progress(None)
                 self.footer_bar.set_status("Clustering could not start because another run is active.")
@@ -1070,22 +1686,132 @@ class ProductionClusterApp(QMainWindow):
             self.job_manager.update(job_id, progress=value, text=status)
 
     def _on_directory_changed(self, directory: str) -> None:
+        self.settings_store.setValue("workspace/selected_folder", str(directory or ""))
+        if directory and self.recent_folder_history.record(directory):
+            self._refresh_recent_folder_menus()
         self.current_folder_label.setText(directory or "No folder selected")
         self.current_folder_label.setToolTip(directory or "")
+        self.gallery_pane.empty_run_button.setEnabled(bool(directory))
         if directory:
             self.footer_bar.set_status(f"Folder selected: {directory}")
             self._set_activity("Folder ready")
         else:
             self.footer_bar.set_status("Select a folder to start clustering.")
             self._set_activity("Idle")
-        if (
-            directory
-            and hasattr(self, "faces_pane")
-            and self._active_workspace == "faces"
-            and not self.faces_pane.face_folder_path.text().strip()
-            and self.faces_pane.is_face_folder_tab_active()
-        ):
-            self.faces_pane.refresh_face_library(refresh_people=True, reason="folder-changed")
+        if directory and self.faces_pane is not None:
+            if self.faces_pane.face_folder_path.text().strip() != directory:
+                self.faces_pane.face_folder_path.blockSignals(True)
+                self.faces_pane.face_folder_path.setText(directory)
+                self.faces_pane.face_folder_path.blockSignals(False)
+                self.faces_pane._update_face_scope_summary()
+
+    def _on_model_download_started(self, item_keys: tuple) -> None:
+        label = "Downloading model assets"
+        job_id = self.job_manager.register_job(label, cancel_fn=self.model_download_controller.cancel)
+        self._model_download_job_id = job_id
+        item_text = ", ".join(str(item).split(":text=", 1)[0] for item in item_keys)
+        status = f"Downloading model assets: {item_text}" if item_text else "Downloading model assets"
+        self.job_manager.update(job_id, progress=-1, text="Cache lookup and download starting")
+        self.footer_bar.set_status(status)
+        self.footer_bar.set_progress(-1, status)
+        self._set_activity("Downloading model assets...")
+        self._update_footer_storage_state()
+
+    def _on_model_download_progress(self, value: int, status: str) -> None:
+        self.footer_bar.set_progress(value, status)
+        self.footer_bar.set_status(status)
+        self._set_activity(status)
+        if self._model_download_job_id is not None:
+            self.job_manager.update(self._model_download_job_id, progress=value, text=status)
+
+    def _finish_model_download_job(self, status: str, *, error: str = "", cache_text: str = "") -> None:
+        job_id = self._model_download_job_id
+        self._model_download_job_id = None
+        if job_id is None:
+            return
+        if cache_text:
+            self.job_manager.update(
+                job_id,
+                progress=100 if status == "finished" else -1,
+                text=cache_text,
+                cache_status=cache_text,
+            )
+        self.job_manager.finish(job_id, status=status, error=error, cache_status=cache_text)
+
+    def _on_model_download_completed(self, result: dict) -> None:
+        requested = tuple(str(item) for item in result.get("requested") or ())
+        downloaded = tuple(str(item) for item in result.get("downloaded") or ())
+        reused = tuple(str(item) for item in result.get("reused") or ())
+        cache_parts = []
+        if downloaded:
+            cache_parts.append(f"downloaded {len(downloaded)}")
+        if reused:
+            cache_parts.append(f"reused {len(reused)} cached")
+        cache_text = "Cache ready" + (f" ({', '.join(cache_parts)})" if cache_parts else "")
+        self._finish_model_download_job("finished", cache_text=cache_text)
+        self.footer_bar.set_progress(None)
+        self.footer_bar.set_status(f"{cache_text}.")
+        self._set_activity("Model cache ready")
+
+        pending_run = self._pending_model_download_run
+        self._pending_model_download_run = None
+        post_install_name = self._active_post_install_model_name
+        self._active_post_install_model_name = None
+        self._refresh_footer_storage_usage()
+        if self._is_shutting_down:
+            return
+        if any(item.split(":text=", 1)[0] == "facenet" for item in requested):
+            self._reload_face_services_from_settings()
+        if pending_run is not None:
+            request, run_origin = pending_run
+            verification = self.model_asset_service.build_download_plan(
+                request.embedding_models,
+                generate_cluster_meanings=bool(request.generate_cluster_meanings),
+                requested_meaning_model=request.cluster_meaning_model,
+            )
+            if verification.requires_download:
+                missing = ", ".join(verification.unavailable_items)
+                message = f"Model download finished, but the local readiness check still reports missing assets: {missing}."
+                self._set_running_state(False)
+                self.footer_bar.set_status(message)
+                self._set_activity("Model verification failed")
+                errorBox("Model verification failed", message)
+                return
+            self.footer_bar.set_status("Model cache verified. Starting clustering...")
+            self._set_activity("Starting clustering worker...")
+            if not self._start_request(replace(request, allow_model_downloads=False), run_origin=run_origin):
+                self._set_running_state(False)
+                errorBox("Clustering could not start", "The model cache is ready, but the clustering worker could not start.")
+            return
+        if post_install_name:
+            infoBox("Model downloaded", f"{model_label(post_install_name)} is ready in the shared runtime cache.")
+
+    def _on_model_download_failed(self, message: str) -> None:
+        pending_run = self._pending_model_download_run
+        post_install_name = self._active_post_install_model_name
+        self._pending_model_download_run = None
+        self._active_post_install_model_name = None
+        self._finish_model_download_job("failed", error=message)
+        self.footer_bar.set_progress(None)
+        self.footer_bar.set_status(f"Model download failed: {message}")
+        self._set_activity("Model download failed")
+        if pending_run is not None:
+            self._set_running_state(False)
+        self._refresh_footer_storage_usage()
+        if not self._is_shutting_down and (pending_run is not None or post_install_name):
+            errorBox("Model download failed", message)
+
+    def _on_model_download_cancelled(self) -> None:
+        pending_run = self._pending_model_download_run
+        self._pending_model_download_run = None
+        self._active_post_install_model_name = None
+        self._finish_model_download_job("cancelled", cache_text="Cancelled; completed and partial cache files are retained")
+        self.footer_bar.set_progress(None)
+        self.footer_bar.set_status("Model download cancelled. Cached files will be reused on retry.")
+        self._set_activity("Model download cancelled")
+        if pending_run is not None:
+            self._set_running_state(False)
+        self._refresh_footer_storage_usage()
 
     def _on_clustering_started(self) -> None:
         job_id = self.job_manager.register_job("Production clustering", cancel_fn=self.session_controller.cancel)
@@ -1275,16 +2001,17 @@ class ProductionClusterApp(QMainWindow):
             self._sync_pane_toggle_buttons()
 
     def _remember_visible_pane_widths(self) -> None:
+        widths = self._layout_widths()
         main_sizes = self.main_splitter.sizes()
         if len(main_sizes) >= 2 and self.source_pane.isVisible() and int(main_sizes[0]) > 0:
-            self._pane_restore_widths["source"] = max(220, int(main_sizes[0]))
+            self._pane_restore_widths["source"] = max(widths["source"], int(main_sizes[0]))
         cluster_sizes = self.clustering_splitter.sizes()
         if len(cluster_sizes) != 3:
             return
         if self.clustering_pane.isVisible() and int(cluster_sizes[0]) > 0:
-            self._pane_restore_widths["controls"] = max(380, int(cluster_sizes[0]))
+            self._pane_restore_widths["controls"] = max(widths["controls"], int(cluster_sizes[0]))
         if self.cluster_right_splitter.isVisible() and int(cluster_sizes[2]) > 0:
-            self._pane_restore_widths["details"] = max(420, int(cluster_sizes[2]))
+            self._pane_restore_widths["details"] = max(widths["details"], int(cluster_sizes[2]))
 
     def _sync_pane_toggle_buttons(self) -> None:
         mapping = {
@@ -1296,6 +2023,18 @@ class ProductionClusterApp(QMainWindow):
             button.blockSignals(True)
             button.setChecked(bool(checked))
             button.blockSignals(False)
+        action_mapping = {
+            "source": getattr(self, "source_view_action", None),
+            "controls": getattr(self, "controls_view_action", None),
+            "details": getattr(self, "details_view_action", None),
+        }
+        for key, action in action_mapping.items():
+            if action is None:
+                continue
+            checked = mapping[key][1]
+            action.blockSignals(True)
+            action.setChecked(bool(checked))
+            action.blockSignals(False)
 
     def _set_pane_visible(self, pane_key: str, visible: bool) -> None:
         visible = bool(visible)
@@ -1323,27 +2062,96 @@ class ProductionClusterApp(QMainWindow):
     def _reflow_main_splitter(self, *, force: bool = False) -> None:
         _ = force
         self._remember_visible_pane_widths()
-        total_width = max(1440, int(self.width() or 1920))
+        widths = self._layout_widths()
+        total_width = max(widths["window"], int(self.width() or self._screen_available_width or widths["window"]))
         source_visible = self._source_pane_visible()
-        source = int(self._pane_restore_widths["source"]) if source_visible else 0
-        workspace = max(1040, total_width - source - 24)
+        source = min(widths["source_max"], max(widths["source"], int(self._pane_restore_widths["source"]))) if source_visible else 0
+        workspace = max(widths["workspace"], total_width - source - 24)
+        if source_visible and source + workspace + 24 > total_width:
+            source = max(widths["source"], total_width - workspace - 24)
         self.source_pane.setVisible(source_visible)
         self.main_splitter.setSizes([source, workspace])
         if self._clustering_mode == "basic":
             controls = 0
-            details = max(420, int(self._pane_restore_widths["details"]))
-            gallery = max(760, workspace - details - 18)
+            details = min(widths["details_max"], max(widths["details"], int(self._pane_restore_widths["details"])))
+            gallery = max(widths["gallery"], workspace - details - 18)
+            if gallery + details > workspace:
+                details = max(widths["details"], workspace - widths["gallery"])
+                gallery = max(widths["gallery"], workspace - details)
             self.clustering_pane.setVisible(False)
             self.cluster_right_splitter.setVisible(True)
             self.clustering_splitter.setSizes([controls, gallery, details])
             return
 
-        controls = int(self._pane_restore_widths["controls"]) if self._pane_visibility["controls"] else 0
-        details = int(self._pane_restore_widths["details"]) if self._pane_visibility["details"] else 0
-        gallery = max(760, workspace - controls - details - 18)
+        controls = min(widths["controls_max"], max(widths["controls"], int(self._pane_restore_widths["controls"]))) if self._pane_visibility["controls"] else 0
+        details = min(widths["details_max"], max(widths["details"], int(self._pane_restore_widths["details"]))) if self._pane_visibility["details"] else 0
+        gallery = max(widths["gallery"], workspace - controls - details - 18)
+        visible_side_total = controls + details
+        if gallery + visible_side_total > workspace:
+            remaining_for_sides = max(0, workspace - widths["gallery"])
+            if controls and details:
+                controls = max(widths["controls"], min(controls, int(remaining_for_sides * 0.55)))
+                details = max(widths["details"], remaining_for_sides - controls)
+            elif controls:
+                controls = max(widths["controls"], remaining_for_sides)
+            elif details:
+                details = max(widths["details"], remaining_for_sides)
+            gallery = max(widths["gallery"], workspace - controls - details)
         self.clustering_pane.setVisible(self._pane_visibility["controls"])
         self.cluster_right_splitter.setVisible(self._pane_visibility["details"])
         self.clustering_splitter.setSizes([controls, gallery, details])
+
+    def apply_screen_geometry_constraints(self, available_size: tuple[int, int]) -> None:
+        width, height = available_size
+        self._screen_available_width = max(1, int(width))
+        self._screen_available_height = max(1, int(height))
+        widths = self._layout_widths()
+        min_height = min(900, max(720, self._screen_available_height))
+        self.setMinimumSize(widths["window"], min_height)
+        self.source_pane.setMinimumWidth(widths["source"])
+        self.source_pane.setMaximumWidth(widths["source_max"])
+        self.clustering_pane.setMinimumWidth(widths["controls"])
+        self.clustering_pane.setMaximumWidth(widths["controls_max"])
+        self.gallery_pane.setMinimumWidth(widths["gallery"])
+        self.cluster_pane.setMinimumWidth(widths["details"])
+        self.cluster_pane.setMaximumWidth(widths["details_max"])
+        self.workspace_stack.setMinimumWidth(widths["workspace"])
+        self.current_folder_label.setMinimumWidth(widths["activity"])
+        if self.faces_pane is not None:
+            self.faces_pane.setMinimumWidth(widths["faces"])
+        self._reflow_main_splitter(force=True)
+
+    def _layout_widths(self) -> dict[str, int]:
+        compact = int(self._screen_available_width or MIN_SUPPORTED_SCREEN_WIDTH) < COMPACT_LAYOUT_WIDTH
+        if compact:
+            return {
+                "window": min(COMPACT_LAYOUT_WIDTH, max(800, int(self._screen_available_width or 1080))),
+                "source": 168,
+                "source_max": 220,
+                "workspace": 720,
+                "controls": 240,
+                "controls_max": 320,
+                "gallery": 340,
+                "details": 200,
+                "details_max": 300,
+                "faces": 720,
+                "activity": 120,
+                "health": 100,
+            }
+        return {
+            "window": 1440,
+            "source": 220,
+            "source_max": 280,
+            "workspace": 1040,
+            "controls": 380,
+            "controls_max": 460,
+            "gallery": 760,
+            "details": 440,
+            "details_max": 680,
+            "faces": 1040,
+            "activity": 280,
+            "health": 130,
+        }
 
     def _apply_gallery_action_visibility(self) -> None:
         if self._clustering_mode == "advanced":
@@ -1364,8 +2172,14 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.set_read_only_mode(read_only)
         self.suggest_tags_button.setEnabled(not read_only)
         self.tag_manager_button.setEnabled(not read_only)
+        if hasattr(self, "suggest_tags_action"):
+            self.suggest_tags_action.setEnabled(not read_only)
+        if hasattr(self, "tag_manager_action"):
+            self.tag_manager_action.setEnabled(not read_only)
+        if self.faces_pane is not None:
+            self.faces_pane.set_read_only_mode(read_only)
         if read_only:
-            tip = "Disabled in read-only safety mode. Turn it off in Settings > Safety to write tags."
+            tip = "Disabled in read-only safety mode. Turn it off in Settings > Safety & Recovery to write tags."
             self.suggest_tags_button.setToolTip(tip)
             self.tag_manager_button.setToolTip(tip)
         else:
@@ -1376,7 +2190,7 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_health_badge()
 
     def _apply_runtime_status(self) -> None:
-        self.performance_profile = select_performance_profile(self._preferred_performance_profile(), self.system_resources)
+        self.performance_profile = self._effective_performance_profile()
         capabilities = self.runtime_service.detect()
         self.execution_policy = self.runtime_service.select_policy(self._preferred_execution_mode())
         self.runtime_badge.update_runtime(capabilities, self.execution_policy)
@@ -1453,6 +2267,7 @@ class ProductionClusterApp(QMainWindow):
             infoBox("Suggested tags applied", f"Added {', '.join(tags)} to {len(affected_paths)} image(s).")
 
         job = AsyncJob(_run)
+        suggested_tags_job_id = self.job_manager.register_job("Applying suggested tags", cancel_fn=job.cancel)
         thread_holder: dict[str, object] = {}
 
         def _cleanup() -> None:
@@ -1461,29 +2276,68 @@ class ProductionClusterApp(QMainWindow):
             self.footer_bar.set_progress(None)
 
         job.progress.connect(self.footer_bar.set_progress)
+        job.progress.connect(
+            lambda value, status: self.job_manager.update(
+                suggested_tags_job_id,
+                progress=value,
+                text=status,
+            )
+        )
         job.progress.connect(lambda _value, status: self._set_activity(status))
-        job.completed.connect(_done)
+
+        def _completed(result) -> None:
+            failures = list(getattr(result, "failures", []))
+            if failures:
+                self.job_manager.finish(
+                    suggested_tags_job_id,
+                    status="failed",
+                    error="; ".join(str(item) for item in failures[:8]),
+                )
+            else:
+                self.job_manager.finish(suggested_tags_job_id, status="finished")
+            _done(result)
+
+        def _failed(message: str) -> None:
+            self.job_manager.finish(suggested_tags_job_id, status="failed", error=message)
+            errorBox("Suggested tags failed", message)
+
+        def _cancelled() -> None:
+            self.job_manager.finish(suggested_tags_job_id, status="cancelled")
+            self.footer_bar.set_status("Suggested tag update cancelled.")
+
+        job.completed.connect(_completed)
         job.completed.connect(lambda _result: _cleanup())
-        job.failed.connect(lambda message: errorBox("Suggested tags failed", message))
+        job.failed.connect(_failed)
         job.failed.connect(lambda _message: _cleanup())
-        job.cancelled.connect(lambda: self.footer_bar.set_status("Suggested tag update cancelled."))
+        job.cancelled.connect(_cancelled)
         job.cancelled.connect(_cleanup)
         thread = start_job_in_thread(job)
         thread_holder["thread"] = thread
         self._retain_async_refs(job, thread)
 
-    def open_settings_dialog(self) -> None:
+    def open_settings_dialog(self, initial_tab: str | None = None) -> None:
         dialog = ProductionSettingsDialog(
             self.settings_store,
             self.runtime_service,
             describe_rebuildable_caches=self.cache_maintenance_service.describe_rebuildable_caches,
-            clear_rebuildable_caches=lambda: self._clear_rebuildable_caches(),
+            clear_rebuildable_caches=self._clear_rebuildable_caches,
             can_clear_rebuildable_caches=lambda: not self._background_runtime_work_active(),
             runtime_layout=self.runtime_layout,
             support_metadata_provider=self._support_metadata,
+            model_download_controller=self.model_download_controller,
+            job_manager=self.job_manager,
             parent=self,
         )
-        if dialog.exec() != dialog.DialogCode.Accepted:
+        if initial_tab:
+            for index in range(dialog.tabs.count()):
+                if dialog.tabs.tabText(index).casefold() == str(initial_tab).casefold():
+                    dialog.tabs.setCurrentIndex(index)
+                    break
+        dialog_result = dialog.exec()
+        face_models_changed = bool(dialog.face_model_inventory_changed())
+        if dialog_result != dialog.DialogCode.Accepted:
+            if face_models_changed:
+                self._reload_face_services_from_settings()
             return
         self._apply_settings_values(dialog.values())
         self.footer_bar.set_status("Production settings updated.")
@@ -1491,13 +2345,19 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_footer_storage_usage()
 
     def _apply_settings_values(self, values: dict[str, object]) -> None:
-        for key, value in values.items():
-            self.settings_store.setValue(key, value)
+        for key, value in self.settings_registry.validate_values(values).items():
+            self.settings_registry.set(self.settings_store, key, value)
         self.settings_store.sync()
         self._apply_runtime_status()
         self._apply_workspace_preferences()
         self._apply_safety_state()
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
+        self._reload_face_services_from_settings()
+
+    def _reload_face_services_from_settings(self) -> None:
+        if self.faces_pane is None:
+            self._face_service_cache = {}
+            return
         self._build_face_services(reset_face_session=False)
         self.faces_pane.face_service_global = self.face_service_global
         self.faces_pane.face_service_session = self.face_service_session
@@ -1512,12 +2372,14 @@ class ProductionClusterApp(QMainWindow):
             self._preferred_face_pipeline_defaults(),
             refresh=False,
         )
-        self.faces_pane.set_active_face_mode(self.faces_pane.current_face_mode(), refresh=True)
+        self.faces_pane.set_active_face_mode("human", refresh=True)
 
     def _post_startup_checks(self) -> None:
-        if not self.isVisible():
+        if self._is_shutting_down or not self.isVisible():
             return
         self._maybe_show_first_run_setup()
+        if self._is_shutting_down:
+            return
         self._maybe_show_last_crash_notice()
         self._refresh_health_badge()
 
@@ -1550,80 +2412,51 @@ class ProductionClusterApp(QMainWindow):
         model_name = str(model_name or self.settings.default_model).strip().lower()
         if not model_name:
             return
-        if self._thread_is_running(self._post_install_model_thread):
+        if self.model_download_controller.is_running():
+            self.footer_bar.set_status("A model download is already active. Open Jobs to monitor or cancel it.")
             return
         self.settings_store.setValue("models/download_default_after_setup", False)
         self.settings_store.sync()
-        if self.model_asset_service.model_available_without_download(model_name):
+        require_text = model_name in TEXT_MODEL_ORDER
+        if self.model_asset_service.model_available_without_download(model_name, require_text=require_text):
             self.footer_bar.set_status(f"{model_label(model_name)} is already available locally.")
             self._set_activity("Model ready")
             return
+        self._active_post_install_model_name = model_name
+        if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
+            self._active_post_install_model_name = None
+            self.footer_bar.set_status("The model download could not start.")
 
-        self.footer_bar.set_status(f"Downloading {model_label(model_name)} into the runtime cache...")
-        self._set_activity("Downloading model...")
-
-        def _run(progress, cancel_check):
-            progress(-1, f"Downloading {model_name} model files...")
-            raise_if_cancelled(cancel_check)
-            from ml.embeddings import ModelManager
-
-            runtime_service = RuntimeCapabilityService()
-            execution_policy = runtime_service.select_policy(self._preferred_execution_mode())
-            performance_profile = select_performance_profile(
-                self._preferred_performance_profile(),
-                self.system_resources,
+    def _request_face_model_download(self, model_name: str) -> None:
+        model_name = str(model_name or "facenet").strip().lower()
+        require_text = model_name in TEXT_MODEL_ORDER
+        if self.model_asset_service.model_available_without_download(model_name, require_text=require_text):
+            self._reload_face_services_from_settings()
+            self.footer_bar.set_status(f"{model_label(model_name)} is already available locally. Scan again to continue.")
+            return
+        if self.model_download_controller.is_running():
+            infoBox(
+                "Model download already running",
+                "Another model download is active. Open Jobs to monitor or cancel it, then scan again.",
             )
-            use_onnx = model_name in BUNDLED_ONNX_INPUT_SIZES
-            manager = ModelManager(
-                use_onnx=use_onnx,
-                execution_policy=execution_policy,
-                runtime_service=runtime_service,
-                performance_profile=performance_profile,
-                allow_model_downloads=True,
-            )
-            bundle = manager.get_bundle(model_name, use_onnx=use_onnx)
-            progress(100, f"{model_name} model files are cached.")
-            return {"model": model_name, "signature": bundle.signature}
-
-        job = AsyncJob(_run)
-        self._post_install_model_job = job
-        thread_holder: dict[str, object | None] = {"thread": None}
-
-        def _cleanup() -> None:
-            thread = thread_holder.get("thread")
-            if thread is not None:
-                self._release_async_refs(job, thread)
-            if self._post_install_model_thread is thread:
-                self._post_install_model_thread = None
-            if self._post_install_model_job is job:
-                self._post_install_model_job = None
-            self.footer_bar.set_progress(None)
-            self._refresh_footer_storage_usage()
-
-        def _done(result: object) -> None:
-            LOGGER.info("Post-install model download completed: %s", result)
-            self.footer_bar.set_status(f"{model_label(model_name)} is ready in the runtime cache.")
-            self._set_activity("Model ready")
-            infoBox("Model downloaded", f"{model_label(model_name)} is now available in the runtime cache.")
-            _cleanup()
-
-        def _failed(message: str) -> None:
-            LOGGER.warning("Post-install model download failed for %s: %s", model_name, message)
-            self.footer_bar.set_status(f"Model download failed: {message}")
-            self._set_activity("Model download failed")
-            errorBox("Model download failed", message)
-            _cleanup()
-
-        job.progress.connect(self.footer_bar.set_progress)
-        job.progress.connect(lambda _value, status: self._set_activity(status))
-        job.completed.connect(_done)
-        job.failed.connect(_failed)
-        job.cancelled.connect(lambda: self.footer_bar.set_status("Model download cancelled."))
-        job.cancelled.connect(_cleanup)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._post_install_model_thread = thread
-        self._retain_async_refs(job, thread)
+            return
+        if not confirmBox(
+            "Install face model?",
+            (
+                f"Face scanning needs {model_label(model_name)} model files.\n\n"
+                f"Download location: {self.settings.cache_dir}\n\n"
+                "The download is checksum-verified, shared across runs, resumable from the cache, "
+                "visible in Jobs, and cancellable.\n\n"
+                "Install it now?"
+            ),
+            parent=self,
+        ):
+            self.footer_bar.set_status("Face-model installation cancelled. No download was started.")
+            return
+        self._active_post_install_model_name = model_name
+        if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
+            self._active_post_install_model_name = None
+            errorBox("Model download could not start", "Open Settings > Models and try the installation again.")
 
     def _maybe_show_last_crash_notice(self) -> None:
         app = QApplication.instance()
@@ -1645,31 +2478,36 @@ class ProductionClusterApp(QMainWindow):
             "Previous crash report found",
             (
                 "The previous production run wrote a crash record. "
-                "Open Settings > Diagnostics to view it or export a support bundle.\n\n"
+                "Open Settings > Support to view it or export a support bundle.\n\n"
                 f"Crash record: {crash_path}"
             ),
         )
 
-    def _clear_rebuildable_caches(self):
-        before = self.cache_maintenance_service.describe_rebuildable_caches()
-        cleared_targets, failures = self._clear_embedding_cache()
+    def _clear_rebuildable_caches(self, *, progress_callback=None, cancel_check=None):
+        before = self.cache_maintenance_service.describe_rebuildable_caches(cancel_check=cancel_check)
+        raise_if_cancelled(cancel_check)
+        cleared_targets, failures = self._clear_embedding_cache(cancel_check=cancel_check)
         disk_cleared, disk_failures = self.cache_maintenance_service.clear_rebuildable_disk_targets(
-            exclude={"embeddings.sqlite3"}
+            exclude={"embeddings.sqlite3"},
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )
         cleared_targets.extend(disk_cleared)
         failures.extend(disk_failures)
-        after = self.cache_maintenance_service.describe_rebuildable_caches()
+        raise_if_cancelled(cancel_check)
+        after = self.cache_maintenance_service.describe_rebuildable_caches(cancel_check=cancel_check)
         return CacheClearResult(
             cleared_targets=tuple(cleared_targets),
             freed_bytes=max(0, int(before.total_bytes - after.total_bytes)),
             failures=tuple(failures),
         )
 
-    def _clear_embedding_cache(self) -> tuple[list[str], list[str]]:
+    def _clear_embedding_cache(self, *, cancel_check=None) -> tuple[list[str], list[str]]:
         failures: list[str] = []
         db_path = Path(self.settings.embedding_cache_db)
         removed = False
         for suffix in ("", "-wal", "-shm"):
+            raise_if_cancelled(cancel_check)
             target = db_path.with_name(db_path.name + suffix)
             try:
                 if target.exists():
@@ -1695,6 +2533,8 @@ class ProductionClusterApp(QMainWindow):
         return f"{int(size_bytes)} B"
 
     def _set_footer_storage_summary(self, summary: RuntimeStorageSummary) -> None:
+        if not self._can_update_widget(getattr(self, "footer_bar", None)):
+            return
         self._last_storage_summary = summary
         text = f"Storage: {self._format_bytes(summary.total_bytes)}"
         lines = [f"Runtime root: {summary.runtime_root}", ""]
@@ -1712,11 +2552,13 @@ class ProductionClusterApp(QMainWindow):
         for key, label in labels.items():
             lines.append(f"{label}: {self._format_bytes(summary.target_bytes.get(key, 0))}")
         lines.append("")
-        lines.append("Clear Caches / Temp removes rebuildable caches, runtime temp files, support bundles, and benchmark artifacts.")
+        lines.append("Clear rebuildable data removes caches, temporary files, support bundles, and benchmark artifacts.")
         lines.append("Tags, logs, crash records, and model assets are preserved.")
         self.footer_bar.set_storage_usage(text, tooltip="\n".join(lines))
 
     def _refresh_footer_storage_usage(self) -> None:
+        if self._is_shutting_down or not self._can_update_widget(getattr(self, "footer_bar", None)):
+            return
         if self._thread_is_running(self._storage_clear_thread):
             return
         if self._thread_is_running(self._storage_usage_thread):
@@ -1726,9 +2568,13 @@ class ProductionClusterApp(QMainWindow):
         self.footer_bar.set_storage_usage("Storage: scanning...", tooltip="Scanning runtime storage usage...")
         self._update_footer_storage_state()
 
-        def _run(_progress, cancel_check):
+        def _run(progress, cancel_check):
             raise_if_cancelled(cancel_check)
-            return self.cache_maintenance_service.describe_runtime_storage(self.runtime_layout)
+            return self.cache_maintenance_service.describe_runtime_storage(
+                self.runtime_layout,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
 
         job = AsyncJob(_run)
         self._storage_usage_job = job
@@ -1748,12 +2594,18 @@ class ProductionClusterApp(QMainWindow):
             self._update_footer_storage_state()
 
         def _done(payload: object) -> None:
+            if self._is_shutting_down:
+                _cleanup()
+                return
             if _current_generation() and isinstance(payload, RuntimeStorageSummary):
                 self._set_footer_storage_summary(payload)
             _cleanup()
 
         def _failed(message: str) -> None:
-            if _current_generation():
+            if self._is_shutting_down:
+                _cleanup()
+                return
+            if _current_generation() and self._can_update_widget(getattr(self, "footer_bar", None)):
                 self.footer_bar.set_storage_usage("Storage: unavailable", tooltip=f"Storage refresh failed: {message}")
                 LOGGER.warning("Footer storage refresh failed: %s", message)
             _cleanup()
@@ -1785,23 +2637,32 @@ class ProductionClusterApp(QMainWindow):
         ):
             return
         self.gallery_pane.clear_memory_caches(reload_visible=False)
-        before = self.cache_maintenance_service.describe_runtime_storage(self.runtime_layout)
         self.footer_bar.set_progress(-1, "Clearing caches and generated runtime data...")
         self.footer_bar.set_status("Clearing caches and generated runtime data...")
         self._set_activity("Clearing caches...")
         self._update_footer_storage_state()
 
         def _run(progress, cancel_check):
-            _ = cancel_check
             progress(-1, "Clearing caches and generated runtime data...")
-            cleared_targets, failures = self._clear_embedding_cache()
+            before = self.cache_maintenance_service.describe_runtime_storage(
+                self.runtime_layout,
+                cancel_check=cancel_check,
+            )
+            raise_if_cancelled(cancel_check)
+            cleared_targets, failures = self._clear_embedding_cache(cancel_check=cancel_check)
             disk_cleared, disk_failures = self.cache_maintenance_service.clear_runtime_cleanup_targets(
                 self.runtime_layout,
                 exclude={"embeddings.sqlite3"},
+                progress_callback=progress,
+                cancel_check=cancel_check,
             )
             cleared_targets.extend(disk_cleared)
             failures.extend(disk_failures)
-            after = self.cache_maintenance_service.describe_runtime_storage(self.runtime_layout)
+            raise_if_cancelled(cancel_check)
+            after = self.cache_maintenance_service.describe_runtime_storage(
+                self.runtime_layout,
+                cancel_check=cancel_check,
+            )
             return CacheClearResult(
                 cleared_targets=tuple(cleared_targets),
                 freed_bytes=max(0, int(before.total_bytes - after.total_bytes)),
@@ -1810,6 +2671,7 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._storage_clear_job = job
+        storage_clear_job_id = self.job_manager.register_job("Clearing runtime caches", cancel_fn=job.cancel)
         thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
@@ -1826,6 +2688,14 @@ class ProductionClusterApp(QMainWindow):
         def _done(result: object) -> None:
             self.footer_bar.set_progress(None)
             if isinstance(result, CacheClearResult):
+                if result.failures:
+                    self.job_manager.finish(
+                        storage_clear_job_id,
+                        status="failed",
+                        error="; ".join(result.failures[:8]),
+                    )
+                else:
+                    self.job_manager.finish(storage_clear_job_id, status="finished")
                 self.footer_bar.set_status(
                     f"Cleared {len(result.cleared_targets)} targets and freed {self._format_bytes(result.freed_bytes)}."
                 )
@@ -1833,6 +2703,7 @@ class ProductionClusterApp(QMainWindow):
                 if result.failures:
                     LOGGER.warning("Runtime cache clear completed with errors: %s", "; ".join(result.failures))
             else:
+                self.job_manager.finish(storage_clear_job_id, status="finished")
                 self.footer_bar.set_status("Caches cleared.")
                 self._set_activity("Caches cleared")
             if self.gallery_pane.images:
@@ -1840,17 +2711,32 @@ class ProductionClusterApp(QMainWindow):
             _cleanup()
 
         def _failed(message: str) -> None:
+            self.job_manager.finish(storage_clear_job_id, status="failed", error=message)
             self.footer_bar.set_progress(None)
             self.footer_bar.set_status(f"Cache clear failed: {message}")
             self._set_activity("Cache clear failed")
             errorBox("Cache clear failed", message)
             _cleanup()
 
+        def _cancelled() -> None:
+            self.job_manager.finish(storage_clear_job_id, status="cancelled")
+            self.footer_bar.set_progress(None)
+            self.footer_bar.set_status("Cache clear cancelled. Already removed rebuildable files remain removed.")
+            self._set_activity("Cache clear cancelled")
+            _cleanup()
+
         job.progress.connect(self.footer_bar.set_progress)
+        job.progress.connect(
+            lambda value, status: self.job_manager.update(
+                storage_clear_job_id,
+                progress=value,
+                text=status,
+            )
+        )
         job.progress.connect(lambda _value, status: self._set_activity(status))
         job.completed.connect(_done)
         job.failed.connect(_failed)
-        job.cancelled.connect(_cleanup)
+        job.cancelled.connect(_cancelled)
         thread = start_job_in_thread(job)
         thread_holder["thread"] = thread
         self._storage_clear_thread = thread
@@ -1877,6 +2763,8 @@ class ProductionClusterApp(QMainWindow):
         }
 
     def _capture_face_context(self, paths: list[str]) -> dict[str, dict[str, object]]:
+        if self.faces_pane is None:
+            return {}
         return {
             str(path): dict(context)
             for path in paths
@@ -1956,12 +2844,13 @@ class ProductionClusterApp(QMainWindow):
         return context
 
     def _set_activity(self, text: str) -> None:
+        if self._is_shutting_down:
+            return
         normalized = str(text or "").strip() or "Idle"
-        self.activity_label.setText(normalized)
-        self.activity_label.setToolTip(normalized)
+        self.footer_bar.set_status(normalized)
 
     def _refresh_health_badge(self) -> None:
-        if not hasattr(self, "health_badge"):
+        if self._is_shutting_down or not self._can_update_widget(getattr(self, "runtime_badge", None)):
             return
         issues: list[str] = []
         notes: list[str] = [
@@ -1987,14 +2876,11 @@ class ProductionClusterApp(QMainWindow):
             issues.append("Crash report present")
             notes.append(f"Last crash: {self.runtime_layout.last_crash_json}")
         if issues:
-            self.health_badge.setText("Health: attention")
-            self.health_badge.setProperty("health", "warn")
             notes.extend(["", "Attention:"])
             notes.extend(f"- {issue}" for issue in issues)
+            self.runtime_badge.set_health("warning", notes)
         else:
-            self.health_badge.setText("Health: OK")
-            self.health_badge.setProperty("health", "ok")
-        self.health_badge.setToolTip("\n".join(notes))
+            self.runtime_badge.set_health("ok", notes)
 
     @staticmethod
     def _thread_is_running(thread) -> bool:
@@ -2004,6 +2890,18 @@ class ProductionClusterApp(QMainWindow):
             return bool(thread.isRunning())
         except Exception:
             return False
+
+    @staticmethod
+    def _qt_object_alive(widget: object | None) -> bool:
+        if widget is None:
+            return False
+        try:
+            return not bool(sip.isdeleted(widget))
+        except Exception:
+            return True
+
+    def _can_update_widget(self, widget: object | None) -> bool:
+        return not self._is_shutting_down and self._qt_object_alive(widget)
 
     @staticmethod
     def _wait_for_thread(thread, timeout_ms: int = 2500) -> bool:
@@ -2190,16 +3088,24 @@ class ProductionClusterApp(QMainWindow):
         self._update_footer_storage_state()
 
     def closeEvent(self, event) -> None:
+        # Mark shutdown before cancelling or waiting. Worker completion signals
+        # may already be queued on the GUI thread; their handlers must see the
+        # guard before this window (and its footer) can be deleted.
+        self._is_shutting_down = True
         self._startup_check_timer.stop()
         self._post_install_timer.stop()
         self._pending_post_install_model_name = None
+        self._pending_model_download_run = None
+        self._active_post_install_model_name = None
         self._cancel_request_preflight()
         self._cancel_cluster_tag_context_refresh()
-        for job, thread in (
+        runtime_jobs = (
             (self._storage_usage_job, self._storage_usage_thread),
             (self._storage_clear_job, self._storage_clear_thread),
             (self._post_install_model_job, self._post_install_model_thread),
-        ):
+            (self._faces_init_job, self._faces_init_thread),
+        )
+        for job, thread in runtime_jobs:
             if job is None:
                 continue
             self._retain_async_refs(job, thread)
@@ -2213,32 +3119,52 @@ class ProductionClusterApp(QMainWindow):
         self._storage_clear_thread = None
         self._post_install_model_job = None
         self._post_install_model_thread = None
+        self._faces_init_job = None
+        self._faces_init_thread = None
         self._preflight_job = None
         self._preflight_thread = None
         ready_to_close = self._wait_for_thread(self._tag_context_thread, 2500)
-        for job, thread in list(self._retained_async_refs):
+        retained_jobs = list(self._retained_async_refs)
+        for job, thread in retained_jobs:
             if job is not None:
                 try:
                     job.cancel()
                 except Exception:
                     pass
             ready_to_close = self._wait_for_thread(thread, 2500) and ready_to_close
+        if ready_to_close:
+            for job, thread in (*runtime_jobs, *retained_jobs):
+                dispose = getattr(job, "dispose", None)
+                if callable(dispose):
+                    try:
+                        dispose()
+                    except Exception:
+                        pass
+                try:
+                    if getattr(thread, "_job", None) is job:
+                        thread._job = None
+                except (AttributeError, RuntimeError):
+                    pass
         self._retained_async_refs = []
+        ready_to_close = self.model_download_controller.shutdown(2500) and ready_to_close
         ready_to_close = self.session_controller.shutdown(2500) and ready_to_close
         try:
             ready_to_close = self.gallery_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
         except Exception:
             ready_to_close = False
-        try:
-            ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
-        except Exception:
-            ready_to_close = False
+        if self.faces_pane is not None:
+            try:
+                ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+            except Exception:
+                ready_to_close = False
         try:
             ready_to_close = self.cluster_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
         except Exception:
             ready_to_close = False
         if not ready_to_close:
-            self.footer_bar.set_status("Waiting for background work to stop before closing.")
+            self._is_shutting_down = False
+            if self._can_update_widget(getattr(self, "footer_bar", None)):
+                self.footer_bar.set_status("Waiting for background work to stop before closing.")
             self._set_activity("Stopping background work...")
             event.ignore()
             return
@@ -2246,6 +3172,44 @@ class ProductionClusterApp(QMainWindow):
         self.settings_store.setValue("workspace/faces_mode", self._faces_mode)
         self.settings_store.sync()
         super().closeEvent(event)
+
+    def _mark_shutting_down(self) -> None:
+        self._is_shutting_down = True
+        self._pending_model_download_run = None
+        self._active_post_install_model_name = None
+        try:
+            self.model_download_controller.cancel()
+        except Exception:
+            pass
+        for timer_name in ("_startup_check_timer", "_post_install_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is None:
+                continue
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        for generation_name in ("_preflight_generation", "_tag_context_generation", "_storage_usage_generation"):
+            if hasattr(self, generation_name):
+                try:
+                    setattr(self, generation_name, int(getattr(self, generation_name)) + 1)
+                except Exception:
+                    pass
+        for job_name in (
+            "_preflight_job",
+            "_tag_context_job",
+            "_storage_usage_job",
+            "_storage_clear_job",
+            "_post_install_model_job",
+            "_faces_init_job",
+        ):
+            job = getattr(self, job_name, None)
+            if job is None:
+                continue
+            try:
+                job.cancel()
+            except Exception:
+                pass
 
 
 def _restore_cluster_dict(raw: dict[str, object]) -> dict[str, dict[int, list[str]]]:
@@ -2331,6 +3295,10 @@ def run() -> int:
     flush_logging_handlers()
     try:
         app = QApplication.instance() or QApplication([])
+        app.setApplicationName(PRODUCTION_DISPLAY_NAME)
+        app.setApplicationDisplayName(PRODUCTION_DISPLAY_NAME)
+        app.setOrganizationName(PRODUCTION_QSETTINGS_ORG)
+        desktop_entry_path = configure_linux_desktop_entry(app, executable_path=Path(sys.executable))
         icon_path = production_icon_path()
         app_icon = production_app_icon()
         if app_icon.isNull():
@@ -2338,6 +3306,8 @@ def run() -> int:
         else:
             app.setWindowIcon(app_icon)
             LOGGER.info("app icon applied | id=%s path=%s", startup_id, icon_path)
+        if desktop_entry_path is not None:
+            LOGGER.info("linux desktop entry ready | id=%s path=%s", startup_id, desktop_entry_path)
         LOGGER.info(
             "qt application ready | id=%s app_instance=%s primary_screen=%s",
             startup_id,
@@ -2383,6 +3353,11 @@ def _show_main_window_on_screen(window: ProductionClusterApp) -> None:
     screen = QApplication.primaryScreen()
     if screen is not None:
         available = screen.availableGeometry()
+        logical = screen.geometry()
+        if not _screen_geometry_supported(logical):
+            window.show_unsupported_resolution_view((int(logical.width()), int(logical.height())))
+        else:
+            window.apply_screen_geometry_constraints((int(available.width()), int(available.height())))
         target_width = min(max(1440, int(available.width() * 0.96)), available.width())
         target_height = min(max(900, int(available.height() * 0.96)), available.height())
         window.resize(target_width, target_height)
@@ -2435,6 +3410,22 @@ def _ensure_window_visible(window: ProductionClusterApp) -> None:
         available.getRect(),
         window.frameGeometry().getRect(),
     )
+
+
+def _screen_geometry_supported(geometry) -> bool:
+    if geometry is None:
+        return True
+    try:
+        width = int(geometry.width())
+        height = int(geometry.height())
+        long_edge = max(width, height)
+        short_edge = min(width, height)
+        return long_edge >= max(MIN_SUPPORTED_SCREEN_WIDTH, MIN_SUPPORTED_SCREEN_HEIGHT) and short_edge >= min(
+            MIN_SUPPORTED_SCREEN_WIDTH,
+            MIN_SUPPORTED_SCREEN_HEIGHT,
+        )
+    except Exception:
+        return True
 
 
 def _screen_summary(screen: object | None) -> str:

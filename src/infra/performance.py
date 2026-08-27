@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class PerformanceProfile:
     backend_worker_cap: int | None
     cpu_batch_size: int
     gpu_batch_size: int
+    vram_headroom_mb: int
 
     def backend_workers_for(self, backend_count: int) -> int:
         backend_count = max(1, int(backend_count))
@@ -83,6 +84,7 @@ def select_performance_profile(profile_name: str | None, resources: SystemResour
             backend_worker_cap=1,
             cpu_batch_size=max(4, min(8, logical)),
             gpu_batch_size=max(8, min(16, logical * 2)),
+            vram_headroom_mb=1536,
         )
 
     if profile == "max_speed":
@@ -100,6 +102,7 @@ def select_performance_profile(profile_name: str | None, resources: SystemResour
             backend_worker_cap=None,
             cpu_batch_size=max(16, min(24, logical)),
             gpu_batch_size=max(24, logical * 2),
+            vram_headroom_mb=1024,
         )
 
     return PerformanceProfile(
@@ -116,7 +119,34 @@ def select_performance_profile(profile_name: str | None, resources: SystemResour
         backend_worker_cap=max(1, min(3, max(1, logical // 4))),
         cpu_batch_size=max(8, min(24, logical)),
         gpu_batch_size=max(16, min(48, logical * 2)),
+        vram_headroom_mb=1024,
     )
+
+
+def apply_performance_overrides(
+    profile: PerformanceProfile,
+    *,
+    cpu_batch_size: int | None = None,
+    gpu_batch_size: int | None = None,
+    embedding_preprocess_workers: int | None = None,
+    thumbnail_workers: int | None = None,
+    thumbnail_prefetch_rows: int | None = None,
+    vram_headroom_mb: int | None = None,
+) -> PerformanceProfile:
+    values: dict[str, int] = {}
+    if cpu_batch_size is not None:
+        values["cpu_batch_size"] = max(1, min(512, int(cpu_batch_size)))
+    if gpu_batch_size is not None:
+        values["gpu_batch_size"] = max(1, min(1024, int(gpu_batch_size)))
+    if embedding_preprocess_workers is not None:
+        values["embedding_preprocess_workers"] = max(1, min(128, int(embedding_preprocess_workers)))
+    if thumbnail_workers is not None:
+        values["thumbnail_workers"] = max(1, min(64, int(thumbnail_workers)))
+    if thumbnail_prefetch_rows is not None:
+        values["thumbnail_prefetch_rows"] = max(0, min(128, int(thumbnail_prefetch_rows)))
+    if vram_headroom_mb is not None:
+        values["vram_headroom_mb"] = max(256, min(65536, int(vram_headroom_mb)))
+    return replace(profile, **values) if values else profile
 
 
 def _windows_memory() -> tuple[int, int]:

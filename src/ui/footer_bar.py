@@ -46,13 +46,14 @@ class WorkspaceFooter(QWidget):
         self.metrics_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.storage_label = ElidedLabel("Storage: scanning...", self)
         self.storage_label.setMinimumWidth(220)
-        self.clear_storage_button = QPushButton("Clear Caches / Temp", self)
+        self.clear_storage_button = QPushButton("Clear rebuildable data", self)
         self.clear_storage_button.setFixedHeight(24)
         self.clear_storage_button.setToolTip(
             "Clear rebuildable caches, runtime temp files, support bundles, and benchmark artifacts. "
             "This action stays unavailable while clustering or other background work is active."
         )
         self.clear_storage_button.clicked.connect(self.clear_storage_requested.emit)
+        self.clear_storage_button.hide()
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setFixedWidth(150)

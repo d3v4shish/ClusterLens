@@ -17,13 +17,18 @@ class JobIndicatorWidget(QWidget):
         layout.setSpacing(8)
 
         self.label = QLabel("")
-        self.label.setMinimumWidth(220)
+        self.label.setMaximumWidth(260)
+        self.label.setAccessibleName("Active job status")
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(180)
+        self.progress.setFixedWidth(96)
         self.progress.setTextVisible(False)
+        self.progress.setAccessibleName("Active job progress")
+        self.progress.setVisible(False)
         self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setAccessibleName("Cancel active job")
         self.cancel_btn.setVisible(False)
         self.jobs_btn = QPushButton("Jobs…")
+        self.jobs_btn.setAccessibleName("Open job history")
 
         layout.addWidget(self.label)
         layout.addWidget(self.progress)
@@ -44,9 +49,11 @@ class JobIndicatorWidget(QWidget):
     def _refresh(self, *_args) -> None:
         job = self._active_job()
         if job is None:
-            self.label.setText("Idle")
+            self.label.clear()
+            self.label.hide()
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
+            self.progress.hide()
             self.cancel_btn.setVisible(False)
             return
 
@@ -56,12 +63,10 @@ class JobIndicatorWidget(QWidget):
         if job.status == "cancelling":
             text += " (cancelling)"
         self.label.setText(text)
-
-        if job.progress is None:
-            self.progress.setRange(0, 0)  # indeterminate
-        else:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(max(0, min(100, int(job.progress))))
+        self.label.show()
+        # The workspace footer is the single prominent progress indicator.
+        # This header component reports the active job and cancellation only.
+        self.progress.hide()
 
         self.cancel_btn.setVisible(bool(job.cancellable))
 
@@ -85,12 +90,18 @@ class JobsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["Label", "Status", "Progress", "Text", "Started", "Finished"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["Label", "Status", "Progress", "Cache", "Text", "Started", "Finished"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
         close_row = QHBoxLayout()
+        self.cancel_selected_btn = QPushButton("Cancel selected")
+        self.cancel_selected_btn.setAccessibleName("Cancel selected job")
+        self.cancel_selected_btn.clicked.connect(self._cancel_selected)
+        close_row.addWidget(self.cancel_selected_btn)
         close_row.addStretch(1)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
@@ -100,6 +111,7 @@ class JobsDialog(QDialog):
         self.job_manager.job_added.connect(self.refresh)
         self.job_manager.job_updated.connect(self.refresh)
         self.job_manager.job_finished.connect(self.refresh)
+        self.table.itemSelectionChanged.connect(self._update_cancel_state)
         self.refresh()
 
     def refresh(self, *_args) -> None:
@@ -109,13 +121,35 @@ class JobsDialog(QDialog):
             started = datetime.fromtimestamp(job.started_at_s).strftime("%H:%M:%S")
             finished = "" if job.finished_at_s is None else datetime.fromtimestamp(job.finished_at_s).strftime("%H:%M:%S")
             progress = "" if job.progress is None else str(job.progress)
-            values = [job.label, job.status, progress, job.text, started, finished]
+            values = [job.label, job.status, progress, job.cache_status, job.text, started, finished]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if col in (1, 2):
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 if col == 0 and job.error:
                     item.setToolTip(job.error)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(job.job_id))
                 self.table.setItem(row, col, item)
         self.table.resizeColumnsToContents()
+        self._update_cancel_state()
+
+    def _selected_job(self) -> JobState | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        job_id = item.data(Qt.ItemDataRole.UserRole)
+        return self.job_manager.get(int(job_id)) if job_id is not None else None
+
+    def _update_cancel_state(self) -> None:
+        job = self._selected_job()
+        self.cancel_selected_btn.setEnabled(bool(job is not None and job.cancellable))
+
+    def _cancel_selected(self) -> None:
+        job = self._selected_job()
+        if job is not None and job.cancellable:
+            self.job_manager.cancel(job.job_id)
 

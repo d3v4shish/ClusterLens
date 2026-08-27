@@ -93,7 +93,7 @@ class FilePane(QWidget):
             else:
                 label = f"{model_name} (Torch)"
             checkbox = QCheckBox(label)
-            checkbox.setToolTip("ONNX-ready model (DirectML compatible)" if model_name in onnx_ready else "Torch model")
+            checkbox.setToolTip("ONNX-ready model (CUDA/CPU compatible)" if model_name in onnx_ready else "Torch model")
             checkbox.setChecked(model_name == self.settings.default_model)
             checkbox.toggled.connect(self.state_changed.emit)
             self.embedding_checkboxes[model_name] = checkbox
