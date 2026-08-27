@@ -29,7 +29,9 @@ class ClusteringSessionController(QObject):
         super().__init__(parent)
         self.runtime_layout = runtime_layout
         self.repo_root = Path(__file__).resolve().parents[2]
-        self.worker_program = str(Path(sys.executable).resolve())
+        # Keep the virtual-environment entry point. Resolving its symlink can
+        # select the base interpreter, which does not have project packages.
+        self.worker_program = os.path.abspath(sys.executable)
         self._process: QProcess | None = None
         self._request: ProductionClusterRequest | None = None
         self._stdout_buffer = ""
@@ -325,8 +327,17 @@ class ClusteringSessionController(QObject):
         if not message:
             return
         LOGGER.log(level, "Worker stderr: %s", message)
-        if level >= logging.ERROR and not self._error_message:
+        if level >= logging.ERROR and not self._error_message and not message.lower().startswith("traceback"):
             self._error_message = message
+
+    @staticmethod
+    def _stderr_summary(stderr: str) -> str:
+        lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
+        for line in reversed(lines):
+            lowered = line.lower()
+            if "error" in lowered or "exception" in lowered:
+                return line
+        return lines[-1] if lines else ""
 
     @staticmethod
     def _classify_stderr_line(line: str) -> tuple[int, str]:
@@ -365,7 +376,8 @@ class ClusteringSessionController(QObject):
             f"| cwd={self.repo_root} | runtime={self.runtime_layout.root}"
         )
         LOGGER.error(details)
-        self._error_message = self._error_message or details
+        if error == QProcess.ProcessError.FailedToStart:
+            self._error_message = self._error_message or details
         if self._stderr_log_path is not None:
             try:
                 with self._stderr_log_path.open("a", encoding="utf-8") as handle:
@@ -411,7 +423,7 @@ class ClusteringSessionController(QObject):
             return
         if daemon_process and not was_running:
             if had_pending_daemon_request:
-                message = self._error_message or self._stderr_buffer.strip() or (
+                message = self._error_message or self._stderr_summary(self._stderr_buffer) or (
                     f"Persistent worker exited before accepting the request with code {exit_code} ({exit_status})"
                 )
                 self.failed.emit(self._explicit_failure_message(message))
@@ -424,7 +436,7 @@ class ClusteringSessionController(QObject):
             self._delete_process_later(process)
             self._emit_completed_payload()
             return
-        message = self._error_message or self._stderr_buffer.strip() or f"Worker exited with code {exit_code} ({exit_status})"
+        message = self._error_message or self._stderr_summary(self._stderr_buffer) or f"Worker exited with code {exit_code} ({exit_status})"
         self.failed.emit(self._explicit_failure_message(message))
         self._delete_process_later(process)
 

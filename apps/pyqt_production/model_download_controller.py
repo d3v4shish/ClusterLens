@@ -31,7 +31,9 @@ class ModelDownloadController(QObject):
         super().__init__(parent)
         self.runtime_layout = runtime_layout
         self.repo_root = Path(__file__).resolve().parents[2]
-        self.worker_program = str(Path(sys.executable).resolve())
+        # Preserve the active virtual environment instead of resolving through
+        # its python symlink to an interpreter without project dependencies.
+        self.worker_program = os.path.abspath(sys.executable)
         self._process: QProcess | None = None
         self._request_file: Path | None = None
         self._items: tuple[ModelDownloadItem, ...] = ()

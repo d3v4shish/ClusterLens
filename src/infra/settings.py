@@ -12,8 +12,8 @@ class AppSettings:
     app_name: str = "ClusterLens"
     recursive_scan: bool = True
     image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-    default_model: str = "dino"
-    default_cluster_backend: str = "cosine-kmeans"
+    default_model: str = "siglip"
+    default_cluster_backend: str = "hdbscan"
     default_similarity_mode: str = "semantic"
     default_outlier_policy: str = "assign"
     default_use_onnx: bool = False
@@ -174,7 +174,7 @@ PRODUCTION_SETTING_SPECS: tuple[SettingSpec, ...] = (
     SettingSpec("gallery/prefetch_rows", "int", 4, "Gallery prefetch rows.", minimum=0, maximum=128),
     SettingSpec("gallery/confirm_large_runs", "bool", True, "Require confirmation before large gallery/clustering runs."),
     SettingSpec("gallery/operation_journal_retention_days", "int", 0, "Operation journal retention; zero means keep indefinitely.", minimum=0, maximum=3650, user_data=True),
-    SettingSpec("workspace/default_view", "str", "clustering", "Default workspace.", choices=("clustering", "faces")),
+    SettingSpec("workspace/default_view", "str", "gallery", "Default workspace.", choices=("gallery", "clustering", "faces")),
     SettingSpec("workspace/faces_mode", "str", "basic", "Faces UI density/mode.", choices=("basic", "advanced")),
     SettingSpec("workspace/dense_ui", "bool", True, "Use dense desktop spacing."),
     SettingSpec("workspace/recent_folders_v1", "str", "", "Versioned recent-folder history.", user_data=True),
@@ -188,8 +188,8 @@ PRODUCTION_SETTING_SPECS: tuple[SettingSpec, ...] = (
     SettingSpec("faces/max_detections/human", "int", 50, "Maximum human face detections per image.", minimum=1, maximum=1000, user_data=True),
     SettingSpec("faces/identity_similarity_threshold", "float", 0.72, "Face identity similarity threshold.", minimum=0.0, maximum=1.0, user_data=True),
     SettingSpec("faces/pending_accept_threshold", "float", 0.85, "Pending face proposal accept threshold.", minimum=0.0, maximum=1.0, user_data=True),
-    SettingSpec("clustering/default_model", "str", "dino", "Default embedding model."),
-    SettingSpec("clustering/default_backend", "str", "cosine-kmeans", "Default clustering backend."),
+    SettingSpec("clustering/default_model", "str", "siglip", "Default embedding model."),
+    SettingSpec("clustering/default_backend", "str", "hdbscan", "Default clustering backend."),
     SettingSpec("clustering/default_similarity_mode", "str", "semantic", "Default similarity mode."),
     SettingSpec("clustering/default_outlier_policy", "str", "assign", "Default outlier policy."),
     SettingSpec("clustering/default_cluster_count", "int", 12, "Default cluster count.", minimum=2, maximum=10000),

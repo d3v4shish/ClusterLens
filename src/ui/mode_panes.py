@@ -334,7 +334,7 @@ class ClusteringOptionsPane(QWidget):
         self.preset_combo.addItem("High Quality", "high_quality")
         self.preset_combo.addItem("Custom", "custom")
         self.preset_combo.setCurrentIndex(self.preset_combo.findData("balanced"))
-        self.preset_summary = QLabel("Balanced quality, time, and memory use.")
+        self.preset_summary = QLabel("SigLIP with HDBSCAN for natural photo groups and outliers.")
         self.preset_summary.setWordWrap(True)
         preset_layout.addRow("Preset", self.preset_combo)
         preset_layout.addRow(self.preset_summary)
@@ -515,7 +515,7 @@ class ClusteringOptionsPane(QWidget):
         preset = str(preset or "custom")
         summaries = {
             "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "Balanced quality, time, and memory use for most photo folders.",
+            "balanced": "SigLIP with HDBSCAN for natural photo groups and outliers.",
             "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
             "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
         }
@@ -533,8 +533,8 @@ class ClusteringOptionsPane(QWidget):
                 "outlier": "assign", "clusters": 8, "onnx": True,
             },
             "balanced": {
-                "models": {"dino"}, "backends": {"cosine-kmeans"}, "modes": {"semantic"},
-                "outlier": "assign", "clusters": 12, "onnx": False,
+                "models": {"siglip"}, "backends": {"hdbscan"}, "modes": {"semantic"},
+                "outlier": "isolate", "clusters": 12, "onnx": False,
             },
             "high_quality": {
                 "models": {"dinov2_base", "clip"}, "backends": {"hdbscan", "graph"}, "modes": {"semantic", "cosine"},
@@ -668,7 +668,7 @@ class ClusteringOptionsPane(QWidget):
         self.technical_panel.setVisible(preset == "custom" or self.option_scope != "production")
         self.preset_summary.setText({
             "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "Balanced quality, time, and memory use for most photo folders.",
+            "balanced": "SigLIP with HDBSCAN for natural photo groups and outliers.",
             "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
             "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
         }.get(preset, "Custom settings."))

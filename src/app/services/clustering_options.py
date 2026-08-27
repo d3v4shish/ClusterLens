@@ -67,7 +67,7 @@ ONNX_READY_MODELS = frozenset({"fast_preview", "convnext", "resnet"})
 
 LEGACY_BACKEND_ORDER = ("cosine-kmeans", "hdbscan", "graph", "faiss", "sklearn")
 PRODUCTION_BACKEND_ORDER = ("cosine-kmeans", "hdbscan", "graph")
-DEFAULT_PRODUCTION_BACKENDS = ("cosine-kmeans", "hdbscan", "graph")
+DEFAULT_PRODUCTION_BACKENDS = ("hdbscan",)
 
 BACKEND_TOOLTIPS = {
     "cosine-kmeans": "Fast fixed-count clustering. Best default when you want predictable cluster counts.",

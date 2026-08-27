@@ -47,6 +47,7 @@ from ui.cluster_pane import ClusterPane  # noqa: E402
 from ui.error_mbox import TagManagerDialog, confirmBox, errorBox, infoBox  # noqa: E402
 from ui.footer_bar import WorkspaceFooter  # noqa: E402
 from ui.gallery_pane import GalleryPane  # noqa: E402
+from ui.sectioned_gallery import GallerySection, SectionedGallery  # noqa: E402
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
 from ui.job_manager import JobManager  # noqa: E402
 from ui.job_widgets import JobIndicatorWidget  # noqa: E402
@@ -182,6 +183,13 @@ class ProductionClusterApp(QMainWindow):
         self._clustering_mode = "basic"
         self._faces_mode = "basic"
         self._active_workspace = "clustering"
+        self._gallery_paths: list[str] = []
+        self._gallery_snapshot_key = ""
+        self._gallery_discovery_generation = 0
+        self._gallery_discovery_job = None
+        self._gallery_discovery_thread = None
+        self._gallery_primary_comparison_key = ""
+        self._active_cluster_directory = ""
         self._pane_visibility = {"source": True, "controls": True, "details": True}
         self._advanced_pane_visibility = {"source": True, "controls": True, "details": True}
         self._pane_restore_widths = {"source": 250, "controls": 420, "details": 440}
@@ -308,8 +316,20 @@ class ProductionClusterApp(QMainWindow):
         self.clustering_splitter.setStretchFactor(1, 8)
         self.clustering_splitter.setStretchFactor(2, 3)
 
+        self.photo_gallery_workspace = QWidget(self.workspace_stack)
+        photo_gallery_layout = QHBoxLayout(self.photo_gallery_workspace)
+        photo_gallery_layout.setContentsMargins(0, 0, 0, 0)
+        photo_gallery_layout.setSpacing(6)
+        self.photo_gallery = SectionedGallery(self.photo_gallery_workspace)
+        self.photo_gallery._actions.job_manager = self.job_manager
+        self.photo_gallery._actions.metadata_service = self.photo_metadata_service
+        self.photo_gallery._actions.image_tag_service = self.image_tag_service
+        self.photo_gallery.set_read_only_mode(self._read_only_mode())
+        photo_gallery_layout.addWidget(self.photo_gallery, stretch=1)
+
         self.faces_placeholder = self._build_faces_placeholder()
 
+        self.workspace_stack.addWidget(self.photo_gallery_workspace)
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_placeholder)
         self.workspace_stack.setMinimumWidth(1040)
@@ -638,6 +658,12 @@ class ProductionClusterApp(QMainWindow):
         self.feature_label = QLabel(PRODUCTION_DISPLAY_NAME)
         self.feature_label.setProperty("role", "section")
         self.feature_label.setAccessibleName("ClusterLens")
+        self.gallery_workspace_button = QPushButton("Gallery")
+        self.gallery_workspace_button.setCheckable(True)
+        self.gallery_workspace_button.setProperty("nav", True)
+        self.gallery_workspace_button.setAccessibleName("Open Gallery workspace")
+        apply_icon(self.gallery_workspace_button, "workspace")
+        self.gallery_workspace_button.clicked.connect(lambda: self.set_active_workspace("gallery"))
         self.clustering_workspace_button = QPushButton("Clustering")
         self.clustering_workspace_button.setCheckable(True)
         self.clustering_workspace_button.setProperty("nav", True)
@@ -737,6 +763,7 @@ class ProductionClusterApp(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings_dialog)
 
         row.addWidget(self.feature_label)
+        row.addWidget(self.gallery_workspace_button)
         row.addWidget(self.clustering_workspace_button)
         row.addWidget(self.faces_workspace_button)
         row.addWidget(self.current_folder_label, stretch=1)
@@ -756,6 +783,7 @@ class ProductionClusterApp(QMainWindow):
             self.cluster_actions_button,
         ):
             legacy_widget.hide()
+        QWidget.setTabOrder(self.gallery_workspace_button, self.clustering_workspace_button)
         QWidget.setTabOrder(self.clustering_workspace_button, self.faces_workspace_button)
         QWidget.setTabOrder(self.faces_workspace_button, self.mode_selector)
         QWidget.setTabOrder(self.mode_selector, self.view_button)
@@ -789,6 +817,9 @@ class ProductionClusterApp(QMainWindow):
         self.runtime_badge.clicked.connect(self._open_runtime_status_details)
         self.gallery_pane.paths_removed.connect(self._on_gallery_paths_removed)
         self.gallery_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
+        self.photo_gallery.organize_requested.connect(self.run_gallery_organize)
+        self.photo_gallery.paths_removed.connect(self._on_gallery_paths_removed)
+        self.photo_gallery.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
         self.session_controller.progress.connect(self._on_clustering_progress)
@@ -806,8 +837,9 @@ class ProductionClusterApp(QMainWindow):
     def _install_shell_shortcuts(self) -> None:
         self._shell_shortcuts: list[QShortcut] = []
         shortcuts = (
-            ("Ctrl+1", lambda: self.set_active_workspace("clustering")),
-            ("Ctrl+2", lambda: self.set_active_workspace("faces")),
+            ("Ctrl+1", lambda: self.set_active_workspace("gallery")),
+            ("Ctrl+2", lambda: self.set_active_workspace("clustering")),
+            ("Ctrl+3", lambda: self.set_active_workspace("faces")),
             ("Ctrl+,", self.open_settings_dialog),
             ("Ctrl+O", self._focus_folder_picker),
             ("Ctrl+F", self._focus_workspace_search),
@@ -842,7 +874,7 @@ class ProductionClusterApp(QMainWindow):
     def _show_keyboard_help(self) -> None:
         infoBox(
             "Keyboard shortcuts",
-            "Ctrl+1 Clustering\nCtrl+2 Faces\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
+            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
         )
 
     def _open_runtime_status_details(self) -> None:
@@ -895,7 +927,7 @@ class ProductionClusterApp(QMainWindow):
         )
 
     def _preferred_workspace(self) -> str:
-        return self._normalize_workspace_id(str(self.settings_registry.get(self.settings_store, "workspace/default_view", "clustering")))
+        return self._normalize_workspace_id(str(self.settings_registry.get(self.settings_store, "workspace/default_view", "gallery")))
 
     def _preferred_faces_ui_mode(self) -> str:
         return self._normalize_ui_mode(str(self.settings_registry.get(self.settings_store, "workspace/faces_mode", "basic")))
@@ -999,6 +1031,8 @@ class ProductionClusterApp(QMainWindow):
     @staticmethod
     def _normalize_workspace_id(value: str) -> str:
         text = str(value or "").strip().lower()
+        if text in {"gallery", "photos", "photo gallery"}:
+            return "gallery"
         if text in {"faces", "face_search", "face search"}:
             return "faces"
         return "clustering"
@@ -1110,6 +1144,10 @@ class ProductionClusterApp(QMainWindow):
             pixmap_cache_size=self.performance_profile.pixmap_cache_size,
             qimage_cache_size=self.performance_profile.qimage_cache_size,
         )
+        self.photo_gallery.set_view_preferences(
+            thumbnail_size=thumbnail_size,
+            cache_size=self.performance_profile.qimage_cache_size,
+        )
         if self.faces_pane is not None:
             self.faces_pane.results_gallery.apply_view_preferences(
                 thumbnail_size=thumbnail_size,
@@ -1139,12 +1177,18 @@ class ProductionClusterApp(QMainWindow):
                 self.mode_selector.blockSignals(False)
 
     def _sync_workspace_buttons(self) -> None:
-        for key, button in {"clustering": self.clustering_workspace_button, "faces": self.faces_workspace_button}.items():
+        for key, button in {
+            "gallery": self.gallery_workspace_button,
+            "clustering": self.clustering_workspace_button,
+            "faces": self.faces_workspace_button,
+        }.items():
             button.blockSignals(True)
             button.setChecked(self._active_workspace == key)
             button.blockSignals(False)
 
     def _source_pane_visible(self) -> bool:
+        if self._active_workspace == "gallery":
+            return True
         if self._active_workspace == "faces":
             return bool(self._advanced_pane_visibility["source"])
         if self._clustering_mode == "basic":
@@ -1152,10 +1196,14 @@ class ProductionClusterApp(QMainWindow):
         return bool(self._pane_visibility["source"])
 
     def _refresh_workspace_ui(self) -> None:
+        is_gallery = self._active_workspace == "gallery"
         is_clustering = self._active_workspace == "clustering"
-        faces_pane = None if is_clustering else self._ensure_faces_workspace()
-        self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
-        if not is_clustering and self.faces_pane is not None:
+        faces_pane = None if (is_clustering or is_gallery) else self._ensure_faces_workspace()
+        if is_gallery:
+            self.workspace_stack.setCurrentWidget(self.photo_gallery_workspace)
+        else:
+            self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
+        if not is_clustering and not is_gallery and self.faces_pane is not None:
             self.faces_pane.ensure_current_faces_tab_loaded()
         if self.faces_pane is not None:
             self.faces_pane.set_ui_mode(self._faces_mode)
@@ -1175,6 +1223,7 @@ class ProductionClusterApp(QMainWindow):
         self.controls_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.details_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.source_view_action.setVisible((not is_clustering) or self._clustering_mode == "advanced")
+        self.mode_selector.setVisible(not is_gallery)
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -1186,6 +1235,8 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_workspace_ui()
 
     def set_active_workspace_mode(self, mode: str) -> None:
+        if self._active_workspace == "gallery":
+            return
         if self._active_workspace == "faces":
             self.set_faces_mode(mode)
             return
@@ -1428,6 +1479,7 @@ class ProductionClusterApp(QMainWindow):
             errorBox("CUDA unavailable", message)
             return False
         self.current_run_origin = str(run_origin or "folder")
+        self._active_cluster_directory = str(request.directory or "")
         self.current_tag_filter = tuple(request.tag_filter)
         self.current_tag_match = request.tag_match or "Any"
         self._cancel_cluster_tag_context_refresh()
@@ -1497,7 +1549,7 @@ class ProductionClusterApp(QMainWindow):
         self._update_footer_storage_state()
         job_id = self.job_manager.register_job("Preparing clustering run", cancel_fn=self.cancel_clustering)
         self._preflight_job_id = job_id
-        request_copy = replace(request, source_paths=None)
+        request_copy = replace(request)
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
@@ -1517,16 +1569,30 @@ class ProductionClusterApp(QMainWindow):
             progress(10, f"Folder scan complete: {discovered_count} image(s) discovered.")
 
             if not request_copy.tag_filter:
+                requested_paths = tuple(request_copy.source_paths or ())
+                source_paths = list(discovered.paths)
+                source_fingerprints = list(discovered.fingerprints)
+                if requested_paths:
+                    requested_set = set(requested_paths)
+                    source_paths = [path for path in discovered.paths if path in requested_set]
+                    source_fingerprints = [fingerprint for fingerprint in discovered.fingerprints if fingerprint[0] in requested_set]
+                    if len(source_paths) < 2:
+                        raise ValueError("The displayed gallery changed before organizing could start. Refresh the folder and try again.")
+                snapshot_key = (
+                    EmbeddingIndexService.build_snapshot_key_from_fingerprints(source_fingerprints)
+                    if requested_paths
+                    else discovered.snapshot_key
+                )
                 return PreparedRunPayload(
                     request=replace(
                         request_copy,
-                        source_paths=list(discovered.paths),
-                        source_fingerprints=list(discovered.fingerprints),
-                        source_snapshot_key=discovered.snapshot_key,
+                        source_paths=source_paths,
+                        source_fingerprints=source_fingerprints,
+                        source_snapshot_key=snapshot_key,
                     ),
-                    run_origin="folder",
+                    run_origin="gallery" if requested_paths else "folder",
                     discovered_count=discovered_count,
-                    matched_count=discovered_count,
+                    matched_count=len(source_paths),
                 )
 
             def _tag_progress(value: int, status: str) -> None:
@@ -1704,6 +1770,121 @@ class ProductionClusterApp(QMainWindow):
                 self.faces_pane.face_folder_path.setText(directory)
                 self.faces_pane.face_folder_path.blockSignals(False)
                 self.faces_pane._update_face_scope_summary()
+        self._load_gallery_folder(directory)
+
+    def _load_gallery_folder(self, directory: str) -> None:
+        """Discover on a worker so selecting a folder never blocks the photo view."""
+        self._gallery_discovery_generation += 1
+        generation = self._gallery_discovery_generation
+        previous = self._gallery_discovery_job
+        if previous is not None:
+            try:
+                previous.cancel()
+            except Exception:
+                pass
+        self._gallery_paths = []
+        self._gallery_snapshot_key = ""
+        if not directory or not Path(directory).is_dir():
+            self.photo_gallery.set_empty_state("Choose a folder to show its photos.")
+            return
+        self.photo_gallery.set_empty_state("Finding photos in this folder...", can_organize=False)
+
+        def _run(progress, cancel_check):
+            from app.services.discovery import ImageDiscoveryService
+
+            return ImageDiscoveryService().discover_result(
+                directory,
+                recursive=bool(self.clustering_pane.recursive_checkbox.isChecked()),
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
+
+        job = AsyncJob(_run)
+        self._gallery_discovery_job = job
+
+        def _finished(result) -> None:
+            if generation != self._gallery_discovery_generation or self._is_shutting_down:
+                return
+            self._gallery_paths = list(getattr(result, "paths", ()) or ())
+            self._gallery_snapshot_key = str(getattr(result, "snapshot_key", "") or "")
+            if not self._gallery_paths:
+                self.photo_gallery.set_empty_state("No supported photos were found in this folder.", can_organize=False)
+                return
+            self.photo_gallery.organize_button.setEnabled(len(self._gallery_paths) >= 2)
+            self.photo_gallery.set_sections(
+                [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
+                status=f"Showing {len(self._gallery_paths)} photos. Organize when you are ready.",
+            )
+
+        def _failed(message: str) -> None:
+            if generation == self._gallery_discovery_generation and not self._is_shutting_down:
+                self.photo_gallery.set_empty_state(f"Could not read this folder: {message}")
+
+        job.completed.connect(_finished)
+        job.failed.connect(_failed)
+        thread = start_job_in_thread(job)
+        self._gallery_discovery_thread = thread
+        self._retain_async_refs(job, thread)
+        thread.finished.connect(lambda: self._release_async_refs(job, thread), Qt.ConnectionType.QueuedConnection)
+
+    def run_gallery_organize(self) -> None:
+        if self._run_request_active():
+            errorBox("Busy", "Wait for the active clustering run to finish before organizing this gallery.")
+            return
+        if len(self._gallery_paths) < 2:
+            self.photo_gallery.set_empty_state("Choose a folder with at least two photos before organizing.")
+            return
+        request = self._build_request()
+        models = list(request.embedding_models or [])
+        backends = list(request.clustering_backends or [])
+        modes = list(request.similarity_modes or [request.similarity_mode])
+        request = replace(
+            request,
+            embedding_models=models[:1],
+            clustering_backends=backends[:1],
+            similarity_modes=modes[:1],
+            similarity_mode=modes[0] if modes else request.similarity_mode,
+            tag_filter=[],
+            source_paths=list(self._gallery_paths),
+            generate_cluster_meanings=False,
+            generate_cluster_explanations=False,
+        )
+        self._gallery_primary_comparison_key = "::".join(
+            (request.embedding_models[0], request.similarity_mode, request.clustering_backends[0])
+        )
+        self.footer_bar.set_status("Organizing photos with the current primary clustering settings...")
+        self._start_request_preflight(request)
+
+    def _gallery_sections_from_clusters(self) -> list[GallerySection]:
+        if not self.cluster_data:
+            return [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")]
+        comparison_key = self._gallery_primary_comparison_key
+        if comparison_key not in self.cluster_data:
+            comparison_key = next(iter(self.cluster_data))
+        clusters = self.cluster_data.get(comparison_key, {})
+        gallery_paths = set(self._gallery_paths)
+        ordered = sorted(
+            ((int(cluster_id), [path for path in paths if path in gallery_paths]) for cluster_id, paths in clusters.items()),
+            key=lambda item: (item[0] == -1, -len(item[1]), item[0]),
+        )
+        sections: list[GallerySection] = []
+        used: set[str] = set()
+        for cluster_id, paths in ordered:
+            if not paths:
+                continue
+            used.update(paths)
+            sections.append(
+                GallerySection(
+                    section_id=f"cluster:{comparison_key}:{cluster_id}",
+                    paths=tuple(paths),
+                    kind="other" if cluster_id == -1 else "photos",
+                    title="Other photos" if cluster_id == -1 else "Photo group",
+                )
+            )
+        remaining = [path for path in self._gallery_paths if path not in used]
+        if remaining:
+            sections.append(GallerySection("other:unassigned", tuple(remaining), kind="other", title="Other photos"))
+        return sections or [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")]
 
     def _on_model_download_started(self, item_keys: tuple) -> None:
         label = "Downloading model assets"
@@ -1855,6 +2036,11 @@ class ProductionClusterApp(QMainWindow):
             cluster_meanings=self.cluster_meanings,
         )
         self.gallery_pane.set_membership_context(self.membership_by_image, self.metrics_by_backend)
+        if self._gallery_paths and self._active_cluster_directory == self.source_pane.selected_directory:
+            self.photo_gallery.set_sections(
+                self._gallery_sections_from_clusters(),
+                status="Photos organized by the current primary clustering result.",
+            )
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
         self.clustering_pane.update_metrics(self.last_run_metrics)
         self.footer_bar.set_metrics(self.clustering_pane._last_metrics_text)
@@ -1900,6 +2086,8 @@ class ProductionClusterApp(QMainWindow):
     def _set_running_state(self, running: bool) -> None:
         self.clustering_pane.set_running(running)
         self.source_pane.set_running(running)
+        if hasattr(self, "photo_gallery"):
+            self.photo_gallery.organize_button.setEnabled(not running and len(self._gallery_paths) >= 2)
         self._update_footer_storage_state()
 
     def update_gallery(self, comparison_key: str, cluster_id: int) -> None:
@@ -2170,6 +2358,8 @@ class ProductionClusterApp(QMainWindow):
     def _apply_safety_state(self) -> None:
         read_only = self._read_only_mode()
         self.gallery_pane.set_read_only_mode(read_only)
+        if hasattr(self, "photo_gallery"):
+            self.photo_gallery.set_read_only_mode(read_only)
         self.suggest_tags_button.setEnabled(not read_only)
         self.tag_manager_button.setEnabled(not read_only)
         if hasattr(self, "suggest_tags_action"):

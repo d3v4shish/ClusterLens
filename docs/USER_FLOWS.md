@@ -1,13 +1,14 @@
 # ClusterLens User Flows
 
-ClusterLens has two production workspaces: Clustering and Faces. Both use the same selected folder. The header always shows the current folder, workspace mode, active jobs, runtime state, and Settings.
+ClusterLens has three production workspaces: Gallery, Clustering, and Faces. They use the same selected folder. The header always shows the current folder, active jobs, runtime state, and Settings.
 
 ## Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+1` | Open Clustering |
-| `Ctrl+2` | Open Faces |
+| `Ctrl+1` | Open Gallery |
+| `Ctrl+2` | Open Clustering |
+| `Ctrl+3` | Open Faces |
 | `Ctrl+O` | Focus folder selection |
 | `Ctrl+F` | Focus Faces search |
 | `Ctrl+R` | Run clustering |
@@ -22,6 +23,16 @@ ClusterLens has two production workspaces: Clustering and Faces. Both use the sa
 3. Confirm the resolved folder in the header. Clustering and Faces now use that same folder; changing it does not start a scan by itself.
 
 A fresh launch with no restored folder displays a genuine no-folder state. It never scans `/home` implicitly.
+
+## Browse and organize photos
+
+1. Open Gallery and select a folder. Every supported photo appears immediately while thumbnails load in the background.
+2. Gallery inherits recursive discovery and the primary model, similarity mode, backend, outlier policy, cache, and runtime settings from Clustering. New runs begin with SigLIP and HDBSCAN; if SigLIP is not available locally, ClusterLens asks before downloading it and otherwise uses its available local fallback. Gallery uses only the first configured comparison so the photo view remains simple.
+3. Select **Organize** to arrange the whole folder. The largest groups appear first. Group headers show only photo counts and actions; they intentionally do not expose cluster IDs, models, scores, or explanations.
+4. Use a group checkbox to act on several groups together. A group header can collapse, inspect, reveal, tag, copy, move, or send its photos to ClusterLens Trash.
+5. Face detection, face search, and face review are available only in the Faces workspace. Gallery stays focused on browsing and organizing the folder's photos.
+
+Photo tiles show the ClusterLens EXIF person name when available, followed by the filename. Double-click a photo or press Enter to open the basic Photo Inspector; wheel zoom, fit, previous/next navigation, and Escape-to-close are available there.
 
 ## Cluster photos
 

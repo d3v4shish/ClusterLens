@@ -675,7 +675,7 @@ class ProductionSettingsDialog(QDialog):
             "performance/decode_workers": int(self.decode_workers.value()),
             "performance/vram_headroom_mb": int(self.vram_headroom_mb.value()),
             "runtime/show_badge": bool(self.runtime_badge.isChecked()),
-            "workspace/default_view": "clustering",
+            "workspace/default_view": str(self.settings_registry.get(self.settings_store, "workspace/default_view", "gallery")),
             "gallery/thumbnail_size": int(self.thumbnail_size.value()),
             "gallery/thumbnail_workers": int(self.thumbnail_workers.value()),
             "gallery/prefetch_rows": int(self.prefetch_rows.value()),
