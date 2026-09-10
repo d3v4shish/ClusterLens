@@ -1,5 +1,17 @@
 # Current implementation plan
 
+## Names workspace validation pass
+
+- [x] Measure deterministic startup and Names query latency on an isolated temporary runtime/SQLite fixture.
+  Contract: the assessment does not read, mutate, or depend on a user's photos, caches, or face-label database.
+  Validation: five release startup gates passed; seeded 50,000-face SQLite fixture measured 36.122 ms median global-name aggregation and 1.119 ms selected-name photo retrieval. See `BENCHMARKS.md`.
+- [x] Run correctness and stability validation for the committed Names workspace.
+  Contract: durable-label recovery, exact-name filtering, async refresh/shutdown, and the full test suite are assessed without changing user-visible behavior.
+  Validation: four focused Names tests passed in five consecutive runs (20 passes); full suite result was 449 passed / 9 known non-Names failures; CUDA source smoke entered the event loop. Python compilation is rerun after these documentation updates.
+- [x] Record measured results and unresolved failures in the project documentation.
+  Contract: no performance or stability claim is made without command output and retained measurements.
+  Validation: `BENCHMARKS.md`, `HOTSPOTS.md`, and this checklist name the fixture, environment, measurements, and test result.
+
 ## Durable Names workspace
 
 - [x] Make explicit face naming durable and recover legacy manual pending labels.
@@ -46,7 +58,8 @@
   Evidence: the application entered its event loop from the clean feature checkout using `/home/d3v/.local/share/ClusterLens`.
 - [x] Verify applied face-pipeline settings persist.
   Evidence: isolated QSettings smoke check saved detector, embedder, and advanced JSON preferences.
-- [ ] Update the historical performance backlog only when a benchmark is actually run.
+- [x] Update the historical performance backlog after a benchmark is actually run.
+  Evidence: the 2026-09-10 Names workspace assessment is recorded in `BENCHMARKS.md` and `HOTSPOTS.md`.
 
 ## Persistent managed face models
 
