@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel, QToolButton, QWidget
+from PyQt6.QtWidgets import QLabel, QToolButton, QToolTip, QWidget
 
 from infra.logging_config import get_logger
 
@@ -18,10 +18,14 @@ class HelpIconButton(QToolButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAutoRaise(True)
-        self.setFixedSize(32, 32)
+        self.setFixedSize(20, 20)
         self.setProperty("helpIcon", True)
+        self.clicked.connect(self._show_help)
         if help_key:
             self.setObjectName(f"helpIcon_{help_key}")
+
+    def _show_help(self) -> None:
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self)
 
 
 def build_help_inline(

@@ -10,7 +10,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from app.services.model_assets import ModelAssetService
+from app.services.model_assets import (
+    HF_CACHE_REQUIRED_FILES,
+    HF_CACHE_TEXT_REQUIRED_FILES,
+    ModelAssetService,
+    _complete_hf_cache_snapshot,
+)
 from infra.atomic_io import atomic_write_text
 from infra.cancel import raise_if_cancelled
 from infra.performance import select_performance_profile
@@ -59,6 +64,12 @@ class ModelDownloadResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ModelCacheRecoveryResult:
+    repaired_revisions: tuple[str, ...]
+    complete_models: tuple[str, ...]
+
+
 def normalize_model_download_items(items: list[ModelDownloadItem] | tuple[ModelDownloadItem, ...]) -> tuple[ModelDownloadItem, ...]:
     requirements: dict[str, bool] = {}
     order: list[str] = []
@@ -78,6 +89,49 @@ class ModelDownloadService:
         self.settings = settings or get_settings()
         self.assets = ModelAssetService(settings=self.settings)
         self.lock_root = Path(self.settings.cache_dir) / "model_download_locks"
+
+    def recover_cached_models(self) -> ModelCacheRecoveryResult:
+        """Make complete persisted Hugging Face snapshots active again.
+
+        Downloads are stored in the application cache, but a process can stop
+        after snapshot creation and before the ``refs/main`` pointer update.
+        Readiness checks can still find the files while the runtime resolves a
+        stale reference. Repair that local pointer without downloading or
+        deleting anything.
+        """
+        configure_model_cache_environment(self.settings)
+        repaired: list[str] = []
+        complete: list[str] = []
+        hub_root = Path(self.settings.cache_dir) / "huggingface" / "hub"
+        for model_name, repository in HF_SNAPSHOT_REPOSITORIES.items():
+            repo_dir = hub_root / f"models--{repository.replace('/', '--')}"
+            base_groups = HF_CACHE_REQUIRED_FILES.get(model_name, ())
+            text_groups = base_groups + HF_CACHE_TEXT_REQUIRED_FILES.get(model_name, ())
+            snapshot = _complete_hf_cache_snapshot(repo_dir, text_groups)
+            if snapshot is None:
+                snapshot = _complete_hf_cache_snapshot(repo_dir, base_groups)
+            if snapshot is None:
+                continue
+            complete.append(model_name)
+            snapshots_dir = repo_dir / "snapshots"
+            try:
+                snapshot.relative_to(snapshots_dir)
+            except ValueError:
+                continue
+            refs_dir = repo_dir / "refs"
+            refs_dir.mkdir(parents=True, exist_ok=True)
+            ref_path = refs_dir / "main"
+            try:
+                current = ref_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                current = ""
+            if current != snapshot.name:
+                atomic_write_text(ref_path, snapshot.name)
+                repaired.append(model_name)
+        return ModelCacheRecoveryResult(
+            repaired_revisions=tuple(repaired),
+            complete_models=tuple(complete),
+        )
 
     def acquire(
         self,

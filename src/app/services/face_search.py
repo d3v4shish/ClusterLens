@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from time import monotonic
@@ -238,10 +238,10 @@ def normalize_face_component_id(value: str | None, fallback: str = "") -> str:
     return text or str(fallback or "").strip().lower().replace(" ", "_")
 
 
-def face_model_root_dir(model_root: str | Path | None) -> Path:
+def face_model_root_dir(model_root: str | Path | None) -> Path | None:
     root_text = str(model_root or "").strip()
     if not root_text:
-        return Path()
+        return None
     return Path(root_text).expanduser()
 
 
@@ -274,7 +274,7 @@ def bundled_face_model_root_dirs() -> tuple[Path, ...]:
 def face_model_candidate_roots(model_root: str | Path | None) -> tuple[tuple[str, Path], ...]:
     roots: list[tuple[str, Path]] = [("managed", face_model_runtime_root_dir())]
     external_root = face_model_root_dir(model_root)
-    if str(external_root):
+    if external_root is not None:
         roots.append(("external", external_root))
     roots.extend(("bundled", root) for root in bundled_face_model_root_dirs())
     unique: list[tuple[str, Path]] = []
@@ -540,7 +540,7 @@ def _legacy_animal_face_bundle(model_root: str | Path | None, mode: str | None) 
     if mode_id not in ANIMAL_FACE_MODES:
         raise ValueError("Animal ONNX bundles are only valid for dog and cat modes.")
     root = face_model_root_dir(model_root)
-    if not str(root):
+    if root is None:
         raise ValueError("Animal face model root is not configured.")
     bundle_dir = root / mode_id
     if not bundle_dir.exists():
@@ -680,7 +680,7 @@ def _load_face_detector_bundle(bundle_dir: Path, mode: FaceMode, detector_id: st
             f"Ready at {bundle_dir}."
             if available
             else (
-                f"{bundle_dir.name} is not installed. Use Settings > Models > Install Selected Face Pack. "
+                f"{bundle_dir.name} is not installed. Use Settings > Face Models > Install Selected Face Pack. "
                 f"Managed cache: {face_model_runtime_root_dir()}."
                 if source_kind in {"bundled", "managed"}
                 else f"Missing detector.onnx in the configured external face-model bundle: {bundle_dir}."
@@ -730,13 +730,59 @@ def _load_face_embedder_bundle(bundle_dir: Path, mode: FaceMode, embedder_id: st
             f"Ready at {bundle_dir}."
             if available
             else (
-                f"{bundle_dir.name} is not installed. Use Settings > Models > Install Selected Face Pack. "
+                f"{bundle_dir.name} is not installed. Use Settings > Face Models > Install Selected Face Pack. "
                 f"Managed cache: {face_model_runtime_root_dir()}."
                 if source_kind in {"bundled", "managed"}
                 else f"Missing embedder.onnx in the configured external face-model bundle: {bundle_dir}."
             )
         ),
     )
+
+
+_RAW_EXTERNAL_DETECTOR_FILENAMES: dict[str, tuple[str, ...]] = {
+    "scrfd_500m_kps": ("det_500m.onnx", "scrfd_500m.onnx"),
+    "scrfd_2.5g_kps": ("det_2.5g.onnx", "scrfd_2.5g.onnx"),
+    "scrfd_10g_kps": ("scrfd_10g_gnkps_fp32.onnx", "scrfd_10g.onnx", "det_10g.onnx"),
+    "scrfd_34gf_kps": ("scrfd_34g_gnkps.onnx", "scrfd_34g.onnx", "det_34g.onnx"),
+}
+_RAW_EXTERNAL_EMBEDDER_FILENAMES: dict[str, tuple[str, ...]] = {
+    "arcface_r50": ("w600k_r50.onnx", "arcface_r50.onnx"),
+    "arcface_r100_glint360k": ("glintr100.onnx", "w600k_r100.onnx", "arcface_r100.onnx"),
+    "mobilefacenet_arcface": ("w600k_mbf.onnx", "mobilefacenet.onnx"),
+    "adaface_r100": ("adaface_ir101.onnx", "adaface_r100.onnx"),
+}
+
+
+def _raw_external_model_paths(model_root: str | Path | None, filenames: tuple[str, ...]) -> tuple[Path, ...]:
+    """Return direct, user-selected ONNX files without scanning arbitrary folders."""
+    root = face_model_root_dir(model_root)
+    if root is None or not root.is_dir():
+        return ()
+    matches: list[Path] = []
+    for filename in filenames:
+        for candidate in (root / filename, root / "models" / filename):
+            if candidate.is_file():
+                matches.append(candidate)
+                break
+    return tuple(matches)
+
+
+def _prefer_available_detector(
+    current: FaceDetectorBundle | None,
+    candidate: FaceDetectorBundle,
+) -> FaceDetectorBundle:
+    if current is None or (candidate.available and not current.available):
+        return candidate
+    return current
+
+
+def _prefer_available_embedder(
+    current: FaceEmbedderBundle | None,
+    candidate: FaceEmbedderBundle,
+) -> FaceEmbedderBundle:
+    if current is None or (candidate.available and not current.available):
+        return candidate
+    return current
 
 
 def list_face_detector_bundles(model_root: str | Path | None, mode: str | None) -> list[FaceDetectorBundle]:
@@ -794,9 +840,27 @@ def list_face_detector_bundles(model_root: str | Path | None, mode: str | None) 
             )
         except Exception:
             pass
+    catalog = {bundle.detector_id: bundle for bundle in bundles}
+    if mode_id == "human":
+        for detector_id, filenames in _RAW_EXTERNAL_DETECTOR_FILENAMES.items():
+            for model_path in _raw_external_model_paths(model_root, filenames):
+                template = catalog.get(detector_id)
+                if template is None:
+                    continue
+                bundles.append(
+                    replace(
+                        template,
+                        source_kind="external",
+                        bundle_dir=model_path.parent,
+                        detector_path=model_path,
+                        available=True,
+                        availability_message=f"Downloaded external model: {model_path}.",
+                    )
+                )
+                break
     deduped: dict[str, FaceDetectorBundle] = {}
     for bundle in bundles:
-        deduped.setdefault(bundle.detector_id, bundle)
+        deduped[bundle.detector_id] = _prefer_available_detector(deduped.get(bundle.detector_id), bundle)
     return list(deduped.values())
 
 
@@ -818,7 +882,7 @@ def list_face_embedder_bundles(model_root: str | Path | None, mode: str | None) 
                 availability_message=(
                     "Built-in human embedder is ready."
                     if builtin_ready
-                    else "FaceNet weights are not installed. Open Settings > Models and install FaceNet."
+                    else "FaceNet weights are not installed. Open Settings > Face Models and install FaceNet."
                 ),
             )
         )
@@ -851,9 +915,27 @@ def list_face_embedder_bundles(model_root: str | Path | None, mode: str | None) 
             )
         except Exception:
             pass
+    catalog = {bundle.embedder_id: bundle for bundle in bundles}
+    if mode_id == "human":
+        for embedder_id, filenames in _RAW_EXTERNAL_EMBEDDER_FILENAMES.items():
+            for model_path in _raw_external_model_paths(model_root, filenames):
+                template = catalog.get(embedder_id)
+                if template is None:
+                    continue
+                bundles.append(
+                    replace(
+                        template,
+                        source_kind="external",
+                        bundle_dir=model_path.parent,
+                        embedder_path=model_path,
+                        available=True,
+                        availability_message=f"Downloaded external model: {model_path}.",
+                    )
+                )
+                break
     deduped: dict[str, FaceEmbedderBundle] = {}
     for bundle in bundles:
-        deduped.setdefault(bundle.embedder_id, bundle)
+        deduped[bundle.embedder_id] = _prefer_available_embedder(deduped.get(bundle.embedder_id), bundle)
     return list(deduped.values())
 
 
@@ -971,14 +1053,22 @@ def _hardware_execution_tag(hardware_class: str | None) -> str:
     return ""
 
 
-def _face_choice_label(display_name: str, hardware_class: str | None, *, install_required: bool) -> str:
+def _face_choice_label(
+    display_name: str,
+    hardware_class: str | None,
+    *,
+    available: bool,
+    source_kind: str,
+) -> str:
     label = str(display_name)
     execution_tag = _hardware_execution_tag(hardware_class)
     if execution_tag:
         label = f"{label} [{execution_tag}]"
-    if install_required:
-        label = f"{label} (install required)"
-    return label
+    if source_kind == "builtin" and available:
+        return f"{label} — Built-in"
+    if available:
+        return f"{label} — Downloaded"
+    return f"{label} — Install for {_hardware_execution_tag(hardware_class) or 'CPU/GPU'}"
 
 
 def face_detector_choices(model_root: str | Path | None, mode: str | None) -> list[tuple[str, str]]:
@@ -987,7 +1077,8 @@ def face_detector_choices(model_root: str | Path | None, mode: str | None) -> li
         label = _face_choice_label(
             bundle.display_name,
             bundle.hardware_class,
-            install_required=bool(not bundle.available and bundle.source_kind != "builtin"),
+            available=bundle.available,
+            source_kind=bundle.source_kind,
         )
         choices.append((str(bundle.detector_id), label))
     return choices
@@ -999,7 +1090,8 @@ def face_embedder_choices(model_root: str | Path | None, mode: str | None) -> li
         label = _face_choice_label(
             bundle.display_name,
             bundle.hardware_class,
-            install_required=bool(not bundle.available),
+            available=bundle.available,
+            source_kind=bundle.source_kind,
         )
         choices.append((str(bundle.embedder_id), label))
     return choices
@@ -2012,7 +2104,7 @@ class FaceEmbeddingService:
         if self._model is None:
             if not ModelAssetService().local_cache_present("facenet"):
                 raise RuntimeError(
-                    "FaceNet VGGFace2 weights are not installed. Open Settings > Models, select FaceNet, "
+                    "FaceNet VGGFace2 weights are not installed. Open Settings > Face Models, select FaceNet, "
                     "and choose Download / Install Selected. The download will appear in Jobs and can be cancelled."
                 )
             self._model = InceptionResnetV1(pretrained="vggface2").eval().to(self.device)
@@ -2024,7 +2116,7 @@ class FaceEmbeddingService:
     def readiness_message(self) -> str:
         if self.is_ready():
             return f"Embedder: {self.display_name}."
-        return "FaceNet weights are not installed. Open Settings > Models and install FaceNet."
+        return "FaceNet weights are not installed. Open Settings > Face Models and install FaceNet."
 
 
 class AnimalFaceDetectionService:

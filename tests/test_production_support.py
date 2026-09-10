@@ -183,6 +183,16 @@ class ProductionSupportTests(unittest.TestCase):
                 resolved = settings_mod.get_runtime_base_dir()
                 self.assertEqual(Path(tmp), resolved)
 
+    def test_settings_uses_linux_data_home_without_a_runtime_override(self):
+        with TemporaryDirectory() as tmp:
+            environment = dict(os.environ)
+            environment.pop("CLUSTERLENS_RUNTIME_ROOT", None)
+            environment.pop("IMAGE_CLUSTERING_APP_DIR", None)
+            environment["XDG_DATA_HOME"] = tmp
+            with patch.dict(os.environ, environment, clear=True):
+                settings_mod._RUNTIME_BASE_DIR = None
+                self.assertEqual(Path(tmp) / "ClusterLens", settings_mod.get_runtime_base_dir())
+
     def test_workers_receive_the_canonical_runtime_root(self):
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"CLUSTERLENS_RUNTIME_ROOT": tmp}, clear=False):
@@ -273,6 +283,30 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertEqual("face_search_index.db", Path(service.db_path).name)
                 self.assertTrue(service.is_ready())
                 self.assertNotIn("_internal", service.readiness_message())
+                window.close()
+
+    def test_production_startup_promotes_a_complete_interrupted_face_model_before_faces_ui(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.services.face_model_installer import FaceModelInstaller
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFaceRecoveryTest")
+                installer = FaceModelInstaller()
+                target = installer.bundle_dir("yunet_2026may")
+                staging = target.parent / ".yunet_2026may.test.installing"
+                staging.mkdir(parents=True)
+                installer._copy_catalog_metadata("yunet_2026may", staging)
+                payload = staging / "detector.onnx"
+                payload.write_bytes(b"complete-staged-model")
+                installer._write_install_record(payload, bundle_id="yunet_2026may")
+
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+
+                self.assertTrue((target / "detector.onnx").is_file())
+                self.assertFalse(staging.exists())
                 window.close()
 
     def test_production_face_results_open_in_main_gallery(self):

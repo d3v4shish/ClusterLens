@@ -57,17 +57,19 @@ QToolTip {
 }
 
 QGroupBox {
-  border: 1px solid #303844;
+  border: 1px solid #3B4757;
   border-radius: 8px;
-  margin-top: 10px;
-  padding: 10px;
-  background: #11151A;
+  margin-top: 12px;
+  padding: 11px 10px 10px 10px;
+  background: #111820;
 }
 QGroupBox::title {
   subcontrol-origin: margin;
-  left: 10px;
+  left: 11px;
   padding: 0 6px 0 6px;
-  color: #D4DBE4;
+  background: #111820;
+  color: #DCE8F7;
+  font-weight: 650;
 }
 
 QLabel {
@@ -92,8 +94,8 @@ QComboBox::down-arrow {
 }
 
 QPushButton {
-  background: #171C22;
-  border: 1px solid #303844;
+  background: #151C25;
+  border: 1px solid #3B4757;
   border-radius: 8px;
   padding: 6px 10px;
   min-height: 20px;
@@ -101,8 +103,8 @@ QPushButton {
 QGroupBox[role="danger"] { border-color: #DA3633; background: #1B1010; }
 QGroupBox[role="danger"]::title { color: #FFAAA6; }
 QPushButton:hover {
-  background: #202731;
-  border: 1px solid #465366;
+  background: #202A36;
+  border: 1px solid #5B6B80;
 }
 QPushButton:pressed {
   background: #101010;
@@ -126,6 +128,23 @@ QPushButton[kind="primary"] {
   font-weight: 650;
 }
 QPushButton[kind="primary"]:hover { background: #4893FA; }
+QPushButton[kind="primary"]:disabled {
+  background: #132237;
+  border: 1px solid #29496B;
+  color: #71839A;
+}
+QPushButton[kind="secondary"] {
+  background: #111B28;
+  border: 1px solid #456A91;
+  color: #D7E8FA;
+  font-weight: 600;
+}
+QPushButton[kind="secondary"]:hover { background: #172A40; border-color: #6FA6DD; }
+QPushButton[kind="secondary"]:disabled {
+  background: #101721;
+  border: 1px solid #263A4E;
+  color: #71839A;
+}
 QPushButton[kind="danger"] {
   background: #491515;
   border: 1px solid #DA3633;
@@ -190,29 +209,68 @@ QCheckBox {
 }
 
 QTabWidget::pane {
-  border: 1px solid #2A2A2A;
+  border: 1px solid #344153;
   border-radius: 8px;
   top: -1px;
   background: #0E0E0E;
 }
 QTabBar::tab {
-  background: #101010;
-  border: 1px solid #2A2A2A;
+  background: #0F141B;
+  border: 1px solid #293545;
   border-bottom: none;
   border-top-left-radius: 8px;
   border-top-right-radius: 8px;
   padding: 6px 10px;
   margin-right: 4px;
-  color: #CFCFCF;
+  color: #B9C5D3;
+  font-weight: 600;
 }
 QTabBar::tab:selected {
-  background: #0E0E0E;
+  background: #173554;
   color: #FFFFFF;
-  border: 1px solid #3A3A3A;
+  border: 1px solid #5D9FE5;
+  font-weight: 700;
 }
 QTabBar::tab:hover {
-  border: 1px solid #3A3A3A;
+  background: #16202C;
+  border: 1px solid #5B6B80;
 }
+
+/* Faces task navigation is primary navigation, not an ordinary button row. */
+QTabBar#facesTaskNavigation::tab {
+  background: #101721;
+  border: 1px solid #2E3D4F;
+  border-radius: 7px;
+  padding: 6px 8px;
+  margin: 1px;
+  color: #C4D0DE;
+  font-weight: 650;
+}
+QTabBar#facesTaskNavigation::tab:selected {
+  background: #17416C;
+  border: 1px solid #66AEF5;
+  color: #FFFFFF;
+  font-weight: 700;
+}
+QTabBar#facesTaskNavigation::tab:hover { background: #1A2C40; border-color: #6C91B8; }
+
+/* Result-view tabs are subordinate to task navigation but retain a clear state. */
+QTabBar#faceResultViewTabs::tab {
+  background: #0E131A;
+  border: 1px solid #2B3949;
+  border-radius: 6px;
+  padding: 6px 12px;
+  margin: 2px 3px;
+  color: #B9C7D6;
+  font-weight: 600;
+}
+QTabBar#faceResultViewTabs::tab:selected {
+  background: #153354;
+  border: 1px solid #5794D2;
+  color: #FFFFFF;
+  font-weight: 700;
+}
+QTabBar#faceResultViewTabs::tab:hover { background: #182536; border-color: #5A7899; }
 
 /* Workspace tabs in the top toolbar */
 QTabBar#workspaceTabs::tab {
@@ -300,6 +358,20 @@ QWidget#workspaceFooter QLabel {
   color: #B5BEC9;
   font-size: 12px;
 }
+QLabel#footerFolderChip {
+  color: #DCEBFF;
+  background: #17365D;
+  border: 1px solid #2D6FAD;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+QLabel#selectedFolderRoot {
+  color: #BFD7F2;
+  background: #141E2A;
+  border: 1px solid #2A4057;
+  border-radius: 3px;
+  padding: 4px 6px;
+}
 
 QWidget#applicationHeader {
   background: #11151A;
@@ -320,6 +392,18 @@ QWidget#emptyStateCard {
 QLabel[role="title"] { font-size: 20px; font-weight: 700; color: #F2F5F8; }
 QLabel[role="section"] { font-size: 15px; font-weight: 650; color: #F2F5F8; }
 QLabel[role="helper"] { font-size: 11px; color: #B5BEC9; }
+QPushButton#facesStatusStrip {
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  padding: 3px 2px;
+  min-height: 18px;
+  text-align: left;
+  font-size: 14px;
+  font-weight: 600;
+  color: #DCEBFF;
+}
+QPushButton#facesStatusStrip:hover { background: #17365D; color: #FFFFFF; }
 QLabel[state="warning"] { color: #F0C674; }
 QLabel[state="error"] { color: #FF8A86; }
 QLabel[state="success"] { color: #7EE787; }

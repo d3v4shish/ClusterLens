@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.services.cache_maintenance import CacheMaintenanceService
 from app.services.face_model_installer import FaceModelInstaller
+from app.services import face_model_installer as face_model_installer_module
 from app.services.cluster_meanings import ClusterMeaningCacheService, ClusterMeaningService
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest
 from app.services.discovery import DiscoveryResult, ImageDiscoveryService
@@ -799,6 +800,20 @@ class ServiceTests(unittest.TestCase):
             all_matches = service.select_paths_by_tags([str(image_a), str(image_b)], ["selfie", "group"], "All")
             self.assertEqual([str(image_b)], all_matches)
 
+    def test_image_tags_preserves_a_corrupt_database_and_starts_empty(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "tags.sqlite3"
+            db_path.write_bytes(b"not a sqlite database")
+
+            service = ImageTagService(db_path=db_path)
+
+            backups = list(root.glob("tags.sqlite3.corrupt-*"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual(b"not a sqlite database", backups[0].read_bytes())
+            self.assertTrue(db_path.read_bytes().startswith(b"SQLite format 3\x00"))
+            self.assertEqual({}, service.load_tags_for_paths([]))
+
     def test_image_tags_exif_roundtrip_preserves_other_comment_keys(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "photo.jpg"
@@ -1134,7 +1149,6 @@ class ServiceTests(unittest.TestCase):
                 "cluster_results/": cache_root / "cluster_results",
                 "cluster_meanings/": cache_root / "cluster_meanings",
                 "embedding_indexes/": cache_root / "embedding_indexes",
-                "face_model_assets/": cache_root / "face_model_assets",
                 "thumbnails/": thumbnails_dir,
                 "onnx_models/": cache_root / "onnx_models",
                 "tmp/": cache_root / "tmp",
@@ -1148,7 +1162,7 @@ class ServiceTests(unittest.TestCase):
                 cache_root / "perceptual_hashes.db",
                 cache_root / "perceptual_hashes_session.db",
             ]
-            excluded_dirs = [cache_root / "huggingface", cache_root / "torch"]
+            excluded_dirs = [cache_root / "face_model_assets", cache_root / "huggingface", cache_root / "torch"]
             for name, path in targets.items():
                 if name.endswith("/"):
                     path.mkdir(parents=True, exist_ok=True)
@@ -1175,7 +1189,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(set(targets.keys()), set(cleared))
             self.assertEqual((), failures)
             self.assertFalse((cache_root / "embeddings.sqlite3").exists())
-            for directory_name in ("cluster_results/", "cluster_meanings/", "embedding_indexes/", "face_model_assets/", "thumbnails/", "onnx_models/", "tmp/"):
+            for directory_name in ("cluster_results/", "cluster_meanings/", "embedding_indexes/", "thumbnails/", "onnx_models/", "tmp/"):
                 path = targets[directory_name]
                 self.assertTrue(path.exists())
                 self.assertEqual([], list(path.iterdir()))
@@ -2841,7 +2855,7 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(detector.available)
         self.assertFalse(embedder.available)
         for message in (detector.availability_message, embedder.availability_message):
-            self.assertIn("Settings > Models", message)
+            self.assertIn("Settings > Face Models", message)
             self.assertIn("managed-face-models", message)
             self.assertNotIn("_internal", message)
             self.assertNotIn("detector.onnx in", message)
@@ -2863,6 +2877,27 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("[CPU/GPU]", embedder_labels["mobilefacenet_arcface"])
         self.assertIn("[CPU]", embedder_labels["sface_2021dec"])
         self.assertIn("[CPU]", embedder_labels["sface_2021dec_int8bq"])
+
+    def test_direct_external_scrfd_and_arcface_files_are_marked_downloaded(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            detector_path = root / "scrfd_10g_gnkps_fp32.onnx"
+            embedder_path = root / "glintr100.onnx"
+            detector_path.write_bytes(b"detector")
+            embedder_path.write_bytes(b"embedder")
+
+            with patch("app.services.face_search.face_model_runtime_root_dir", return_value=root / "managed"):
+                detector = resolve_face_detector_bundle(root, "human", "scrfd_10g_kps")
+                embedder = resolve_face_embedder_bundle(root, "human", "arcface_r100_glint360k")
+                detector_labels = dict(face_detector_choices(root, "human"))
+                embedder_labels = dict(face_embedder_choices(root, "human"))
+
+        self.assertTrue(detector.available)
+        self.assertTrue(embedder.available)
+        self.assertEqual(detector_path, detector.detector_path)
+        self.assertEqual(embedder_path, embedder.embedder_path)
+        self.assertIn("Downloaded", detector_labels["scrfd_10g_kps"])
+        self.assertIn("Downloaded", embedder_labels["arcface_r100_glint360k"])
 
     def test_selected_face_model_profile_recognizes_latest_gpu_and_opencv_cpu(self):
         self.assertEqual(
@@ -2912,6 +2947,17 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(embedder_bundle.available)
             self.assertEqual("managed", embedder_bundle.source_kind)
 
+    def test_blank_face_model_root_does_not_treat_the_working_directory_as_external_models(self):
+        with TemporaryDirectory() as tmp, patch.object(
+            face_search_module,
+            "face_model_runtime_root_dir",
+            return_value=Path(tmp) / "managed",
+        ):
+            self.assertIsNone(face_search_module.face_model_root_dir(""))
+            roots = face_search_module.face_model_candidate_roots("")
+
+        self.assertNotIn("external", [source_kind for source_kind, _path in roots])
+
     def test_face_model_installer_inventory_reflects_managed_cache(self):
         with TemporaryDirectory() as tmp:
             fake_settings = SimpleNamespace(cache_dir=Path(tmp))
@@ -2942,6 +2988,79 @@ class ServiceTests(unittest.TestCase):
             self.assertGreater(refreshed["scrfd_2.5g_kps"].size_bytes, 0)
             self.assertTrue(refreshed["yunet_2026may"].installed)
             self.assertGreater(refreshed["yunet_2026may"].size_bytes, 0)
+            restarted = FaceModelInstaller(settings=fake_settings)
+            after_restart = {item.bundle_id: item for item in restarted.inventory()}
+            self.assertTrue(after_restart["scrfd_2.5g_kps"].installed)
+            self.assertTrue(after_restart["yunet_2026may"].installed)
+
+    def test_face_model_installer_recovers_missing_bundle_from_verified_download_cache(self):
+        with TemporaryDirectory() as tmp:
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            payload = b"recoverable-yunet-payload"
+            payload_sha = hashlib.sha256(payload).hexdigest()
+            cached = installer.download_cache_dir() / f"{payload_sha[:16]}-yunet.onnx"
+            cached.write_bytes(payload)
+            installer._set_bundle_present("yunet_2026may")
+
+            with patch.object(
+                face_model_installer_module,
+                "_RECOVERY_RECIPES",
+                {"yunet_2026may": ((payload_sha, "yunet.onnx", None),)},
+            ), patch("app.services.face_model_installer.urllib.request.urlopen") as urlopen:
+                result = installer.recover_managed_models()
+
+            self.assertEqual(("yunet_2026may",), result.restored)
+            self.assertEqual((), result.failures)
+            self.assertTrue(installer._bundle_installed("yunet_2026may"))
+            self.assertTrue((installer.bundle_dir("yunet_2026may") / "detector.onnx").is_file())
+            urlopen.assert_not_called()
+
+    def test_face_model_installer_promotes_complete_interrupted_bundle(self):
+        with TemporaryDirectory() as tmp:
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            target = installer.bundle_dir("yunet_2026may")
+            staging = target.parent / ".yunet_2026may.test.installing"
+            staging.mkdir(parents=True)
+            installer._copy_catalog_metadata("yunet_2026may", staging)
+            payload = staging / "detector.onnx"
+            payload.write_bytes(b"complete-staged-model")
+            installer._write_install_record(payload, bundle_id="yunet_2026may")
+
+            result = installer.recover_managed_models()
+
+            self.assertEqual(("yunet_2026may",), result.promoted_interrupted)
+            self.assertTrue((target / "detector.onnx").is_file())
+            self.assertFalse(staging.exists())
+
+    def test_face_model_installer_respects_manual_delete_during_recovery(self):
+        with TemporaryDirectory() as tmp:
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            payload = b"recoverable-yunet-payload"
+            payload_sha = hashlib.sha256(payload).hexdigest()
+            cached = installer.download_cache_dir() / f"{payload_sha[:16]}-yunet.onnx"
+            cached.write_bytes(payload)
+            installer._set_bundle_deleted("yunet_2026may")
+
+            with patch.object(
+                face_model_installer_module,
+                "_RECOVERY_RECIPES",
+                {"yunet_2026may": ((payload_sha, "yunet.onnx", None),)},
+            ):
+                result = installer.recover_managed_models()
+
+            self.assertEqual((), result.restored)
+            self.assertFalse(installer.bundle_dir("yunet_2026may").exists())
+
+    def test_face_model_installer_reports_missing_bundle_when_no_local_recovery_source_exists(self):
+        with TemporaryDirectory() as tmp:
+            installer = FaceModelInstaller(settings=SimpleNamespace(cache_dir=Path(tmp)))
+            installer._set_bundle_present("yunet_2026may")
+
+            result = installer.recover_managed_models()
+
+            self.assertEqual((), result.restored)
+            self.assertIn("yunet_2026may", result.unavailable)
+            self.assertFalse(installer.bundle_dir("yunet_2026may").exists())
 
     def test_face_model_installer_uses_pyinstaller_bundle_root_for_catalog(self):
         with TemporaryDirectory() as tmp:
@@ -3137,6 +3256,27 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([], list(download_cache.iterdir()))
             self.assertEqual(b"installed", installed.read_bytes())
 
+    def test_model_download_recovery_repairs_stale_huggingface_revision_pointer(self):
+        with TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "cache"
+            settings = SimpleNamespace(cache_dir=cache_root, base_dir=Path(tmp))
+            service = ModelDownloadService(settings=settings)
+            repo_dir = cache_root / "huggingface" / "hub" / "models--openai--clip-vit-base-patch32"
+            snapshot = repo_dir / "snapshots" / "complete-local"
+            snapshot.mkdir(parents=True)
+            for filename in ("config.json", "preprocessor_config.json", "model.safetensors", "tokenizer.json"):
+                (snapshot / filename).write_bytes(b"ready")
+            refs = repo_dir / "refs"
+            refs.mkdir()
+            (refs / "main").write_text("missing-revision", encoding="utf-8")
+
+            result = service.recover_cached_models()
+
+            self.assertIn("clip", result.complete_models)
+            self.assertEqual(("clip",), result.repaired_revisions)
+            self.assertEqual("complete-local", (refs / "main").read_text(encoding="utf-8"))
+            self.assertTrue(service.assets.local_cache_present("clip", require_text=True))
+
     def test_facenet_cache_readiness_rejects_zero_byte_checkpoint(self):
         for relative_dir in (Path("torch/checkpoints"), Path("torch/hub/checkpoints")):
             with self.subTest(relative_dir=relative_dir), TemporaryDirectory() as tmp:
@@ -3191,8 +3331,8 @@ class ServiceTests(unittest.TestCase):
         ) as inception:
             service = face_search_module.FaceEmbeddingService(execution_policy=policy)
             self.assertFalse(service.is_ready())
-            self.assertIn("Settings > Models", service.readiness_message())
-            with self.assertRaisesRegex(RuntimeError, "Settings > Models"):
+            self.assertIn("Settings > Face Models", service.readiness_message())
+            with self.assertRaisesRegex(RuntimeError, "Settings > Face Models"):
                 service._get_model()
             inception.assert_not_called()
 

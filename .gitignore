@@ -41,6 +41,7 @@ __pycache__/
 .backups/
 .runtime/
 .venv/
+.venv-gpu-cu121/
 build/
 dist/
 src/build/

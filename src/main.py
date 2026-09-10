@@ -691,7 +691,7 @@ class ClusterGalleryApp(QMainWindow):
         is_clustering = self._active_workspace == "clustering"
         self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else self.faces_pane)
         if not is_clustering:
-            self.faces_pane.ensure_current_faces_tab_loaded()
+            self.faces_pane.ensure_faces_workspace_loaded()
         self.faces_pane.set_ui_mode(self._faces_mode)
         self.source_pane.set_basic_mode(
             is_clustering and self._clustering_mode == "basic",

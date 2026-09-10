@@ -40,6 +40,10 @@ class WorkspaceFooter(QWidget):
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(10)
 
+        self.folder_label = ElidedLabel("Folder: none", self)
+        self.folder_label.setObjectName("footerFolderChip")
+        self.folder_label.setAccessibleName("Selected folder")
+        self.folder_label.setMinimumWidth(220)
         self.status_label = ElidedLabel("Idle", self)
         self.metrics_label = ElidedLabel("", self)
         self.performance_dashboard_label = self.metrics_label
@@ -61,6 +65,7 @@ class WorkspaceFooter(QWidget):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.hide()
 
+        layout.addWidget(self.folder_label, stretch=3)
         layout.addWidget(self.status_label, stretch=4)
         layout.addWidget(self.metrics_label, stretch=5)
         layout.addWidget(self.storage_label, stretch=3)
@@ -69,6 +74,11 @@ class WorkspaceFooter(QWidget):
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text or "Idle")
+
+    def set_selected_folder(self, path: str) -> None:
+        directory = str(path or "").strip()
+        self.folder_label.setText(f"Folder: {directory}" if directory else "Folder: none")
+        self.folder_label.setToolTip(directory or "No folder selected")
 
     def set_metrics(self, text: str) -> None:
         self.metrics_label.setText(text or "")

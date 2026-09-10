@@ -83,6 +83,14 @@ class ImageTagService:
 
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._create_schema()
+        except sqlite3.DatabaseError:
+            if not self._quarantine_corrupt_database():
+                raise
+            self._create_schema()
+
+    def _create_schema(self) -> None:
         with self._connection() as connection:
             connection.execute(
                 """
@@ -101,6 +109,23 @@ class ImageTagService:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_image_tags_path ON image_tags(image_path)"
             )
+
+    def _quarantine_corrupt_database(self) -> bool:
+        if not self.db_path.exists():
+            return False
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = self.db_path.with_name(f"{self.db_path.name}.corrupt-{timestamp}")
+        try:
+            self.db_path.replace(backup_path)
+            for suffix in ("-wal", "-shm"):
+                sidecar = self.db_path.with_name(f"{self.db_path.name}{suffix}")
+                if sidecar.exists():
+                    sidecar.replace(backup_path.with_name(f"{backup_path.name}{suffix}"))
+        except OSError:
+            LOGGER.exception("Could not preserve corrupt image-tag database %s", self.db_path)
+            return False
+        LOGGER.warning("Preserved corrupt image-tag database at %s", backup_path)
+        return True
 
     @staticmethod
     def normalize_tag(tag: str) -> str:

@@ -806,7 +806,7 @@ class SettingsDialog(QDialog):
                         "",
                         f"Total rebuildable cache size: {self._format_bytes(cache_result.total_bytes)}",
                         "",
-                        "Preserved: image tags, face/search indexes, perceptual hashes, huggingface downloads, and torch downloads.",
+                        "Preserved: image tags, face/search indexes, perceptual hashes, downloaded face models, Hugging Face downloads, and Torch downloads.",
                     ]
                 )
                 self.cache_usage_text.setPlainText("\n".join(lines))
@@ -842,7 +842,7 @@ class SettingsDialog(QDialog):
         if not confirmBox(
             "Clear Rebuildable Caches?",
             "This removes embeddings, clustering results, indexes, thumbnails, ONNX exports, and temp files.\n\n"
-            "Tags, face/search indexes, perceptual hashes, huggingface downloads, and torch downloads are preserved.",
+            "Tags, face/search indexes, perceptual hashes, downloaded face models, Hugging Face downloads, and Torch downloads are preserved.",
             parent=self,
         ):
             return

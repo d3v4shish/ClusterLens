@@ -44,7 +44,6 @@ class CacheMaintenanceService:
         "cluster_results/",
         "cluster_meanings/",
         "embedding_indexes/",
-        "face_model_assets/",
         "thumbnails/",
         "onnx_models/",
         "tmp/",
@@ -60,7 +59,6 @@ class CacheMaintenanceService:
             "cluster_results/": cache_dir / "cluster_results",
             "cluster_meanings/": cache_dir / "cluster_meanings",
             "embedding_indexes/": cache_dir / "embedding_indexes",
-            "face_model_assets/": cache_dir / "face_model_assets",
             "thumbnails/": self.settings.thumbnail_cache_dir,
             "onnx_models/": cache_dir / "onnx_models",
             "tmp/": cache_dir / "tmp",
@@ -142,6 +140,7 @@ class CacheMaintenanceService:
             "ann_files": self._ann_file_paths(),
             "model_caches": (
                 cache_dir / "face_model_assets",
+                cache_dir / "face_model_state.json",
                 cache_dir / "face_model_downloads",
                 cache_dir / "onnx_models",
                 cache_dir / "huggingface",
@@ -227,6 +226,7 @@ class CacheMaintenanceService:
         cache_dir = self.settings.cache_dir
         paths = (
             cache_dir / "face_model_assets",
+            cache_dir / "face_model_state.json",
             cache_dir / "face_model_downloads",
             cache_dir / "onnx_models",
             cache_dir / "huggingface",

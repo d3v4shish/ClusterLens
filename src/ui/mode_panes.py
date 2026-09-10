@@ -167,6 +167,12 @@ class SourcePane(QWidget):
         self.directory_combobox.currentIndexChanged.connect(self.on_directory_changed)
         layout.addWidget(self.directory_combobox)
 
+        self.selected_folder_label = QLabel("No folder selected", self)
+        self.selected_folder_label.setObjectName("selectedFolderRoot")
+        self.selected_folder_label.setWordWrap(False)
+        self.selected_folder_label.setToolTip("Choose a folder to show its subfolders.")
+        layout.addWidget(self.selected_folder_label)
+
         self.file_model = QFileSystemModel()
         self.file_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
         self.file_model.setRootPath(self._browse_root)
@@ -248,20 +254,15 @@ class SourcePane(QWidget):
         self.directory_combobox.addItems(drives)
 
     def on_directory_selected(self, index) -> None:
-        self.selected_directory = self.file_model.filePath(index)
-        self.directory_changed.emit(self.selected_directory)
-        self.state_changed.emit()
+        self.set_selected_directory(self.file_model.filePath(index), emit_state=True)
 
     def on_directory_changed(self, _index) -> None:
         root_directory = self.directory_combobox.currentText()
         self._browse_root = root_directory
-        self.selected_directory = root_directory
         self.file_model.setRootPath(root_directory)
-        self.file_tree.setRootIndex(self.file_model.index(root_directory))
-        self.directory_changed.emit(self.selected_directory)
-        self.state_changed.emit()
+        self.set_selected_directory(root_directory, emit_state=True)
 
-    def set_selected_directory(self, directory: str) -> None:
+    def set_selected_directory(self, directory: str, *, emit_state: bool = False) -> None:
         directory = str(directory or "").strip()
         if not directory or not os.path.exists(directory):
             return
@@ -270,11 +271,17 @@ class SourcePane(QWidget):
             combo_value = f"{drive}/".replace("\\", "/")
             idx = self.directory_combobox.findText(combo_value)
             if idx >= 0:
+                self.directory_combobox.blockSignals(True)
                 self.directory_combobox.setCurrentIndex(idx)
+                self.directory_combobox.blockSignals(False)
         self.selected_directory = directory
-        self.file_model.setRootPath(directory)
+        self.file_model.setRootPath(self._browse_root)
         self.file_tree.setRootIndex(self.file_model.index(directory))
+        self.selected_folder_label.setText(f"Root: {directory}")
+        self.selected_folder_label.setToolTip(directory)
         self.directory_changed.emit(self.selected_directory)
+        if emit_state:
+            self.state_changed.emit()
 
     def set_running(self, running: bool) -> None:
         self.basic_run_button.setVisible(not running)

@@ -15,6 +15,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from infra.cancel import raise_if_cancelled
 from infra.atomic_io import atomic_write_text, atomic_write_with
@@ -87,6 +88,29 @@ _CATALOG_METADATA_PATHS: dict[str, str] = {
 DOWNLOAD_IO_TIMEOUT_SECONDS = 15
 DOWNLOAD_RETRY_ATTEMPTS = 4
 
+# A managed bundle can be reconstructed without network access when its
+# verified source archive remains in ``face_model_downloads``.  This mapping is
+# deliberately limited to deterministic, pre-existing download recipes; it
+# never attempts to fetch a missing model during startup recovery.
+_RECOVERY_RECIPES: dict[str, tuple[tuple[str, str, str | None], ...]] = {
+    "scrfd_2.5g_kps": ((RECOMMENDED_MODEL_ARCHIVE_SHA256, "buffalo_m.zip", "det_2.5g.onnx"),),
+    "arcface_r50": ((RECOMMENDED_MODEL_ARCHIVE_SHA256, "buffalo_m.zip", "w600k_r50.onnx"),),
+    "scrfd_500m_kps": ((EDGE_MODEL_ARCHIVE_SHA256, "buffalo_s.zip", "det_500m.onnx"),),
+    "mobilefacenet_arcface": ((EDGE_MODEL_ARCHIVE_SHA256, "buffalo_s.zip", "w600k_mbf.onnx"),),
+    "scrfd_10g_kps": (
+        (LATEST_GPU_MODEL_ARCHIVE_SHA256, "antelopev2.zip", "scrfd_10g_bnkps.onnx"),
+        (SCRFD_10G_KPS_SHA256, "scrfd_10g_gnkps_fp32.onnx", None),
+    ),
+    "arcface_r100_glint360k": ((LATEST_GPU_MODEL_ARCHIVE_SHA256, "antelopev2.zip", "glintr100.onnx"),),
+    "scrfd_34gf_kps": ((SCRFD_34GF_KPS_SHA256, "scrfd_34g_gnkps.onnx", None),),
+    "adaface_r100": ((ADAFACE_R100_SHA256, "adaface_ir101.onnx", None),),
+    "sface_2021dec": ((SFACE_2021DEC_SHA256, "face_recognition_sface_2021dec.onnx", None),),
+    "sface_2021dec_int8bq": ((SFACE_2021DEC_INT8BQ_SHA256, "face_recognition_sface_2021dec_int8bq.onnx", None),),
+    "yunet_2026may": ((YUNET_2026MAY_SHA256, "face_detection_yunet_2026may.onnx", None),),
+    "yunet_2023mar": ((YUNET_2023MAR_SHA256, "face_detection_yunet_2023mar.onnx", None),),
+    "yunet_2023mar_int8bq": ((YUNET_2023MAR_INT8BQ_SHA256, "face_detection_yunet_2023mar_int8bq.onnx", None),),
+}
+
 
 @dataclass(frozen=True)
 class FaceModelInventoryItem:
@@ -99,6 +123,14 @@ class FaceModelInventoryItem:
     source_url: str
     license: str
     status: str
+
+
+@dataclass(frozen=True)
+class FaceModelRecoveryResult:
+    restored: tuple[str, ...]
+    promoted_interrupted: tuple[str, ...]
+    unavailable: tuple[str, ...]
+    failures: tuple[str, ...]
 
 
 def face_model_runtime_root_dir(settings: AppSettings | None = None) -> Path:
@@ -119,6 +151,64 @@ class FaceModelInstaller:
         root = Path(self.settings.cache_dir) / "face_model_downloads"
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def state_path(self) -> Path:
+        """Return the durable record of managed face-model intent.
+
+        The record intentionally lives beside, not inside, the installed
+        bundle tree.  A damaged or removed ``face_model_assets`` directory can
+        therefore still be reconstructed from retained verified downloads.
+        """
+        return Path(self.settings.cache_dir) / "face_model_state.json"
+
+    def recover_managed_models(self) -> FaceModelRecoveryResult:
+        """Repair interrupted or missing managed bundles without networking.
+
+        A user explicitly deleting a model is remembered and never undone.
+        Missing bundles with no retained verified source are left absent and
+        reported to the caller so the UI can truthfully show ``Install``.
+        """
+        self.runtime_root()
+        lease = SharedDownloadLease(
+            Path(self.settings.cache_dir) / "model_download_locks",
+            "face-model-recovery",
+            wait_message="Waiting for another ClusterLens process to reconcile face models...",
+        )
+        lease.acquire()
+        try:
+            state = self._read_state()
+            bundles = state["bundles"]
+            restored: list[str] = []
+            unavailable: list[str] = []
+            failures: list[str] = []
+            promoted = self._recover_interrupted_promotions(bundles, failures)
+
+            for bundle_id in _BUNDLE_LAYOUTS:
+                entry = bundles.get(bundle_id)
+                if self._bundle_installed(bundle_id):
+                    if not isinstance(entry, dict) or bool(entry.get("deleted")):
+                        bundles[bundle_id] = {"deleted": False, "last_seen_at": int(time.time())}
+                    continue
+                if not isinstance(entry, dict) or bool(entry.get("deleted")):
+                    continue
+                try:
+                    if self._restore_bundle_from_download_cache(bundle_id):
+                        restored.append(bundle_id)
+                        bundles[bundle_id] = {"deleted": False, "last_seen_at": int(time.time())}
+                    else:
+                        unavailable.append(bundle_id)
+                except Exception as exc:
+                    failures.append(f"{bundle_id}: {exc}")
+
+            self._write_state(state)
+            return FaceModelRecoveryResult(
+                restored=tuple(restored),
+                promoted_interrupted=tuple(promoted),
+                unavailable=tuple(unavailable),
+                failures=tuple(failures),
+            )
+        finally:
+            lease.release()
 
     def clear_download_cache(self, progress=None, cancel_check=None) -> tuple[tuple[str, ...], int, tuple[str, ...]]:
         """Clear reusable face archives without racing another app process."""
@@ -162,6 +252,10 @@ class FaceModelInstaller:
         return self.runtime_root() / mode / plural_kind / bundle_id
 
     def inventory(self) -> tuple[FaceModelInventoryItem, ...]:
+        # Settings may be opened without a complete application startup (for
+        # example in a test or a packaged maintenance entry point). Reconcile
+        # here as well so a recoverable bundle is never presented as missing.
+        self.recover_managed_models()
         items: list[FaceModelInventoryItem] = []
         for bundle_id, (_mode, plural_kind, label) in _BUNDLE_LAYOUTS.items():
             bundle_dir = self.bundle_dir(bundle_id)
@@ -446,11 +540,13 @@ class FaceModelInstaller:
     def delete_installed_model(self, bundle_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         bundle_dir = self.bundle_dir(bundle_id)
         if not bundle_dir.exists():
+            self._set_bundle_deleted(bundle_id)
             return (), ()
         try:
             shutil.rmtree(bundle_dir)
         except OSError as exc:
             return (), (f"{bundle_dir}: {exc}",)
+        self._set_bundle_deleted(bundle_id)
         return (str(bundle_dir),), ()
 
     def bundled_catalog_root(self) -> Path:
@@ -674,23 +770,18 @@ class FaceModelInstaller:
             member = self._find_zip_member(archive, member_name)
             if member is None:
                 raise RuntimeError(f"{archive_path.name} does not contain {member_name}.")
-            bundle_dir = self.bundle_dir(bundle_id)
-            bundle_dir.mkdir(parents=True, exist_ok=True)
-            self._copy_catalog_metadata(bundle_id, bundle_dir)
-            final_output = bundle_dir / output_name
-            atomic_write_with(
-                final_output,
-                lambda temporary: self._copy_zip_member(archive, member, temporary),
+            self._install_bundle_atomically(
+                bundle_id,
+                output_name,
+                lambda output_path: self._copy_zip_member(archive, member, output_path),
             )
-            self._write_install_record(final_output)
 
     def _install_payload_file(self, payload_path: Path, *, bundle_id: str, output_name: str) -> None:
-        bundle_dir = self.bundle_dir(bundle_id)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        self._copy_catalog_metadata(bundle_id, bundle_dir)
-        final_output = bundle_dir / output_name
-        atomic_write_with(final_output, lambda temporary: shutil.copyfile(payload_path, temporary))
-        self._write_install_record(final_output)
+        self._install_bundle_atomically(
+            bundle_id,
+            output_name,
+            lambda output_path: shutil.copyfile(payload_path, output_path),
+        )
 
     def _copy_catalog_metadata(self, bundle_id: str, bundle_dir: Path) -> None:
         relative_path = _CATALOG_METADATA_PATHS[bundle_id]
@@ -753,17 +844,58 @@ class FaceModelInstaller:
         with archive.open(member, "r") as source, output_path.open("wb") as target:
             shutil.copyfileobj(source, target)
 
-    def _write_install_record(self, payload_path: Path) -> None:
+    def _install_bundle_atomically(self, bundle_id: str, output_name: str, write_payload) -> None:
+        """Publish a complete face bundle as one directory rename.
+
+        Readers see either the previous complete bundle or the new verified
+        bundle.  The recovery pass can promote a completed staging directory
+        if the process stops between the two renames.
+        """
+        target_dir = self.bundle_dir(bundle_id)
+        parent = target_dir.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = parent / f".{bundle_id}.{uuid4().hex}.installing"
+        staging_dir.mkdir()
+        try:
+            self._copy_catalog_metadata(bundle_id, staging_dir)
+            payload_path = staging_dir / output_name
+            atomic_write_with(payload_path, write_payload)
+            self._write_install_record(payload_path, bundle_id=bundle_id)
+            if not self._bundle_dir_is_complete(staging_dir, bundle_id, verify_sha=True):
+                raise RuntimeError(f"Staged {bundle_id} bundle did not pass its integrity check.")
+            self._promote_bundle_directory(staging_dir, target_dir)
+            self._set_bundle_present(bundle_id)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+    def _promote_bundle_directory(self, staging_dir: Path, target_dir: Path) -> None:
+        previous_dir: Path | None = None
+        if target_dir.exists():
+            previous_dir = target_dir.parent / f".{target_dir.name}.{uuid4().hex}.previous"
+            target_dir.replace(previous_dir)
+        try:
+            staging_dir.replace(target_dir)
+        except Exception:
+            if previous_dir is not None and previous_dir.exists() and not target_dir.exists():
+                previous_dir.replace(target_dir)
+            raise
+        if previous_dir is not None:
+            shutil.rmtree(previous_dir, ignore_errors=True)
+
+    def _write_install_record(self, payload_path: Path, *, bundle_id: str = "") -> None:
         stat = payload_path.stat()
         record_path = payload_path.with_name("install.json")
         atomic_write_text(
             record_path,
             json.dumps(
                 {
+                    "bundle_id": str(bundle_id or ""),
                     "payload": payload_path.name,
                     "sha256": self._sha256_path(payload_path),
                     "size_bytes": int(stat.st_size),
                     "mtime_ns": int(stat.st_mtime_ns),
+                    "installed_at": int(time.time()),
                 },
                 indent=2,
                 sort_keys=True,
@@ -794,6 +926,135 @@ class FaceModelInstaller:
             return verified, verified
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return False, False
+
+    def _bundle_dir_is_complete(self, bundle_dir: Path, bundle_id: str, *, verify_sha: bool) -> bool:
+        _mode, plural_kind, _label = self._bundle_layout(bundle_id)
+        output_name = "detector.onnx" if plural_kind == "detectors" else "embedder.onnx"
+        payload_path = bundle_dir / output_name
+        if not (bundle_dir / "metadata.json").is_file():
+            return False
+        installed, verified = self._installed_payload_state(payload_path)
+        if not installed:
+            return False
+        if not verify_sha:
+            return True
+        if not verified:
+            return False
+        try:
+            record = json.loads((bundle_dir / "install.json").read_text(encoding="utf-8"))
+            expected_sha = str(record.get("sha256") or "").strip().lower()
+            return bool(expected_sha and self._sha256_path(payload_path) == expected_sha)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+
+    def _recover_interrupted_promotions(self, bundles: dict[str, object], failures: list[str]) -> list[str]:
+        promoted: list[str] = []
+        for bundle_id in _BUNDLE_LAYOUTS:
+            entry = bundles.get(bundle_id)
+            if isinstance(entry, dict) and bool(entry.get("deleted")):
+                continue
+            target_dir = self.bundle_dir(bundle_id)
+            if self._bundle_dir_is_complete(target_dir, bundle_id, verify_sha=False):
+                continue
+            parent = target_dir.parent
+            if not parent.is_dir():
+                continue
+            candidates = [
+                *sorted(parent.glob(f".{bundle_id}.*.installing"), key=lambda path: path.name, reverse=True),
+                *sorted(parent.glob(f".{bundle_id}.*.previous"), key=lambda path: path.name, reverse=True),
+            ]
+            source_dir = next(
+                (path for path in candidates if self._bundle_dir_is_complete(path, bundle_id, verify_sha=True)),
+                None,
+            )
+            if source_dir is None:
+                continue
+            try:
+                if target_dir.exists():
+                    corrupt_dir = parent / f".{bundle_id}.{uuid4().hex}.corrupt"
+                    target_dir.replace(corrupt_dir)
+                source_dir.replace(target_dir)
+                promoted.append(bundle_id)
+            except OSError as exc:
+                failures.append(f"{bundle_id}: unable to promote an interrupted install: {exc}")
+        return promoted
+
+    def _restore_bundle_from_download_cache(self, bundle_id: str) -> bool:
+        _mode, plural_kind, _label = self._bundle_layout(bundle_id)
+        output_name = "detector.onnx" if plural_kind == "detectors" else "embedder.onnx"
+        for expected_sha, filename, archive_member in _RECOVERY_RECIPES.get(bundle_id, ()):
+            cached_path = self._verified_recovery_download(expected_sha, filename)
+            if cached_path is None:
+                continue
+            if archive_member is None:
+                self._install_payload_file(cached_path, bundle_id=bundle_id, output_name=output_name)
+            else:
+                self._install_zip_member(
+                    cached_path,
+                    member_name=archive_member,
+                    bundle_id=bundle_id,
+                    output_name=output_name,
+                )
+            return True
+        return False
+
+    def _verified_recovery_download(self, expected_sha: str, filename: str) -> Path | None:
+        cache_path = self.download_cache_dir() / f"{str(expected_sha)[:16]}-{Path(filename).name}"
+        metadata_path = cache_path.with_name(f"{cache_path.name}.verified.json")
+        if self._verified_download_cache_entry(cache_path, metadata_path, expected_sha):
+            return cache_path
+        if not cache_path.is_file():
+            return None
+        try:
+            actual_sha = self._sha256_path(cache_path)
+            if actual_sha != str(expected_sha).strip().lower():
+                return None
+            stat = cache_path.stat()
+            atomic_write_text(
+                metadata_path,
+                json.dumps(
+                    {
+                        "sha256": actual_sha,
+                        "size_bytes": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                        "source_url": "",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+            return cache_path
+        except OSError:
+            return None
+
+    def _read_state(self) -> dict[str, object]:
+        try:
+            payload = json.loads(self.state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            payload = {}
+        bundles = payload.get("bundles") if isinstance(payload, dict) else None
+        return {
+            "version": 1,
+            "bundles": dict(bundles) if isinstance(bundles, dict) else {},
+        }
+
+    def _write_state(self, state: dict[str, object]) -> None:
+        atomic_write_text(self.state_path(), json.dumps(state, indent=2, sort_keys=True))
+
+    def _set_bundle_present(self, bundle_id: str) -> None:
+        state = self._read_state()
+        bundles = state["bundles"]
+        assert isinstance(bundles, dict)
+        bundles[bundle_id] = {"deleted": False, "last_seen_at": int(time.time())}
+        self._write_state(state)
+
+    def _set_bundle_deleted(self, bundle_id: str) -> None:
+        self._bundle_layout(bundle_id)
+        state = self._read_state()
+        bundles = state["bundles"]
+        assert isinstance(bundles, dict)
+        bundles[bundle_id] = {"deleted": True, "last_seen_at": int(time.time())}
+        self._write_state(state)
 
     @staticmethod
     def _find_zip_member(archive: zipfile.ZipFile, member_name: str) -> str | None:

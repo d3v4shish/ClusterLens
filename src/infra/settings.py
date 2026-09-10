@@ -186,6 +186,7 @@ PRODUCTION_SETTING_SPECS: tuple[SettingSpec, ...] = (
     SettingSpec("faces/default_embedder/human", "str", "arcface_r100_glint360k", "Default human face embedder.", user_data=True),
     SettingSpec("faces/detector_score_threshold/human", "float", 0.35, "Human face detector score threshold.", minimum=0.0, maximum=1.0, user_data=True),
     SettingSpec("faces/max_detections/human", "int", 50, "Maximum human face detections per image.", minimum=1, maximum=1000, user_data=True),
+    SettingSpec("faces/pipeline_preferences/human", "str", "", "Applied advanced human face-pipeline preferences.", user_data=True),
     SettingSpec("faces/identity_similarity_threshold", "float", 0.72, "Face identity similarity threshold.", minimum=0.0, maximum=1.0, user_data=True),
     SettingSpec("faces/pending_accept_threshold", "float", 0.85, "Pending face proposal accept threshold.", minimum=0.0, maximum=1.0, user_data=True),
     SettingSpec("clustering/default_model", "str", "siglip", "Default embedding model."),

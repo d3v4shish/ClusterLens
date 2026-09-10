@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 import logging
 import os
 from pathlib import Path
@@ -34,8 +35,9 @@ from app.services.cache_maintenance import CacheClearResult, CacheMaintenanceSer
 from app.services.cluster_explanations import ClusterExplanation  # noqa: E402
 from app.services.cluster_meanings import ClusterMeaning  # noqa: E402
 from app.services.clustering_options import model_label, normalize_clustering_backends, normalize_embedding_models  # noqa: E402
+from app.services.face_model_installer import FaceModelInstaller  # noqa: E402
 from app.services.model_assets import MODEL_SOURCE_LABELS, TEXT_MODEL_ORDER, ModelAssetService, ModelDownloadPlan  # noqa: E402
-from app.services.model_downloads import ModelDownloadItem, normalize_model_download_items  # noqa: E402
+from app.services.model_downloads import ModelDownloadItem, ModelDownloadService, normalize_model_download_items  # noqa: E402
 from app.services.image_tags import ClusterTagSummary, ImageTagService  # noqa: E402
 from app.services.saved_searches import SavedSearchService  # noqa: E402
 from app.services.photo_metadata import PhotoMetadataService  # noqa: E402
@@ -139,6 +141,7 @@ class ProductionClusterApp(QMainWindow):
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
         self._run_runtime_migrations()
         self._cleanup_runtime_temp_on_startup()
+        self._recover_downloaded_model_storage()
         self.session_controller = ClusteringSessionController(runtime_layout, self)
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
         self.model_download_controller = ModelDownloadController(runtime_layout, self)
@@ -231,6 +234,40 @@ class ProductionClusterApp(QMainWindow):
             LOGGER.info("Cleared startup runtime temp targets: %s", ", ".join(cleared))
         if failures:
             LOGGER.warning("Startup runtime temp cleanup failed: %s", "; ".join(failures))
+
+    def _recover_downloaded_model_storage(self) -> None:
+        """Reconcile durable model state before any selector reads it.
+
+        This path is local-only: it may promote an interrupted face install or
+        repair a Hugging Face cache reference, but it never starts a download
+        during application startup.
+        """
+        try:
+            face_result = FaceModelInstaller(self.settings).recover_managed_models()
+            if face_result.promoted_interrupted or face_result.restored:
+                LOGGER.info(
+                    "Recovered managed face models | promoted=%s restored=%s",
+                    list(face_result.promoted_interrupted),
+                    list(face_result.restored),
+                )
+            if face_result.unavailable:
+                LOGGER.warning(
+                    "Previously installed face models are missing and have no local recovery archive: %s",
+                    ", ".join(face_result.unavailable),
+                )
+            if face_result.failures:
+                LOGGER.warning("Face-model recovery completed with failures: %s", "; ".join(face_result.failures))
+        except Exception:
+            LOGGER.exception("Face-model startup recovery failed")
+        try:
+            clustering_result = ModelDownloadService(self.settings).recover_cached_models()
+            if clustering_result.repaired_revisions:
+                LOGGER.info(
+                    "Recovered clustering model cache references: %s",
+                    ", ".join(clustering_result.repaired_revisions),
+                )
+        except Exception:
+            LOGGER.exception("Clustering-model startup recovery failed")
 
     def _run_runtime_migrations(self) -> None:
         try:
@@ -611,8 +648,9 @@ class ProductionClusterApp(QMainWindow):
         pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
         pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
         pane.saved_clustering_filter_requested.connect(self._run_saved_clustering_filter)
-        pane.open_face_model_settings_requested.connect(lambda: self.open_settings_dialog("Models"))
+        pane.open_face_model_settings_requested.connect(lambda: self.open_settings_dialog("Face Models"))
         pane.face_pipeline_controls_requested.connect(self._show_face_pipeline_controls)
+        pane.face_pipeline_applied.connect(self._persist_face_pipeline_defaults)
         pane.install_face_model_requested.connect(self._request_face_model_download)
         pane.source_folder_changed.connect(self._set_shared_source_folder)
         pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
@@ -621,12 +659,9 @@ class ProductionClusterApp(QMainWindow):
 
     def _show_face_pipeline_controls(self) -> None:
         self.set_active_workspace("faces")
-        self.set_faces_mode("advanced")
         pane = self._ensure_faces_workspace()
-        pane.reveal_face_pipeline_controls()
-        self.footer_bar.set_status(
-            "Face pipeline editor opened. Install missing components in Settings > Models, then choose a detector and embedder."
-        )
+        pane.open_face_pipeline_dialog()
+        self.footer_bar.set_status("Face pipeline editor opened.")
 
     def _set_shared_source_folder(self, directory: str) -> None:
         directory = str(directory or "").strip()
@@ -1010,7 +1045,46 @@ class ProductionClusterApp(QMainWindow):
                 "score_threshold": self._preferred_face_detector_score_threshold(mode),
                 "max_detections": self._preferred_face_max_detections(mode),
             }
+            raw_preferences = str(
+                self.settings_registry.get(self.settings_store, f"faces/pipeline_preferences/{mode}", "") or ""
+            ).strip()
+            if raw_preferences:
+                try:
+                    saved_preferences = json.loads(raw_preferences)
+                except (TypeError, ValueError):
+                    saved_preferences = None
+                if isinstance(saved_preferences, dict):
+                    defaults[mode].update({str(key): value for key, value in saved_preferences.items()})
         return defaults
+
+    def _persist_face_pipeline_defaults(self, preferences_by_mode: dict[str, object]) -> None:
+        for raw_mode, raw_preferences in dict(preferences_by_mode or {}).items():
+            mode = _face_search_api().normalize_face_mode(str(raw_mode))
+            if mode != "human" or not isinstance(raw_preferences, dict):
+                continue
+            preferences = {str(key): value for key, value in raw_preferences.items()}
+            detector_id = str(preferences.get("detector_id") or "").strip()
+            embedder_id = str(preferences.get("embedder_id") or "").strip()
+            if detector_id:
+                self.settings_registry.set(self.settings_store, f"faces/default_detector/{mode}", detector_id)
+            if embedder_id:
+                self.settings_registry.set(self.settings_store, f"faces/default_embedder/{mode}", embedder_id)
+            self.settings_registry.set(
+                self.settings_store,
+                f"faces/detector_score_threshold/{mode}",
+                float(preferences.get("score_threshold", 0.35) or 0.0),
+            )
+            self.settings_registry.set(
+                self.settings_store,
+                f"faces/max_detections/{mode}",
+                max(1, int(preferences.get("max_detections", 50) or 50)),
+            )
+            self.settings_registry.set(
+                self.settings_store,
+                f"faces/pipeline_preferences/{mode}",
+                json.dumps(preferences, ensure_ascii=False, sort_keys=True),
+            )
+        self.settings_store.sync()
 
     def _keep_worker_warm(self) -> bool:
         return bool(self.settings_registry.get(self.settings_store, "performance/keep_worker_warm", False))
@@ -1757,6 +1831,7 @@ class ProductionClusterApp(QMainWindow):
             self._refresh_recent_folder_menus()
         self.current_folder_label.setText(directory or "No folder selected")
         self.current_folder_label.setToolTip(directory or "")
+        self.footer_bar.set_selected_folder(directory)
         self.gallery_pane.empty_run_button.setEnabled(bool(directory))
         if directory:
             self.footer_bar.set_status(f"Folder selected: {directory}")
@@ -2519,8 +2594,13 @@ class ProductionClusterApp(QMainWindow):
             parent=self,
         )
         if initial_tab:
+            aliases = {
+                "models": "Clustering Models",
+                "face models": "Face Models",
+            }
+            target_tab = aliases.get(str(initial_tab).casefold(), str(initial_tab))
             for index in range(dialog.tabs.count()):
-                if dialog.tabs.tabText(index).casefold() == str(initial_tab).casefold():
+                if dialog.tabs.tabText(index).casefold() == target_tab.casefold():
                     dialog.tabs.setCurrentIndex(index)
                     break
         dialog_result = dialog.exec()
@@ -2646,7 +2726,7 @@ class ProductionClusterApp(QMainWindow):
         self._active_post_install_model_name = model_name
         if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
             self._active_post_install_model_name = None
-            errorBox("Model download could not start", "Open Settings > Models and try the installation again.")
+            errorBox("Model download could not start", "Open Settings > Face Models and try the installation again.")
 
     def _maybe_show_last_crash_notice(self) -> None:
         app = QApplication.instance()
@@ -3066,7 +3146,7 @@ class ProductionClusterApp(QMainWindow):
             issues.append("Crash report present")
             notes.append(f"Last crash: {self.runtime_layout.last_crash_json}")
         if issues:
-            notes.extend(["", "Attention:"])
+            notes.extend(["", "Application health notes:"])
             notes.extend(f"- {issue}" for issue in issues)
             self.runtime_badge.set_health("warning", notes)
         else:

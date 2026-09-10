@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -191,6 +192,7 @@ class ProductionSettingsDialog(QDialog):
         self._face_model_job = None
         self._face_model_thread = None
         self._face_model_inventory_changed = False
+        self._external_face_model_root = ""
         self._journal_restore_job = None
         self._journal_restore_thread = None
         self._journal_refresh_job = None
@@ -331,12 +333,9 @@ class ProductionSettingsDialog(QDialog):
         )
 
     def _build_models_tab(self) -> None:
-        tab = QWidget(self)
-        layout = QVBoxLayout(tab)
+        clustering_tab = QWidget(self)
+        layout = QVBoxLayout(clustering_tab)
         self.offline_model_downloads = QCheckBox("Offline mode: never download missing model files automatically")
-        self.offline_model_downloads.setToolTip(
-            "When enabled, clustering uses only bundled model assets or already cached model files. Missing models fall back or fail visibly."
-        )
         layout.addWidget(self.offline_model_downloads)
 
         self.model_inventory_table = QTableWidget(0, 5, self)
@@ -369,28 +368,23 @@ class ProductionSettingsDialog(QDialog):
             actions.addWidget(button, index // 3, index % 3)
         layout.addLayout(actions)
 
-        self.model_status_label = QLabel(
-            "Packaged ONNX assets are verified by checksum when metadata contains sha256. "
-            "Cached Torch/Hugging Face downloads are shown separately and can be deleted here."
-        )
+        self.model_status_label = QLabel()
         self.model_status_label.setWordWrap(True)
         layout.addWidget(self.model_status_label)
+        layout.addStretch(1)
 
-        self.license_text = QTextEdit(self)
-        self.license_text.setReadOnly(True)
-        self.license_text.setMaximumHeight(140)
-        layout.addWidget(self.license_text)
+        models_scroll = QScrollArea(self)
+        models_scroll.setObjectName("models_scroll_area")
+        models_scroll.setWidgetResizable(True)
+        models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        models_scroll.setWidget(clustering_tab)
+        self.tabs.addTab(models_scroll, "Clustering Models")
 
-        self.face_model_group = QGroupBox("Face inference packs", tab)
-        face_layout = QGridLayout(self.face_model_group)
-        face_note = QLabel(
-            "Default GPU pipeline: SCRFD 10G detector + ArcFace R100 embedder. "
-            "Install optional ONNX detector/embedder packs for Advanced Faces. Downloads are checksum-verified, "
-            "resumable, shared in the runtime cache, shown in Jobs, and cancellable."
-        )
-        face_note.setWordWrap(True)
-        face_layout.addWidget(face_note, 0, 0, 1, 2)
-        self.face_model_pack_combo = QComboBox(self.face_model_group)
+        face_tab = QWidget(self)
+        face_layout = QGridLayout(face_tab)
+        face_layout.setColumnStretch(0, 1)
+        face_layout.setColumnStretch(1, 1)
+        self.face_model_pack_combo = QComboBox(face_tab)
         for label, profile_id in (
             ("Default GPU — SCRFD 10G + ArcFace R100", "latest_gpu"),
             ("Balanced — SCRFD 2.5G + ArcFace R50", "recommended"),
@@ -406,29 +400,42 @@ class ProductionSettingsDialog(QDialog):
         self.install_face_model_pack_button = QPushButton("Install Selected Face Pack")
         self.open_face_model_cache_button = QPushButton("Open Face Model Cache")
         self.clear_face_download_cache_button = QPushButton("Clear Face Download Cache")
-        face_layout.addWidget(self.face_model_pack_combo, 1, 0)
-        face_layout.addWidget(self.install_face_model_pack_button, 1, 1)
-        self.installed_face_model_combo = QComboBox(self.face_model_group)
+        face_layout.addWidget(self.face_model_pack_combo, 0, 0)
+        face_layout.addWidget(self.install_face_model_pack_button, 0, 1)
+        self.external_face_model_root_label = QLabel("External model folder: not selected", face_tab)
+        self.external_face_model_root_label.setWordWrap(True)
+        self.choose_external_face_model_root_button = QPushButton("Choose Face Model Folder")
+        self.open_external_face_model_root_button = QPushButton("Open Face Model Folder")
+        face_layout.addWidget(self.external_face_model_root_label, 1, 0, 1, 2)
+        face_layout.addWidget(self.choose_external_face_model_root_button, 2, 0)
+        face_layout.addWidget(self.open_external_face_model_root_button, 2, 1)
+
+        self.face_model_inventory_table = QTableWidget(0, 5, face_tab)
+        self.face_model_inventory_table.setHorizontalHeaderLabels(["Component", "Type", "Hardware", "State", "Location"])
+        self.face_model_inventory_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.face_model_inventory_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.face_model_inventory_table.verticalHeader().setVisible(False)
+        for column in range(4):
+            self.face_model_inventory_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.face_model_inventory_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        face_layout.addWidget(self.face_model_inventory_table, 3, 0, 1, 2)
+
+        self.installed_face_model_combo = QComboBox(face_tab)
         self.delete_face_model_button = QPushButton("Delete Installed Face Component")
-        face_layout.addWidget(self.installed_face_model_combo, 2, 0)
-        face_layout.addWidget(self.delete_face_model_button, 2, 1)
-        face_layout.addWidget(self.open_face_model_cache_button, 3, 0)
-        face_layout.addWidget(self.clear_face_download_cache_button, 3, 1)
-        face_layout.setColumnStretch(0, 1)
+        face_layout.addWidget(self.installed_face_model_combo, 4, 0)
+        face_layout.addWidget(self.delete_face_model_button, 4, 1)
+        face_layout.addWidget(self.open_face_model_cache_button, 5, 0)
+        face_layout.addWidget(self.clear_face_download_cache_button, 5, 1)
         self.face_model_status_label = QLabel()
         self.face_model_status_label.setWordWrap(True)
-        face_layout.addWidget(self.face_model_status_label, 4, 0, 1, 2)
-        layout.addWidget(self.face_model_group)
+        face_layout.addWidget(self.face_model_status_label, 6, 0, 1, 2)
 
-        # The model inventory and optional face-pack controls must remain
-        # reachable on laptop-height and portrait displays. Scrolling the
-        # whole page also avoids nesting a second horizontal scroll region.
-        models_scroll = QScrollArea(self)
-        models_scroll.setObjectName("models_scroll_area")
-        models_scroll.setWidgetResizable(True)
-        models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        models_scroll.setWidget(tab)
-        self.tabs.addTab(models_scroll, "Models")
+        face_scroll = QScrollArea(self)
+        face_scroll.setObjectName("face_models_scroll_area")
+        face_scroll.setWidgetResizable(True)
+        face_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        face_scroll.setWidget(face_tab)
+        self.tabs.addTab(face_scroll, "Face Models")
 
         self.refresh_models_button.clicked.connect(self.refresh_model_inventory)
         self.install_model_button.clicked.connect(self._download_selected_model)
@@ -443,6 +450,8 @@ class ProductionSettingsDialog(QDialog):
             lambda: self._open_path(self.face_model_installer.runtime_root())
         )
         self.clear_face_download_cache_button.clicked.connect(self._clear_face_download_cache)
+        self.choose_external_face_model_root_button.clicked.connect(self._choose_external_face_model_root)
+        self.open_external_face_model_root_button.clicked.connect(self._open_external_face_model_root)
 
     def _build_storage_tab(self) -> None:
         tab = QWidget(self)
@@ -661,6 +670,8 @@ class ProductionSettingsDialog(QDialog):
         self.read_only_mode.setChecked(bool(registry.get(self.settings_store, "safety/read_only_mode", False)))
         self.update_checks_enabled.setChecked(bool(registry.get(self.settings_store, "updates/checks_enabled", False)))
         self.update_channel.setCurrentText(str(registry.get(self.settings_store, "updates/channel", "stable")))
+        self._external_face_model_root = str(registry.get(self.settings_store, "faces/model_root", "") or "").strip()
+        self._update_external_face_model_root_label()
         self._apply_profile_preview(update_tuning=False)
 
     def values(self) -> dict[str, object]:
@@ -681,6 +692,7 @@ class ProductionSettingsDialog(QDialog):
             "gallery/prefetch_rows": int(self.prefetch_rows.value()),
             "workspace/dense_ui": bool(self.dense_ui.isChecked()),
             "models/offline_mode": bool(self.offline_model_downloads.isChecked()),
+            "faces/model_root": self._external_face_model_root,
             "safety/read_only_mode": bool(self.read_only_mode.isChecked()),
             "updates/checks_enabled": bool(self.update_checks_enabled.isChecked()),
             "updates/channel": self.update_channel.currentText(),
@@ -723,7 +735,6 @@ class ProductionSettingsDialog(QDialog):
 
     def _populate_model_inventory(self, items: list[object]) -> None:
         self.model_inventory_table.setRowCount(len(items))
-        license_lines: list[str] = []
         for row, item in enumerate(items):
             state_parts = []
             if item.packaged:
@@ -749,11 +760,7 @@ class ProductionSettingsDialog(QDialog):
                 if item.validation_status == "invalid":
                     table_item.setForeground(Qt.GlobalColor.red)
                 self.model_inventory_table.setItem(row, column, table_item)
-            license_lines.append(
-                f"{model_label(item.model_name)}\nSource: {item.source_url or item.source_label}\nLicense: {item.license}\n"
-            )
         self.model_inventory_table.resizeRowsToContents()
-        self.license_text.setPlainText("\n".join(license_lines))
         self._update_model_action_state()
 
     def _selected_model_name(self) -> str | None:
@@ -929,6 +936,7 @@ class ProductionSettingsDialog(QDialog):
             if index >= 0:
                 self.installed_face_model_combo.setCurrentIndex(index)
         self.installed_face_model_combo.blockSignals(False)
+        self._populate_face_model_inventory_table()
         if installed:
             verified = sum("verified" in str(item.status) for item in installed)
             self.face_model_status_label.setText(
@@ -941,6 +949,67 @@ class ProductionSettingsDialog(QDialog):
                 "before using the built-in face embedder."
             )
         self._update_face_model_action_state()
+
+    def _update_external_face_model_root_label(self) -> None:
+        root = str(self._external_face_model_root or "").strip()
+        self.external_face_model_root_label.setText(
+            f"External model folder: {root}" if root else "External model folder: not selected"
+        )
+        self.external_face_model_root_label.setToolTip(root or "Choose a folder containing downloaded face-model ONNX files.")
+
+    def _choose_external_face_model_root(self) -> None:
+        current = str(self._external_face_model_root or self.face_model_installer.runtime_root())
+        selected = QFileDialog.getExistingDirectory(self, "Choose Face Model Folder", current)
+        if not selected:
+            return
+        self._external_face_model_root = str(Path(selected).expanduser())
+        self._update_external_face_model_root_label()
+        self._refresh_face_model_inventory()
+
+    def _open_external_face_model_root(self) -> None:
+        root = str(self._external_face_model_root or "").strip()
+        if root:
+            self._open_path(Path(root))
+
+    def _populate_face_model_inventory_table(self) -> None:
+        from app.services.face_search import list_face_detector_bundles, list_face_embedder_bundles
+
+        rows: list[tuple[str, str, str, str, str]] = []
+        root = self._external_face_model_root
+        for bundle in list_face_detector_bundles(root, "human"):
+            state = "Built-in" if bundle.source_kind == "builtin" and bundle.available else (
+                "Downloaded" if bundle.available else f"Install for {self._hardware_label(bundle.hardware_class)}"
+            )
+            location = str(bundle.detector_path or bundle.bundle_dir or "")
+            rows.append((bundle.display_name, "Detector", bundle.hardware_class or "CPU/GPU", state, location))
+        for bundle in list_face_embedder_bundles(root, "human"):
+            state = "Built-in" if bundle.source_kind == "builtin" and bundle.available else (
+                "Downloaded" if bundle.available else f"Install for {self._hardware_label(bundle.hardware_class)}"
+            )
+            location = str(bundle.embedder_path or bundle.bundle_dir or "")
+            rows.append((bundle.display_name, "Embedder", bundle.hardware_class or "CPU/GPU", state, location))
+        rows.sort(key=lambda row: (row[1], row[0].casefold()))
+        table = self.face_model_inventory_table
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                table.setItem(row_index, column, item)
+        table.resizeRowsToContents()
+
+    @staticmethod
+    def _hardware_label(value: str) -> str:
+        text = str(value or "").casefold()
+        has_cpu = "cpu" in text
+        has_gpu = "gpu" in text or "cuda" in text
+        if has_cpu and has_gpu:
+            return "CPU/GPU"
+        if has_gpu:
+            return "GPU"
+        if has_cpu:
+            return "CPU"
+        return "CPU/GPU"
 
     def _update_face_model_action_state(self) -> None:
         if not hasattr(self, "install_face_model_pack_button"):
@@ -958,6 +1027,8 @@ class ProductionSettingsDialog(QDialog):
         self.delete_face_model_button.setEnabled((not busy) and mutation_allowed and has_installed)
         self.open_face_model_cache_button.setEnabled(not busy)
         self.clear_face_download_cache_button.setEnabled((not busy) and mutation_allowed)
+        self.choose_external_face_model_root_button.setEnabled(not busy)
+        self.open_external_face_model_root_button.setEnabled(not busy and bool(self._external_face_model_root))
 
     def _install_selected_face_model_pack(self) -> None:
         profile_id = str(self.face_model_pack_combo.currentData() or "latest_gpu")

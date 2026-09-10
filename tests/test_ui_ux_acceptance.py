@@ -136,23 +136,30 @@ class UiUxAcceptanceTests(unittest.TestCase):
             self.assertEqual(["All Faces", "Folder Review", "Face Search", "Identities"], pane.tab_labels())
             self.assertTrue(pane.tabs.tabBar().isHidden())
             self.assertEqual(
-                ["All Faces", "Detect Faces", "Find a Person", "People & Groups"],
+                ["All Faces", "Detect", "Find"],
                 [pane.task_navigation.tabText(index) for index in range(pane.task_navigation.count())],
             )
+            self.assertFalse(pane.face_library_tabs.tabBar().isTabVisible(1))
             for name in (
                 "face_settings_group",
                 "face_identity_management_group",
                 "face_identity_danger_group",
-                "face_db_scope_field",
                 "face_delete_db_button",
                 "face_purge_data_button",
             ):
                 self.assertFalse(getattr(pane, name).isVisibleTo(pane), name)
+            for name in (
+                "face_db_scope_field",
+                "face_upload_to_global_button",
+                "face_database_path_label",
+                "face_review_source_summary",
+                "face_model_status_dashboard_label",
+            ):
+                self.assertFalse(hasattr(pane, name), name)
             self.assertTrue(pane.face_pipeline_summary_group.isVisibleTo(pane))
             self.assertTrue(pane.face_choose_pipeline_button.isVisibleTo(pane))
             self.assertTrue(pane.face_model_settings_button.isVisibleTo(pane))
-            self.assertIn("Configured default pending install", pane.face_model_status_dashboard_label.text())
-            self.assertIn("scrfd_10g_kps + arcface_r100_glint360k", pane.face_model_status_dashboard_label.text())
+            self.assertRegex(pane.face_model_summary_label.text(), r" — (CPU|GPU)$")
             self.assertTrue(pane.face_scan_button.isVisibleTo(pane))
             self.assertNotIn("dog", pane.face_mode_combo.currentText().casefold())
             self.assertNotIn("cat", pane.face_mode_combo.currentText().casefold())
@@ -181,22 +188,23 @@ class UiUxAcceptanceTests(unittest.TestCase):
             self.addCleanup(self._close_widget, dialog)
 
             self.assertEqual(
-                ["General", "Performance", "Models", "Storage", "Safety & Recovery", "Updates", "Support"],
+                ["General", "Performance", "Clustering Models", "Face Models", "Storage", "Safety & Recovery", "Updates", "Support"],
                 [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())],
             )
             self.assertFalse(hasattr(dialog, "run_release_gates_button"))
-            safety = dialog.tabs.widget(4)
+            safety = dialog.tabs.widget(5)
             safety_buttons = [button.text() for button in safety.findChildren(QPushButton)]
             self.assertNotIn("Open Journal", safety_buttons)
             self.assertIn("Restore (skip conflicts)", safety_buttons)
             self.assertIn("Restore with unique names", safety_buttons)
-            support = dialog.tabs.widget(6)
+            support = dialog.tabs.widget(7)
             self.assertIn("Open operation journal", [button.text() for button in support.findChildren(QPushButton)])
-            models = dialog.tabs.widget(2)
-            model_buttons = [button.text() for button in models.findChildren(QPushButton)]
+            face_models = dialog.tabs.widget(3)
+            model_buttons = [button.text() for button in face_models.findChildren(QPushButton)]
             self.assertIn("Install Selected Face Pack", model_buttons)
             self.assertIn("Delete Installed Face Component", model_buttons)
             self.assertIn("Clear Face Download Cache", model_buttons)
+            self.assertIn("Choose Face Model Folder", model_buttons)
             self.assertGreaterEqual(dialog.face_model_pack_combo.count(), 8)
             self.assertEqual("latest_gpu", dialog.face_model_pack_combo.currentData())
             self.assertIn("SCRFD 10G + ArcFace R100", dialog.face_model_pack_combo.currentText())
@@ -204,9 +212,10 @@ class UiUxAcceptanceTests(unittest.TestCase):
             dialog.tabs.setCurrentIndex(2)
             dialog.show()
             APP.processEvents()
-            self.assertEqual("models_scroll_area", models.objectName())
-            self.assertEqual(Qt.ScrollBarPolicy.ScrollBarAlwaysOff, models.horizontalScrollBarPolicy())
-            self.assertGreater(models.verticalScrollBar().maximum(), 0)
+            clustering_models = dialog.tabs.widget(2)
+            self.assertEqual("models_scroll_area", clustering_models.objectName())
+            self.assertEqual(Qt.ScrollBarPolicy.ScrollBarAlwaysOff, clustering_models.horizontalScrollBarPolicy())
+            self.assertGreaterEqual(clustering_models.verticalScrollBar().maximum(), 0)
             dialog.close()
             APP.processEvents()
 
