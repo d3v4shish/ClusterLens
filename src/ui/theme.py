@@ -145,6 +145,16 @@ QPushButton[kind="secondary"]:disabled {
   border: 1px solid #263A4E;
   color: #71839A;
 }
+QToolButton[kind="secondary"] {
+  background: #111B28;
+  border: 1px solid #456A91;
+  border-radius: 8px;
+  color: #D7E8FA;
+  font-weight: 600;
+  padding: 6px 10px;
+}
+QToolButton[kind="secondary"]:hover { background: #172A40; border-color: #6FA6DD; }
+QToolButton[kind="secondary"]:disabled { background: #101721; border-color: #263A4E; color: #71839A; }
 QPushButton[kind="danger"] {
   background: #491515;
   border: 1px solid #DA3633;

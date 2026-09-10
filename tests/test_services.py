@@ -3815,6 +3815,90 @@ class ServiceTests(unittest.TestCase):
             self.assertIsNotNone(refreshed)
             self.assertEqual("Alice", refreshed.person_name)
 
+    def test_recover_legacy_manual_labels_promotes_durable_names_and_photo_summaries(self):
+        with TemporaryDirectory() as tmp:
+            image_a = Path(tmp) / "legacy_a.jpg"
+            image_b = Path(tmp) / "legacy_b.jpg"
+            Image.new("RGB", (64, 64), (12, 24, 36)).save(image_a)
+            Image.new("RGB", (64, 64), (36, 24, 12)).save(image_b)
+            db_path = Path(tmp) / "faces.sqlite3"
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=db_path,
+            )
+            service.save_face_records(
+                [
+                    FaceIndexRecord(str(image_a), 0, (0, 0, 32, 32), 0.99, np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+                    FaceIndexRecord(str(image_a), 1, (32, 0, 64, 32), 0.99, np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+                    FaceIndexRecord(str(image_b), 0, (0, 0, 32, 32), 0.99, np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+                ],
+                mtime_ns=image_a.stat().st_mtime_ns,
+                file_size=image_a.stat().st_size,
+                assess_quality=False,
+            )
+            service.label_indexed_faces(
+                "Alice",
+                [(str(image_a), 0), (str(image_a), 1), (str(image_b), 0)],
+                similarity_threshold=0.5,
+            )
+
+            reopened = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=db_path,
+            )
+            recovery = reopened.recover_legacy_manual_face_labels()
+
+            self.assertEqual(3, recovery.promoted_count)
+            self.assertEqual(0, recovery.conflict_count)
+            self.assertEqual([], reopened.load_pending_face_labels())
+            self.assertEqual(
+                [("Alice", 3, 2)],
+                [(summary.person_name, summary.face_count, summary.photo_count) for summary in reopened.list_named_photo_summaries()],
+            )
+            self.assertEqual([str(image_a), str(image_b)], reopened.list_named_photo_paths("Alice"))
+
+    def test_recover_legacy_manual_labels_keeps_conflicting_durable_label(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "legacy_conflict.jpg"
+            Image.new("RGB", (64, 64), (12, 24, 36)).save(image_path)
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=Path(tmp) / "faces.sqlite3",
+            )
+            service.save_face_records(
+                [
+                    FaceIndexRecord(
+                        str(image_path),
+                        0,
+                        (0, 0, 32, 32),
+                        0.99,
+                        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                    )
+                ],
+                mtime_ns=image_path.stat().st_mtime_ns,
+                file_size=image_path.stat().st_size,
+                assess_quality=False,
+            )
+            service.label_indexed_faces_immediately("Bob", [(str(image_path), 0)], similarity_threshold=0.5)
+            with service._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO pending_face_labels(image_path, face_index, person_name, confidence, source)
+                    VALUES (?, ?, ?, ?, 'manual_selected_faces')
+                    """,
+                    (str(image_path), 0, "Alice", 1.0),
+                )
+
+            recovery = service.recover_legacy_manual_face_labels()
+
+            self.assertEqual(0, recovery.promoted_count)
+            self.assertEqual(1, recovery.conflict_count)
+            self.assertEqual("Bob", service.list_face_labels()[0].person_name)
+            self.assertEqual("Alice", service.load_pending_face_labels()[0].person_name)
+
     def test_accept_pending_face_labels_batch_can_be_undone(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "undo_label.jpg"

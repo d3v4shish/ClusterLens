@@ -25,6 +25,7 @@ from app.services.cluster_meanings import ClusterMeaning, ClusterMeaningLabel
 from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
 from app.services.clustering_pipeline import ClusteringRequest, MultiBackendClusteringResult
 from app.services.face_search import BUILTIN_HUMAN_DETECTOR_ID, BUILTIN_HUMAN_EMBEDDER_ID, EditableFaceInput, FaceAlbumGroupSummary, FaceAlbumRecord, FaceClusterIdentitySuggestion, FaceClusterMember, FaceClusteringComparisonResult, FaceFolderReviewImage, FaceLabelAcceptanceBatch, FaceLabelAssignment, FaceScanImageRecord, FaceSearchRequest, FaceSearchResult, IndexedFaceRecord, PersonProfile, PersonPrototypeFace
+from app.services.face_search import NamedPhotoSummary
 from app.services.image_tags import ClusterTagSummary, ImageTagService
 from app.services.saved_searches import SavedSearchService
 from app.services.similarity_search import SearchResult
@@ -43,6 +44,7 @@ from ui.gallery_pane import (
     MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE,
 )
 from ui.job_manager import JobManager
+from ui.names_pane import NamesPane
 from ui.photo_inspector_dialog import EditableFaceDraft, PhotoInspectorDialog
 from ui.search_pane import FaceResultGroup, FaceTileItem, FaceTileListModel, SearchPane
 from ui.selection_details_pane import SelectionDetailsPane
@@ -2114,6 +2116,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsNotNone(window.clustering_pane)
         self.assertIsNotNone(window.gallery_pane)
         self.assertIsNotNone(window.faces_pane)
+        self.assertIsNotNone(window.names_pane)
         self.assertIsNotNone(window.footer_bar)
         self.assertEqual("basic", window._clustering_mode)
         self.assertEqual("clustering", window._active_workspace)
@@ -2121,6 +2124,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertFalse(window.advanced_mode_button.isChecked())
         self.assertTrue(window.clustering_workspace_button.isChecked())
         self.assertFalse(window.faces_workspace_button.isChecked())
+        self.assertFalse(window.names_workspace_button.isChecked())
         self.assertTrue(window.source_pane.basic_action_section.isVisible())
         self.assertTrue(window.source_pane.basic_run_button.isVisible())
         self.assertFalse(window.source_pane.basic_cancel_button.isVisible())
@@ -2138,6 +2142,72 @@ class UiSmokeTests(unittest.TestCase):
         self.assertGreater(sizes[1], sizes[0])
         self.assertEqual(["All Faces", "Folder Review", "Face Search", "Identities"], window.faces_pane.tab_labels())
         window.close()
+
+    def test_names_workspace_is_a_top_level_page_with_one_names_sidebar(self):
+        window = ClusterGalleryApp()
+        refresh_calls: list[bool] = []
+        window.names_pane.refresh_names = lambda: refresh_calls.append(True)
+        window.show()
+        APP.processEvents()
+
+        window.set_active_workspace("names")
+        APP.processEvents()
+
+        self.assertEqual("names", window._active_workspace)
+        self.assertTrue(window.names_workspace_button.isChecked())
+        self.assertFalse(window.clustering_workspace_button.isChecked())
+        self.assertFalse(window.faces_workspace_button.isChecked())
+        self.assertIs(window.workspace_stack.currentWidget(), window.names_pane)
+        self.assertEqual([True], refresh_calls)
+        self.assertFalse(window.source_pane.isVisible())
+        self.assertFalse(window.basic_mode_button.isVisible())
+        self.assertFalse(window.advanced_mode_button.isVisible())
+        self.assertFalse(window.source_toggle.isVisible())
+        self.assertFalse(window.controls_toggle.isVisible())
+        self.assertFalse(window.details_toggle.isVisible())
+        self.assertEqual("Feature: Names", window.feature_label.text())
+        window.close()
+
+    def test_names_pane_lists_durable_names_and_unique_photo_paths(self):
+        class _NameService:
+            db_path = "/tmp/names-test.sqlite3"
+
+            def __init__(self):
+                self.recovery_calls = 0
+
+            def recover_legacy_manual_face_labels(self):
+                self.recovery_calls += 1
+                return SimpleNamespace(promoted_count=0, duplicate_count=0, conflict_count=0)
+
+            def list_named_photo_summaries(self):
+                return [
+                    NamedPhotoSummary("Alice", face_count=3, photo_count=2),
+                    NamedPhotoSummary("Bob", face_count=1, photo_count=1),
+                ]
+
+            def list_named_photo_paths(self, person_name):
+                return {
+                    "Alice": ["/photos/alice-a.jpg", "/photos/alice-b.jpg"],
+                    "Bob": ["/photos/bob.jpg"],
+                }.get(str(person_name), [])
+
+        service = _NameService()
+        pane = NamesPane(lambda: service)
+        pane.show()
+        try:
+            pane.refresh_names()
+            self.assertTrue(self._wait_until(lambda: self._list_view_count(pane.names_list) == 2))
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/alice-a.jpg", "/photos/alice-b.jpg"]))
+            self.assertEqual(1, service.recovery_calls)
+            self.assertIn("Alice", self._list_view_text(pane.names_list, 0))
+            self.assertEqual("Alice · 2 unique photo(s)", pane.status_label.text())
+            pane.search_field.setText("Bob")
+            APP.processEvents()
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/bob.jpg"]))
+            self.assertEqual("Bob · 1 unique photo(s)", pane.status_label.text())
+        finally:
+            pane.shutdown_jobs(timeout_ms=500)
+            pane.close()
 
     def test_runtime_warmup_is_deferred_outside_clustering_workspace(self):
         progress_calls: list[object] = []
@@ -3580,6 +3650,33 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("Create New Cluster From Selected Faces", pane.face_results_split_button.text())
         self.assertEqual("Merge Selected Clusters", pane.face_results_merge_button.text())
         self.assertEqual("Review Pending Labels", pane.face_results_review_pending_button.text())
+        self.assertEqual("Actions", pane.face_results_actions_menu_button.text())
+        self.assertEqual("Advanced Actions", pane.face_results_advanced_actions_menu_button.text())
+        self.assertFalse(pane.face_results_queue_suggestion_button.isVisible())
+        self.assertFalse(pane.face_results_split_button.isVisible())
+        self.assertEqual(
+            [
+                "Queue Suggested Identity",
+                "Reject Suggestion",
+                "Keep Cluster Unlabeled",
+                "Show Photo",
+                "Open Inspector",
+                "Review Pending Labels",
+                "Export Cluster Results",
+            ],
+            [action.text() for action in pane.face_results_actions_menu.actions() if not action.isSeparator()],
+        )
+        self.assertEqual(
+            [
+                "Create New Cluster From Selected Faces",
+                "Merge Selected Clusters",
+                "Recluster Selected Cluster",
+                "Run Current Backend Again",
+            ],
+            [action.text() for action in pane.face_results_advanced_actions_menu.actions()],
+        )
+        self.assertTrue(pane.face_results_actions_menu_button.toolTip())
+        self.assertTrue(pane.face_results_name_button.toolTip())
         self.assertEqual("Find Similar From Selection", pane.face_search_selected_card_button.text())
         self.assertEqual("Find by Face", pane.face_search_button.text())
         self.assertEqual("Find by Name + Similar", pane.face_find_name_button.text())
@@ -4267,11 +4364,12 @@ class UiSmokeTests(unittest.TestCase):
             with patch("ui.search_pane.QInputDialog.getText", return_value=("Dana", True)):
                 pane._prepare_name_selected_face_results()
 
-            self.assertEqual(1, len(service.label_indexed_faces_calls))
-            self.assertEqual(0, len(service.label_indexed_faces_immediately_calls))
-            self.assertEqual("Dana", service.label_indexed_faces_calls[0]["person_name"])
-            self.assertEqual([("/photos/a.jpg", 0)], service.label_indexed_faces_calls[0]["face_refs"])
-            self.assertIn("Queued review for 'Dana' on 1 face(s) from Grouped Photos.", pane.status_label.text())
+            self.assertEqual(0, len(service.label_indexed_faces_calls))
+            self.assertEqual(1, len(service.label_indexed_faces_immediately_calls))
+            self.assertEqual("Dana", service.label_indexed_faces_immediately_calls[0]["person_name"])
+            self.assertEqual([("/photos/a.jpg", 0)], service.label_indexed_faces_immediately_calls[0]["face_refs"])
+            self.assertEqual("manual_selected_faces", service.label_indexed_faces_immediately_calls[0]["source"])
+            self.assertIn("Saved 'Dana' on 1 face(s) from Grouped Photos.", pane.status_label.text())
         finally:
             pane.close()
 

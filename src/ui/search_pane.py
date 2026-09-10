@@ -1113,6 +1113,7 @@ class SearchPane(QWidget):
     source_folder_changed = pyqtSignal(str)
     recent_folder_remove_requested = pyqtSignal(str)
     recent_folders_clear_requested = pyqtSignal()
+    face_labels_changed = pyqtSignal()
 
     def __init__(
         self,
@@ -1323,6 +1324,7 @@ class SearchPane(QWidget):
         self._retained_face_album_refresh_refs: list[tuple[object | None, object | None]] = []
         self._face_album_request_id = 0
         self._face_album_refresh_in_progress = False
+        self._legacy_manual_label_recovery_db_paths: set[str] = set()
         self._face_album_publish_job = None
         self._face_album_publish_thread = None
         self._retained_face_album_publish_refs: list[tuple[object | None, object | None]] = []
@@ -1551,6 +1553,12 @@ class SearchPane(QWidget):
         self.face_results_date_from.setPlaceholderText("Date from YYYY-MM-DD")
         self.face_results_date_to = QLineEdit()
         self.face_results_date_to.setPlaceholderText("Date to YYYY-MM-DD")
+        self.face_results_sort_combo.setToolTip("Choose how face groups and their photos are ordered.")
+        self.face_results_label_filter_combo.setToolTip("Limit results to named faces, unlabeled faces, or both.")
+        self.face_results_quality_filter_combo.setToolTip("Limit results by saved face-quality review state.")
+        self.face_results_folder_filter.setToolTip("Advanced: show only photo paths containing this text.")
+        self.face_results_date_from.setToolTip("Advanced: include photos on or after this date.")
+        self.face_results_date_to.setToolTip("Advanced: include photos on or before this date.")
         for widget in (
             self.face_results_sort_combo,
             self.face_results_label_filter_combo,
@@ -1560,6 +1568,13 @@ class SearchPane(QWidget):
             self.face_results_date_to,
         ):
             face_results_filters.addWidget(widget)
+        face_results_filters.addWidget(
+            HelpIconButton(
+                "Use Sort, Labels, and Quality to narrow the visible groups. Folder and date filters are available in Advanced mode.",
+                self.face_results_panel,
+                help_key="face_groups_filters",
+            )
+        )
         face_results_layout.addLayout(face_results_filters)
         self.face_results_sort_combo.currentIndexChanged.connect(lambda _index: self._request_face_result_filter_refresh())
         self.face_results_label_filter_combo.currentIndexChanged.connect(lambda _index: self._request_face_result_filter_refresh())
@@ -1585,6 +1600,24 @@ class SearchPane(QWidget):
         self.face_results_compare_again_button = QPushButton("Run Current Backend Again")
         self.face_results_review_pending_button = QPushButton("Review Pending Labels")
         self.face_results_export_button = QPushButton("Export Cluster Results")
+        action_help = {
+            self.face_results_name_button: "Save the typed name onto the selected face tiles immediately.",
+            self.face_results_name_clusters_button: "Save one name onto every face in the selected raw clusters immediately.",
+            self.face_results_queue_suggestion_button: "Queue the suggested identity for review; it is not saved until accepted.",
+            self.face_results_reject_suggestion_button: "Dismiss the current suggested identity for this cluster.",
+            self.face_results_keep_unknown_button: "Keep this cluster intentionally unnamed in the current review session.",
+            self.face_results_jump_button: "Open the source photo for the selected face.",
+            self.face_results_show_group_photos_button: "Show the photos belonging to the selected group.",
+            self.face_results_edit_button: "Open the selected face's source photo in the inspector.",
+            self.face_results_split_button: "Create a new cluster from selected faces in the current raw cluster.",
+            self.face_results_merge_button: "Merge exactly two compatible selected raw clusters.",
+            self.face_results_recluster_button: "Run the selected raw cluster through the current grouping backend again.",
+            self.face_results_compare_again_button: "Run the current grouping backend again for the most recent comparison.",
+            self.face_results_review_pending_button: "Open pending automatic face-label proposals for review.",
+            self.face_results_export_button: "Export the current cluster results.",
+        }
+        for button, tooltip in action_help.items():
+            button.setToolTip(tooltip)
         for button in (
             self.face_results_name_button,
             self.face_results_name_clusters_button,
@@ -1638,18 +1671,62 @@ class SearchPane(QWidget):
         self._mode_required_buttons.append(self.face_results_name_clusters_button)
         face_results_actions.addWidget(self.face_results_name_button)
         face_results_actions.addWidget(self.face_results_name_clusters_button)
-        face_results_actions.addWidget(self.face_results_queue_suggestion_button)
-        face_results_actions.addWidget(self.face_results_reject_suggestion_button)
-        face_results_actions.addWidget(self.face_results_keep_unknown_button)
-        face_results_actions.addWidget(self.face_results_jump_button)
         face_results_actions.addWidget(self.face_results_show_group_photos_button)
-        face_results_actions.addWidget(self.face_results_edit_button)
-        face_results_actions.addWidget(self.face_results_split_button)
-        face_results_actions.addWidget(self.face_results_merge_button)
-        face_results_actions.addWidget(self.face_results_recluster_button)
-        face_results_actions.addWidget(self.face_results_compare_again_button)
-        face_results_actions.addWidget(self.face_results_review_pending_button)
-        face_results_actions.addWidget(self.face_results_export_button)
+        self.face_results_actions_menu_button = QToolButton(self.face_results_panel)
+        self.face_results_actions_menu_button.setText("Actions")
+        self.face_results_actions_menu_button.setProperty("kind", "secondary")
+        self.face_results_actions_menu_button.setToolTip(
+            "Less-frequent review, inspection, and export actions for the current selection."
+        )
+        self.face_results_actions_menu = QMenu(self.face_results_actions_menu_button)
+        self.face_results_actions_menu_button.setMenu(self.face_results_actions_menu)
+        self.face_results_actions_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.face_results_advanced_actions_menu_button = QToolButton(self.face_results_panel)
+        self.face_results_advanced_actions_menu_button.setText("Advanced Actions")
+        self.face_results_advanced_actions_menu_button.setProperty("kind", "secondary")
+        self.face_results_advanced_actions_menu_button.setToolTip(
+            "Technical cluster editing and rerun actions. Available in Advanced mode."
+        )
+        self.face_results_advanced_actions_menu = QMenu(self.face_results_advanced_actions_menu_button)
+        self.face_results_advanced_actions_menu_button.setMenu(self.face_results_advanced_actions_menu)
+        self.face_results_advanced_actions_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        def add_menu_action(menu: QMenu, button: QPushButton):
+            action = menu.addAction(button.text())
+            action.setToolTip(button.toolTip())
+            action.setStatusTip(button.toolTip())
+            action.triggered.connect(button.click)
+            button._linked_menu_action = action
+            return action
+
+        for button in (
+            self.face_results_queue_suggestion_button,
+            self.face_results_reject_suggestion_button,
+            self.face_results_keep_unknown_button,
+            self.face_results_jump_button,
+            self.face_results_edit_button,
+            self.face_results_review_pending_button,
+        ):
+            add_menu_action(self.face_results_actions_menu, button)
+        self.face_results_actions_menu.addSeparator()
+        add_menu_action(self.face_results_actions_menu, self.face_results_export_button)
+        for button in (
+            self.face_results_split_button,
+            self.face_results_merge_button,
+            self.face_results_recluster_button,
+            self.face_results_compare_again_button,
+        ):
+            add_menu_action(self.face_results_advanced_actions_menu, button)
+        face_results_actions.addWidget(self.face_results_actions_menu_button)
+        face_results_actions.addWidget(self.face_results_advanced_actions_menu_button)
+        face_results_actions.addWidget(
+            HelpIconButton(
+                "Select one or more raw groups to name them. Select face tiles to name only those faces. "
+                "Primary actions stay visible; Actions contains review and inspection tools, while Advanced Actions contains cluster editing.",
+                self.face_results_panel,
+                help_key="face_groups_actions",
+            )
+        )
         face_results_layout.addLayout(face_results_actions)
         self.face_result_view_tabs = QTabBar(self.face_results_panel)
         self.face_result_view_tabs.setObjectName("faceResultViewTabs")
@@ -2600,7 +2677,11 @@ class SearchPane(QWidget):
         if action is None:
             return
         mutation_blocked = self._read_only_mode and bool(action.property("mutationAction"))
-        action.setEnabled(bool(enabled) and not mutation_blocked)
+        final_enabled = bool(enabled) and not mutation_blocked
+        action.setEnabled(final_enabled)
+        linked_menu_action = getattr(action, "_linked_menu_action", None)
+        if linked_menu_action is not None:
+            linked_menu_action.setEnabled(final_enabled)
 
     def _ensure_writable_face_action(self, action: str) -> bool:
         if not self._read_only_mode:
@@ -5878,6 +5959,7 @@ class SearchPane(QWidget):
             self._maybe_refresh_global_face_album(reason="face cluster named")
             self._refresh_face_identities(force_reload=True)
             self._apply_face_result_filters()
+            self.face_labels_changed.emit()
 
         self._start_job("Naming cluster", _run, _done)
 
@@ -5925,6 +6007,24 @@ class SearchPane(QWidget):
             bool(self._face_cluster_compare_last_refs) and self._face_result_active_group_kind == "raw",
         )
         self._set_guarded_action_enabled(self.face_results_review_pending_button, True)
+        self._set_guarded_action_enabled(self.face_results_export_button, bool(self._face_result_source_groups))
+        standard_actions = (
+            self.face_results_queue_suggestion_button,
+            self.face_results_reject_suggestion_button,
+            self.face_results_keep_unknown_button,
+            self.face_results_jump_button,
+            self.face_results_edit_button,
+            self.face_results_review_pending_button,
+            self.face_results_export_button,
+        )
+        advanced_actions = (
+            self.face_results_split_button,
+            self.face_results_merge_button,
+            self.face_results_recluster_button,
+            self.face_results_compare_again_button,
+        )
+        self.face_results_actions_menu_button.setEnabled(any(button.isEnabled() for button in standard_actions))
+        self.face_results_advanced_actions_menu_button.setEnabled(any(button.isEnabled() for button in advanced_actions))
 
     def _clear_face_cluster_result_details(self) -> None:
         if hasattr(self, "face_results_cluster_summary"):
@@ -6880,6 +6980,7 @@ class SearchPane(QWidget):
         self.refresh_face_library(refresh_people=True, reason="identities merged from identities tab")
         self._maybe_refresh_global_face_album(reason="identities merged from identities tab")
         self._refresh_face_identities(force_reload=True)
+        self.face_labels_changed.emit()
         self._show_face_identities_tab()
 
     def _clear_selected_identity_labels(self) -> None:
@@ -6911,6 +7012,7 @@ class SearchPane(QWidget):
         self.refresh_face_library(refresh_people=True, reason="identity labels cleared from identities tab")
         self._maybe_refresh_global_face_album(reason="identity labels cleared from identities tab")
         self._refresh_face_identities(force_reload=True)
+        self.face_labels_changed.emit()
         self._show_face_identities_tab()
 
     def _current_face_identity_name(self) -> str:
@@ -7023,10 +7125,11 @@ class SearchPane(QWidget):
         def _run(progress, cancel_check):
             progress(-1, "Saving selected face label...")
             _ = cancel_check
-            return self._active_face_service().label_indexed_faces(
+            return self._active_face_service().label_indexed_faces_immediately(
                 person_name,
                 refs,
                 similarity_threshold=threshold,
+                source="manual_selected_faces",
             )
 
         def _done(person) -> None:
@@ -7046,13 +7149,14 @@ class SearchPane(QWidget):
                 cover_face_ref=cover_ref,
             )
             self.status_label.setText(
-                f"Queued review for '{person.person_name}' on {len(refs)} face(s) from {source_label}."
+                f"Saved '{person.person_name}' on {len(refs)} face(s) from {source_label}."
             )
             self._refresh_pending_face_labels()
             self.refresh_face_library(reason="face refs named")
             self._maybe_refresh_global_face_album(reason="face refs named")
             self._refresh_face_identities(force_reload=True)
             self._apply_face_result_filters()
+            self.face_labels_changed.emit()
 
         self._start_job("Saving selected face label", _run, _done)
 
@@ -8945,9 +9049,17 @@ class SearchPane(QWidget):
         self._cancel_face_album_refresh_job(replaced=True)
         self._log_face_event("album_refresh_requested", reason=pending_reason, request_id=request_id)
         service = self._global_face_service()
+        recovery_database_key = str(getattr(service, "db_path", "") or id(service))
+        recover_manual_labels = recovery_database_key not in self._legacy_manual_label_recovery_db_paths
 
         def _run(progress, cancel_check):
             progress(-1, "Loading global detected-face album...")
+            recovery = None
+            recovery_fn = getattr(service, "recover_legacy_manual_face_labels", None)
+            if recover_manual_labels and callable(recovery_fn):
+                recovery = recovery_fn()
+            if cancel_check():
+                raise Cancelled()
             group_page_loader = getattr(service, "load_face_album_group_page", None)
             member_page_loader = getattr(service, "load_face_album_member_page", None)
             if callable(group_page_loader) and callable(member_page_loader):
@@ -8978,6 +9090,7 @@ class SearchPane(QWidget):
                     "members": list(member_page.items if member_page is not None else ()),
                     "group_page": group_page,
                     "member_page": member_page,
+                    "manual_label_recovery": recovery,
                 }
             snapshot_loader = getattr(service, "load_face_album_snapshot", None)
             if callable(snapshot_loader):
@@ -9005,6 +9118,7 @@ class SearchPane(QWidget):
                 "include_tiny_faces": bool(include_tiny_faces),
                 "groups": groups,
                 "members": members,
+                "manual_label_recovery": recovery,
             }
 
         job = AsyncJob(_run)
@@ -9055,6 +9169,11 @@ class SearchPane(QWidget):
                 _finish_job("cancelled")
                 return
             self._apply_face_album_snapshot(result)
+            if recover_manual_labels:
+                self._legacy_manual_label_recovery_db_paths.add(recovery_database_key)
+            recovery = result.get("manual_label_recovery")
+            if int(getattr(recovery, "promoted_count", 0) or 0):
+                self.face_labels_changed.emit()
             _finish_job("finished")
 
         job.completed.connect(_completed)
@@ -10072,6 +10191,9 @@ class SearchPane(QWidget):
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.setVisible(bool(advanced))
+        advanced_actions_menu = getattr(self, "face_results_advanced_actions_menu_button", None)
+        if advanced_actions_menu is not None:
+            advanced_actions_menu.setVisible(bool(advanced))
         pipeline_summary = getattr(self, "face_pipeline_summary_group", None)
         if pipeline_summary is not None:
             pipeline_summary.setVisible(True)
@@ -10089,11 +10211,6 @@ class SearchPane(QWidget):
             "face_results_folder_filter",
             "face_results_date_from",
             "face_results_date_to",
-            "face_results_split_button",
-            "face_results_merge_button",
-            "face_results_recluster_button",
-            "face_results_compare_again_button",
-            "face_results_export_button",
             "face_results_cluster_explanation",
             "face_results_cluster_suggestion",
             "face_results_membership_table",
@@ -15713,6 +15830,8 @@ class SearchPane(QWidget):
             self.refresh_face_library(reason="pending face labels accepted")
             self._maybe_refresh_global_face_album(reason="pending face labels accepted")
             self._refresh_pending_face_labels()
+            if accepted:
+                self.face_labels_changed.emit()
 
         self._start_job("Accepting face-label proposals", _run, _done)
 
@@ -15798,6 +15917,8 @@ class SearchPane(QWidget):
             self.refresh_face_library(reason="pending face labels undone")
             self._maybe_refresh_global_face_album(reason="pending face labels undone")
             self._refresh_pending_face_labels()
+            if count:
+                self.face_labels_changed.emit()
 
         self._start_job("Undoing face-label acceptance", _run, _done)
 
@@ -15828,6 +15949,7 @@ class SearchPane(QWidget):
             self.refresh_face_library(reason="identities merged")
             self._maybe_refresh_global_face_album(reason="identities merged")
             self._list_face_labels()
+            self.face_labels_changed.emit()
 
         self._start_job("Merging labels", _run, _done)
 
@@ -15854,6 +15976,7 @@ class SearchPane(QWidget):
             self.refresh_face_library(reason="identity labels cleared")
             self._maybe_refresh_global_face_album(reason="identity labels cleared")
             self._list_face_labels()
+            self.face_labels_changed.emit()
 
         self._start_job("Clearing person", _run, _done)
 

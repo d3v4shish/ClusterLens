@@ -1486,6 +1486,24 @@ class FaceLabelAssignment:
 
 
 @dataclass(frozen=True)
+class NamedPhotoSummary:
+    """Durable saved-name counts used by the global Names workspace."""
+
+    person_name: str
+    face_count: int
+    photo_count: int
+
+
+@dataclass(frozen=True)
+class ManualLabelRecoveryResult:
+    """Outcome of promoting legacy manual labels that were incorrectly queued."""
+
+    promoted_count: int
+    duplicate_count: int
+    conflict_count: int
+
+
+@dataclass(frozen=True)
 class FaceLabelAcceptanceBatch:
     accepted: tuple[FaceLabelAssignment, ...]
     previous_labels: tuple[FaceLabelAssignment, ...]
@@ -8528,6 +8546,155 @@ class FaceIndexService:
                 )
             )
         return assignments
+
+    def list_named_photo_summaries(
+        self,
+        *,
+        include_tiny_faces: bool = True,
+        include_hidden: bool = False,
+    ) -> list[NamedPhotoSummary]:
+        """Return durable names with visible face and distinct-photo counts.
+
+        This intentionally reads ``face_labels`` rather than prototypes or the
+        review queue.  A person can therefore remain visible in Names even if
+        an older database contains labels without a matching profile row.
+        """
+
+        query = """
+            SELECT l.person_name, COUNT(1), COUNT(DISTINCT l.image_path)
+            FROM face_labels l
+            JOIN face_index i ON i.image_path=l.image_path AND i.face_index=l.face_index
+            LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+        """
+        conditions: list[str] = []
+        if not include_tiny_faces:
+            conditions.append("COALESCE(i.is_tiny, 0)=0")
+        if not include_hidden:
+            conditions.append("COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0")
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " GROUP BY l.person_name ORDER BY lower(l.person_name), l.person_name"
+        with self._connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return [
+            NamedPhotoSummary(
+                person_name=str(row[0] or ""),
+                face_count=int(row[1] or 0),
+                photo_count=int(row[2] or 0),
+            )
+            for row in rows
+            if str(row[0] or "").strip()
+        ]
+
+    def list_named_photo_paths(
+        self,
+        person_name: str,
+        *,
+        include_tiny_faces: bool = True,
+        include_hidden: bool = False,
+    ) -> list[str]:
+        """Return unique global photo paths with a durable label for ``person_name``."""
+
+        name = str(person_name or "").strip()
+        if not name:
+            return []
+        query = """
+            SELECT DISTINCT l.image_path
+            FROM face_labels l
+            JOIN face_index i ON i.image_path=l.image_path AND i.face_index=l.face_index
+            LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+            WHERE l.person_name=?
+        """
+        args: list[object] = [name]
+        if not include_tiny_faces:
+            query += " AND COALESCE(i.is_tiny, 0)=0"
+        if not include_hidden:
+            query += " AND COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0"
+        query += " ORDER BY l.image_path"
+        with self._connect() as connection:
+            rows = connection.execute(query, args).fetchall()
+        return list(dict.fromkeys(str(row[0] or "") for row in rows if str(row[0] or "").strip()))
+
+    def recover_legacy_manual_face_labels(self) -> ManualLabelRecoveryResult:
+        """Promote old explicit manual labels that were accidentally queued.
+
+        Earlier UI versions routed ``manual_selected_faces`` through the
+        review queue.  Explicit user input should be durable, but recovery
+        must never overwrite a label saved later by the user.  Conflicting
+        proposals are deliberately left pending for the existing review UI.
+        """
+
+        promoted: list[tuple[str, int, str, float]] = []
+        resolved_ids: list[int] = []
+        duplicate_count = 0
+        conflict_count = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_id, image_path, face_index, person_name, confidence
+                FROM pending_face_labels
+                WHERE source='manual_selected_faces'
+                ORDER BY proposal_id
+                """
+            ).fetchall()
+            for row in rows:
+                proposal_id = int(row[0] or 0)
+                image_path = str(row[1] or "")
+                face_index = int(row[2] or 0)
+                person_name = str(row[3] or "").strip()
+                confidence = float(row[4] or 1.0)
+                if not proposal_id or not image_path or not person_name:
+                    continue
+                existing = connection.execute(
+                    "SELECT person_name FROM face_labels WHERE image_path=? AND face_index=?",
+                    (image_path, face_index),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0] or "").strip() == person_name:
+                        resolved_ids.append(proposal_id)
+                        duplicate_count += 1
+                    else:
+                        conflict_count += 1
+                    continue
+                face_exists = connection.execute(
+                    "SELECT 1 FROM face_index WHERE image_path=? AND face_index=?",
+                    (image_path, face_index),
+                ).fetchone()
+                if face_exists is None:
+                    continue
+                promoted.append((image_path, face_index, person_name, confidence))
+                resolved_ids.append(proposal_id)
+            if promoted:
+                connection.executemany(
+                    """
+                    INSERT INTO face_labels(image_path, face_index, person_name, confidence)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    promoted,
+                )
+            if resolved_ids:
+                connection.executemany(
+                    "DELETE FROM pending_face_labels WHERE proposal_id=?",
+                    [(proposal_id,) for proposal_id in resolved_ids],
+                )
+            if promoted or duplicate_count or conflict_count:
+                self._record_action_audit(
+                    "recover_legacy_manual_face_labels",
+                    details={
+                        "promoted_count": len(promoted),
+                        "duplicate_count": duplicate_count,
+                        "conflict_count": conflict_count,
+                    },
+                    reversible=False,
+                    connection=connection,
+                )
+        if promoted or duplicate_count:
+            self._invalidate_identity_caches()
+        return ManualLabelRecoveryResult(
+            promoted_count=len(promoted),
+            duplicate_count=duplicate_count,
+            conflict_count=conflict_count,
+        )
 
     def merge_person_labels(self, source_name: str, target_name: str) -> None:
         self.merge_person_identities(source_name, target_name)

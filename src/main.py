@@ -34,6 +34,7 @@ from ui.job_manager import JobManager
 from ui.job_widgets import JobIndicatorWidget
 from ui.recent_folders import RecentFolderHistory
 from ui.mode_panes import ClusteringOptionsPane, SourcePane
+from ui.names_pane import NamesPane
 from ui.runtime_widgets import RuntimeBadge
 from ui.theme import apply_ultra_dark
 
@@ -329,8 +330,12 @@ class ClusterGalleryApp(QMainWindow):
         self.faces_pane.set_active_face_mode(self._preferred_face_mode(), refresh=False)
         self._refresh_recent_folder_menus()
 
+        self.names_pane = NamesPane(lambda: self.face_service_global, self.workspace_stack)
+        self.faces_pane.face_labels_changed.connect(self.names_pane.refresh_names)
+
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_pane)
+        self.workspace_stack.addWidget(self.names_pane)
 
         self.source_pane.setMinimumWidth(220)
         self.source_pane.setMaximumWidth(280)
@@ -341,6 +346,7 @@ class ClusterGalleryApp(QMainWindow):
         self.cluster_right_splitter.setMaximumWidth(680)
         self.workspace_stack.setMinimumWidth(1040)
         self.faces_pane.setMinimumWidth(1040)
+        self.names_pane.setMinimumWidth(1040)
 
         self.main_splitter.addWidget(self.source_pane)
         self.main_splitter.addWidget(self.workspace_stack)
@@ -400,10 +406,17 @@ class ClusterGalleryApp(QMainWindow):
         self.feature_label = QLabel("Feature: Clustering")
         self.clustering_workspace_button = QPushButton("Clustering")
         self.clustering_workspace_button.setCheckable(True)
+        self.clustering_workspace_button.setProperty("nav", True)
         self.clustering_workspace_button.clicked.connect(lambda: self.set_active_workspace("clustering"))
         self.faces_workspace_button = QPushButton("Faces")
         self.faces_workspace_button.setCheckable(True)
+        self.faces_workspace_button.setProperty("nav", True)
         self.faces_workspace_button.clicked.connect(lambda: self.set_active_workspace("faces"))
+        self.names_workspace_button = QPushButton("Names")
+        self.names_workspace_button.setCheckable(True)
+        self.names_workspace_button.setProperty("nav", True)
+        self.names_workspace_button.setToolTip("Browse durable saved names and the photos containing their labeled faces.")
+        self.names_workspace_button.clicked.connect(lambda: self.set_active_workspace("names"))
         self.current_folder_label = QLabel("No folder selected")
         self.basic_mode_button = QPushButton("Basic")
         self.basic_mode_button.setCheckable(True)
@@ -440,6 +453,7 @@ class ClusterGalleryApp(QMainWindow):
         row.addWidget(self.feature_label)
         row.addWidget(self.clustering_workspace_button)
         row.addWidget(self.faces_workspace_button)
+        row.addWidget(self.names_workspace_button)
         row.addWidget(self.current_folder_label, stretch=1)
         row.addWidget(self.basic_mode_button)
         row.addWidget(self.advanced_mode_button)
@@ -624,6 +638,8 @@ class ClusterGalleryApp(QMainWindow):
         text = str(value or "").strip().lower()
         if text in {"faces", "face_search", "face search"}:
             return "faces"
+        if text in {"names", "people", "saved names"}:
+            return "names"
         return "clustering"
 
     def _load_json(self, key: str) -> dict[str, object]:
@@ -652,6 +668,13 @@ class ClusterGalleryApp(QMainWindow):
             pixmap_cache_size=self.performance_profile.pixmap_cache_size,
             qimage_cache_size=self.performance_profile.qimage_cache_size,
         )
+        self.names_pane.gallery.apply_view_preferences(
+            thumbnail_size=thumbnail_size,
+            worker_count=self.performance_profile.thumbnail_workers,
+            prefetch_rows=self.performance_profile.thumbnail_prefetch_rows,
+            pixmap_cache_size=self.performance_profile.pixmap_cache_size,
+            qimage_cache_size=self.performance_profile.qimage_cache_size,
+        )
         self.faces_pane.apply_face_tile_preferences(
             worker_count=self.performance_profile.thumbnail_workers,
             cache_size=self.performance_profile.pixmap_cache_size,
@@ -674,6 +697,7 @@ class ClusterGalleryApp(QMainWindow):
         mapping = {
             "clustering": self.clustering_workspace_button,
             "faces": self.faces_workspace_button,
+            "names": self.names_workspace_button,
         }
         for key, button in mapping.items():
             button.blockSignals(True)
@@ -681,6 +705,8 @@ class ClusterGalleryApp(QMainWindow):
             button.blockSignals(False)
 
     def _source_pane_visible(self) -> bool:
+        if self._active_workspace == "names":
+            return False
         if self._active_workspace == "faces":
             return bool(self._advanced_pane_visibility["source"])
         if self._clustering_mode == "basic":
@@ -689,25 +715,32 @@ class ClusterGalleryApp(QMainWindow):
 
     def _refresh_workspace_ui(self) -> None:
         is_clustering = self._active_workspace == "clustering"
-        self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else self.faces_pane)
-        if not is_clustering:
+        is_faces = self._active_workspace == "faces"
+        is_names = self._active_workspace == "names"
+        workspace = self.clustering_workspace if is_clustering else (self.faces_pane if is_faces else self.names_pane)
+        self.workspace_stack.setCurrentWidget(workspace)
+        if is_faces:
             self.faces_pane.ensure_faces_workspace_loaded()
+        if is_names:
+            self.names_pane.refresh_names()
         self.faces_pane.set_ui_mode(self._faces_mode)
         self.source_pane.set_basic_mode(
             is_clustering and self._clustering_mode == "basic",
             running=bool(self.worker and self.worker.isRunning()),
         )
-        self.basic_mode_button.setVisible(True)
-        self.advanced_mode_button.setVisible(True)
-        self.source_toggle.setVisible((not is_clustering) or self._clustering_mode == "advanced")
+        self.basic_mode_button.setVisible(not is_names)
+        self.advanced_mode_button.setVisible(not is_names)
+        self.source_toggle.setVisible(not is_names and ((not is_clustering) or self._clustering_mode == "advanced"))
         self.controls_toggle.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.details_toggle.setVisible(is_clustering and self._clustering_mode == "advanced")
         if is_clustering:
             mode_label = "Basic" if self._clustering_mode == "basic" else "Advanced"
             self.feature_label.setText(f"Feature: Clustering | {mode_label}")
-        else:
+        elif is_faces:
             mode_label = "Basic" if self._faces_mode == "basic" else "Advanced"
             self.feature_label.setText(f"Feature: Faces | {mode_label}")
+        else:
+            self.feature_label.setText("Feature: Names")
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -900,6 +933,10 @@ class ClusterGalleryApp(QMainWindow):
             ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=timeout_ms) and ready_to_close
         except Exception:
             ready_to_close = False
+        try:
+            ready_to_close = self.names_pane.shutdown_jobs(timeout_ms=timeout_ms) and ready_to_close
+        except Exception:
+            ready_to_close = False
 
         return ready_to_close
 
@@ -962,6 +999,8 @@ class ClusterGalleryApp(QMainWindow):
             refresh=False,
         )
         self.faces_pane.set_active_face_mode(self.faces_pane.current_face_mode(), refresh=True)
+        if self._active_workspace == "names":
+            self.names_pane.refresh_names()
         self.update_runtime_status()
 
     def _update_metrics_overlay(self) -> None:
