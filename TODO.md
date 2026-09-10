@@ -1,5 +1,11 @@
 # Current implementation plan
 
+## Cluster comparison typography
+
+- [x] Replace the default one-line cluster-table renderer with compact two-line cluster rows and readable comparison headers.
+  Contract: cluster IDs, selection, highlighting, tooltips, hover previews, and the underlying comparison keys remain unchanged; each visible row shows a clear cluster/outlier label plus photo and tag summary without relying on Qt's clipped default text.
+  Validation: `QT_QPA_PLATFORM=offscreen uv run --with pytest python -m pytest tests/test_ui_smoke.py -k 'cluster_pane_uses_readable_two_line_cluster_cells or cluster_pane_renders_cluster_tag_summary or cluster_pane_exposes_selected_cluster_target or cluster_pane_hover_popup_opens_on_hover_and_hides_on_empty_target'` passed (4 tests); an offscreen rendered table was visually checked with the application theme.
+
 ## Sidebar typography and Names hover preview
 
 - [x] Render sidebar name, identity, and unlabeled-group rows as a dense title plus muted metadata line rather than delimiter-heavy text.

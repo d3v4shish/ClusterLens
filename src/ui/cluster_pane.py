@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QPoint, QRect, QSize, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
     QTableView,
     QTableWidget,
     QTableWidgetItem,
@@ -299,6 +301,39 @@ def _comparison_model_key(comparison_key: str) -> str:
 def _display_model_name(model_name: str) -> str:
     normalized = str(model_name or "").strip().lower()
     return MODEL_DISPLAY_NAMES.get(normalized, normalized.upper() if normalized else "model")
+
+
+def _display_comparison_name(comparison_key: str) -> str:
+    """Turn the stable internal comparison key into a compact table heading."""
+
+    parts = [part.strip() for part in str(comparison_key or "").split("::") if part.strip()]
+    if not parts:
+        return "Clustering"
+    labels = [_display_model_name(parts[0])]
+    if len(parts) == 2:
+        labels.append(_display_cluster_backend_name(parts[1]))
+    elif len(parts) >= 3:
+        labels.append(_display_similarity_mode(parts[1]))
+        labels.append(_display_cluster_backend_name(parts[2]))
+        labels.extend(parts[3:])
+    return " · ".join(labels)
+
+
+def _display_similarity_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return {"semantic": "Semantic", "cosine": "Cosine"}.get(normalized, normalized.replace("_", " ").title())
+
+
+def _display_cluster_backend_name(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    known = {
+        "cosine-kmeans": "Cosine K-Means",
+        "hdbscan": "HDBSCAN",
+        "graph": "Graph",
+        "faiss": "FAISS",
+        "sklearn": "scikit-learn",
+    }
+    return known.get(normalized, normalized.replace("_", " ").replace("-", " ").title())
 
 
 def _reliability_level(explanation: ClusterExplanation | None) -> str:
@@ -616,6 +651,10 @@ class ClusterShapeWidget(QFrame):
 
 
 class ClusterGridModel(QAbstractTableModel):
+    ClusterKeyRole = Qt.ItemDataRole.UserRole
+    TitleRole = Qt.ItemDataRole.UserRole + 1
+    SubtitleRole = Qt.ItemDataRole.UserRole + 2
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._columns: list[str] = []
@@ -636,6 +675,17 @@ class ClusterGridModel(QAbstractTableModel):
     def summary_lines_for_cell(self, cell: ClusterCell) -> list[str]:
         return _cluster_summary_lines(cell, self.summary_for_cell(cell))
 
+    def title_for_cell(self, cell: ClusterCell) -> str:
+        return "Unclustered photos" if int(cell.cluster_id) == -1 else f"Cluster {int(cell.cluster_id)}"
+
+    def subtitle_for_cell(self, cell: ClusterCell) -> str:
+        summary = self.summary_for_cell(cell)
+        photo_text = f"{len(cell.images)} photo{'s' if len(cell.images) != 1 else ''}"
+        if summary is None or not summary.top_tags:
+            return photo_text
+        tag_text = ", ".join(str(tag) for tag, _count in summary.top_tags[:2])
+        return f"{photo_text} · {tag_text}"
+
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or index.row() >= len(self._rows) or index.column() >= len(self._columns):
             return None
@@ -644,27 +694,35 @@ class ClusterGridModel(QAbstractTableModel):
             return None
         key = (cell.comparison_key, int(cell.cluster_id))
         if role == Qt.ItemDataRole.DisplayRole:
-            return f"Cluster {cell.cluster_id}\n{len(cell.images)} images"
-        if role == Qt.ItemDataRole.UserRole:
+            return f"{self.title_for_cell(cell)}\n{self.subtitle_for_cell(cell)}"
+        if role == self.ClusterKeyRole:
             return key
+        if role == self.TitleRole:
+            return self.title_for_cell(cell)
+        if role == self.SubtitleRole:
+            return self.subtitle_for_cell(cell)
         if role == Qt.ItemDataRole.ToolTipRole:
             return "\n".join(self.summary_lines_for_cell(cell))
+        if role == Qt.ItemDataRole.BackgroundRole and self._selected == key:
+            return QColor(COLORS["surface_selected"])
         if role == Qt.ItemDataRole.BackgroundRole and key in self._highlighted:
-            return QColor("#FFF3B0")
+            return QColor("#33270C")
         if role == Qt.ItemDataRole.FontRole and key in self._highlighted:
             font = QFont()
             font.setBold(True)
             return font
-        if role == Qt.ItemDataRole.BackgroundRole and self._selected == key:
-            return QColor("#D9ECFF")
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
         if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self._columns):
-            return self._columns[section]
-        return str(section + 1)
+            key = self._columns[section]
+            if role == Qt.ItemDataRole.DisplayRole:
+                return _display_comparison_name(key)
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return f"{_display_comparison_name(key)}\nComparison key: {key}"
+        if role == Qt.ItemDataRole.DisplayRole:
+            return str(section + 1)
+        return None
 
     def update_data(
         self,
@@ -708,6 +766,69 @@ class ClusterGridModel(QAbstractTableModel):
         if not index.isValid() or index.row() >= len(self._rows) or index.column() >= len(self._columns):
             return None
         return self._rows[index.row()][index.column()]
+
+
+class ClusterCellDelegate(QStyledItemDelegate):
+    """Dense, legible renderer for virtualized cluster-comparison table cells."""
+
+    _row_height = 54
+    _minimum_column_width = 196
+
+    def sizeHint(self, option, index):  # type: ignore[override]
+        base = super().sizeHint(option, index)
+        return QSize(max(self._minimum_column_width, base.width()), max(self._row_height, base.height()))
+
+    def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
+        title = str(index.data(ClusterGridModel.TitleRole) or "").strip()
+        subtitle = str(index.data(ClusterGridModel.SubtitleRole) or "").strip()
+        if not title:
+            return
+
+        is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        is_hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        model_background = index.data(Qt.ItemDataRole.BackgroundRole)
+        if is_selected:
+            background = QColor(COLORS["surface_selected"])
+            border = QColor("#3C6FB6")
+        elif isinstance(model_background, QColor):
+            background = model_background
+            border = QColor(COLORS["border_strong"])
+        elif is_hovered:
+            background = QColor("#16202C")
+            border = QColor(COLORS["border"])
+        else:
+            background = QColor(COLORS["surface"])
+            border = QColor("#202933")
+
+        rect = option.rect
+        painter.save()
+        painter.fillRect(rect, background)
+        painter.setPen(QPen(border, 1))
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        content = rect.adjusted(12, 6, -12, -6)
+        title_font = QFont(option.font)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        title_metrics = QFontMetrics(title_font)
+        painter.setFont(title_font)
+        painter.setPen(QColor(COLORS["text"]))
+        painter.drawText(
+            QRect(content.left(), content.top(), content.width(), title_metrics.height()),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            title_metrics.elidedText(title, Qt.TextElideMode.ElideRight, max(1, content.width())),
+        )
+        if subtitle:
+            subtitle_font = QFont(option.font)
+            subtitle_font.setPointSize(max(10, subtitle_font.pointSize() - 1))
+            subtitle_metrics = QFontMetrics(subtitle_font)
+            painter.setFont(subtitle_font)
+            painter.setPen(QColor(COLORS["text_muted"]))
+            painter.drawText(
+                QRect(content.left(), content.bottom() - subtitle_metrics.height() + 1, content.width(), subtitle_metrics.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                subtitle_metrics.elidedText(subtitle, Qt.TextElideMode.ElideRight, max(1, content.width())),
+            )
+        painter.restore()
 
 
 class ClusterPane(QWidget):
@@ -781,9 +902,19 @@ class ClusterPane(QWidget):
         layout.addLayout(header_row)
 
         self.cluster_table = QTableView()
+        self.cluster_table.setProperty("clusterComparisonTable", True)
         self.cluster_table.setModel(self._grid_model)
+        self.cluster_table.setItemDelegate(ClusterCellDelegate(self.cluster_table))
         self.cluster_table.horizontalHeader().setStretchLastSection(True)
+        self.cluster_table.horizontalHeader().setMinimumSectionSize(ClusterCellDelegate._minimum_column_width)
+        self.cluster_table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.cluster_table.horizontalHeader().setProperty("clusterComparisonHeader", True)
         self.cluster_table.verticalHeader().hide()
+        self.cluster_table.verticalHeader().setDefaultSectionSize(ClusterCellDelegate._row_height)
+        self.cluster_table.setShowGrid(False)
+        self.cluster_table.setWordWrap(False)
         self.cluster_table.clicked.connect(self.on_cluster_selected)
         self.cluster_table.setToolTip(CLUSTER_PANE_HELP["cluster_comparisons"])
         self.cluster_table.setMinimumHeight(360)

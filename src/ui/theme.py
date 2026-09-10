@@ -346,6 +346,23 @@ QHeaderView::section {
   border: 1px solid #2A2A2A;
 }
 
+QTableView[clusterComparisonTable="true"] {
+  background: #11151A;
+  border: 1px solid #303844;
+  border-radius: 8px;
+  padding: 0px;
+  selection-background-color: #102A46;
+}
+QTableView[clusterComparisonTable="true"]::item { padding: 0px; }
+QHeaderView[clusterComparisonHeader="true"]::section {
+  background: #171C22;
+  color: #DCE8F7;
+  border: 0px;
+  border-bottom: 1px solid #465366;
+  padding: 8px 12px;
+  font-weight: 650;
+}
+
 QScrollBar:vertical, QScrollBar:horizontal {
   background: #0B0B0B;
   border: 1px solid #1A1A1A;

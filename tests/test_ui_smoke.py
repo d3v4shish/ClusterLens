@@ -34,7 +34,7 @@ from infra.runtime import ExecutionPolicy, RuntimeCapabilities, RuntimeCapabilit
 import main as main_module
 from main import ClusterGalleryApp
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
-from ui.cluster_pane import CLUSTER_BASIS_EMPTY_TEXT, ClusterPane
+from ui.cluster_pane import CLUSTER_BASIS_EMPTY_TEXT, ClusterCellDelegate, ClusterPane, ClusterGridModel
 from ui.common import HelpIconButton
 from ui.gallery_model import GalleryImageModel, GalleryItemDelegate, MAX_FACE_BOXES_PER_TILE
 from ui.gallery_pane import (
@@ -1540,6 +1540,51 @@ class UiSmokeTests(unittest.TestCase):
         tooltip = pane._grid_model.data(pane._grid_model.index(0, 0), Qt.ItemDataRole.ToolTipRole)
         self.assertIn("selfie (2)", pane.summary_label.text())
         self.assertIn("Tagged images: 2/2", tooltip)
+
+    def test_cluster_pane_uses_readable_two_line_cluster_cells(self):
+        pane = ClusterPane()
+        pane.update_clusters(
+            {
+                "siglip::semantic::hdbscan": {
+                    -1: ["outlier.jpg"],
+                    0: ["a.jpg", "b.jpg", "c.jpg"],
+                }
+            },
+            cluster_summaries={
+                "siglip::semantic::hdbscan": {
+                    0: ClusterTagSummary(
+                        tag_counts={"travel": 3, "family": 2},
+                        top_tags=(("travel", 3), ("family", 2)),
+                        tagged_image_count=3,
+                        unique_tag_count=2,
+                    )
+                }
+            },
+        )
+
+        outlier_index = pane._grid_model.index(0, 0)
+        cluster_index = pane._grid_model.index(1, 0)
+        delegate = pane.cluster_table.itemDelegate()
+
+        self.assertIsInstance(delegate, ClusterCellDelegate)
+        self.assertEqual("Unclustered photos", outlier_index.data(ClusterGridModel.TitleRole))
+        self.assertEqual("1 photo", outlier_index.data(ClusterGridModel.SubtitleRole))
+        self.assertEqual("Cluster 0", cluster_index.data(ClusterGridModel.TitleRole))
+        self.assertEqual("3 photos · travel, family", cluster_index.data(ClusterGridModel.SubtitleRole))
+        self.assertEqual(
+            "SigLIP · Semantic · HDBSCAN",
+            pane._grid_model.headerData(0, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole),
+        )
+        self.assertIn(
+            "siglip::semantic::hdbscan",
+            pane._grid_model.headerData(0, Qt.Orientation.Horizontal, Qt.ItemDataRole.ToolTipRole),
+        )
+        self.assertGreaterEqual(delegate.sizeHint(QStyleOptionViewItem(), cluster_index).height(), 54)
+        self.assertGreaterEqual(pane.cluster_table.verticalHeader().defaultSectionSize(), 54)
+
+        pane.on_cluster_selected(cluster_index)
+        self.assertEqual(("siglip::semantic::hdbscan", 0), pane.prev_selection)
+        self.assertEqual(("a.jpg", "b.jpg", "c.jpg"), pane.current_selection_target().paths)
 
     def test_cluster_pane_advanced_mode_shows_cluster_basis_for_selected_cluster(self):
         pane = ClusterPane()
