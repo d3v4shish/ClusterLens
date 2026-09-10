@@ -10204,7 +10204,11 @@ class SearchPane(QWidget):
             if library_tabs.currentIndex() == 1:
                 library_tabs.setCurrentIndex(0)
         if hasattr(self, "face_search_quick_group"):
-            self.face_search_quick_group.setVisible(bool(advanced))
+            # Keep the retained walkthrough and saved-search implementation out
+            # of the primary Find task.  The active controls below have their
+            # own tooltips and help affordances, so this long-form panel should
+            # not claim vertical space even in Advanced mode.
+            self.face_search_quick_group.setVisible(False)
         for widget in getattr(self, "face_profile_technical_fields", []):
             widget.setVisible(bool(advanced))
         for widget_name in (
@@ -10281,6 +10285,7 @@ class SearchPane(QWidget):
         if not hasattr(self, "face_search_grid"):
             return
         mode = self._face_search_layout_mode_for_viewport()
+        self._refresh_face_search_action_layout(mode)
         if not force and mode == self._face_search_layout_mode:
             return
         self._clear_layout(self.face_search_grid)
@@ -10288,26 +10293,41 @@ class SearchPane(QWidget):
         self.face_search_grid.setColumnStretch(1, 1 if mode == "wide" else 0)
         for row in range(9):
             self.face_search_grid.setRowStretch(row, 0)
-        self.face_search_grid.addWidget(self.face_search_quick_group, 0, 0, 1, 2)
         if mode == "wide":
-            self.face_search_grid.addWidget(self.face_search_selected_group, 1, 0)
-            self.face_search_grid.addWidget(self.face_find_group, 1, 1)
+            self.face_search_grid.addWidget(self.face_search_selected_group, 0, 0)
+            self.face_search_grid.addWidget(self.face_find_group, 0, 1)
+            self.face_search_grid.addWidget(self.face_find_name_group, 1, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_manage_group, 2, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_save_group, 3, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_pending_group, 4, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_people_query_group, 5, 0, 1, 2)
+            self.face_search_grid.setRowStretch(6, 1)
+        else:
+            self.face_search_grid.addWidget(self.face_search_selected_group, 0, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_find_group, 1, 0, 1, 2)
             self.face_search_grid.addWidget(self.face_find_name_group, 2, 0, 1, 2)
             self.face_search_grid.addWidget(self.face_manage_group, 3, 0, 1, 2)
             self.face_search_grid.addWidget(self.face_save_group, 4, 0, 1, 2)
             self.face_search_grid.addWidget(self.face_pending_group, 5, 0, 1, 2)
             self.face_search_grid.addWidget(self.face_people_query_group, 6, 0, 1, 2)
             self.face_search_grid.setRowStretch(7, 1)
-        else:
-            self.face_search_grid.addWidget(self.face_search_selected_group, 1, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_find_group, 2, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_find_name_group, 3, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_manage_group, 4, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_save_group, 5, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_pending_group, 6, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_people_query_group, 7, 0, 1, 2)
-            self.face_search_grid.setRowStretch(8, 1)
         self._face_search_layout_mode = mode
+
+    def _refresh_face_search_action_layout(self, mode: str) -> None:
+        """Use a button grid only where the active Find pane has room for it."""
+
+        selected_actions = getattr(self, "face_search_selected_actions_grid", None)
+        if selected_actions is None:
+            return
+        self._clear_layout(selected_actions)
+        if mode == "wide":
+            selected_actions.addWidget(self.face_search_selected_card_button, 0, 0)
+            selected_actions.addWidget(self.face_search_name_selected_card_button, 0, 1)
+            selected_actions.setColumnStretch(0, 1)
+            selected_actions.setColumnStretch(1, 1)
+            return
+        selected_actions.addWidget(self.face_search_selected_card_button, 0, 0, 1, 2)
+        selected_actions.addWidget(self.face_search_name_selected_card_button, 1, 0, 1, 2)
 
     def _build_face_album_tab(self) -> None:
         tab_body = QWidget()
@@ -14099,21 +14119,27 @@ class SearchPane(QWidget):
         self._set_face_walkthrough_visible(True)
         self.face_search_quick_group = quick_group
 
-        selected_group, selected_layout = self._group_box("1. Find From Selected Face", tooltip=FACE_HELP["find_photos_selected_face"])
+        selected_group, selected_layout = self._group_box("Selected Face", tooltip=FACE_HELP["find_photos_selected_face"])
         self.face_search_selected_context_label = self._helper_label(
-            "Select one face in Face Library or Detected Faces first.",
+            "No face selected.",
             tooltip=FACE_HELP["find_photos_selected_face"],
         )
-        selected_layout.addWidget(self.face_search_selected_context_label)
-        selected_layout.addWidget(
-            self._helper_label(
-                "Use this when you already picked the exact face tile you want to search or name.",
-                tooltip=FACE_HELP["find_photos_selected_face"],
+        selected_context_row = QHBoxLayout()
+        selected_context_row.setContentsMargins(0, 0, 0, 0)
+        selected_context_row.setSpacing(4)
+        selected_context_row.addWidget(self.face_search_selected_context_label, stretch=1)
+        selected_context_row.addWidget(
+            HelpIconButton(
+                FACE_HELP["find_photos_selected_face"],
+                selected_group,
+                help_key="find_from_selected_face",
             )
         )
-        selected_buttons = QVBoxLayout()
+        selected_layout.addLayout(selected_context_row)
+        selected_buttons = QGridLayout()
         selected_buttons.setContentsMargins(0, 0, 0, 0)
-        selected_buttons.setSpacing(6)
+        selected_buttons.setHorizontalSpacing(6)
+        selected_buttons.setVerticalSpacing(6)
         self.face_search_selected_card_button = QPushButton("Find Similar From Selection")
         self.face_search_selected_card_button.setProperty("kind", "primary")
         self.face_search_name_selected_card_button = QPushButton("Name Selected Faces")
@@ -14122,8 +14148,8 @@ class SearchPane(QWidget):
         self.face_search_name_selected_card_button.clicked.connect(self._save_selected_face_name)
         self._action_buttons.extend([self.face_search_selected_card_button, self.face_search_name_selected_card_button])
         self._mode_required_buttons.extend([self.face_search_selected_card_button, self.face_search_name_selected_card_button])
-        selected_buttons.addWidget(self.face_search_selected_card_button)
-        selected_buttons.addWidget(self.face_search_name_selected_card_button)
+        self.face_search_selected_actions_grid = selected_buttons
+        self._refresh_face_search_action_layout("compact")
         selected_layout.addLayout(selected_buttons)
         self.face_search_selected_options_toggle = self._expander_button("Options", checked=False, tooltip=FACE_HELP["find_photos_selected_face"])
         selected_layout.addWidget(self.face_search_selected_options_toggle)
@@ -14148,24 +14174,18 @@ class SearchPane(QWidget):
         self.face_search_selected_group = selected_group
 
         find_group, find_layout = self._group_box("Find by Face", tooltip=FACE_HELP["find_same_person"])
-        find_layout.addWidget(
-            self._helper_label(
-                "Choose one clear face photo and search the indexed folder for similar people.",
-                tooltip=FACE_HELP["query_face_image"],
-            )
-        )
-        find_fields = QVBoxLayout()
+        find_fields = QGridLayout()
         find_fields.setContentsMargins(0, 0, 0, 0)
-        find_fields.setSpacing(8)
+        find_fields.setHorizontalSpacing(6)
+        find_fields.setVerticalSpacing(8)
         self.face_find_fields_grid = find_fields
-        find_fields.addWidget(self._field_widget("Query face image", self._path_row(self.face_query_path), tooltip=FACE_HELP["query_face_image"]))
-        find_fields.addWidget(self.face_query_detect_button)
-        find_fields.addWidget(self.face_query_faces_summary)
-        find_fields.addWidget(self.face_query_faces_list)
-        find_layout.addLayout(find_fields)
-        find_buttons = QVBoxLayout()
-        find_buttons.setContentsMargins(0, 0, 0, 0)
-        find_buttons.setSpacing(6)
+        find_fields.addWidget(
+            self._field_widget("Query face image", self._path_row(self.face_query_path), tooltip=FACE_HELP["query_face_image"]),
+            0,
+            0,
+            1,
+            2,
+        )
         self.face_index_button = QPushButton("Index Current Folder")
         self.face_index_button.setToolTip(FACE_HELP["index_current_folder"])
         self.face_search_button = QPushButton("Find by Face")
@@ -14174,8 +14194,14 @@ class SearchPane(QWidget):
         self.face_index_button.clicked.connect(self._index_faces)
         self.face_search_button.clicked.connect(self._search_faces)
         self._mode_required_buttons.extend([self.face_index_button, self.face_search_button])
-        find_buttons.addWidget(self.face_search_button)
-        find_layout.addLayout(find_buttons)
+        find_fields.addWidget(self.face_query_detect_button, 1, 0)
+        find_fields.addWidget(self.face_index_button, 1, 1)
+        find_fields.addWidget(self.face_query_faces_summary, 2, 0, 1, 2)
+        find_fields.addWidget(self.face_query_faces_list, 3, 0, 1, 2)
+        find_fields.addWidget(self.face_search_button, 4, 0, 1, 2)
+        find_fields.setColumnStretch(0, 1)
+        find_fields.setColumnStretch(1, 1)
+        find_layout.addLayout(find_fields)
         self.face_find_options_toggle = self._expander_button("Options", checked=False, tooltip=FACE_HELP["find_same_person"])
         find_layout.addWidget(self.face_find_options_toggle)
         self.face_find_options_panel = QWidget(find_group)
@@ -14185,7 +14211,6 @@ class SearchPane(QWidget):
         find_options_layout.addWidget(self._field_widget("Recognition mode", self.face_recognition_mode_combo, tooltip=FACE_HELP["face_recognition_min_score"]))
         find_options_layout.addWidget(self._field_widget("Top-K", self.face_top_k, tooltip=FACE_HELP["name_search_top_k"]))
         find_options_layout.addWidget(self._field_widget("Min face score", self.face_min_score, tooltip=FACE_HELP["selected_face_min_score"]))
-        find_options_layout.addWidget(self.face_index_button)
         self.face_find_options_toggle.toggled.connect(
             lambda checked: self._set_expander_state(self.face_find_options_toggle, self.face_find_options_panel, checked)
         )
@@ -14194,12 +14219,6 @@ class SearchPane(QWidget):
         self.face_find_group = find_group
 
         find_name_group, find_name_layout = self._group_box("Find by Name", tooltip=FACE_HELP["find_photos_saved_name"])
-        find_name_layout.addWidget(
-            self._helper_label(
-                "Enter a saved name to show its stored faces and visually similar faces that are still unlabeled.",
-                tooltip=FACE_HELP["find_photos_saved_name"],
-            )
-        )
         self.face_find_name_query = QLineEdit(find_name_group)
         self.face_find_name_query.setPlaceholderText("Saved person name")
         self.face_find_name_query.setToolTip(FACE_HELP["find_photos_saved_name"])
@@ -14210,10 +14229,19 @@ class SearchPane(QWidget):
         )
         self.face_find_name_button.clicked.connect(self._search_by_name)
         self.face_find_name_query.returnPressed.connect(self._search_by_name)
-        find_name_layout.addWidget(
-            self._field_widget("Name", self.face_find_name_query, tooltip=FACE_HELP["find_photos_saved_name"])
+        find_name_fields = QGridLayout()
+        find_name_fields.setContentsMargins(0, 0, 0, 0)
+        find_name_fields.setHorizontalSpacing(6)
+        find_name_fields.setVerticalSpacing(8)
+        self.face_find_name_fields_grid = find_name_fields
+        find_name_fields.addWidget(
+            self._field_widget("Name", self.face_find_name_query, tooltip=FACE_HELP["find_photos_saved_name"]),
+            0,
+            0,
         )
-        find_name_layout.addWidget(self.face_find_name_button)
+        find_name_fields.addWidget(self.face_find_name_button, 0, 1, alignment=Qt.AlignmentFlag.AlignBottom)
+        find_name_fields.setColumnStretch(0, 1)
+        find_name_layout.addLayout(find_name_fields)
         self._action_buttons.append(self.face_find_name_button)
         self._mode_required_buttons.append(self.face_find_name_button)
         self.face_find_name_group = find_name_group

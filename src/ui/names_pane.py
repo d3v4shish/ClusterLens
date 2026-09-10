@@ -19,15 +19,14 @@ if TYPE_CHECKING:
 NAMES_HELP = (
     "Names are durable face-to-person assignments stored in the global face database. "
     "Select a name to see every unique photo containing a face saved with that name. "
-    "Right-click one or more selected photos to change only their relevant face labels: Name affects "
-    "unlabeled faces, while Rename and Unlabel affect only the active saved name. "
+    "Every photo in this view already has the active saved name. Right-click one or more selected photos "
+    "to rename or unlabel only those matching face rows. "
     "Similarity-only matches remain in Faces > Find by Name."
 )
 
 SELECTED_IMAGES_HELP = (
-    "Select photos with Ctrl-click, Shift-click, or their checkboxes. Name applies only to "
-    "unlabeled visible faces in those photos. Rename and Unlabel apply only to faces that "
-    "currently have the active saved name, so other people in the same photo are never changed."
+    "Select photos with Ctrl-click, Shift-click, or their checkboxes. Rename and Unlabel apply only to "
+    "faces that currently have the active saved name, so other people in the same photo are never changed."
 )
 
 
@@ -273,12 +272,6 @@ class NamesPane(QWidget):
         editable = selected_count > 0 and not busy and not self._read_only_mode
         return [
             (
-                "Name Selected…",
-                "Assign a name to unlabeled visible faces in the selected photos. Existing labels are preserved.",
-                self._name_selected_images,
-                editable,
-            ),
-            (
                 "Rename Selected…",
                 "Move only the active name's face labels in the selected photos to a different saved name.",
                 self._rename_selected_images,
@@ -291,24 +284,6 @@ class NamesPane(QWidget):
                 editable and bool(active_name),
             ),
         ]
-
-    def _name_selected_images(self) -> None:
-        paths = self._selected_image_paths()
-        if not paths:
-            return
-        name, accepted = QInputDialog.getText(
-            self,
-            "Name selected faces",
-            "Name for unlabeled visible face(s) in the selected photo(s):",
-        )
-        target = str(name or "").strip()
-        if not accepted or not target:
-            return
-        self._start_selected_image_mutation(
-            operation="name",
-            target_name=target,
-            image_paths=paths,
-        )
 
     def _rename_selected_images(self) -> None:
         source = self._current_name() or self._selected_name

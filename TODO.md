@@ -1,5 +1,14 @@
 # Current implementation plan
 
+## Compact Find and strict Names editing
+
+- [x] Hide the verbose advanced Find walkthrough/saved-search panel, replace explanatory prose in core Find sections with existing hover/help affordances, and use the available grid layout for selected-face, query-face, and name-query controls.
+  Contract: Find retains selected-face, query-photo, and saved-name search behavior; direct controls fit horizontally when their containing pane is sufficiently wide; advanced walkthrough and saved-search implementation remains retained but hidden.
+  Validation: `QT_QPA_PLATFORM=offscreen uv run --with pytest python -m pytest tests/test_ui_smoke.py -k 'face_workspace_guidance_and_action_labels_are_visible or face_workspace_layout_keeps_search_cards_readable_in_task_pane'` passed (2 tests); the focused three-test Find/Names command passed after grid assertions were added. `uv run python -m py_compile src/ui/search_pane.py src/ui/names_pane.py tests/test_ui_smoke.py` and `git diff --check` passed. A broader offscreen UI rerun retains two recorded unrelated failures: the unchanged Scan group's 330 px size hint at a 280 px sidebar viewport, and a test that assumes the currently persistent SCRFD/ArcFace profile is not installed.
+- [x] Restrict Names context editing to labels that are already named.
+  Contract: Names continues to list only exact durable label photos, and its context menu contains Rename Selected and Unlabel Selected only; initial naming remains in Faces detection/group workflows.
+  Validation: `QT_QPA_PLATFORM=offscreen uv run --with pytest python -m pytest tests/test_ui_smoke.py::UiSmokeTests::test_names_pane_selected_image_actions_are_scoped_to_the_active_name tests/test_services.py -k 'selected_image or named_photo or label'` passed (15 tests). It covers both operations, preserved two-photo selection, read-only guards, and durable SQLite mappings.
+
 ## Names context-menu actions
 
 - [x] Move selected-photo Name, Rename, and Unlabel actions from the Names header into the photo gallery right-click menu.

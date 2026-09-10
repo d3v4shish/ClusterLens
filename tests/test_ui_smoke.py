@@ -2271,73 +2271,51 @@ class UiSmokeTests(unittest.TestCase):
 
             select_photos()
             actions = {item[0]: item for item in pane._names_context_menu_actions("/photos/mixed-a.jpg")}
-            self.assertTrue(actions["Name Selected…"][3])
             self.assertTrue(actions["Rename Selected…"][3])
             self.assertTrue(actions["Unlabel Selected"][3])
+            self.assertNotIn("Name Selected…", actions)
             self.assertIsNotNone(pane.gallery.context_menu_action_provider)
             pane.set_read_only_mode(True)
             self.assertTrue(all(not item[3] for item in pane._names_context_menu_actions("/photos/mixed-a.jpg")))
             pane.set_read_only_mode(False)
 
-            def choose_name_action(*_args):
+            def choose_rename_action(*_args):
                 return next(
                     action
                     for menu in pane.gallery.findChildren(QMenu)
                     for action in menu.actions()
-                    if action.text() == "Name Selected…"
+                    if action.text() == "Rename Selected…"
                 )
 
             with (
-                patch("ui.names_pane.QInputDialog.getText", return_value=("Bob", True)),
-                patch("ui.gallery_pane.QMenu.exec", side_effect=choose_name_action),
+                patch("ui.names_pane.QInputDialog.getText", return_value=("Cara", True)),
+                patch("ui.gallery_pane.QMenu.exec", side_effect=choose_rename_action),
             ):
                 pane.gallery.on_context_menu(pane.gallery.list_view.visualRect(pane.gallery.model.index(0, 0)).center())
             self.assertTrue(
                 self._wait_until(
-                    lambda: service.calls[:1] == [("name", "Bob", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
+                    lambda: service.calls[:1]
+                    == [("rename", "Alice", "Cara", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
                 )
             )
             self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
             self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
 
-            alice_index = pane.names_model.index(0, 0)
-            pane.names_list.setCurrentIndex(alice_index)
-            pane.names_list.selectionModel().select(
-                alice_index,
-                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
-            )
             self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
             self.assertTrue(
                 self._wait_until(lambda: pane.gallery.images == ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"])
             )
             self.assertTrue(self._wait_until(lambda: pane._photos_job is None))
             select_photos()
-            with patch("ui.names_pane.QInputDialog.getText", return_value=("Cara", True)):
-                actions["Rename Selected…"][2]()
-            self.assertTrue(
-                self._wait_until(
-                    lambda: service.calls[1:2] == [
-                        ("rename", "Alice", "Cara", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))
-                    ]
-                )
-            )
-            self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
-            self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
-
-            self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
-            self.assertTrue(
-                self._wait_until(lambda: pane.gallery.images == ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"])
-            )
-            select_photos()
             with patch("ui.names_pane.confirmBox", return_value=True):
                 actions["Unlabel Selected"][2]()
             self.assertTrue(
                 self._wait_until(
-                    lambda: service.calls[2:3] == [("unlabel", "Alice", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
+                    lambda: service.calls[1:2] == [("unlabel", "Alice", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
                 )
             )
             self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
-            self.assertEqual(3, len(changes))
+            self.assertEqual(2, len(changes))
         finally:
             pane.shutdown_jobs(timeout_ms=500)
             pane.close()
@@ -3880,7 +3858,12 @@ class UiSmokeTests(unittest.TestCase):
         self.assertNotEqual(-1, pane.face_quality_page_layout.indexOf(pane.face_review_quality_field))
         self.assertNotEqual(-1, pane.face_quality_page_layout.indexOf(pane.face_review_reason_field))
         self.assertIsInstance(pane.face_profile_fields_grid, QVBoxLayout)
-        self.assertIsInstance(pane.face_find_fields_grid, QVBoxLayout)
+        self.assertIsInstance(pane.face_find_fields_grid, QGridLayout)
+        self.assertIsInstance(pane.face_find_name_fields_grid, QGridLayout)
+        self.assertIs(pane.face_find_fields_grid.itemAtPosition(1, 0).widget(), pane.face_query_detect_button)
+        self.assertIs(pane.face_find_fields_grid.itemAtPosition(1, 1).widget(), pane.face_index_button)
+        self.assertIs(pane.face_find_fields_grid.itemAtPosition(4, 0).widget(), pane.face_search_button)
+        self.assertIs(pane.face_find_name_fields_grid.itemAtPosition(0, 1).widget(), pane.face_find_name_button)
         self.assertIsInstance(pane.face_save_fields_grid, QVBoxLayout)
         self.assertIsInstance(pane.face_manage_fields_grid, QVBoxLayout)
         self.assertEqual(-1, pane.face_library_grid.indexOf(pane.face_people_group))
@@ -3888,7 +3871,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertNotEqual(-1, pane.face_library_selection_grid.indexOf(pane.face_profile_group))
         self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_people_group))
         self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_profile_group))
-        self.assertIs(pane.face_search_grid.itemAtPosition(0, 0).widget(), pane.face_search_quick_group)
+        self.assertTrue(pane.face_search_quick_group.isHidden())
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
         self.assertNotEqual(-1, pane.face_search_grid.indexOf(pane.face_search_selected_group))
         self.assertNotEqual(-1, pane.face_search_grid.indexOf(pane.face_people_query_group))
         self.assertEqual(["Detect Faces", "Review & Name"], [pane.face_library_tabs.tabText(index) for index in range(pane.face_library_tabs.count())])
@@ -6010,7 +5994,6 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual((1, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(people_index))
         self.assertEqual((2, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(profile_index))
 
-        quick_search_index = pane.face_search_grid.indexOf(pane.face_search_quick_group)
         selected_index = pane.face_search_grid.indexOf(pane.face_search_selected_group)
         find_index = pane.face_search_grid.indexOf(pane.face_find_group)
         manage_index = pane.face_search_grid.indexOf(pane.face_manage_group)
@@ -6018,13 +6001,20 @@ class UiSmokeTests(unittest.TestCase):
         pending_index = pane.face_search_grid.indexOf(pane.face_pending_group)
         people_query_index = pane.face_search_grid.indexOf(pane.face_people_query_group)
         self.assertEqual("compact", pane._face_search_layout_mode)
-        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(quick_search_index))
-        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
-        self.assertEqual((2, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
+        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
+        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
         self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
         self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
         self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
         self.assertEqual((6, 0, 1, 2), pane.face_search_grid.getItemPosition(people_query_index))
+        selected_actions = pane.face_search_selected_actions_grid
+        self.assertEqual((0, 0, 1, 2), selected_actions.getItemPosition(0))
+        self.assertEqual((1, 0, 1, 2), selected_actions.getItemPosition(1))
+        pane._refresh_face_search_action_layout("wide")
+        self.assertEqual((0, 0, 1, 1), selected_actions.getItemPosition(0))
+        self.assertEqual((0, 1, 1, 1), selected_actions.getItemPosition(1))
+        pane._refresh_face_search_action_layout("compact")
 
         pane.workspace_splitter.setSizes([340, 1060])
         pane._refresh_face_grid_layouts(force=True)
@@ -6034,7 +6024,6 @@ class UiSmokeTests(unittest.TestCase):
         people_index = pane.face_library_selection_grid.indexOf(pane.face_people_group)
         scanned_index = pane.face_library_selection_grid.indexOf(pane.face_scanned_group)
         profile_index = pane.face_library_selection_grid.indexOf(pane.face_profile_group)
-        quick_search_index = pane.face_search_grid.indexOf(pane.face_search_quick_group)
         selected_index = pane.face_search_grid.indexOf(pane.face_search_selected_group)
         find_index = pane.face_search_grid.indexOf(pane.face_find_group)
         manage_index = pane.face_search_grid.indexOf(pane.face_manage_group)
@@ -6045,9 +6034,9 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual((0, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(scanned_index))
         self.assertEqual((1, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(people_index))
         self.assertEqual((2, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(profile_index))
-        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(quick_search_index))
-        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
-        self.assertEqual((2, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
+        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
+        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
         self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
         self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
         self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
