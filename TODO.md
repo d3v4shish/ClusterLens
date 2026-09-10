@@ -1,5 +1,11 @@
 # Current implementation plan
 
+## Names selected-image label actions
+
+- [x] Add Name, Rename, and Unlabel actions for selected photos in the Names workspace.
+  Contract: selection is by photo for a compact gallery workflow, but mutations remain face-level: Name affects only unlabeled visible faces in the selected photos; Rename and Unlabel affect only faces currently carrying the active saved name. The actions update the durable global face-label mapping and refresh Faces and Names without blocking the UI.
+  Validation: focused SQLite service test covers a mixed-person photo, identity cleanup, and reopening persistence; two offscreen Names UI tests cover selection, action enablement, and asynchronous mutation; the production-shell Names test confirms the actions are visible without opening Faces. Python compilation and `git diff --check` passed. The broader suite retains pre-existing environment/model and layout failures; focused potential-regression checks for bulk face naming and lazy startup passed, while the header acceptance test remains order-sensitive to a persisted Gallery workspace mode.
+
 ## Production Names workspace alignment
 
 - [x] Expose the existing Names workspace from the production PyQt shell used by `scripts/run_app*.sh`.

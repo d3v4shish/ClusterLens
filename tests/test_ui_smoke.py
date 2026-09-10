@@ -44,6 +44,7 @@ from ui.gallery_pane import (
     MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE,
 )
 from ui.job_manager import JobManager
+from ui.list_models import ListEntryModel
 from ui.names_pane import NamesPane
 from ui.photo_inspector_dialog import EditableFaceDraft, PhotoInspectorDialog
 from ui.search_pane import FaceResultGroup, FaceTileItem, FaceTileListModel, SearchPane
@@ -2205,6 +2206,105 @@ class UiSmokeTests(unittest.TestCase):
             APP.processEvents()
             self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/bob.jpg"]))
             self.assertEqual("Bob · 1 unique photo(s)", pane.status_label.text())
+        finally:
+            pane.shutdown_jobs(timeout_ms=500)
+            pane.close()
+
+    def test_names_pane_selected_image_actions_are_scoped_to_the_active_name(self):
+        class _NameService:
+            db_path = "/tmp/names-actions-test.sqlite3"
+
+            def __init__(self):
+                self.calls: list[tuple] = []
+
+            def recover_legacy_manual_face_labels(self):
+                return SimpleNamespace(promoted_count=0, duplicate_count=0, conflict_count=0)
+
+            def list_named_photo_summaries(self):
+                return [
+                    NamedPhotoSummary("Alice", face_count=1, photo_count=1),
+                    NamedPhotoSummary("Bob", face_count=1, photo_count=1),
+                ]
+
+            def list_named_photo_paths(self, person_name):
+                return {
+                    "Alice": ["/photos/mixed.jpg"],
+                    "Bob": ["/photos/mixed.jpg"],
+                }.get(str(person_name), [])
+
+            def label_unlabeled_faces_in_images(self, person_name, image_paths):
+                self.calls.append(("name", person_name, tuple(image_paths)))
+                return 1
+
+            def rename_labeled_faces_in_images(self, source_name, target_name, image_paths):
+                self.calls.append(("rename", source_name, target_name, tuple(image_paths)))
+                return 1
+
+            def unlabel_labeled_faces_in_images(self, person_name, image_paths):
+                self.calls.append(("unlabel", person_name, tuple(image_paths)))
+                return 1
+
+        service = _NameService()
+        pane = NamesPane(lambda: service)
+        changes: list[bool] = []
+        pane.face_labels_changed.connect(lambda: changes.append(True))
+        pane.show()
+        try:
+            pane.refresh_names()
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
+
+            def select_photo() -> None:
+                index = pane.gallery.model.index(0, 0)
+                pane.gallery.list_view.selectionModel().select(
+                    index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+                )
+                APP.processEvents()
+
+            select_photo()
+            self.assertTrue(pane.name_selected_button.isEnabled())
+            self.assertTrue(pane.rename_selected_button.isEnabled())
+            self.assertTrue(pane.unlabel_selected_button.isEnabled())
+
+            with patch("ui.names_pane.QInputDialog.getText", return_value=("Bob", True)):
+                pane._name_selected_images()
+            self.assertTrue(self._wait_until(lambda: service.calls[:1] == [("name", "Bob", ("/photos/mixed.jpg",))]))
+            self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
+            self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
+
+            alice_index = pane.names_model.index(0, 0)
+            pane.names_list.setCurrentIndex(alice_index)
+            pane.names_list.selectionModel().select(
+                alice_index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
+            self.assertTrue(self._wait_until(lambda: pane._photos_job is None))
+            select_photo()
+            self.assertTrue(pane.rename_selected_button.isEnabled())
+            with patch("ui.names_pane.QInputDialog.getText", return_value=("Cara", True)):
+                pane._rename_selected_images()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: service.calls[1:2] == [("rename", "Alice", "Cara", ("/photos/mixed.jpg",))]
+                )
+            )
+            self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
+            self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
+
+            self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
+            select_photo()
+            with patch("ui.names_pane.confirmBox", return_value=True):
+                pane._unlabel_selected_images()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: service.calls[2:3] == [("unlabel", "Alice", ("/photos/mixed.jpg",))]
+                )
+            )
+            self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
+            self.assertEqual(3, len(changes))
         finally:
             pane.shutdown_jobs(timeout_ms=500)
             pane.close()

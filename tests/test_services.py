@@ -3859,6 +3859,66 @@ class ServiceTests(unittest.TestCase):
             )
             self.assertEqual([str(image_a), str(image_b)], reopened.list_named_photo_paths("Alice"))
 
+    def test_selected_image_name_rename_and_unlabel_are_face_scoped_and_persistent(self):
+        with TemporaryDirectory() as tmp:
+            image_a = Path(tmp) / "mixed_people.jpg"
+            image_b = Path(tmp) / "alice_only.jpg"
+            Image.new("RGB", (64, 64), (12, 24, 36)).save(image_a)
+            Image.new("RGB", (64, 64), (36, 24, 12)).save(image_b)
+            db_path = Path(tmp) / "faces.sqlite3"
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=db_path,
+            )
+            service.save_face_records(
+                [
+                    FaceIndexRecord(str(image_a), 0, (0, 0, 32, 32), 0.99, np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+                    FaceIndexRecord(str(image_a), 1, (32, 0, 64, 32), 0.99, np.array([0.0, 1.0, 0.0], dtype=np.float32)),
+                    FaceIndexRecord(str(image_b), 0, (0, 0, 32, 32), 0.99, np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+                ],
+                mtime_ns=image_a.stat().st_mtime_ns,
+                file_size=image_a.stat().st_size,
+                assess_quality=False,
+            )
+            service.label_indexed_faces_immediately("Alice", [(str(image_a), 0), (str(image_b), 0)], similarity_threshold=0.5)
+
+            self.assertEqual(1, service.label_unlabeled_faces_in_images("Bob", [str(image_a), str(image_b)]))
+            self.assertEqual(1, service.rename_labeled_faces_in_images("Alice", "Cara", [str(image_a)]))
+            self.assertEqual(1, service.unlabel_labeled_faces_in_images("Cara", [str(image_a)]))
+
+            labels = {
+                (item.image_path, item.face_index): item.person_name
+                for item in service.list_face_labels()
+            }
+            self.assertEqual(
+                {
+                    (str(image_a), 1): "Bob",
+                    (str(image_b), 0): "Alice",
+                },
+                labels,
+            )
+            self.assertEqual([str(image_b)], service.list_named_photo_paths("Alice"))
+            self.assertEqual([str(image_a)], service.list_named_photo_paths("Bob"))
+            self.assertIsNone(service.find_person_prototype("Cara"))
+
+            reopened = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=db_path,
+            )
+            self.assertEqual(
+                [("Alice", 1, 1), ("Bob", 1, 1)],
+                [
+                    (summary.person_name, summary.face_count, summary.photo_count)
+                    for summary in reopened.list_named_photo_summaries()
+                ],
+            )
+            self.assertEqual(
+                {(str(image_a), 1): "Bob", (str(image_b), 0): "Alice"},
+                {(item.image_path, item.face_index): item.person_name for item in reopened.list_face_labels()},
+            )
+
     def test_recover_legacy_manual_labels_keeps_conflicting_durable_label(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "legacy_conflict.jpg"

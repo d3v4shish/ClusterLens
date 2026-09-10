@@ -3,11 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QItemSelectionModel, Qt
-from PyQt6.QtWidgets import QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListView, QPushButton, QSplitter, QVBoxLayout, QWidget
+from PyQt6.QtCore import QItemSelectionModel, Qt, pyqtSignal
+from PyQt6.QtWidgets import QAbstractItemView, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QPushButton, QSplitter, QVBoxLayout, QWidget
 
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.common import HelpIconButton
+from ui.error_mbox import confirmBox
 from ui.gallery_pane import GalleryPane
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel
 
@@ -18,12 +19,22 @@ if TYPE_CHECKING:
 NAMES_HELP = (
     "Names are durable face-to-person assignments stored in the global face database. "
     "Select a name to see every unique photo containing a face saved with that name. "
+    "Select one or more photos to change only their relevant face labels: Name affects "
+    "unlabeled faces, while Rename and Unlabel affect only the active saved name. "
     "Similarity-only matches remain in Faces > Find by Name."
+)
+
+SELECTED_IMAGES_HELP = (
+    "Select photos with Ctrl-click, Shift-click, or their checkboxes. Name applies only to "
+    "unlabeled visible faces in those photos. Rename and Unlabel apply only to faces that "
+    "currently have the active saved name, so other people in the same photo are never changed."
 )
 
 
 class NamesPane(QWidget):
-    """Global, read-only browser for durable saved face labels."""
+    """Global browser and bounded editor for durable saved face labels."""
+
+    face_labels_changed = pyqtSignal()
 
     def __init__(self, face_service_provider: Callable[[], "FaceIndexService"], parent=None) -> None:
         super().__init__(parent)
@@ -36,6 +47,9 @@ class NamesPane(QWidget):
         self._refresh_thread = None
         self._photos_job = None
         self._photos_thread = None
+        self._mutation_job = None
+        self._mutation_thread = None
+        self._read_only_mode = False
         self._recovered_database_paths: set[str] = set()
         self._build_ui()
 
@@ -62,6 +76,38 @@ class NamesPane(QWidget):
         self.status_label = QLabel("Open Names to load saved face labels.")
         self.status_label.setToolTip(NAMES_HELP)
         layout.addWidget(self.status_label)
+
+        actions = QWidget(self)
+        actions.setObjectName("namesSelectedImageActions")
+        actions_layout = QGridLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setHorizontalSpacing(6)
+        actions_layout.setVerticalSpacing(4)
+        self.selection_label = QLabel("Select photo(s) to change their matching face labels.", actions)
+        self.selection_label.setToolTip(SELECTED_IMAGES_HELP)
+        actions_layout.addWidget(self.selection_label, 0, 0)
+        actions_help = HelpIconButton(SELECTED_IMAGES_HELP, actions, help_key="names_selected_images")
+        actions_layout.addWidget(actions_help, 0, 1)
+        actions_layout.setColumnStretch(2, 1)
+        self.name_selected_button = QPushButton("Name Selected…", actions)
+        self.name_selected_button.setToolTip(
+            "Assign a new or existing name to unlabeled visible faces in the selected photos. Existing labels are preserved."
+        )
+        self.name_selected_button.clicked.connect(self._name_selected_images)
+        self.rename_selected_button = QPushButton("Rename Selected…", actions)
+        self.rename_selected_button.setToolTip(
+            "Move only the active name's face labels in the selected photos to a different saved name."
+        )
+        self.rename_selected_button.clicked.connect(self._rename_selected_images)
+        self.unlabel_selected_button = QPushButton("Unlabel Selected", actions)
+        self.unlabel_selected_button.setToolTip(
+            "Remove only the active name's face labels in the selected photos. Other people in those photos are unchanged."
+        )
+        self.unlabel_selected_button.clicked.connect(self._unlabel_selected_images)
+        actions_layout.addWidget(self.name_selected_button, 1, 0)
+        actions_layout.addWidget(self.rename_selected_button, 1, 1)
+        actions_layout.addWidget(self.unlabel_selected_button, 1, 2)
+        layout.addWidget(actions)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -110,18 +156,26 @@ class NamesPane(QWidget):
             show_select_folder=False,
             show_run=False,
         )
+        self.gallery.list_view.selectionModel().selectionChanged.connect(lambda *_args: self._update_selected_image_actions())
+        self.gallery.model.dataChanged.connect(lambda *_args: self._update_selected_image_actions())
         splitter.addWidget(self.gallery)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 9)
         splitter.setSizes([280, 1060])
         layout.addWidget(splitter, stretch=1)
+        self._update_selected_image_actions()
 
-    def refresh_names(self) -> None:
+    def set_read_only_mode(self, enabled: bool) -> None:
+        self._read_only_mode = bool(enabled)
+        self.gallery.set_read_only_mode(self._read_only_mode)
+        self._update_selected_image_actions()
+
+    def refresh_names(self, *, preserve_name: str | None = None) -> None:
         """Load names asynchronously and recover legacy explicit manual labels once."""
 
         self._refresh_token += 1
         token = self._refresh_token
-        selected_name = self._current_name() or self._selected_name
+        selected_name = str(preserve_name or "").strip() or self._current_name() or self._selected_name
         service = self._face_service_provider()
         database_key = str(getattr(service, "db_path", "") or id(service))
         recover = database_key not in self._recovered_database_paths
@@ -151,6 +205,7 @@ class NamesPane(QWidget):
             if conflicts:
                 recovery_text += f" {conflicts} conflicting older proposal(s) remain in review."
             self.status_label.setText(f"{len(list(summaries or []))} saved name(s).{recovery_text}")
+            self._update_selected_image_actions()
 
         self._start_job("refresh", _run, _done, lambda _message: self.status_label.setText("Could not load saved names."))
 
@@ -194,6 +249,7 @@ class NamesPane(QWidget):
                 show_select_folder=False,
                 show_run=False,
             )
+            self._update_selected_image_actions()
             return
         index = self.names_model.index(row, 0)
         self.names_list.setCurrentIndex(index)
@@ -213,6 +269,7 @@ class NamesPane(QWidget):
         if not name or name == self._selected_name and self._photos_thread is not None:
             return
         self._selected_name = name
+        self._update_selected_image_actions()
         self._photos_token += 1
         token = self._photos_token
         service = self._face_service_provider()
@@ -236,8 +293,133 @@ class NamesPane(QWidget):
                 show_run=False,
             )
             self.status_label.setText(f"{name} · {len(paths)} unique photo(s)")
+            self._update_selected_image_actions()
 
         self._start_job("photos", _run, _done, lambda _message: self.status_label.setText(f"Could not load photos for {name}."))
+
+    def _selected_image_paths(self) -> list[str]:
+        selected = self.gallery._selected_gallery_paths()
+        if selected:
+            return selected
+        return list(self.gallery.model.checked_paths())
+
+    def _update_selected_image_actions(self) -> None:
+        selected_count = len(self._selected_image_paths())
+        active_name = self._current_name() or self._selected_name
+        busy = self._mutation_job is not None
+        editable = selected_count > 0 and not busy and not self._read_only_mode
+        self.name_selected_button.setEnabled(editable)
+        self.rename_selected_button.setEnabled(editable and bool(active_name))
+        self.unlabel_selected_button.setEnabled(editable and bool(active_name))
+        if self._read_only_mode:
+            self.selection_label.setText("Read-only safety mode prevents face-label changes.")
+        elif selected_count:
+            self.selection_label.setText(f"{selected_count} selected photo(s) · active name: {active_name or 'none'}")
+        else:
+            self.selection_label.setText("Select photo(s) to change their matching face labels.")
+
+    def _name_selected_images(self) -> None:
+        paths = self._selected_image_paths()
+        if not paths:
+            self._update_selected_image_actions()
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Name selected faces",
+            "Name for unlabeled visible face(s) in the selected photo(s):",
+        )
+        target = str(name or "").strip()
+        if not accepted or not target:
+            return
+        self._start_selected_image_mutation(
+            operation="name",
+            target_name=target,
+            image_paths=paths,
+        )
+
+    def _rename_selected_images(self) -> None:
+        source = self._current_name() or self._selected_name
+        paths = self._selected_image_paths()
+        if not source or not paths:
+            self._update_selected_image_actions()
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename selected face labels",
+            f"New name for {source} face label(s) in the selected photo(s):",
+        )
+        target = str(name or "").strip()
+        if not accepted or not target or target == source:
+            return
+        self._start_selected_image_mutation(
+            operation="rename",
+            source_name=source,
+            target_name=target,
+            image_paths=paths,
+        )
+
+    def _unlabel_selected_images(self) -> None:
+        source = self._current_name() or self._selected_name
+        paths = self._selected_image_paths()
+        if not source or not paths:
+            self._update_selected_image_actions()
+            return
+        if not confirmBox(
+            "Unlabel selected faces",
+            (
+                f"Remove {source} only from matching face(s) in {len(paths)} selected photo(s)? "
+                "Other face labels in these photos will not change."
+            ),
+            parent=self,
+        ):
+            return
+        self._start_selected_image_mutation(
+            operation="unlabel",
+            source_name=source,
+            image_paths=paths,
+        )
+
+    def _start_selected_image_mutation(
+        self,
+        *,
+        operation: str,
+        image_paths: list[str],
+        source_name: str = "",
+        target_name: str = "",
+    ) -> None:
+        if self._read_only_mode:
+            self._update_selected_image_actions()
+            return
+        service = self._face_service_provider()
+        paths = list(dict.fromkeys(str(path) for path in image_paths if str(path or "").strip()))
+        if not paths:
+            return
+        self.status_label.setText("Saving selected face labels...")
+        self._update_selected_image_actions()
+
+        def _run(progress, cancel_check):
+            progress(-1, "Saving selected face labels...")
+            if operation == "name":
+                return service.label_unlabeled_faces_in_images(target_name, paths)
+            if operation == "rename":
+                return service.rename_labeled_faces_in_images(source_name, target_name, paths)
+            return service.unlabel_labeled_faces_in_images(source_name, paths)
+
+        def _done(count) -> None:
+            changed = int(count or 0)
+            label = {"name": "Named", "rename": "Renamed", "unlabel": "Unlabeled"}.get(operation, "Updated")
+            self.status_label.setText(f"{label} {changed} face(s). Refreshing saved names...")
+            self._selected_name = target_name if target_name else source_name
+            self.face_labels_changed.emit()
+            self.refresh_names(preserve_name=self._selected_name)
+            self._update_selected_image_actions()
+
+        self._start_job(
+            "mutation",
+            _run,
+            _done,
+            lambda _message: self.status_label.setText("Could not save the selected face labels."),
+        )
 
     def _start_job(self, slot: str, fn, on_completed, on_failed) -> None:
         old_job = getattr(self, f"_{slot}_job", None)
@@ -250,6 +432,8 @@ class NamesPane(QWidget):
         setattr(self, f"_{slot}_job", job)
         if slot == "refresh":
             self.refresh_button.setEnabled(False)
+        if slot == "mutation":
+            self._update_selected_image_actions()
 
         def _complete(result) -> None:
             if getattr(self, f"_{slot}_job", None) is not job:
@@ -258,6 +442,8 @@ class NamesPane(QWidget):
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
             on_completed(result)
+            if slot == "mutation":
+                self._update_selected_image_actions()
 
         def _fail(message: str) -> None:
             if getattr(self, f"_{slot}_job", None) is not job:
@@ -266,12 +452,16 @@ class NamesPane(QWidget):
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
             on_failed(message)
+            if slot == "mutation":
+                self._update_selected_image_actions()
 
         def _cancel() -> None:
             if getattr(self, f"_{slot}_job", None) is job:
                 setattr(self, f"_{slot}_job", None)
                 if slot == "refresh":
                     self.refresh_button.setEnabled(True)
+                if slot == "mutation":
+                    self._update_selected_image_actions()
 
         job.completed.connect(_complete)
         job.failed.connect(_fail)
@@ -286,7 +476,7 @@ class NamesPane(QWidget):
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready = True
-        for slot in ("refresh", "photos"):
+        for slot in ("refresh", "photos", "mutation"):
             job = getattr(self, f"_{slot}_job", None)
             thread = getattr(self, f"_{slot}_thread", None)
             if job is not None:
@@ -300,4 +490,6 @@ class NamesPane(QWidget):
         self._refresh_thread = None
         self._photos_job = None
         self._photos_thread = None
+        self._mutation_job = None
+        self._mutation_thread = None
         return self.gallery.shutdown_jobs(timeout_ms=timeout_ms) and ready

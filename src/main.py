@@ -332,6 +332,7 @@ class ClusterGalleryApp(QMainWindow):
 
         self.names_pane = NamesPane(lambda: self.face_service_global, self.workspace_stack)
         self.faces_pane.face_labels_changed.connect(self.names_pane.refresh_names)
+        self.names_pane.face_labels_changed.connect(self._on_names_face_labels_changed)
 
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_pane)
@@ -751,6 +752,12 @@ class ClusterGalleryApp(QMainWindow):
         self._refresh_workspace_ui()
         if self._active_workspace == "clustering":
             self.maybe_warm_runtime()
+
+    def _on_names_face_labels_changed(self) -> None:
+        """Refresh the existing Faces views after a bounded Names label edit."""
+
+        self.faces_pane.refresh_face_library(reason="labels changed in Names")
+        self.faces_pane.refresh_face_album(reason="labels changed in Names", force_refresh=True)
 
     @staticmethod
     def _normalize_ui_mode(mode: str) -> str:

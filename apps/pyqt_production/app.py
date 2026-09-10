@@ -822,9 +822,10 @@ class ProductionClusterApp(QMainWindow):
         pane.gallery.job_manager = self.job_manager
         pane.gallery.metadata_service = self.photo_metadata_service
         pane.gallery.image_tag_service = self.image_tag_service
-        pane.gallery.set_read_only_mode(self._read_only_mode())
+        pane.set_read_only_mode(self._read_only_mode())
         pane.setMinimumWidth(self._layout_widths()["faces"])
         self.names_pane = pane
+        pane.face_labels_changed.connect(self._on_names_face_labels_changed)
         if self.faces_pane is not None:
             self.faces_pane.face_labels_changed.connect(pane.refresh_names)
         self._apply_workspace_preferences()
@@ -841,6 +842,14 @@ class ProductionClusterApp(QMainWindow):
         if self._active_workspace == "names":
             self.workspace_stack.setCurrentWidget(pane)
             pane.refresh_names()
+
+    def _on_names_face_labels_changed(self) -> None:
+        """Refresh already-created Faces views after an exact Names label edit."""
+
+        if self.faces_pane is None:
+            return
+        self.faces_pane.refresh_face_library(reason="labels changed in Names")
+        self.faces_pane.refresh_face_album(reason="labels changed in Names", force_refresh=True)
 
     def _connect_faces_signals(self, pane) -> None:
         pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
@@ -2671,6 +2680,8 @@ class ProductionClusterApp(QMainWindow):
             self.tag_manager_action.setEnabled(not read_only)
         if self.faces_pane is not None:
             self.faces_pane.set_read_only_mode(read_only)
+        if self.names_pane is not None:
+            self.names_pane.set_read_only_mode(read_only)
         if read_only:
             tip = "Disabled in read-only safety mode. Turn it off in Settings > Safety & Recovery to write tags."
             self.suggest_tags_button.setToolTip(tip)

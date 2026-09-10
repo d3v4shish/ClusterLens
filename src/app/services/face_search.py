@@ -8615,6 +8615,277 @@ class FaceIndexService:
             rows = connection.execute(query, args).fetchall()
         return list(dict.fromkeys(str(row[0] or "") for row in rows if str(row[0] or "").strip()))
 
+    def label_unlabeled_faces_in_images(self, person_name: str, image_paths: list[str]) -> int:
+        """Save ``person_name`` on visible, currently-unlabeled faces in selected photos.
+
+        Photo selection is intentionally only a way to choose a bounded set of
+        face records. Existing labels in a mixed-person photo are left alone.
+        """
+
+        target = str(person_name or "").strip()
+        if not target:
+            raise ValueError("Identity name is required.")
+        refs = self._selected_image_face_refs(image_paths, unlabeled_only=True)
+        return self._apply_selected_image_label_change(
+            target_name=target,
+            face_refs=refs,
+            action="name_selected_images",
+        )
+
+    def rename_labeled_faces_in_images(self, source_name: str, target_name: str, image_paths: list[str]) -> int:
+        """Rename only ``source_name`` face labels in the selected photos."""
+
+        source = str(source_name or "").strip()
+        target = str(target_name or "").strip()
+        if not source or not target:
+            raise ValueError("Both the current and new identity names are required.")
+        if source == target:
+            return 0
+        refs = self._selected_image_face_refs(image_paths, person_name=source)
+        return self._apply_selected_image_label_change(
+            source_name=source,
+            target_name=target,
+            face_refs=refs,
+            action="rename_selected_image_labels",
+        )
+
+    def unlabel_labeled_faces_in_images(self, person_name: str, image_paths: list[str]) -> int:
+        """Remove only ``person_name`` face labels in the selected photos."""
+
+        source = str(person_name or "").strip()
+        if not source:
+            raise ValueError("The current identity name is required.")
+        refs = self._selected_image_face_refs(image_paths, person_name=source)
+        return self._apply_selected_image_label_change(
+            source_name=source,
+            face_refs=refs,
+            action="unlabel_selected_image_labels",
+        )
+
+    def _selected_image_face_refs(
+        self,
+        image_paths: list[str],
+        *,
+        person_name: str = "",
+        unlabeled_only: bool = False,
+    ) -> list[tuple[str, int]]:
+        """Return visible face rows in explicitly selected images only."""
+
+        paths = self._candidate_path_query_values(image_paths)
+        if not paths:
+            return []
+        name = str(person_name or "").strip()
+        query = """
+            SELECT i.image_path, i.face_index
+            FROM face_index i
+            LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+            WHERE COALESCE(i.hidden, 0)=0
+        """
+        params: list[object] = []
+        if name:
+            query += " AND l.person_name=?"
+            params.append(name)
+        elif unlabeled_only:
+            query += " AND l.person_name IS NULL"
+        query += " ORDER BY i.image_path, i.face_index"
+        with self._connect() as connection:
+            rows = self._execute_scoped_query(
+                connection,
+                query,
+                params,
+                image_column="i.image_path",
+                candidate_paths=paths,
+            )
+        return list(dict.fromkeys((str(row[0]), int(row[1])) for row in rows if str(row[0] or "").strip()))
+
+    def _apply_selected_image_label_change(
+        self,
+        *,
+        source_name: str = "",
+        target_name: str = "",
+        face_refs: list[tuple[str, int]],
+        action: str,
+    ) -> int:
+        """Persist a bounded face-label mutation and repair touched identities.
+
+        ``face_labels`` is authoritative for Names. Prototype rows are derived
+        identity data, so they are reconciled immediately after the durable
+        transaction and never used to broaden a photo-level selection.
+        """
+
+        source = str(source_name or "").strip()
+        target = str(target_name or "").strip()
+        normalized_refs = list(
+            dict.fromkeys(
+                (str(image_path), int(face_index))
+                for image_path, face_index in list(face_refs or [])
+                if str(image_path or "").strip()
+            )
+        )
+        if not normalized_refs:
+            return 0
+
+        records: list[IndexedFaceRecord] = []
+        for image_path, face_index in normalized_refs:
+            record = self.load_face_record(image_path, face_index)
+            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+                records.append(record)
+        if not records:
+            return 0
+        refs = [(record.image_path, int(record.face_index)) for record in records]
+
+        with self._connect() as connection:
+            # The Name action promises not to overwrite an already-saved
+            # label. Serialize this check with the subsequent write so a
+            # concurrent face workflow cannot turn a previously-unlabeled
+            # selected row into somebody else's label between the two steps.
+            connection.execute("BEGIN IMMEDIATE")
+            applicable_refs: list[tuple[str, int]] = []
+            for image_path, face_index in refs:
+                row = connection.execute(
+                    "SELECT person_name FROM face_labels WHERE image_path=? AND face_index=?",
+                    (image_path, face_index),
+                ).fetchone()
+                existing_name = str(row[0] or "").strip() if row is not None else ""
+                if source:
+                    if existing_name == source:
+                        applicable_refs.append((image_path, face_index))
+                elif not existing_name:
+                    applicable_refs.append((image_path, face_index))
+            if not applicable_refs:
+                return 0
+
+            if target:
+                target_existing = connection.execute(
+                    "SELECT COUNT(1) FROM person_prototype_faces WHERE person_name=?",
+                    (target,),
+                ).fetchone()
+                next_sort_row = connection.execute(
+                    "SELECT COALESCE(MAX(sort_order), -1) FROM person_prototype_faces WHERE person_name=?",
+                    (target,),
+                ).fetchone()
+                next_sort_order = int((next_sort_row or (-1,))[0]) + 1
+                target_has_example = bool(int((target_existing or [0])[0] or 0))
+                connection.executemany(
+                    """
+                    INSERT INTO face_labels(image_path, face_index, person_name, confidence)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(image_path, face_index) DO UPDATE SET
+                        person_name=excluded.person_name,
+                        confidence=excluded.confidence
+                    """,
+                    [(image_path, face_index, target, 1.0) for image_path, face_index in applicable_refs],
+                )
+                connection.executemany(
+                    "DELETE FROM pending_face_labels WHERE image_path=? AND face_index=?",
+                    applicable_refs,
+                )
+                for offset, (image_path, face_index) in enumerate(applicable_refs):
+                    connection.execute(
+                        """
+                        INSERT INTO person_prototype_faces(person_name, image_path, face_index, pinned, sort_order)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(person_name, image_path, face_index) DO NOTHING
+                        """,
+                        (
+                            target,
+                            image_path,
+                            face_index,
+                            1 if not target_has_example and offset == 0 else 0,
+                            next_sort_order + offset,
+                        ),
+                    )
+            else:
+                connection.executemany(
+                    "DELETE FROM face_labels WHERE image_path=? AND face_index=? AND person_name=?",
+                    [(image_path, face_index, source) for image_path, face_index in applicable_refs],
+                )
+
+            if source:
+                connection.executemany(
+                    "DELETE FROM person_prototype_faces WHERE person_name=? AND image_path=? AND face_index=?",
+                    [(source, image_path, face_index) for image_path, face_index in applicable_refs],
+                )
+            self._record_action_audit(
+                action,
+                target=target or source,
+                details={
+                    "source_name": source,
+                    "target_name": target,
+                    "face_count": len(applicable_refs),
+                },
+                reversible=False,
+                connection=connection,
+            )
+
+        self._invalidate_identity_caches()
+        if target:
+            self._reconcile_identity_after_selected_label_change(target)
+        if source and source != target:
+            self._reconcile_identity_after_selected_label_change(source)
+        self._invalidate_identity_caches()
+        return len(applicable_refs)
+
+    def _reconcile_identity_after_selected_label_change(self, person_name: str) -> None:
+        """Keep one touched identity's search prototype consistent with labels."""
+
+        name = str(person_name or "").strip()
+        if not name:
+            return
+        with self._connect() as connection:
+            has_labels = connection.execute(
+                "SELECT 1 FROM face_labels WHERE person_name=? LIMIT 1",
+                (name,),
+            ).fetchone()
+            if has_labels is None:
+                connection.execute("DELETE FROM person_prototype_faces WHERE person_name=?", (name,))
+                connection.execute("DELETE FROM person_prototypes WHERE person_name=?", (name,))
+                connection.execute("DELETE FROM person_profiles WHERE person_name=?", (name,))
+                return
+            rows = connection.execute(
+                """
+                SELECT p.image_path, p.face_index, p.pinned
+                FROM person_prototype_faces p
+                JOIN face_labels l ON l.image_path=p.image_path AND l.face_index=p.face_index
+                WHERE p.person_name=? AND l.person_name=?
+                ORDER BY p.pinned DESC, p.sort_order ASC, p.image_path ASC, p.face_index ASC
+                """,
+                (name, name),
+            ).fetchall()
+            if not rows:
+                rows = connection.execute(
+                    """
+                    SELECT l.image_path, l.face_index, 0
+                    FROM face_labels l
+                    WHERE l.person_name=?
+                    ORDER BY l.confidence DESC, l.image_path ASC, l.face_index ASC
+                    LIMIT 64
+                    """,
+                    (name,),
+                ).fetchall()
+
+        pinned_ref = next(
+            ((str(row[0]), int(row[1])) for row in rows if bool(row[2])),
+            None,
+        )
+        records: list[IndexedFaceRecord] = []
+        for image_path, face_index, _pinned in rows:
+            record = self.load_face_record(str(image_path), int(face_index))
+            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+                records.append(record)
+        if not records:
+            return
+        existing = self.find_person_prototype(name)
+        threshold = float(existing.similarity_threshold) if existing is not None else self.recognition_min_score
+        self._save_person_prototype(
+            name,
+            np.asarray([record.embedding for record in records], dtype=np.float32),
+            similarity_threshold=threshold,
+            prototype_face_refs=[(record.image_path, int(record.face_index)) for record in records],
+        )
+        if pinned_ref is not None and pinned_ref in {(record.image_path, int(record.face_index)) for record in records}:
+            self.pin_person_prototype_face(name, pinned_ref[0], pinned_ref[1])
+
     def recover_legacy_manual_face_labels(self) -> ManualLabelRecoveryResult:
         """Promote old explicit manual labels that were accidentally queued.
 
