@@ -44,7 +44,7 @@ from ui.gallery_pane import (
     MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE,
 )
 from ui.job_manager import JobManager
-from ui.list_models import ListEntryModel
+from ui.list_models import ListEntryModel, SidebarListEntryDelegate
 from ui.names_pane import NamesPane
 from ui.photo_inspector_dialog import EditableFaceDraft, PhotoInspectorDialog
 from ui.search_pane import FaceResultGroup, FaceTileItem, FaceTileListModel, SearchPane
@@ -2201,6 +2201,11 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/alice-a.jpg", "/photos/alice-b.jpg"]))
             self.assertEqual(1, service.recovery_calls)
             self.assertIn("Alice", self._list_view_text(pane.names_list, 0))
+            self.assertIsInstance(pane.names_list.itemDelegate(), SidebarListEntryDelegate)
+            self.assertEqual(
+                "2 photo(s) · 3 face(s)",
+                pane.names_model.index(0, 0).data(ListEntryModel.SubtitleRole),
+            )
             self.assertEqual("Alice · 2 unique photo(s)", pane.status_label.text())
             pane.search_field.setText("Bob")
             APP.processEvents()
@@ -2208,6 +2213,67 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual("Bob · 1 unique photo(s)", pane.status_label.text())
         finally:
             pane.shutdown_jobs(timeout_ms=500)
+            pane.close()
+
+    def test_names_pane_hover_preview_is_cached_and_does_not_change_selection(self):
+        class _NameService:
+            db_path = "/tmp/names-hover-test.sqlite3"
+
+            def __init__(self):
+                self.path_calls: list[str] = []
+
+            def recover_legacy_manual_face_labels(self):
+                return SimpleNamespace(promoted_count=0, duplicate_count=0, conflict_count=0)
+
+            def list_named_photo_summaries(self):
+                return [NamedPhotoSummary("Alice", face_count=3, photo_count=2)]
+
+            def list_named_photo_paths(self, person_name):
+                self.path_calls.append(str(person_name))
+                return ["/photos/alice-a.jpg", "/photos/alice-b.jpg"]
+
+        service = _NameService()
+        pane = NamesPane(lambda: service)
+        pane.resize(960, 700)
+        pane.show()
+        try:
+            pane.refresh_names()
+            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/alice-a.jpg", "/photos/alice-b.jpg"]))
+            index = pane.names_model.index(0, 0)
+            selected_before = pane.names_list.currentIndex().data(ListEntryModel.PayloadRole)
+            calls_before_hover = len(service.path_calls)
+
+            def _fake_sheet(_service, _paths, size, *, max_items=9, columns=3, cancel_check=None):
+                _ = (max_items, columns, cancel_check)
+                image = QImage(int(size.width()), int(size.height()), QImage.Format.Format_RGB32)
+                image.fill(Qt.GlobalColor.blue)
+                return image
+
+            with patch("ui.names_pane.ThumbnailService.build_contact_sheet_qimage", new=_fake_sheet):
+                row_rect = pane.names_list.visualRect(index)
+                QTest.mouseMove(pane.names_list.viewport(), row_rect.center())
+                if not self._wait_until(lambda: pane._hover_popup.isVisible(), timeout_s=1.0):
+                    pane._update_name_hover_preview(index)
+                self.assertTrue(self._wait_until(lambda: pane._hover_popup.isVisible()))
+                self.assertTrue(self._wait_until(lambda: len(pane._hover_preview_cache) == 1))
+                self.assertEqual("Alice", pane._hover_popup.title_label.text())
+                self.assertEqual("2 photo(s) · 3 saved face(s)", pane._hover_popup.summary_label.text())
+                self.assertEqual("Alice", pane.names_list.currentIndex().data(ListEntryModel.PayloadRole))
+                self.assertEqual(calls_before_hover + 1, len(service.path_calls))
+                self.assertEqual(selected_before, pane.names_list.currentIndex().data(ListEntryModel.PayloadRole))
+
+                pane._hide_name_hover_preview(cancel_preview=True)
+                pane._update_name_hover_preview(index)
+                APP.processEvents()
+                self.assertTrue(pane._hover_popup.isVisible())
+                self.assertEqual(calls_before_hover + 1, len(service.path_calls))
+                pixmap = pane._hover_popup.image_label.pixmap()
+                self.assertIsNotNone(pixmap)
+                self.assertFalse(pixmap.isNull())
+                self.assertEqual(255, pixmap.toImage().pixelColor(5, 5).blue())
+        finally:
+            self.assertTrue(pane.shutdown_jobs(timeout_ms=1000))
+            self.assertFalse(pane._hover_popup.isVisible())
             pane.close()
 
     def test_names_pane_selected_image_actions_are_scoped_to_the_active_name(self):
@@ -3605,6 +3671,12 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([], service.count_indexed_faces_calls)
         self.assertEqual(1, pane.face_named_people_list.count())
         self.assertEqual(1, pane.face_unlabeled_groups_list.count())
+        self.assertTrue(pane.face_named_people_list.property("sidebarList"))
+        self.assertIsInstance(pane.face_named_people_list.itemDelegate(), SidebarListEntryDelegate)
+        self.assertEqual("Alice", pane.face_named_people_list.item(0).text())
+        self.assertIn("visible", pane.face_named_people_list.item(0).data(ListEntryModel.SubtitleRole))
+        self.assertEqual("a.jpg", pane.face_unlabeled_groups_list.item(0).text())
+        self.assertIn("unlabeled face", pane.face_unlabeled_groups_list.item(0).data(ListEntryModel.SubtitleRole))
         selected_photo_help = pane.findChild(HelpIconButton, "helpIcon_selected_photo_faces")
         self.assertIsNotNone(selected_photo_help)
         self.assertTrue(selected_photo_help.toolTip())

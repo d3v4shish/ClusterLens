@@ -1,5 +1,14 @@
 # Current implementation plan
 
+## Sidebar typography and Names hover preview
+
+- [x] Render sidebar name, identity, and unlabeled-group rows as a dense title plus muted metadata line rather than delimiter-heavy text.
+  Contract: the existing selection payloads, filtering, tooltips, and virtual/paged models remain unchanged; dense rows preserve their counts and full detail on hover.
+  Validation: `QT_QPA_PLATFORM=offscreen uv run --with pytest python -m pytest tests/test_ui_smoke.py -k 'names_pane_lists_durable_names_and_unique_photo_paths or names_pane_hover_preview_is_cached_and_does_not_change_selection or face_library_scan_and_refresh_ignore_hidden_candidate_scope or profile_controls_save_favorite_birth_date_hidden_and_identity_summary'` passed (4 tests); Python compilation and `git diff --check` passed.
+- [x] Add a bounded, asynchronous contact-sheet preview when hovering a saved name.
+  Contract: hover never blocks the UI; it shows only photos explicitly labeled with that name, cancels stale work, bounds memory with an LRU cache, and does not alter selection or gallery contents.
+  Validation: the focused Names hover test verifies worker completion, exact labeled-photo content, cache reuse, unchanged selection, and clean shutdown. The full offscreen UX acceptance suite passed 6 checks; its one existing header-state failure is unrelated to these sidebar views.
+
 ## Compact Find and strict Names editing
 
 - [x] Hide the verbose advanced Find walkthrough/saved-search panel, replace explanatory prose in core Find sections with existing hover/help affordances, and use the available grid layout for selected-face, query-face, and name-query controls.

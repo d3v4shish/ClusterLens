@@ -85,6 +85,25 @@ QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTreeView, QTableView, QCombo
   selection-color: #FFFFFF;
 }
 
+QListView[sidebarList="true"], QListWidget[sidebarList="true"] {
+  background: #11151A;
+  border: 1px solid #303844;
+  border-radius: 8px;
+  padding: 2px;
+  outline: 0;
+}
+QListView[sidebarList="true"]::item, QListWidget[sidebarList="true"]::item {
+  border-bottom: 1px solid #202933;
+  padding: 2px 4px;
+}
+QListView[sidebarList="true"]::item:selected, QListWidget[sidebarList="true"]::item:selected {
+  background: #173554;
+  color: #FFFFFF;
+}
+QListView[sidebarList="true"]::item:hover, QListWidget[sidebarList="true"]::item:hover {
+  background: #16202C;
+}
+
 QComboBox::drop-down {
   border: 0px;
 }

@@ -109,7 +109,7 @@ from ui.common import HelpIconButton, build_help_inline
 from ui.error_mbox import confirmBox, errorBox, infoBox
 from ui.async_job import AsyncJob, Cancelled, detach_running_async_job, start_job_in_thread, wait_for_thread_shutdown
 from ui.gallery_pane import GalleryPane
-from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel
+from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
 from ui.photo_inspector_dialog import EditableFaceDraft
 from ui.theme import COLORS
 
@@ -1749,10 +1749,12 @@ class SearchPane(QWidget):
         face_results_body_layout.setSpacing(8)
         self.face_results_groups_model = ListEntryModel(self)
         self.face_results_groups_list = QListView()
+        self.face_results_groups_list.setProperty("sidebarList", True)
         self.face_results_groups_list.setMaximumWidth(260)
         self.face_results_groups_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.face_results_groups_list.setUniformItemSizes(True)
         self.face_results_groups_list.setModel(self.face_results_groups_model)
+        self.face_results_groups_list.setItemDelegate(SidebarListEntryDelegate(self.face_results_groups_list))
         self.face_results_groups_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.face_results_groups_list.customContextMenuRequested.connect(self._show_face_result_group_context_menu)
         face_results_group_selection_model = self.face_results_groups_list.selectionModel()
@@ -1767,10 +1769,12 @@ class SearchPane(QWidget):
         raw_groups_layout.addWidget(self.face_results_groups_list, stretch=1)
         self.face_results_merged_groups_model = ListEntryModel(self)
         self.face_results_merged_groups_list = QListView()
+        self.face_results_merged_groups_list.setProperty("sidebarList", True)
         self.face_results_merged_groups_list.setMaximumWidth(260)
         self.face_results_merged_groups_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.face_results_merged_groups_list.setUniformItemSizes(True)
         self.face_results_merged_groups_list.setModel(self.face_results_merged_groups_model)
+        self.face_results_merged_groups_list.setItemDelegate(SidebarListEntryDelegate(self.face_results_merged_groups_list))
         merged_group_selection_model = self.face_results_merged_groups_list.selectionModel()
         if merged_group_selection_model is not None:
             merged_group_selection_model.selectionChanged.connect(lambda *_args: self._on_face_result_group_selection_changed("merged_name"))
@@ -6728,15 +6732,25 @@ class SearchPane(QWidget):
         entries: list[ListEntry] = []
         for profile in list(profiles or []):
             duplicates = self._face_identity_duplicates.get(str(profile.person_name), ())
-            suffix = f" | possible duplicate x{len(duplicates)}" if duplicates else ""
             prefix = "[Favorite] " if bool(getattr(profile, "favorite", False)) else ""
+            subtitle_parts = [
+                f"{profile.visible_face_count} visible",
+                f"{profile.labeled_count} labeled",
+                f"{profile.example_count} examples",
+            ]
+            if bool(getattr(profile, "hidden", False)):
+                subtitle_parts.append("hidden")
+            if duplicates:
+                subtitle_parts.append(f"possible duplicate ×{len(duplicates)}")
             entries.append(
                 ListEntry(
-                    title=(
-                        f"{prefix}{profile.person_name} | examples={profile.example_count} | "
-                        f"labeled={profile.labeled_count} | visible={profile.visible_face_count}{suffix}"
+                    title=f"{prefix}{profile.person_name}",
+                    subtitle=" · ".join(subtitle_parts),
+                    tooltip=(
+                        f"Saved identity {profile.person_name}\n"
+                        f"{profile.example_count} example(s) · {profile.labeled_count} labeled face(s) · "
+                        f"{profile.visible_face_count} visible face(s)"
                     ),
-                    tooltip=f"Saved identity {profile.person_name}",
                     payload=str(profile.person_name),
                 )
             )
@@ -10408,12 +10422,16 @@ class SearchPane(QWidget):
         self.face_folder_path.setToolTip(FACE_HELP["scan_source"])
 
         self.face_named_people_list = QListWidget()
+        self.face_named_people_list.setProperty("sidebarList", True)
+        self.face_named_people_list.setItemDelegate(SidebarListEntryDelegate(self.face_named_people_list))
         self.face_named_people_list.setMinimumHeight(220)
         self.face_named_people_list.setMaximumHeight(280)
         self.face_named_people_list.setToolTip(
             "Saved identities for this folder. Click one to load its name and profile fields."
         )
         self.face_unlabeled_groups_list = QListWidget()
+        self.face_unlabeled_groups_list.setProperty("sidebarList", True)
+        self.face_unlabeled_groups_list.setItemDelegate(SidebarListEntryDelegate(self.face_unlabeled_groups_list))
         self.face_unlabeled_groups_list.setMinimumHeight(220)
         self.face_unlabeled_groups_list.setMaximumHeight(280)
         self.face_unlabeled_groups_list.setToolTip(
@@ -11521,16 +11539,23 @@ class SearchPane(QWidget):
         for profile in profiles:
             if folder and int(getattr(profile, "visible_face_count", 0)) <= 0:
                 continue
-            tags_text = ", ".join(profile.tags[:3]) if profile.tags else "no tags"
-            notes_text = str(profile.notes or "").strip()
             prefix = "[Favorite] " if bool(getattr(profile, "favorite", False)) else ""
-            summary = f"{prefix}{profile.person_name} | examples={profile.example_count} | labeled={profile.labeled_count} | visible={profile.visible_face_count} | thr={profile.similarity_threshold:.2f}"
-            if str(getattr(profile, "birth_date", "") or "").strip():
-                summary += f" | DOB {getattr(profile, 'birth_date', '')}"
-            if notes_text:
-                summary += f" | {notes_text[:36]}"
-            summary += f" | tags={tags_text}"
-            item = QListWidgetItem(summary)
+            title = f"{prefix}{profile.person_name}"
+            subtitle_parts = [
+                f"{profile.visible_face_count} visible",
+                f"{profile.labeled_count} labeled",
+                f"{profile.example_count} examples",
+            ]
+            if bool(getattr(profile, "hidden", False)):
+                subtitle_parts.append("hidden")
+            item = QListWidgetItem(title)
+            item.setData(ListEntryModel.SubtitleRole, " · ".join(subtitle_parts))
+            item.setToolTip(
+                f"{title}\n{profile.example_count} example(s) · {profile.labeled_count} labeled face(s) · "
+                f"{profile.visible_face_count} visible face(s)\n"
+                f"Threshold: {profile.similarity_threshold:.2f}\n"
+                f"Tags: {', '.join(profile.tags[:3]) if profile.tags else 'none'}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, profile)
             self.face_named_people_list.addItem(item)
             visible_profiles += 1
@@ -11554,8 +11579,10 @@ class SearchPane(QWidget):
                 face_count=len(image_records),
                 records=tuple(image_records),
             )
-            item = QListWidgetItem(
-                f"Unlabeled | {Path(image_path).name} | faces={len(image_records)} | conf={average_confidence:.2f}"
+            item = QListWidgetItem(Path(image_path).name)
+            item.setData(
+                ListEntryModel.SubtitleRole,
+                f"{len(image_records)} unlabeled face(s) · confidence {average_confidence:.2f}",
             )
             item.setData(Qt.ItemDataRole.UserRole, payload)
             item.setToolTip(f"{image_path}\n{len(image_records)} unlabeled face(s)")
@@ -14556,7 +14583,9 @@ class SearchPane(QWidget):
 
         self.face_identity_model = PagedListEntryModel(self, page_size=50)
         self.face_identity_list = QListView()
+        self.face_identity_list.setProperty("sidebarList", True)
         self.face_identity_list.setModel(self.face_identity_model)
+        self.face_identity_list.setItemDelegate(SidebarListEntryDelegate(self.face_identity_list))
         self.face_identity_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.face_identity_list.setUniformItemSizes(True)
         self.face_identity_list.setToolTip(FACE_HELP["people_groups"])

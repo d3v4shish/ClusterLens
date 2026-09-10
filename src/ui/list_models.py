@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QAbstractListModel, QModelIndex, Qt
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSize, Qt
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter
+from PyQt6.QtWidgets import QApplication, QStyle, QStyledItemDelegate, QStyleOptionViewItem
+
+from ui.theme import COLORS
 
 
 @dataclass(frozen=True)
@@ -12,10 +15,12 @@ class ListEntry:
     tooltip: str = ""
     payload: object | None = None
     icon: QIcon | None = None
+    subtitle: str = ""
 
 
 class ListEntryModel(QAbstractListModel):
     PayloadRole = Qt.ItemDataRole.UserRole + 1
+    SubtitleRole = Qt.ItemDataRole.UserRole + 2
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -32,6 +37,8 @@ class ListEntryModel(QAbstractListModel):
         item = self._items[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             return item.title
+        if role == self.SubtitleRole:
+            return item.subtitle
         if role == Qt.ItemDataRole.ToolTipRole:
             return item.tooltip
         if role == Qt.ItemDataRole.DecorationRole:
@@ -139,3 +146,67 @@ class PagedListEntryModel(ListEntryModel):
         else:
             items = list(self._all_items)
         self._matching_items = sorted(items, key=lambda item: item.title.casefold(), reverse=self._sort_descending)
+
+
+class SidebarListEntryDelegate(QStyledItemDelegate):
+    """Draw dense sidebar rows with separate label and supporting metadata."""
+
+    _title_color = QColor(COLORS["text"])
+    _subtitle_color = QColor(COLORS["text_muted"])
+
+    @staticmethod
+    def _text_parts(index) -> tuple[str, str]:
+        title = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+        subtitle = str(index.data(ListEntryModel.SubtitleRole) or "").strip()
+        if subtitle:
+            return title, subtitle
+        lines = [line.strip() for line in title.splitlines() if line.strip()]
+        if len(lines) > 1:
+            return lines[0], " · ".join(lines[1:])
+        return title, ""
+
+    def sizeHint(self, option, index):  # type: ignore[override]
+        base = super().sizeHint(option, index)
+        _title, subtitle = self._text_parts(index)
+        minimum_height = 46 if subtitle else 32
+        return QSize(base.width(), max(base.height(), minimum_height))
+
+    def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
+        title, subtitle = self._text_parts(index)
+        if not subtitle:
+            super().paint(painter, option, index)
+            return
+
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        style_option.text = ""
+        style_option.icon = QIcon()
+        style = style_option.widget.style() if style_option.widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, style_option, painter, style_option.widget)
+
+        content = style_option.rect.adjusted(10, 5, -10, -5)
+        title_font = QFont(style_option.font)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        title_metrics = QFontMetrics(title_font)
+        subtitle_font = QFont(style_option.font)
+        subtitle_font.setPointSize(max(9, subtitle_font.pointSize() - 1))
+        subtitle_metrics = QFontMetrics(subtitle_font)
+        selected = bool(style_option.state & QStyle.StateFlag.State_Selected)
+        title_color = style_option.palette.highlightedText().color() if selected else self._title_color
+        subtitle_color = style_option.palette.highlightedText().color() if selected else self._subtitle_color
+        painter.save()
+        painter.setFont(title_font)
+        painter.setPen(title_color)
+        painter.drawText(
+            content.x(),
+            content.y() + title_metrics.ascent(),
+            title_metrics.elidedText(title, Qt.TextElideMode.ElideRight, max(1, content.width())),
+        )
+        painter.setFont(subtitle_font)
+        painter.setPen(subtitle_color)
+        painter.drawText(
+            content.x(),
+            content.bottom() - subtitle_metrics.descent(),
+            subtitle_metrics.elidedText(subtitle, Qt.TextElideMode.ElideRight, max(1, content.width())),
+        )
+        painter.restore()
