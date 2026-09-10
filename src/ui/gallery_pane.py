@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import Event, Lock
 from time import perf_counter
 
-from PyQt6.QtCore import QEvent, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage, QImageReader
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
@@ -262,6 +262,7 @@ class GalleryPane(QWidget):
         self.face_reset_draft_callback = None
         self.face_auto_clean_callback = None
         self.action_target_provider = None
+        self.context_menu_action_provider = None
         self.metadata_service = None
         self.image_tag_service = None
         self.review_action_mode = "add"
@@ -447,6 +448,13 @@ class GalleryPane(QWidget):
         index = self.list_view.indexAt(pos)
         if not index.isValid():
             return
+        selection_model = self.list_view.selectionModel()
+        if selection_model is not None and not selection_model.isSelected(index):
+            self.list_view.setCurrentIndex(index)
+            selection_model.select(
+                index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+            )
         image_path = index.data(self.model.PathRole)
         if not image_path:
             return
@@ -476,13 +484,32 @@ class GalleryPane(QWidget):
             review_action = menu.addAction("Remove From Review")
         elif self.review_action_mode == "add":
             review_action = menu.addAction("Add To Review")
+        context_callbacks: dict[object, object] = {}
+        if callable(self.context_menu_action_provider):
+            try:
+                extra_actions = self.context_menu_action_provider(str(image_path)) or []
+            except Exception:
+                LOGGER.exception("Gallery context-menu action provider failed image_path=%s", image_path)
+                extra_actions = []
+            for item in extra_actions:
+                try:
+                    text, tooltip, callback, enabled = item
+                except (TypeError, ValueError):
+                    continue
+                if not callable(callback):
+                    continue
+                extra_action = self._add_menu_action(menu, str(text), str(tooltip), lambda: None)
+                extra_action.setEnabled(bool(enabled))
+                context_callbacks[extra_action] = callback
         menu.addSeparator()
         move_to_trash = menu.addAction("Move to ClusterLens Trash (selection)")
         move_to_dir = menu.addAction("Move To... (Selection)")
         move_to_trash.setEnabled(not self.read_only_mode)
         move_to_dir.setEnabled(not self.read_only_mode)
         action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
-        if action == open_inspector:
+        if action in context_callbacks:
+            context_callbacks[action]()
+        elif action == open_inspector:
             self.on_item_double_clicked(index)
         elif edit_faces is not None and action == edit_faces:
             self._open_inspector(index, allow_face_edit=True)
@@ -1288,6 +1315,11 @@ class GalleryPane(QWidget):
     def set_action_target_provider(self, provider) -> None:
         self.action_target_provider = provider
         self.refresh_selection_target_hint()
+
+    def set_context_menu_action_provider(self, provider) -> None:
+        """Set an optional provider for workspace-specific right-click actions."""
+
+        self.context_menu_action_provider = provider
 
     def set_inspector_display_mode(self, mode: str) -> None:
         self.inspector_display_mode = "advanced" if str(mode).strip().lower() == "advanced" else "basic"

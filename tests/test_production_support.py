@@ -280,9 +280,7 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertFalse(window.faces_workspace_button.isChecked())
                 self.assertFalse(window._source_pane_visible())
                 self.assertIsNone(window.faces_pane)
-                self.assertTrue(window.names_pane.name_selected_button.isVisible())
-                self.assertTrue(window.names_pane.rename_selected_button.isVisible())
-                self.assertTrue(window.names_pane.unlabel_selected_button.isVisible())
+                self.assertTrue(callable(window.names_pane.gallery.context_menu_action_provider))
                 window.close()
 
     def test_production_face_provider_never_instantiates_an_uninstalled_default_pack(self):

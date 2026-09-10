@@ -14,7 +14,7 @@ from PIL import Image
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QSize, Qt, QSettings, QThread
 from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QGridLayout, QMessageBox, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QGridLayout, QMenu, QMessageBox, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -2228,8 +2228,8 @@ class UiSmokeTests(unittest.TestCase):
 
             def list_named_photo_paths(self, person_name):
                 return {
-                    "Alice": ["/photos/mixed.jpg"],
-                    "Bob": ["/photos/mixed.jpg"],
+                    "Alice": ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"],
+                    "Bob": ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"],
                 }.get(str(person_name), [])
 
             def label_unlabeled_faces_in_images(self, person_name, image_paths):
@@ -2251,24 +2251,52 @@ class UiSmokeTests(unittest.TestCase):
         pane.show()
         try:
             pane.refresh_names()
-            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
+            self.assertTrue(
+                self._wait_until(lambda: pane.gallery.images == ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"])
+            )
 
-            def select_photo() -> None:
-                index = pane.gallery.model.index(0, 0)
-                pane.gallery.list_view.selectionModel().select(
-                    index,
+            def select_photos() -> None:
+                selection_model = pane.gallery.list_view.selectionModel()
+                first = pane.gallery.model.index(0, 0)
+                second = pane.gallery.model.index(1, 0)
+                selection_model.select(
+                    first,
                     QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+                )
+                selection_model.select(
+                    second,
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
                 )
                 APP.processEvents()
 
-            select_photo()
-            self.assertTrue(pane.name_selected_button.isEnabled())
-            self.assertTrue(pane.rename_selected_button.isEnabled())
-            self.assertTrue(pane.unlabel_selected_button.isEnabled())
+            select_photos()
+            actions = {item[0]: item for item in pane._names_context_menu_actions("/photos/mixed-a.jpg")}
+            self.assertTrue(actions["Name Selected…"][3])
+            self.assertTrue(actions["Rename Selected…"][3])
+            self.assertTrue(actions["Unlabel Selected"][3])
+            self.assertIsNotNone(pane.gallery.context_menu_action_provider)
+            pane.set_read_only_mode(True)
+            self.assertTrue(all(not item[3] for item in pane._names_context_menu_actions("/photos/mixed-a.jpg")))
+            pane.set_read_only_mode(False)
 
-            with patch("ui.names_pane.QInputDialog.getText", return_value=("Bob", True)):
-                pane._name_selected_images()
-            self.assertTrue(self._wait_until(lambda: service.calls[:1] == [("name", "Bob", ("/photos/mixed.jpg",))]))
+            def choose_name_action(*_args):
+                return next(
+                    action
+                    for menu in pane.gallery.findChildren(QMenu)
+                    for action in menu.actions()
+                    if action.text() == "Name Selected…"
+                )
+
+            with (
+                patch("ui.names_pane.QInputDialog.getText", return_value=("Bob", True)),
+                patch("ui.gallery_pane.QMenu.exec", side_effect=choose_name_action),
+            ):
+                pane.gallery.on_context_menu(pane.gallery.list_view.visualRect(pane.gallery.model.index(0, 0)).center())
+            self.assertTrue(
+                self._wait_until(
+                    lambda: service.calls[:1] == [("name", "Bob", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
+                )
+            )
             self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
             self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
 
@@ -2279,28 +2307,33 @@ class UiSmokeTests(unittest.TestCase):
                 QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
             )
             self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
-            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
+            self.assertTrue(
+                self._wait_until(lambda: pane.gallery.images == ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"])
+            )
             self.assertTrue(self._wait_until(lambda: pane._photos_job is None))
-            select_photo()
-            self.assertTrue(pane.rename_selected_button.isEnabled())
+            select_photos()
             with patch("ui.names_pane.QInputDialog.getText", return_value=("Cara", True)):
-                pane._rename_selected_images()
+                actions["Rename Selected…"][2]()
             self.assertTrue(
                 self._wait_until(
-                    lambda: service.calls[1:2] == [("rename", "Alice", "Cara", ("/photos/mixed.jpg",))]
+                    lambda: service.calls[1:2] == [
+                        ("rename", "Alice", "Cara", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))
+                    ]
                 )
             )
             self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))
             self.assertTrue(self._wait_until(lambda: pane._refresh_job is None))
 
             self.assertTrue(self._wait_until(lambda: pane.names_list.currentIndex().data(ListEntryModel.PayloadRole) == "Alice"))
-            self.assertTrue(self._wait_until(lambda: pane.gallery.images == ["/photos/mixed.jpg"]))
-            select_photo()
+            self.assertTrue(
+                self._wait_until(lambda: pane.gallery.images == ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"])
+            )
+            select_photos()
             with patch("ui.names_pane.confirmBox", return_value=True):
-                pane._unlabel_selected_images()
+                actions["Unlabel Selected"][2]()
             self.assertTrue(
                 self._wait_until(
-                    lambda: service.calls[2:3] == [("unlabel", "Alice", ("/photos/mixed.jpg",))]
+                    lambda: service.calls[2:3] == [("unlabel", "Alice", ("/photos/mixed-a.jpg", "/photos/mixed-b.jpg"))]
                 )
             )
             self.assertTrue(self._wait_until(lambda: pane._mutation_job is None))

@@ -1,5 +1,11 @@
 # Current implementation plan
 
+## Names context-menu actions
+
+- [x] Move selected-photo Name, Rename, and Unlabel actions from the Names header into the photo gallery right-click menu.
+  Contract: right-clicking an unselected photo selects it; right-clicking an already-selected photo preserves the complete multi-photo selection. The menu retains the ordinary gallery actions and exposes the same face-safe label mutations with read-only guards.
+  Validation: focused offscreen Names tests verify the menu items, two-photo selection preservation, disabled read-only behavior, and the existing async durable-label operation. Production Names workspace coverage confirms the optional gallery action hook is present without opening Faces.
+
 ## Names selected-image label actions
 
 - [x] Add Name, Rename, and Unlabel actions for selected photos in the Names workspace.
