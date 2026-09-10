@@ -1,6 +1,6 @@
 # Architecture
 
-ClusterLens is a local PyQt desktop application. `apps.pyqt_production` builds the shell, owns QSettings/runtime services, and coordinates the Gallery, Clustering, lazy-loaded Faces, and Names workspaces.
+ClusterLens is a local PyQt desktop application. `apps.pyqt_production` builds the shell, owns QSettings/runtime services, and coordinates the Gallery, Clustering, lazy-loaded Faces, and lazy-loaded Names workspaces. Opening Names creates only the configured global face-index service on a worker, then loads durable labels; it does not require the Faces widget or face inference to be opened first.
 
 Folder selection flows from `SourcePane` to the main window, gallery, and Faces folder review. The selected folder is the tree root; job status is separate from the persistent footer path chip.
 

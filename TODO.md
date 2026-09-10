@@ -1,5 +1,11 @@
 # Current implementation plan
 
+## Production Names workspace alignment
+
+- [x] Expose the existing Names workspace from the production PyQt shell used by `scripts/run_app*.sh`.
+  Contract: the visible production toolbar has Clustering, Faces, and Names; Names uses the production global face database and remains usable before the lazy Faces pane is opened.
+  Validation: focused production test creates Names, waits for its durable-label refresh, and verifies that Faces remains unopened; startup-performance and all UX-acceptance tests passed. The GPU source launch follows this checklist update.
+
 ## Names workspace validation pass
 
 - [x] Measure deterministic startup and Names query latency on an isolated temporary runtime/SQLite fixture.

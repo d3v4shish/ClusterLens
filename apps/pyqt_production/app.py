@@ -106,6 +106,12 @@ class FacesWorkspacePayload:
     services_session: dict[str, object]
 
 
+@dataclass(frozen=True)
+class NamesWorkspacePayload:
+    service: object
+    service_key: tuple[str, str, str, str]
+
+
 class ProductionClusterApp(QMainWindow):
     def __init__(self, runtime_layout: RuntimeLayout):
         super().__init__()
@@ -204,7 +210,13 @@ class ProductionClusterApp(QMainWindow):
         self.face_service_session = None
         self.faces_pane = None
         self.faces_placeholder = None
+        self.names_pane = None
+        self.names_placeholder = None
         self._faces_session_reset_pending = True
+        self._names_init_job = None
+        self._names_init_thread = None
+        self._names_init_job_id: int | None = None
+        self._names_init_scheduled = False
         self._main_gallery_context_overrides: dict[str, dict[str, object]] = {}
         self._startup_check_timer = QTimer(self)
         self._startup_check_timer.setSingleShot(True)
@@ -365,10 +377,12 @@ class ProductionClusterApp(QMainWindow):
         photo_gallery_layout.addWidget(self.photo_gallery, stretch=1)
 
         self.faces_placeholder = self._build_faces_placeholder()
+        self.names_placeholder = self._build_names_placeholder()
 
         self.workspace_stack.addWidget(self.photo_gallery_workspace)
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_placeholder)
+        self.workspace_stack.addWidget(self.names_placeholder)
         self.workspace_stack.setMinimumWidth(1040)
 
         self.main_splitter.addWidget(self.source_pane)
@@ -399,6 +413,27 @@ class ProductionClusterApp(QMainWindow):
         layout.addWidget(self.faces_placeholder_title)
         layout.addWidget(self.faces_placeholder_detail)
         layout.addWidget(self.faces_placeholder_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        return panel
+
+    def _build_names_placeholder(self) -> QWidget:
+        panel = QWidget(self.workspace_stack)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        self.names_placeholder_title = QLabel("Names workspace")
+        self.names_placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.names_placeholder_title.setObjectName("namesLazyTitle")
+        self.names_placeholder_detail = QLabel("Opening the saved global face-label database…")
+        self.names_placeholder_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.names_placeholder_detail.setWordWrap(True)
+        self.names_placeholder_button = QPushButton("Open Names")
+        self.names_placeholder_button.setMinimumWidth(180)
+        self.names_placeholder_button.clicked.connect(self._start_names_workspace_load)
+        layout.addWidget(self.names_placeholder_title)
+        layout.addWidget(self.names_placeholder_detail)
+        layout.addWidget(self.names_placeholder_button, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addStretch(1)
         return panel
 
@@ -436,6 +471,139 @@ class ProductionClusterApp(QMainWindow):
             self._faces_init_scheduled = True
             QTimer.singleShot(0, self._start_faces_workspace_load)
         return self.faces_placeholder
+
+    def _ensure_names_workspace(self):
+        if self.names_pane is not None:
+            return self.names_pane
+        if not self._names_init_scheduled and not self._thread_is_running(self._names_init_thread):
+            self._names_init_scheduled = True
+            QTimer.singleShot(0, self._start_names_workspace_load)
+        return self.names_placeholder
+
+    def _start_names_workspace_load(self) -> None:
+        self._names_init_scheduled = False
+        if self._is_shutting_down:
+            return
+        if self.names_pane is not None and self.face_service_global is not None:
+            return
+        if self._thread_is_running(self._names_init_thread):
+            return
+
+        model_root = str(self.settings_registry.get(self.settings_store, "faces/model_root", "") or "").strip()
+        configured_detector = str(
+            self.settings_registry.get(self.settings_store, "faces/default_detector/human") or ""
+        ).strip()
+        configured_embedder = str(
+            self.settings_registry.get(self.settings_store, "faces/default_embedder/human") or ""
+        ).strip()
+        detector_score = float(
+            self.settings_registry.get(self.settings_store, "faces/detector_score_threshold/human")
+        )
+        max_detections = max(
+            1,
+            int(self.settings_registry.get(self.settings_store, "faces/max_detections/human", 50)),
+        )
+        cache_dir = Path(self.settings.cache_dir)
+        if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
+            self.names_placeholder_detail.setText("Opening the saved global face-label database…")
+        if self._can_update_widget(getattr(self, "names_placeholder_button", None)):
+            self.names_placeholder_button.setEnabled(False)
+
+        def _run(progress, cancel_check):
+            progress(-1, "Opening saved face labels…")
+            face_search = _face_search_api()
+            mode = "human"
+            detector, embedder = face_search.resolve_ready_face_pipeline_ids(
+                model_root,
+                mode,
+                configured_detector or face_search.DEFAULT_HUMAN_FACE_DETECTOR_ID,
+                configured_embedder or face_search.DEFAULT_HUMAN_FACE_EMBEDDER_ID,
+            )
+            raise_if_cancelled(cancel_check)
+            if detector == face_search.BUILTIN_HUMAN_DETECTOR_ID and embedder == face_search.BUILTIN_HUMAN_EMBEDDER_ID:
+                db_path = cache_dir / "face_search_index.db"
+            else:
+                db_path = cache_dir / f"face_search_human_{detector}__{embedder}.db"
+            service = face_search.FaceIndexService(
+                mode=mode,
+                execution_policy=self.execution_policy,
+                runtime_service=self.runtime_service,
+                model_root=model_root,
+                detector_id=detector,
+                embedder_id=embedder,
+                detector_score_threshold=detector_score,
+                detector_max_detections=max_detections,
+                db_path=db_path,
+            )
+            raise_if_cancelled(cancel_check)
+            return NamesWorkspacePayload(
+                service=service,
+                service_key=("global", mode, detector, embedder),
+            )
+
+        job = AsyncJob(_run)
+        self._names_init_job = job
+        self._names_init_job_id = self.job_manager.register_job("Opening Names", cancel_fn=job.cancel)
+        job.progress.connect(
+            lambda value, text: self.job_manager.update(
+                self._names_init_job_id or -1,
+                progress=value,
+                text=text,
+            )
+        )
+        job.progress.connect(
+            lambda _value, text: self.names_placeholder_detail.setText(str(text))
+            if self._can_update_widget(getattr(self, "names_placeholder_detail", None))
+            else None
+        )
+
+        def _finish(status: str, error: str = "") -> None:
+            if self._names_init_job_id is not None:
+                self.job_manager.finish(self._names_init_job_id, status=status, error=error)
+            self._names_init_job_id = None
+
+        def _completed(payload) -> None:
+            if self._is_shutting_down or not isinstance(payload, NamesWorkspacePayload):
+                _finish("cancelled")
+                return
+            self._face_service_cache[payload.service_key] = payload.service
+            self.face_services_global = {"human": payload.service}
+            self.face_service_global = payload.service
+            if self.names_pane is None:
+                self._build_names_workspace_widget()
+            else:
+                self.names_pane.refresh_names()
+            _finish("finished")
+
+        def _failed(message: str) -> None:
+            text = str(message or "").strip()
+            _finish("cancelled" if text.casefold() == "cancelled" else "failed", text)
+            if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
+                self.names_placeholder_detail.setText(f"Names could not open: {text}")
+                self.names_placeholder_button.setText("Retry Names")
+                self.names_placeholder_button.setEnabled(True)
+
+        def _cancelled() -> None:
+            _finish("cancelled")
+            if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
+                self.names_placeholder_detail.setText("Names loading was cancelled.")
+                self.names_placeholder_button.setEnabled(True)
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        thread = start_job_in_thread(job)
+        self._names_init_thread = thread
+        self._retain_async_refs(job, thread)
+
+        def _cleanup() -> None:
+            self._release_async_refs(job, thread)
+            if self._names_init_thread is thread:
+                self._names_init_thread = None
+            if self._names_init_job is job:
+                self._names_init_job = None
+
+        thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
 
     def _start_faces_workspace_load(self) -> None:
         self._faces_init_scheduled = False
@@ -644,6 +812,36 @@ class ProductionClusterApp(QMainWindow):
             if target is not None:
                 target.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
+    def _build_names_workspace_widget(self) -> None:
+        if self.names_pane is not None or self._is_shutting_down:
+            return
+
+        from ui.names_pane import NamesPane
+
+        pane = NamesPane(lambda: self.face_service_global, self.workspace_stack)
+        pane.gallery.job_manager = self.job_manager
+        pane.gallery.metadata_service = self.photo_metadata_service
+        pane.gallery.image_tag_service = self.image_tag_service
+        pane.gallery.set_read_only_mode(self._read_only_mode())
+        pane.setMinimumWidth(self._layout_widths()["faces"])
+        self.names_pane = pane
+        if self.faces_pane is not None:
+            self.faces_pane.face_labels_changed.connect(pane.refresh_names)
+        self._apply_workspace_preferences()
+
+        placeholder = self.names_placeholder
+        placeholder_index = self.workspace_stack.indexOf(placeholder) if placeholder is not None else -1
+        if placeholder_index >= 0:
+            self.workspace_stack.insertWidget(placeholder_index, pane)
+            self.workspace_stack.removeWidget(placeholder)
+            placeholder.deleteLater()
+            self.names_placeholder = None
+        else:
+            self.workspace_stack.addWidget(pane)
+        if self._active_workspace == "names":
+            self.workspace_stack.setCurrentWidget(pane)
+            pane.refresh_names()
+
     def _connect_faces_signals(self, pane) -> None:
         pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
         pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
@@ -653,6 +851,8 @@ class ProductionClusterApp(QMainWindow):
         pane.face_pipeline_applied.connect(self._persist_face_pipeline_defaults)
         pane.install_face_model_requested.connect(self._request_face_model_download)
         pane.source_folder_changed.connect(self._set_shared_source_folder)
+        if self.names_pane is not None:
+            pane.face_labels_changed.connect(self.names_pane.refresh_names)
         pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         pane.set_recent_directories(self.recent_folder_history.paths())
@@ -711,6 +911,13 @@ class ProductionClusterApp(QMainWindow):
         self.faces_workspace_button.setAccessibleName("Open Faces workspace")
         apply_icon(self.faces_workspace_button, "search")
         self.faces_workspace_button.clicked.connect(lambda: self.set_active_workspace("faces"))
+        self.names_workspace_button = QPushButton("Names")
+        self.names_workspace_button.setCheckable(True)
+        self.names_workspace_button.setProperty("nav", True)
+        self.names_workspace_button.setAccessibleName("Open Names workspace")
+        self.names_workspace_button.setToolTip("Browse durable saved names and the photos containing their labeled faces.")
+        apply_icon(self.names_workspace_button, "search")
+        self.names_workspace_button.clicked.connect(lambda: self.set_active_workspace("names"))
         self.current_folder_label = QLabel("No folder selected")
         self.current_folder_label.setAccessibleName("Current folder")
         self.current_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -801,6 +1008,7 @@ class ProductionClusterApp(QMainWindow):
         row.addWidget(self.gallery_workspace_button)
         row.addWidget(self.clustering_workspace_button)
         row.addWidget(self.faces_workspace_button)
+        row.addWidget(self.names_workspace_button)
         row.addWidget(self.current_folder_label, stretch=1)
         row.addWidget(self.mode_selector)
         row.addWidget(self.view_button)
@@ -1109,6 +1317,8 @@ class ProductionClusterApp(QMainWindow):
             return "gallery"
         if text in {"faces", "face_search", "face search"}:
             return "faces"
+        if text in {"names", "people", "saved names"}:
+            return "names"
         return "clustering"
 
     @staticmethod
@@ -1234,6 +1444,14 @@ class ProductionClusterApp(QMainWindow):
                 worker_count=self.performance_profile.thumbnail_workers,
                 cache_size=self.performance_profile.pixmap_cache_size,
             )
+        if self.names_pane is not None:
+            self.names_pane.gallery.apply_view_preferences(
+                thumbnail_size=thumbnail_size,
+                worker_count=self.performance_profile.thumbnail_workers,
+                prefetch_rows=self.performance_profile.thumbnail_prefetch_rows,
+                pixmap_cache_size=self.performance_profile.pixmap_cache_size,
+                qimage_cache_size=self.performance_profile.qimage_cache_size,
+            )
         self.runtime_badge.setVisible(bool(self.settings_registry.get(self.settings_store, "runtime/show_badge", self.settings.show_runtime_badge)))
         self._reflow_main_splitter(force=False)
 
@@ -1255,6 +1473,7 @@ class ProductionClusterApp(QMainWindow):
             "gallery": self.gallery_workspace_button,
             "clustering": self.clustering_workspace_button,
             "faces": self.faces_workspace_button,
+            "names": self.names_workspace_button,
         }.items():
             button.blockSignals(True)
             button.setChecked(self._active_workspace == key)
@@ -1263,6 +1482,8 @@ class ProductionClusterApp(QMainWindow):
     def _source_pane_visible(self) -> bool:
         if self._active_workspace == "gallery":
             return True
+        if self._active_workspace == "names":
+            return False
         if self._active_workspace == "faces":
             return bool(self._advanced_pane_visibility["source"])
         if self._clustering_mode == "basic":
@@ -1272,12 +1493,17 @@ class ProductionClusterApp(QMainWindow):
     def _refresh_workspace_ui(self) -> None:
         is_gallery = self._active_workspace == "gallery"
         is_clustering = self._active_workspace == "clustering"
-        faces_pane = None if (is_clustering or is_gallery) else self._ensure_faces_workspace()
+        is_faces = self._active_workspace == "faces"
+        is_names = self._active_workspace == "names"
+        faces_pane = self._ensure_faces_workspace() if is_faces else None
+        names_pane = self._ensure_names_workspace() if is_names else None
         if is_gallery:
             self.workspace_stack.setCurrentWidget(self.photo_gallery_workspace)
+        elif is_names:
+            self.workspace_stack.setCurrentWidget(names_pane)
         else:
             self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
-        if not is_clustering and not is_gallery and self.faces_pane is not None:
+        if is_faces and self.faces_pane is not None:
             self.faces_pane.ensure_current_faces_tab_loaded()
         if self.faces_pane is not None:
             self.faces_pane.set_ui_mode(self._faces_mode)
@@ -1296,8 +1522,8 @@ class ProductionClusterApp(QMainWindow):
         self.cluster_actions_menu_action.setVisible(show_cluster_actions)
         self.controls_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.details_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
-        self.source_view_action.setVisible((not is_clustering) or self._clustering_mode == "advanced")
-        self.mode_selector.setVisible(not is_gallery)
+        self.source_view_action.setVisible((is_faces) or (is_clustering and self._clustering_mode == "advanced"))
+        self.mode_selector.setVisible(not is_gallery and not is_names)
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -1309,7 +1535,7 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_workspace_ui()
 
     def set_active_workspace_mode(self, mode: str) -> None:
-        if self._active_workspace == "gallery":
+        if self._active_workspace in {"gallery", "names"}:
             return
         if self._active_workspace == "faces":
             self.set_faces_mode(mode)
@@ -2382,6 +2608,8 @@ class ProductionClusterApp(QMainWindow):
         self.current_folder_label.setMinimumWidth(widths["activity"])
         if self.faces_pane is not None:
             self.faces_pane.setMinimumWidth(widths["faces"])
+        if self.names_pane is not None:
+            self.names_pane.setMinimumWidth(widths["faces"])
         self._reflow_main_splitter(force=True)
 
     def _layout_widths(self) -> dict[str, int]:
@@ -2627,6 +2855,14 @@ class ProductionClusterApp(QMainWindow):
     def _reload_face_services_from_settings(self) -> None:
         if self.faces_pane is None:
             self._face_service_cache = {}
+            self.face_services_global = {}
+            self.face_services_session = {}
+            self.face_service_global = None
+            self.face_service_session = None
+            if self.names_pane is not None:
+                self.names_pane.status_label.setText("Face settings changed. Reload Names to use the selected pipeline.")
+                self.names_pane.refresh_button.setEnabled(False)
+                self._start_names_workspace_load()
             return
         self._build_face_services(reset_face_session=False)
         self.faces_pane.face_service_global = self.face_service_global
@@ -2643,6 +2879,8 @@ class ProductionClusterApp(QMainWindow):
             refresh=False,
         )
         self.faces_pane.set_active_face_mode("human", refresh=True)
+        if self.names_pane is not None:
+            self.names_pane.refresh_names()
 
     def _post_startup_checks(self) -> None:
         if self._is_shutting_down or not self.isVisible():
@@ -3374,6 +3612,7 @@ class ProductionClusterApp(QMainWindow):
             (self._storage_clear_job, self._storage_clear_thread),
             (self._post_install_model_job, self._post_install_model_thread),
             (self._faces_init_job, self._faces_init_thread),
+            (self._names_init_job, self._names_init_thread),
         )
         for job, thread in runtime_jobs:
             if job is None:
@@ -3391,6 +3630,8 @@ class ProductionClusterApp(QMainWindow):
         self._post_install_model_thread = None
         self._faces_init_job = None
         self._faces_init_thread = None
+        self._names_init_job = None
+        self._names_init_thread = None
         self._preflight_job = None
         self._preflight_thread = None
         ready_to_close = self._wait_for_thread(self._tag_context_thread, 2500)
@@ -3425,6 +3666,11 @@ class ProductionClusterApp(QMainWindow):
         if self.faces_pane is not None:
             try:
                 ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+            except Exception:
+                ready_to_close = False
+        if self.names_pane is not None:
+            try:
+                ready_to_close = self.names_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
             except Exception:
                 ready_to_close = False
         try:
@@ -3472,6 +3718,7 @@ class ProductionClusterApp(QMainWindow):
             "_storage_clear_job",
             "_post_install_model_job",
             "_faces_init_job",
+            "_names_init_job",
         ):
             job = getattr(self, job_name, None)
             if job is None:

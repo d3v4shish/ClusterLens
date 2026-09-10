@@ -92,14 +92,14 @@ class UiUxAcceptanceTests(unittest.TestCase):
                 if not widget.isHidden() and widget.focusPolicy() != Qt.FocusPolicy.NoFocus
             ]
 
-            self.assertLessEqual(len(visible_focus_controls), 7)
+            self.assertLessEqual(len(visible_focus_controls), 8)
             labels = [
                 widget.currentText() if isinstance(widget, QComboBox) else widget.text()
                 for widget in visible_focus_controls
             ]
             active_mode = window.mode_selector.currentText()
             self.assertIn(active_mode, {"Basic", "Advanced"})
-            for label in ("Clustering", "Faces", active_mode, "View", "Settings"):
+            for label in ("Gallery", "Clustering", "Faces", "Names", active_mode, "View", "Settings"):
                 self.assertIn(label, labels)
             self.assertTrue(window.cluster_actions_menu_action.isVisible() is False)
             window.set_active_workspace("clustering")

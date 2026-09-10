@@ -253,6 +253,35 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertFalse(window.clustering_workspace_button.isChecked())
                 window.close()
 
+    def test_production_window_switches_to_names_workspace_without_opening_faces(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionNamesWorkspaceTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                window.show()
+                APP.processEvents()
+
+                self.assertTrue(window.names_workspace_button.isVisible())
+                self.assertIsNone(window.faces_pane)
+                window.set_active_workspace("names")
+                self._wait_for(lambda: window.names_pane is not None, timeout_s=5.0)
+                self._wait_for(
+                    lambda: "saved name(s)" in window.names_pane.status_label.text(),
+                    timeout_s=5.0,
+                )
+
+                self.assertEqual("names", window._active_workspace)
+                self.assertIs(window.workspace_stack.currentWidget(), window.names_pane)
+                self.assertTrue(window.names_workspace_button.isChecked())
+                self.assertFalse(window.faces_workspace_button.isChecked())
+                self.assertFalse(window._source_pane_visible())
+                self.assertIsNone(window.faces_pane)
+                window.close()
+
     def test_production_face_provider_never_instantiates_an_uninstalled_default_pack(self):
         from apps.pyqt_production.app import ProductionClusterApp
         from app.services import face_search
