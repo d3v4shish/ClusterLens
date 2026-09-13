@@ -15,5 +15,17 @@ fi
 export CLUSTERLENS_RUNTIME_ROOT="$benchmark_runtime"
 export PYTHONPATH="$repo_root/src:$repo_root"
 cd "$repo_root"
+if [[ "${1:-}" == "--thumbnail-index-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_thumbnail_index.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--tag-workspace-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_tag_workspace.py "$@"
+    exit 0
+fi
 "$benchmark_python" scripts/benchmark_acceleration.py "$@"
 "$benchmark_python" scripts/benchmark_face_region_metadata.py
+"$benchmark_python" scripts/benchmark_thumbnail_index.py
+"$benchmark_python" scripts/benchmark_tag_workspace.py

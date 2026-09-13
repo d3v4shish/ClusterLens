@@ -490,17 +490,22 @@ class ClusteringOptionsPane(QWidget):
             )
         )
 
-        self.tag_filter_field = QLineEdit()
-        self.tag_filter_field.setPlaceholderText("Comma-separated tags")
-        self.tag_filter_field.setToolTip(CLUSTERING_HELP["tag_filter"])
-        self.tag_filter_field.textChanged.connect(self.state_changed.emit)
-        options_layout.addRow(build_help_label("Tag Filter", CLUSTERING_HELP["tag_filter"], help_key="tag_filter"), self.tag_filter_field)
+        # The production shell has a dedicated Tags workspace.  Keep this
+        # legacy surface for the standalone compatibility shell until it gains
+        # that workspace too.
+        if self.option_scope != "production":
+            self.tag_filter_field = QLineEdit()
+            self.tag_filter_field.setPlaceholderText("Comma-separated tags")
+            self.tag_filter_field.setToolTip(CLUSTERING_HELP["tag_filter"])
+            self.tag_filter_field.textChanged.connect(self.state_changed.emit)
+            options_layout.addRow(build_help_label("Tag Filter", CLUSTERING_HELP["tag_filter"], help_key="tag_filter"), self.tag_filter_field)
 
-        self.tag_match_combobox = QComboBox()
-        self.tag_match_combobox.addItems(["Any", "All"])
-        self.tag_match_combobox.setToolTip(CLUSTERING_HELP["tag_match"])
-        self.tag_match_combobox.currentIndexChanged.connect(self.state_changed.emit)
-        options_layout.addRow(build_help_label("Tag Match", CLUSTERING_HELP["tag_match"], help_key="tag_match"), self.tag_match_combobox)
+            self.tag_match_combobox = QComboBox()
+            self.tag_match_combobox.addItems(["Any", "All"])
+            self.tag_match_combobox.setToolTip(CLUSTERING_HELP["tag_match"])
+            self.tag_match_combobox.currentIndexChanged.connect(self.state_changed.emit)
+            options_layout.addRow(build_help_label("Tag Match", CLUSTERING_HELP["tag_match"], help_key="tag_match"), self.tag_match_combobox)
+
         technical_layout.addWidget(options_group)
         layout.addWidget(self.technical_panel)
 
@@ -526,8 +531,7 @@ class ClusteringOptionsPane(QWidget):
             self.onnx_checkbox,
             self.result_cache_checkbox,
             self.embedding_cache_lookup_checkbox,
-            self.tag_filter_field,
-            self.tag_match_combobox,
+            *([self.tag_filter_field, self.tag_match_combobox] if self.option_scope != "production" else []),
             self.hdbscan_min_cluster_size_spin,
             self.hdbscan_min_samples_spin,
             self.hdbscan_cluster_selection_epsilon_spin,
@@ -650,7 +654,8 @@ class ClusteringOptionsPane(QWidget):
         )
 
     def selected_tag_filters(self) -> list[str]:
-        return [tag.strip() for tag in self.tag_filter_field.text().split(",") if tag.strip()]
+        field = getattr(self, "tag_filter_field", None)
+        return [tag.strip() for tag in field.text().split(",") if tag.strip()] if field is not None else []
 
     def selected_similarity_modes(self) -> list[str]:
         selected = [mode for mode, checkbox in self.similarity_checkboxes.items() if checkbox.isChecked()]
@@ -666,7 +671,8 @@ class ClusteringOptionsPane(QWidget):
         self.state_changed.emit()
 
     def selected_tag_match_mode(self) -> str:
-        return self.tag_match_combobox.currentText().strip() or "Any"
+        combobox = getattr(self, "tag_match_combobox", None)
+        return combobox.currentText().strip() or "Any" if combobox is not None else "Any"
 
     def export_state(self) -> dict[str, object]:
         similarity_modes = self.selected_similarity_modes()
@@ -682,7 +688,7 @@ class ClusteringOptionsPane(QWidget):
             "use_onnx": bool(self.onnx_checkbox.isChecked()),
             "reuse_result_cache": bool(self.result_cache_checkbox.isChecked()),
             "use_embedding_cache_lookup": bool(self.embedding_cache_lookup_checkbox.isChecked()),
-            "tag_filter": self.tag_filter_field.text().strip(),
+            "tag_filter": getattr(self, "tag_filter_field", None).text().strip() if hasattr(self, "tag_filter_field") else "",
             "tag_match": self.selected_tag_match_mode(),
             "backend_options_by_backend": self.backend_options_by_backend(),
         }
@@ -742,8 +748,9 @@ class ClusteringOptionsPane(QWidget):
         self.onnx_checkbox.setChecked(bool(state.get("use_onnx", self.settings.default_use_onnx)))
         self.result_cache_checkbox.setChecked(bool(state.get("reuse_result_cache", self.settings.default_reuse_result_cache)))
         self.embedding_cache_lookup_checkbox.setChecked(bool(state.get("use_embedding_cache_lookup", True)))
-        self.tag_filter_field.setText(str(state.get("tag_filter") or ""))
-        self.tag_match_combobox.setCurrentText(str(state.get("tag_match") or "Any"))
+        if hasattr(self, "tag_filter_field"):
+            self.tag_filter_field.setText(str(state.get("tag_filter") or ""))
+            self.tag_match_combobox.setCurrentText(str(state.get("tag_match") or "Any"))
         self._applying_preset = False
         self.technical_panel.setVisible(True)
         self._refresh_hdbscan_controls()

@@ -103,6 +103,32 @@ def test_expanding_a_group_queues_its_thumbnails_without_waiting_for_layout() ->
     app.processEvents()
 
 
+def test_sectioned_gallery_requests_lazy_face_tools_before_opening_editor() -> None:
+    app = QApplication.instance() or QApplication([])
+    from ui.sectioned_gallery import SectionedGallery
+
+    gallery = SectionedGallery()
+    requested: list[str] = []
+    ready_callbacks: list[object] = []
+    opened: list[tuple[str, bool]] = []
+
+    def _request(path: str, ready, _failed) -> None:
+        requested.append(path)
+        ready_callbacks.append(ready)
+
+    gallery.face_edit_request_handler = _request
+    gallery._open_photo_for_path = lambda path, *, allow_face_edit: opened.append((path, allow_face_edit))  # type: ignore[method-assign]
+
+    gallery._request_face_edit("/photo.jpg")
+
+    assert requested == ["/photo.jpg"]
+    assert gallery.status_label.text() == "Preparing face tools for this photo…"
+    ready_callbacks[0]()
+    assert opened == [("/photo.jpg", True)]
+    gallery.close()
+    app.processEvents()
+
+
 def test_group_header_hover_opens_a_photo_first_preview() -> None:
     app = QApplication.instance() or QApplication([])
     from ui.sectioned_gallery import SectionedGallery

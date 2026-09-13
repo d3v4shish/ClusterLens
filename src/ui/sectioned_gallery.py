@@ -480,6 +480,8 @@ class SectionedGallery(QWidget):
         self._generation = 0
         self._read_only = False
         self.face_service_provider = None
+        # Optional production-shell hook: (image_path, on_ready, on_failed).
+        self.face_edit_request_handler = None
         self.face_edit_saved_callback = None
         self._model = SectionedGalleryModel(self)
         self._delegate = _SectionedPhotoDelegate(self._tile_size, self)
@@ -951,8 +953,8 @@ class SectionedGallery(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("Open", lambda: self._open_photo(index))
-        if self._active_face_service() is not None and not self._read_only:
-            menu.addAction("Edit Face Regions", lambda: self._open_photo(index))
+        if not self._read_only:
+            menu.addAction("Edit Face Regions", lambda: self._request_face_edit(path))
         menu.addAction("Reveal folder", lambda: self._run_for_paths((path,), self._actions.slotOpenSelectedFolders))
         menu.addAction("Tag", lambda: self._run_for_paths((path,), self._actions.slotEditTags))
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -987,7 +989,7 @@ class SectionedGallery(QWidget):
         )
         dialog.exec()
 
-    def _open_photo(self, index: QModelIndex) -> None:
+    def _open_photo(self, index: QModelIndex, *, allow_face_edit: bool | None = None) -> None:
         path = self._model.path_at(index)
         if not path:
             return
@@ -999,12 +1001,49 @@ class SectionedGallery(QWidget):
             metadata_service=self._metadata_service,
             display_mode="basic",
             face_service=self._active_face_service(),
-            allow_face_edit=bool(not self._read_only and self._active_face_service() is not None),
+            allow_face_edit=bool(
+                not self._read_only
+                and self._active_face_service() is not None
+                and (allow_face_edit is True or allow_face_edit is None)
+            ),
             face_edit_saved_callback=self.face_edit_saved_callback,
             job_manager=self._job_manager,
             parent=self,
         )
         dialog.exec()
+
+    def _request_face_edit(self, image_path: str) -> None:
+        path = str(image_path or "")
+        if not path or self._read_only:
+            return
+        if self._active_face_service() is not None:
+            self._open_photo_for_path(path, allow_face_edit=True)
+            return
+        handler = self.face_edit_request_handler
+        if not callable(handler):
+            self.status_label.setText("Face tools are unavailable. Open Faces or Names to configure a face model.")
+            return
+
+        self.status_label.setText("Preparing face tools for this photo…")
+
+        def _ready() -> None:
+            self._open_photo_for_path(path, allow_face_edit=True)
+
+        def _failed(message: str) -> None:
+            self.status_label.setText(f"Face tools could not be prepared: {str(message or 'unknown error')}")
+
+        try:
+            handler(path, _ready, _failed)
+        except Exception as exc:
+            _failed(str(exc))
+
+    def _open_photo_for_path(self, path: str, *, allow_face_edit: bool) -> None:
+        for row in range(self._model.rowCount()):
+            for column in range(self._model.columnCount()):
+                index = self._model.index(row, column)
+                if self._model.path_at(index) == path:
+                    self._open_photo(index, allow_face_edit=allow_face_edit)
+                    return
 
     def _active_face_service(self):
         if not callable(self.face_service_provider):

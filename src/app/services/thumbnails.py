@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import sqlite3
 import shutil
 import time
@@ -9,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from contextlib import closing
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from PIL import Image, ImageOps
 from PyQt6.QtCore import QRect, QSize, Qt
@@ -19,6 +20,72 @@ from infra.settings import get_settings
 
 THUMBNAIL_CACHE_VERSION = "exif_v2"
 THUMBNAIL_CACHE_INDEX_NAME = ".thumbnail_index.sqlite3"
+_PROCESS_DISK_INDEX_LOCK = RLock()
+_PROCESS_DISK_INDEX_READY: OrderedDict[str, tuple[int, int, int, int, int]] = OrderedDict()
+_PROCESS_DISK_INDEX_READY_LIMIT = 32
+
+
+def _disk_index_cache_key(cache_dir: Path) -> str:
+    try:
+        return str(cache_dir.resolve())
+    except OSError:
+        return str(cache_dir.absolute())
+
+
+def _disk_cache_directory_signature(cache_dir: Path) -> tuple[int, int, int]:
+    entry_count = 0
+    newest_mtime_ns = 0
+    total_bytes = 0
+    try:
+        with os.scandir(cache_dir) as entries:
+            for entry in entries:
+                if not entry.name.casefold().endswith(".webp"):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+                entry_count += 1
+                newest_mtime_ns = max(newest_mtime_ns, int(stat.st_mtime_ns))
+                total_bytes += int(stat.st_size)
+    except OSError:
+        return 0, 0, 0
+    return entry_count, newest_mtime_ns, total_bytes
+
+
+def _disk_index_file_identity(cache_dir: Path) -> tuple[int, int]:
+    try:
+        stat = (cache_dir / THUMBNAIL_CACHE_INDEX_NAME).stat()
+        return int(stat.st_dev), int(stat.st_ino)
+    except OSError:
+        return 0, 0
+
+
+def _disk_index_state_signature(cache_dir: Path) -> tuple[int, int, int, int, int]:
+    return (*_disk_cache_directory_signature(cache_dir), *_disk_index_file_identity(cache_dir))
+
+
+def _process_disk_index_is_ready(cache_dir: Path) -> bool:
+    key = _disk_index_cache_key(cache_dir)
+    signature = _disk_index_state_signature(cache_dir)
+    with _PROCESS_DISK_INDEX_LOCK:
+        if _PROCESS_DISK_INDEX_READY.get(key) != signature:
+            return False
+        _PROCESS_DISK_INDEX_READY.move_to_end(key)
+        return True
+
+
+def _mark_process_disk_index_ready(cache_dir: Path) -> None:
+    key = _disk_index_cache_key(cache_dir)
+    signature = _disk_index_state_signature(cache_dir)
+    with _PROCESS_DISK_INDEX_LOCK:
+        _PROCESS_DISK_INDEX_READY[key] = signature
+        _PROCESS_DISK_INDEX_READY.move_to_end(key)
+        while len(_PROCESS_DISK_INDEX_READY) > _PROCESS_DISK_INDEX_READY_LIMIT:
+            _PROCESS_DISK_INDEX_READY.popitem(last=False)
+
+
+def _discard_process_disk_index_state(cache_dir: Path) -> None:
+    key = _disk_index_cache_key(cache_dir)
+    with _PROCESS_DISK_INDEX_LOCK:
+        _PROCESS_DISK_INDEX_READY.pop(key, None)
 
 
 class ThumbnailService:
@@ -61,6 +128,7 @@ class ThumbnailService:
             self._last_prune_s = 0.0
             self._pending_disk_accesses.clear()
             self._last_index_flush_s = 0.0
+            _discard_process_disk_index_state(cache_dir)
 
     def thumbnail_path(self, image_path: str, size: int) -> Path:
         source = Path(image_path).resolve()
@@ -98,6 +166,7 @@ class ThumbnailService:
         if thumb_path.exists():
             self._record_disk_cache_entry(thumb_path)
             return thumb_path
+        thumb_path.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(image_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((size, size))
@@ -268,36 +337,102 @@ class ThumbnailService:
 
     def _connect_disk_index(self) -> sqlite3.Connection:
         self.settings.thumbnail_cache_dir.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(self._disk_index_path()), timeout=10.0)
-        connection.execute("PRAGMA journal_mode=WAL;")
-        connection.execute("PRAGMA synchronous=NORMAL;")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS thumbnail_cache_entries (
-                cache_path TEXT PRIMARY KEY,
-                size_bytes INTEGER NOT NULL,
-                last_access REAL NOT NULL
-            )
-            """
-        )
-        if not self._disk_index_initialized:
-            count = int(connection.execute("SELECT COUNT(*) FROM thumbnail_cache_entries").fetchone()[0] or 0)
-            if count == 0:
-                legacy_rows: list[tuple[str, int, float]] = []
-                for path in self.settings.thumbnail_cache_dir.glob("*.webp"):
-                    try:
-                        stat = path.stat()
-                    except OSError:
-                        continue
-                    legacy_rows.append((str(path), int(stat.st_size), float(stat.st_atime)))
-                if legacy_rows:
-                    connection.executemany(
-                        "INSERT OR REPLACE INTO thumbnail_cache_entries(cache_path, size_bytes, last_access) VALUES (?, ?, ?)",
-                        legacy_rows,
+        connection: sqlite3.Connection | None = None
+        for attempt in range(2):
+            try:
+                connection = sqlite3.connect(str(self._disk_index_path()), timeout=10.0)
+                connection.execute("PRAGMA journal_mode=WAL;")
+                connection.execute("PRAGMA synchronous=NORMAL;")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS thumbnail_cache_entries (
+                        cache_path TEXT PRIMARY KEY,
+                        size_bytes INTEGER NOT NULL,
+                        last_access REAL NOT NULL
                     )
-                    connection.commit()
-            self._disk_index_initialized = True
-        return connection
+                    """
+                )
+                if not self._disk_index_initialized or not _process_disk_index_is_ready(
+                    self.settings.thumbnail_cache_dir
+                ):
+                    # Several views own their own ThumbnailService. The first
+                    # one reconciles interruption/corruption state; the rest
+                    # share that completed result instead of rescanning the
+                    # same bounded cache directory on their worker threads.
+                    with _PROCESS_DISK_INDEX_LOCK:
+                        if not _process_disk_index_is_ready(self.settings.thumbnail_cache_dir):
+                            self._reconcile_disk_index(connection)
+                            _mark_process_disk_index_ready(self.settings.thumbnail_cache_dir)
+                    self._disk_index_initialized = True
+                return connection
+            except sqlite3.DatabaseError as error:
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                if attempt or not self._is_corrupt_disk_index(error):
+                    raise
+                self._reset_corrupt_disk_index()
+        raise RuntimeError("Thumbnail cache index could not be opened")
+
+    @staticmethod
+    def _is_corrupt_disk_index(error: sqlite3.DatabaseError) -> bool:
+        message = str(error).casefold()
+        return "malformed" in message or "not a database" in message or "file is encrypted" in message
+
+    def _reset_corrupt_disk_index(self) -> None:
+        index_path = self._disk_index_path()
+        for path in (index_path, Path(f"{index_path}-wal"), Path(f"{index_path}-shm")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+        self._disk_index_initialized = False
+        self._pending_disk_accesses.clear()
+        self._last_index_flush_s = 0.0
+        _discard_process_disk_index_state(self.settings.thumbnail_cache_dir)
+
+    def _managed_disk_cache_path(self, path: Path) -> bool:
+        try:
+            cache_root = self.settings.thumbnail_cache_dir.resolve()
+            resolved_path = path.resolve(strict=False)
+        except OSError:
+            return False
+        return resolved_path.parent == cache_root and resolved_path.suffix.casefold() == ".webp"
+
+    def _reconcile_disk_index(self, connection: sqlite3.Connection) -> None:
+        """Make the thumbnail index match completed cache files after interruption."""
+
+        indexed_paths = {
+            str(cache_path)
+            for (cache_path,) in connection.execute("SELECT cache_path FROM thumbnail_cache_entries")
+        }
+        existing_rows: list[tuple[str, int, float]] = []
+        existing_paths: set[str] = set()
+        for path in self.settings.thumbnail_cache_dir.glob("*.webp"):
+            if not self._managed_disk_cache_path(path):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            path_text = str(path)
+            existing_paths.add(path_text)
+            if path_text not in indexed_paths:
+                existing_rows.append((path_text, int(stat.st_size), float(stat.st_atime)))
+
+        stale_paths = [
+            (cache_path,)
+            for cache_path in indexed_paths
+            if not self._managed_disk_cache_path(Path(cache_path)) or cache_path not in existing_paths
+        ]
+        if stale_paths:
+            connection.executemany("DELETE FROM thumbnail_cache_entries WHERE cache_path=?", stale_paths)
+        if existing_rows:
+            connection.executemany(
+                "INSERT OR IGNORE INTO thumbnail_cache_entries(cache_path, size_bytes, last_access) VALUES (?, ?, ?)",
+                existing_rows,
+            )
+        connection.commit()
 
     def _record_disk_cache_entry(self, cache_path: Path, *, created: bool = False) -> None:
         try:
@@ -314,11 +449,12 @@ class ThumbnailService:
             )
             if not should_flush:
                 return
-            self._flush_disk_accesses_locked()
+            if self._flush_disk_accesses_locked():
+                _mark_process_disk_index_ready(self.settings.thumbnail_cache_dir)
 
-    def _flush_disk_accesses_locked(self, connection: sqlite3.Connection | None = None) -> None:
+    def _flush_disk_accesses_locked(self, connection: sqlite3.Connection | None = None) -> bool:
         if not self._pending_disk_accesses:
-            return
+            return True
         rows = [
             (cache_path, int(size_bytes), float(last_access))
             for cache_path, (size_bytes, last_access) in self._pending_disk_accesses.items()
@@ -341,12 +477,13 @@ class ThumbnailService:
             if owns_connection:
                 active_connection.commit()
         except sqlite3.Error:
-            return
+            return False
         finally:
             if owns_connection and active_connection is not None:
                 active_connection.close()
         self._pending_disk_accesses.clear()
         self._last_index_flush_s = time.time()
+        return True
 
     def _remove_disk_cache_entries(self, cache_paths: Sequence[Path]) -> None:
         values = [(str(path),) for path in cache_paths if str(path)]
@@ -361,6 +498,7 @@ class ThumbnailService:
                         connection.executemany("DELETE FROM thumbnail_cache_entries WHERE cache_path=?", values)
             except sqlite3.Error:
                 return
+            _mark_process_disk_index_ready(self.settings.thumbnail_cache_dir)
 
     def prune_cache(self) -> None:
         max_bytes = int(self.settings.thumbnail_cache_max_bytes)
@@ -381,6 +519,9 @@ class ThumbnailService:
                         removed_paths: list[tuple[str]] = []
                         for cache_path_text, recorded_size in rows:
                             cache_path = Path(str(cache_path_text))
+                            if not self._managed_disk_cache_path(cache_path):
+                                removed_paths.append((str(cache_path),))
+                                continue
                             try:
                                 actual_size = int(cache_path.stat().st_size)
                                 cache_path.unlink(missing_ok=True)
@@ -394,5 +535,6 @@ class ThumbnailService:
                                 break
                         if removed_paths:
                             connection.executemany("DELETE FROM thumbnail_cache_entries WHERE cache_path=?", removed_paths)
+                            _mark_process_disk_index_ready(self.settings.thumbnail_cache_dir)
             except sqlite3.Error:
                 return

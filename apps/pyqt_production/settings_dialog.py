@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, pyqtSlot
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary
+from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
 from app.services.clustering_options import clustering_model_names, model_label
 from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
 from app.services.face_model_installer import FaceModelInstaller
@@ -149,18 +149,28 @@ class OperationJournalTableModel(QAbstractTableModel):
 
 
 class ProductionSettingsDialog(QDialog):
+    runtime_rescanned = pyqtSignal()
+
     def __init__(
         self,
         settings_store: QSettings,
         runtime_service: RuntimeCapabilityService,
         *,
         describe_rebuildable_caches: Callable[[], CacheUsageSummary] | None = None,
+        describe_generated_storage: Callable[[], GeneratedStorageSummary] | None = None,
         clear_rebuildable_caches: Callable[[], CacheClearResult] | None = None,
+        clear_runtime_temp_files: Callable[[], CacheClearResult] | None = None,
+        clear_face_storage: Callable[[], CacheClearResult] | None = None,
+        clear_model_caches: Callable[[], CacheClearResult] | None = None,
+        clear_logs: Callable[[], CacheClearResult] | None = None,
+        clear_runtime_reports: Callable[[], CacheClearResult] | None = None,
+        clear_model_assets: Callable[[], CacheClearResult] | None = None,
         can_clear_rebuildable_caches: Callable[[], bool] | None = None,
         runtime_layout: RuntimeLayout,
         support_metadata_provider,
         model_download_controller: ModelDownloadController | None = None,
         job_manager: JobManager | None = None,
+        auto_refresh: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -169,7 +179,14 @@ class ProductionSettingsDialog(QDialog):
         self.settings_store = settings_store
         self.runtime_service = runtime_service
         self.describe_rebuildable_caches = describe_rebuildable_caches
+        self.describe_generated_storage = describe_generated_storage
         self.clear_rebuildable_caches = clear_rebuildable_caches
+        self.clear_runtime_temp_files = clear_runtime_temp_files
+        self.clear_face_storage = clear_face_storage
+        self.clear_model_caches = clear_model_caches
+        self.clear_logs = clear_logs
+        self.clear_runtime_reports = clear_runtime_reports
+        self.clear_model_assets = clear_model_assets
         self.can_clear_rebuildable_caches = can_clear_rebuildable_caches or (lambda: True)
         self.runtime_layout = runtime_layout
         self.support_metadata_provider = support_metadata_provider
@@ -218,12 +235,13 @@ class ProductionSettingsDialog(QDialog):
         self.model_download_controller.cancelled.connect(self._on_model_download_cancelled)
         self.model_download_controller.running_changed.connect(self._on_model_download_running_changed)
         self._load_values()
-        self.refresh_runtime_diagnostics()
-        self.refresh_cache_usage()
-        self.refresh_model_inventory()
-        self._refresh_face_model_inventory()
-        self.refresh_operation_journal()
-        self.refresh_log_viewer()
+        if auto_refresh:
+            self.refresh_runtime_diagnostics()
+            self.refresh_cache_usage()
+            self.refresh_model_inventory()
+            self._refresh_face_model_inventory()
+            self.refresh_operation_journal()
+            self.refresh_log_viewer()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -464,23 +482,46 @@ class ProductionSettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         form = QFormLayout()
+        self.runtime_root_label = QLabel(str(self.runtime_layout.root))
+        self.runtime_root_label.setWordWrap(True)
+        self.config_location_label = QLabel(str(self.settings_store.fileName() or "platform defaults"))
+        self.config_location_label.setWordWrap(True)
         self.cache_root_label = QLabel(str(self.app_settings.cache_dir))
         self.cache_root_label.setWordWrap(True)
+        self.generated_storage_text = QTextEdit()
+        self.generated_storage_text.setReadOnly(True)
+        self.generated_storage_text.setPlaceholderText("Scanning generated storage usage...")
         self.cache_usage_text = QTextEdit()
         self.cache_usage_text.setReadOnly(True)
         self.cache_usage_text.setPlaceholderText("Scanning rebuildable cache usage...")
+        form.addRow("Runtime root", self.runtime_root_label)
+        form.addRow("Config location", self.config_location_label)
         form.addRow("Runtime cache location", self.cache_root_label)
+        form.addRow("Generated storage usage", self.generated_storage_text)
         form.addRow("Rebuildable cache usage", self.cache_usage_text)
         layout.addLayout(form)
 
-        actions = QHBoxLayout()
+        actions = QGridLayout()
         self.refresh_cache_usage_button = QPushButton("Refresh Cache Usage")
         self.clear_cache_button = QPushButton("Clear Rebuildable Caches")
-        actions.addWidget(self.refresh_cache_usage_button)
-        actions.addWidget(self.clear_cache_button)
+        self.clear_runtime_temp_button = QPushButton("Clear Temp Files")
+        self.clear_face_storage_button = QPushButton("Clear Face DBs / ANN")
+        self.clear_model_caches_button = QPushButton("Clear Model Caches")
+        self.clear_logs_button = QPushButton("Clear Logs")
+        self.clear_runtime_reports_button = QPushButton("Clear Reports")
+        self.clear_model_assets_button = QPushButton("Clear Installed Model Assets")
+        actions.addWidget(self.refresh_cache_usage_button, 0, 0)
+        actions.addWidget(self.clear_cache_button, 0, 1)
+        actions.addWidget(self.clear_runtime_temp_button, 0, 2)
+        actions.addWidget(self.clear_face_storage_button, 1, 0)
+        actions.addWidget(self.clear_model_caches_button, 1, 1)
+        actions.addWidget(self.clear_logs_button, 1, 2)
+        actions.addWidget(self.clear_runtime_reports_button, 2, 0)
+        actions.addWidget(self.clear_model_assets_button, 2, 1, 1, 2)
         layout.addLayout(actions)
         self.cache_status_label = QLabel(
-            "Rebuildable production caches include embeddings, cluster results, indexes, thumbnails, ONNX exports, meanings, and temp files."
+            "Each clear action affects only the named generated-data category. Source photos, tags, durable face labels, "
+            "recovery history, and settings are preserved."
         )
         self.cache_status_label.setWordWrap(True)
         layout.addWidget(self.cache_status_label)
@@ -489,6 +530,48 @@ class ProductionSettingsDialog(QDialog):
 
         self.refresh_cache_usage_button.clicked.connect(self.refresh_cache_usage)
         self.clear_cache_button.clicked.connect(self._clear_rebuildable_caches)
+        self.clear_runtime_temp_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Temp Files?",
+                "This removes runtime temp files. Resumable model-download files are preserved. Source images are not changed.",
+                self.clear_runtime_temp_files,
+            )
+        )
+        self.clear_face_storage_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Face DBs And ANN Files?",
+                "This removes generated face databases and ANN sidecar files. Durable face labels and source images are not changed.",
+                self.clear_face_storage,
+            )
+        )
+        self.clear_model_caches_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Model Caches?",
+                "This removes generated model caches. Models may need to be reinstalled or downloaded later.",
+                self.clear_model_caches,
+            )
+        )
+        self.clear_logs_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Logs?",
+                "This removes generated log files while preserving the file-operation recovery journal. Source images are not changed.",
+                self.clear_logs,
+            )
+        )
+        self.clear_runtime_reports_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Reports?",
+                "This removes crash reports, support bundles, and benchmark reports. Recovery history and source images are not changed.",
+                self.clear_runtime_reports,
+            )
+        )
+        self.clear_model_assets_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Installed Model Assets?",
+                "This removes installed model assets. Clustering and face actions may need a later model install or download. Source images are not changed.",
+                self.clear_model_assets,
+            )
+        )
 
     def _build_updates_tab(self) -> None:
         tab = QWidget(self)
@@ -1428,6 +1511,33 @@ class ProductionSettingsDialog(QDialog):
             size /= 1024.0
         return f"{size_bytes} B"
 
+    def _format_generated_storage(self, summary: GeneratedStorageSummary) -> str:
+        lines = [
+            f"Runtime root: {summary.runtime_root}",
+            f"Config location: {summary.config_location or 'platform defaults'}",
+            f"Cache root: {summary.cache_root}",
+            "",
+        ]
+        labels = {
+            "logs": "Logs (recovery journal preserved)",
+            "thumbnails": "Thumbnails",
+            "rebuildable_caches": "Rebuildable caches",
+            "face_databases": "Face databases",
+            "ann_files": "Face ANN files",
+            "model_caches": "Model caches",
+            "temp_files": "Temp files",
+            "crash_reports": "Crash reports",
+            "support_bundles": "Support bundles",
+            "benchmarks": "Benchmark reports",
+            "model_assets": "Installed model assets",
+        }
+        for key, label in labels.items():
+            paths = tuple(summary.target_paths.get(key, ()))
+            lines.append(f"{label}: {self._format_bytes(summary.target_bytes.get(key, 0))}")
+            lines.append(f"  {', '.join(paths) if paths else '(not configured)'}")
+        lines.extend(["", f"Total generated storage size: {self._format_bytes(summary.total_bytes)}"])
+        return "\n".join(lines)
+
     def refresh_runtime_diagnostics(self, details: dict[str, object] | None = None) -> None:
         if details is None:
             details = self.runtime_service.diagnostics(str(self.execution_mode.currentData() or "auto"))
@@ -1555,6 +1665,7 @@ class ProductionSettingsDialog(QDialog):
             self._last_verify = None
             details = result if isinstance(result, dict) else None
             self.refresh_runtime_diagnostics(details)
+            self.runtime_rescanned.emit()
 
         job.progress.connect(lambda _value, text: self.runtime_text.setPlainText(str(text)))
         job.completed.connect(_done)
@@ -1589,12 +1700,22 @@ class ProductionSettingsDialog(QDialog):
         self.refresh_cache_usage_button.setEnabled(not busy)
         allow_clear = bool(self.clear_rebuildable_caches) and bool(self.can_clear_rebuildable_caches())
         self.clear_cache_button.setEnabled((not busy) and allow_clear)
+        for button, callback in (
+            (self.clear_runtime_temp_button, self.clear_runtime_temp_files),
+            (self.clear_face_storage_button, self.clear_face_storage),
+            (self.clear_model_caches_button, self.clear_model_caches),
+            (self.clear_logs_button, self.clear_logs),
+            (self.clear_runtime_reports_button, self.clear_runtime_reports),
+            (self.clear_model_assets_button, self.clear_model_assets),
+        ):
+            button.setEnabled((not busy) and bool(callback) and bool(self.can_clear_rebuildable_caches()))
         if not allow_clear and not busy:
             self.cache_status_label.setText("Cache clearing is unavailable while clustering or another production background task is running.")
 
     def refresh_cache_usage(self) -> None:
-        if self.describe_rebuildable_caches is None:
+        if self.describe_rebuildable_caches is None and self.describe_generated_storage is None:
             self.cache_usage_text.setPlainText("Cache usage is unavailable.")
+            self.generated_storage_text.setPlainText("Generated storage usage is unavailable.")
             self._update_cache_action_state()
             return
         if self._thread_is_running(self._cache_usage_thread):
@@ -1604,30 +1725,45 @@ class ProductionSettingsDialog(QDialog):
 
         def _run_usage(progress, cancel_check):
             raise_if_cancelled(cancel_check)
-            try:
-                result = self.describe_rebuildable_caches(
-                    progress_callback=progress,
-                    cancel_check=cancel_check,
-                )
-            except TypeError as exc:
-                if "unexpected keyword" not in str(exc):
-                    raise
-                result = self.describe_rebuildable_caches()
+            result = None
+            generated = None
+            if self.describe_rebuildable_caches is not None:
+                try:
+                    result = self.describe_rebuildable_caches(
+                        progress_callback=progress,
+                        cancel_check=cancel_check,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc):
+                        raise
+                    result = self.describe_rebuildable_caches()
+            if self.describe_generated_storage is not None:
+                try:
+                    generated = self.describe_generated_storage(
+                        progress_callback=progress,
+                        cancel_check=cancel_check,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc):
+                        raise
+                    generated = self.describe_generated_storage()
             raise_if_cancelled(cancel_check)
-            return result
+            return result, generated
 
         job = AsyncJob(_run_usage)
         self._cache_usage_job = job
 
         def _done(result: object) -> None:
-            if isinstance(result, CacheUsageSummary):
-                lines = [f"Runtime cache root: {result.cache_root}", ""]
-                for name, size in result.target_bytes.items():
+            cache_result = result[0] if isinstance(result, tuple) and result else result
+            generated_result = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            if isinstance(cache_result, CacheUsageSummary):
+                lines = [f"Runtime cache root: {cache_result.cache_root}", ""]
+                for name, size in cache_result.target_bytes.items():
                     lines.append(f"{name} {self._format_bytes(size)}")
                 lines.extend(
                     [
                         "",
-                        f"Total rebuildable cache size: {self._format_bytes(result.total_bytes)}",
+                        f"Total rebuildable cache size: {self._format_bytes(cache_result.total_bytes)}",
                         "",
                         "Preserved: image tags, logs, crash records, support bundles, model downloads, and model assets.",
                     ]
@@ -1636,10 +1772,15 @@ class ProductionSettingsDialog(QDialog):
                 self.cache_status_label.setText("Rebuildable cache usage refreshed.")
             else:
                 self.cache_usage_text.setPlainText("Cache usage is unavailable.")
+            if isinstance(generated_result, GeneratedStorageSummary):
+                self.generated_storage_text.setPlainText(self._format_generated_storage(generated_result))
+            elif self.describe_generated_storage is not None:
+                self.generated_storage_text.setPlainText("Generated storage usage is unavailable.")
             self._update_cache_action_state()
 
         def _failed(message: str) -> None:
             self.cache_usage_text.setPlainText("Failed to scan cache usage.")
+            self.generated_storage_text.setPlainText("Failed to scan generated storage usage.")
             self.cache_status_label.setText(f"Cache usage refresh failed: {message}")
             self._update_cache_action_state()
 
@@ -1647,6 +1788,7 @@ class ProductionSettingsDialog(QDialog):
         job.failed.connect(_failed)
         def _cancelled() -> None:
             self.cache_usage_text.setPlainText("Cache usage scan cancelled.")
+            self.generated_storage_text.setPlainText("Generated storage scan cancelled.")
             self.cache_status_label.setText("Cache usage scan cancelled.")
             self._update_cache_action_state()
 
@@ -1714,6 +1856,74 @@ class ProductionSettingsDialog(QDialog):
 
         def _cancelled() -> None:
             self.cache_status_label.setText("Cache clear cancelled. Already removed rebuildable files remain removed.")
+            self._update_cache_action_state()
+            self.refresh_cache_usage()
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="cache_clear")
+        self._cache_clear_thread = thread
+
+    def _clear_generated_storage(
+        self,
+        title: str,
+        message: str,
+        callback: Callable[[], CacheClearResult] | None,
+    ) -> None:
+        if callback is None:
+            return
+        if not self.can_clear_rebuildable_caches():
+            self.cache_status_label.setText(
+                "Wait for the current production background task to finish before clearing generated data."
+            )
+            self._update_cache_action_state()
+            return
+        if not confirmBox(title, message, parent=self):
+            return
+        self.cache_status_label.setText(title.rstrip("?") + "...")
+        self._update_cache_action_state()
+
+        def _run_clear(progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            try:
+                result = callback(progress_callback=progress, cancel_check=cancel_check)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                result = callback()
+            raise_if_cancelled(cancel_check)
+            return result
+
+        job = AsyncJob(_run_clear)
+        self._cache_clear_job = job
+
+        def _done(result: object) -> None:
+            if isinstance(result, CacheClearResult):
+                self.cache_status_label.setText(
+                    f"Cleared {len(result.cleared_targets)} target(s) and freed {self._format_bytes(result.freed_bytes)}."
+                )
+                if result.failures:
+                    errorBox("Storage clear completed with errors", "\n".join(result.failures[:8]))
+                else:
+                    infoBox(
+                        "Storage cleared",
+                        f"Cleared {len(result.cleared_targets)} target(s) and freed {self._format_bytes(result.freed_bytes)}.",
+                    )
+            else:
+                self.cache_status_label.setText("Generated storage cleared.")
+            self._update_cache_action_state()
+            self.refresh_cache_usage()
+
+        def _failed(message_text: str) -> None:
+            self.cache_status_label.setText(f"Storage clear failed: {message_text}")
+            self._update_cache_action_state()
+            errorBox("Storage clear failed", message_text)
+            self.refresh_cache_usage()
+
+        def _cancelled() -> None:
+            self.cache_status_label.setText("Storage clear cancelled. Already removed generated files remain removed.")
             self._update_cache_action_state()
             self.refresh_cache_usage()
 

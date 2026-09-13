@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.folder:
+        gates.append(_fixture_manifest_gate(args.folder))
         gates.append(_benchmark_smoke_gate(args.folder, report_dir, args.allow_downloads, fallback))
     else:
         gates.append(GateResult("benchmark_smoke", "SKIP", "Pass --folder to run a real-image smoke benchmark."))
@@ -169,6 +170,22 @@ def _benchmark_smoke_gate(folder: str, report_dir: Path, allow_downloads: bool, 
         )
     except Exception as exc:
         return GateResult("benchmark_smoke", "FAIL", str(exc))
+
+
+def _fixture_manifest_gate(folder: str) -> GateResult:
+    try:
+        from apps.shared.release_fixture import verified_photo_fixture_metadata
+
+        metadata = verified_photo_fixture_metadata(folder)
+        if metadata is None:
+            return GateResult("fixture_manifest", "SKIP", "No sibling fixture manifest; folder is treated as a user-supplied smoke input.")
+        return GateResult(
+            "fixture_manifest",
+            "PASS",
+            f"photos={metadata['fixture_photo_count']} manifest={metadata['fixture_manifest_path']}",
+        )
+    except Exception as exc:
+        return GateResult("fixture_manifest", "FAIL", str(exc))
 
 
 def _authoritative_ui_gate() -> GateResult:

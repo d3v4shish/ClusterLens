@@ -39,3 +39,32 @@ def test_gallery_model_remaps_lru_rows_after_discontiguous_removal() -> None:
     assert cached_rows == {0, 2}
     assert model.data(model.index(0, 0), GalleryImageModel.PixmapRole).pixelColor(0, 0).red() == 0
     assert model.data(model.index(2, 0), GalleryImageModel.PixmapRole).pixelColor(0, 0).red() == 80
+
+
+def test_main_gallery_requests_lazy_face_tools_before_opening_editor() -> None:
+    from PyQt6.QtWidgets import QApplication
+    from ui.gallery_pane import GalleryPane
+
+    app = QApplication.instance() or QApplication([])
+    pane = GalleryPane()
+    pane.images = ["/photo.jpg"]
+    pane.model.set_images(pane.images)
+    requested: list[str] = []
+    ready_callbacks: list[object] = []
+    opened: list[tuple[str, bool]] = []
+
+    def _request(path: str, ready, _failed) -> None:
+        requested.append(path)
+        ready_callbacks.append(ready)
+
+    pane.face_edit_request_handler = _request
+    pane._open_inspector_for_path = lambda path, *, allow_face_edit: opened.append((path, allow_face_edit))  # type: ignore[method-assign]
+
+    pane._request_face_edit(pane.model.index(0, 0))
+
+    assert requested == ["/photo.jpg"]
+    assert pane.status_label.text() == "Preparing face tools for this photo…"
+    ready_callbacks[0]()
+    assert opened == [("/photo.jpg", True)]
+    pane.close()
+    app.processEvents()

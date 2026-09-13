@@ -1248,6 +1248,8 @@ class SearchPane(QWidget):
         self._face_action_audit_request_id = 0
         self._action_buttons: list[QPushButton] = []
         self._mode_required_buttons: list[QPushButton] = []
+        self._startup_face_ready: bool | None = None
+        self._startup_face_message = ""
         self._temp_query_files: dict[int, str] = {}
         self._auto_reindexed: set[tuple[str, str]] = set()
         self._last_results = []
@@ -3556,6 +3558,15 @@ class SearchPane(QWidget):
         return bool(ready), message
 
     def _ensure_face_models_ready(self, action_label: str) -> bool:
+        if self._startup_face_ready is False:
+            message = self._startup_face_message or "Face model readiness has not been confirmed."
+            self.status_label.setText(f"Face model setup required. {message}")
+            self._show_settings_recovery_error(
+                "Face models are not ready",
+                f"ClusterLens cannot {action_label} yet.\n\n{message}",
+                "Face Models",
+            )
+            return False
         ready, readiness_message = self._active_face_mode_ready_state()
         if ready:
             return True
@@ -3587,6 +3598,9 @@ class SearchPane(QWidget):
         if not hasattr(self, "face_mode_status_label"):
             return
         ready, message = self._active_face_mode_ready_state()
+        if self._startup_face_ready is False:
+            ready = False
+            message = self._startup_face_message or "Checking CUDA and downloaded face models…"
         prefix = face_mode_label(self.current_face_mode())
         if ready:
             self.face_mode_status_label.setText(f"{prefix}: {message}")
@@ -3607,7 +3621,7 @@ class SearchPane(QWidget):
             if button is not None
         )
         for button in self._mode_required_buttons:
-            can_open_setup = button in setup_actions
+            can_open_setup = self._startup_face_ready is not False and button in setup_actions
             self._set_guarded_action_enabled(button, (not busy) and (ready or can_open_setup))
             if not can_open_setup:
                 continue
@@ -3620,6 +3634,34 @@ class SearchPane(QWidget):
             else:
                 setup_note = f"Model setup required: {message}\nClick to open Settings > Face Models."
                 button.setToolTip(f"{base_tooltip}\n\n{setup_note}" if base_tooltip else setup_note)
+
+    def set_startup_readiness(self, ready: bool, message: str) -> None:
+        """Apply the shell's local-only face readiness gate to face actions."""
+
+        self._startup_face_ready = bool(ready)
+        self._startup_face_message = str(message or "").strip()
+        if self._startup_face_ready:
+            active_thread = getattr(self, "_active_thread", None)
+            try:
+                busy = bool(active_thread is not None and active_thread.isRunning())
+            except Exception:
+                busy = False
+            # A previous failed readiness check may have disabled every action.
+            # Restore the normal guarded state once the next local check passes.
+            self._set_busy(busy)
+            return
+        self._update_face_mode_status()
+        allowed = {
+            getattr(self, "face_choose_pipeline_button", None),
+            getattr(self, "face_model_settings_button", None),
+        }
+        for button in self._action_buttons:
+            if button not in allowed:
+                self._set_guarded_action_enabled(button, False)
+                base_tooltip = button.property("faceReadinessBaseToolTip") or button.toolTip() or ""
+                button.setToolTip(
+                    f"{base_tooltip}\n\nFace model setup required: {self._startup_face_message}".strip()
+                )
     def _build_global_controls(self) -> None:
         self.sidebar_scroll = QScrollArea(self.sidebar_panel)
         self.sidebar_scroll.setWidgetResizable(True)

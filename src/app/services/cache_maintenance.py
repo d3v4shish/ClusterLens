@@ -109,14 +109,26 @@ class CacheMaintenanceService:
             total_bytes=sum(target_bytes.values()),
         )
 
-    def describe_generated_storage(self, *, config_location: str = "") -> GeneratedStorageSummary:
-        target_paths = self.generated_storage_targets()
-        target_bytes = {
-            name: sum(self._path_size(Path(path)) for path in paths)
-            for name, paths in target_paths.items()
-        }
+    def describe_generated_storage(
+        self,
+        *,
+        config_location: str = "",
+        runtime_layout=None,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> GeneratedStorageSummary:
+        target_paths = self.generated_storage_targets(runtime_layout=runtime_layout)
+        target_bytes: dict[str, int] = {}
+        total_targets = max(1, len(target_paths))
+        for index, (name, paths) in enumerate(target_paths.items()):
+            raise_if_cancelled(cancel_check)
+            if progress_callback:
+                progress_callback(int(index * 100 / total_targets), f"Scanning {name}")
+            target_bytes[name] = sum(self._path_size(Path(path), cancel_check=cancel_check) for path in paths)
+        if progress_callback:
+            progress_callback(100, "Generated storage scan complete")
         return GeneratedStorageSummary(
-            runtime_root=str(self.settings.base_dir),
+            runtime_root=str(getattr(runtime_layout, "root", self.settings.base_dir)),
             config_location=str(config_location or ""),
             cache_root=str(self.settings.cache_dir),
             target_bytes=target_bytes,
@@ -124,9 +136,15 @@ class CacheMaintenanceService:
             total_bytes=sum(target_bytes.values()),
         )
 
-    def generated_storage_targets(self) -> dict[str, tuple[Path, ...]]:
+    def generated_storage_targets(self, *, runtime_layout=None) -> dict[str, tuple[Path, ...]]:
         cache_dir = self.settings.cache_dir
         rebuildable = self.rebuildable_targets()
+        runtime_targets = {
+            "crash_reports": self._runtime_layout_target(runtime_layout, "crash_dir"),
+            "support_bundles": self._runtime_layout_target(runtime_layout, "support_dir"),
+            "benchmarks": self._runtime_layout_target(runtime_layout, "benchmarks_dir"),
+            "model_assets": self._runtime_layout_target(runtime_layout, "model_assets_dir"),
+        }
         return {
             "logs": (self.settings.log_dir,),
             "thumbnails": (self.settings.thumbnail_cache_dir,),
@@ -147,7 +165,76 @@ class CacheMaintenanceService:
                 cache_dir / "torch",
             ),
             "temp_files": (cache_dir / "tmp",),
+            **{
+                name: (path,) if path is not None else ()
+                for name, path in runtime_targets.items()
+            },
         }
+
+    def clear_generated_storage_category(
+        self,
+        category: str,
+        *,
+        runtime_layout=None,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Remove one explicitly selected generated-data category.
+
+        User-authored data (tags, durable face labels, recovery history, and
+        settings) is intentionally not a category here. Full user-data removal
+        remains a separate, high-friction lifecycle operation.
+        """
+        category = str(category or "").strip()
+        if progress_callback:
+            progress_callback(0, f"Clearing {category or 'selected storage'}")
+        raise_if_cancelled(cancel_check)
+        if category == "logs":
+            result = self.clear_log_files(cancel_check=cancel_check)
+        elif category == "thumbnails":
+            result = self._clear_named_paths(
+                (self.settings.thumbnail_cache_dir,),
+                recreate_dirs=(self.settings.thumbnail_cache_dir,),
+                cancel_check=cancel_check,
+            )
+        elif category == "rebuildable_caches":
+            # The Storage page reports thumbnails, model caches, and temporary
+            # files separately. A category clear must not silently expand into
+            # those other visible categories.
+            rebuildable = self.rebuildable_targets()
+            paths = (
+                self.settings.embedding_cache_db,
+                rebuildable["cluster_results/"],
+                rebuildable["cluster_meanings/"],
+                rebuildable["embedding_indexes/"],
+            )
+            result = self._clear_named_paths(paths, recreate_dirs=paths[1:], cancel_check=cancel_check)
+        elif category == "face_databases":
+            result = self._clear_named_paths(self._face_database_paths(), recreate_dirs=(), cancel_check=cancel_check)
+        elif category == "ann_files":
+            result = self._clear_named_paths(self._ann_file_paths(), recreate_dirs=(), cancel_check=cancel_check)
+        elif category == "model_caches":
+            result = self.clear_model_cache_targets(cancel_check=cancel_check)
+        elif category == "temp_files":
+            result = self.clear_runtime_temp_files(cancel_check=cancel_check)
+        elif category in {"crash_reports", "support_bundles", "benchmarks", "model_assets"}:
+            attribute = {
+                "crash_reports": "crash_dir",
+                "support_bundles": "support_dir",
+                "benchmarks": "benchmarks_dir",
+                "model_assets": "model_assets_dir",
+            }[category]
+            path = self._runtime_layout_target(runtime_layout, attribute)
+            if path is None:
+                result = (), (f"{category} is unavailable without a runtime layout.",)
+            else:
+                result = self._clear_named_paths((path,), recreate_dirs=(path,), cancel_check=cancel_check)
+        else:
+            result = (), (f"Unknown generated-storage category: {category}",)
+        raise_if_cancelled(cancel_check)
+        if progress_callback:
+            progress_callback(100, f"Finished clearing {category}")
+        return result
 
     def clear_rebuildable_disk_targets(
         self,
@@ -204,12 +291,13 @@ class CacheMaintenanceService:
                 failure_messages.append(f"{name}: {exc}")
         return tuple(cleared), tuple(failure_messages)
 
-    def clear_runtime_temp_files(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def clear_runtime_temp_files(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         cleared: list[str] = []
         failures: list[str] = []
         tmp_path = self.rebuildable_targets()["tmp/"]
         try:
-            self._remove_target(tmp_path)
+            self._remove_target(tmp_path, cancel_check=cancel_check)
+            raise_if_cancelled(cancel_check)
             tmp_path.mkdir(parents=True, exist_ok=True)
             cleared.append("tmp/")
         except OSError as exc:
@@ -219,10 +307,14 @@ class CacheMaintenanceService:
         # not disposable runtime temp files. Preserve them across app restarts.
         return tuple(cleared), tuple(failures)
 
-    def clear_face_storage_targets(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self._clear_named_paths([*self._face_database_paths(), *self._ann_file_paths()], recreate_dirs=())
+    def clear_face_storage_targets(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self._clear_named_paths(
+            [*self._face_database_paths(), *self._ann_file_paths()],
+            recreate_dirs=(),
+            cancel_check=cancel_check,
+        )
 
-    def clear_model_cache_targets(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def clear_model_cache_targets(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         cache_dir = self.settings.cache_dir
         paths = (
             cache_dir / "face_model_assets",
@@ -239,9 +331,10 @@ class CacheMaintenanceService:
                 cache_dir / "face_model_downloads",
                 cache_dir / "onnx_models",
             ),
+            cancel_check=cancel_check,
         )
 
-    def clear_log_files(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def clear_log_files(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         log_dir = self.settings.log_dir
         if not log_dir.exists():
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +348,7 @@ class CacheMaintenanceService:
         return self._clear_named_paths(
             tuple(path for path in log_dir.iterdir() if path.name not in protected_names),
             recreate_dirs=(log_dir,),
+            cancel_check=cancel_check,
         )
 
     def clear_partial_model_downloads(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -292,17 +386,25 @@ class CacheMaintenanceService:
         cache_dir = self.settings.cache_dir
         return tuple(sorted(cache_dir.glob("face_search*.faiss*")))
 
-    def _clear_named_paths(self, paths, *, recreate_dirs: tuple[Path, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def _clear_named_paths(
+        self,
+        paths,
+        *,
+        recreate_dirs: tuple[Path, ...],
+        cancel_check=None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         cleared: list[str] = []
         failures: list[str] = []
         for path in tuple(dict.fromkeys(Path(item) for item in paths)):
+            raise_if_cancelled(cancel_check)
             try:
                 if path.exists():
-                    self._remove_target(path)
+                    self._remove_target(path, cancel_check=cancel_check)
                     cleared.append(self._display_target_name(path))
             except OSError as exc:
                 failures.append(f"{self._display_target_name(path)}: {exc}")
         for path in recreate_dirs:
+            raise_if_cancelled(cancel_check)
             try:
                 path.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -317,6 +419,11 @@ class CacheMaintenanceService:
                 return str(path.relative_to(self.settings.base_dir))
             except ValueError:
                 return str(path)
+
+    @staticmethod
+    def _runtime_layout_target(runtime_layout, attribute: str) -> Path | None:
+        value = getattr(runtime_layout, attribute, None)
+        return Path(value) if value is not None else None
 
     def _recreate_directories(self, *, exclude: set[str], cancel_check=None) -> None:
         self.settings.cache_dir.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,56 @@
 # Current implementation plan
 
+## Clean-native operational safety and release evidence
+
+- [x] Expose generated-storage categories in the production Settings dialog without importing the legacy folder cache or catalog.
+  Contract: Storage lists each generated category with its managed paths and size; each clear action is an explicit, cancellable background operation that preserves source photos, tags, durable face labels, recovery history, settings, and non-selected categories.
+  Validation: six deterministic cache-service checks cover category boundaries and durable-data preservation; an offscreen production-dialog check covers the controls and worker callback contract; the isolated source smoke confirms clean teardown.
+- [x] Add deterministic release-evidence commands built around isolated synthetic inputs.
+  Contract: fixture generation, fixture-manifest verification, trash recovery, and packaged-launch verification refuse unsafe paths or report overwrites; they never read user photos or runtime data. Existing release gates remain the source of startup/UI readiness checks.
+  Validation: four temporary-directory tests cover manifest tampering, empty-directory guards, trash collision/restore behavior, and report validation; build and whitespace validation are recorded below.
+- [ ] Design a Clean-native CLI after the user chooses its supported workflows.
+  Contract: it will compose Clean services only and explicitly identify GUI-only workflows; it will not import the legacy per-folder cache or face catalog.
+  Validation: pending user scope decision; this is deliberately not implemented as an unreviewed port.
+
+## Tags correctness and performance audit
+
+- [x] Prevent concurrent or stale Tags inventory/photo page loads from duplicating rows, publishing an old selection, or consuming unbounded worker threads.
+  Contract: rapid Refresh, scope changes, tag selection, and Load more requests coalesce to the newest view state; each page appears at most once and all work remains cancellable/visible.
+  Validation: focused offscreen production checks simulate rapid page/selection requests, verify exact rows and final selection, and retain clean gallery-worker shutdown coverage.
+- [x] Profile and reduce redundant SQLite total-count work on the Tags read path without weakening concurrent write safety.
+  Contract: inventory/photo pages retain correct scope, escaping, source counts, and database recovery while later pages avoid recounting a total already established by the first page.
+  Validation: the generated 75,000-row benchmark identified SQLite execute as the hot path and showed 33.333 ms later pages without the already-known count versus 36.741 ms with it; focused query tests preserve scope, escaping, and pagination behavior.
+
+## Tags workspace migration
+
+- [x] Add a top-level Tags workspace with paged global/current-folder tag inventory and tagged-photo gallery.
+  Contract: browsing tags reads only the durable tag database, never scans media or blocks Qt; selection, paging, cancellation, and errors remain visible through Jobs and inline status.
+  Validation: deterministic SQLite service tests cover query, folder scope, escaping, ordering, and pagination; focused offscreen production coverage confirms current-folder paging, selected-tag gallery publication, and clean embedded-gallery shutdown.
+- [x] Move tag-filter clustering controls and tag management out of Advanced Clustering into Tags.
+  Contract: Gallery quick-edit remains; Tags owns Any/All filters, global database-only rename/delete, and launches the existing tag-filtered clustering preflight.
+  Validation: focused production preflight coverage confirms Tags values reach the existing off-thread discovery flow; deterministic tag-service tests cover durable inventory rename/merge/delete behavior.
+- [x] Make selected-cluster tag suggestions an explicit on-demand Tags action.
+  Contract: suggestion generation and application run as visible cancellable background work, require a selected cluster, and cannot publish stale results or mutate metadata in read-only mode.
+  Validation: focused offscreen production tests cover selection gating, successful mocked on-demand generation, and database-only application. The generation guard, cancellation, and failure paths are implemented; add explicit stale-publication/cancellation regression cases before treating the broad suite as a complete release gate.
+- [x] Measure and document tag-hub query performance.
+  Contract: benchmark fixture is generated locally with deterministic content and does not read user media or caches.
+  Validation: `bash scripts/benchmark.sh --tag-workspace-only`, `bash scripts/build.sh`, the focused production/service/UX suites, compilation, and `git diff --check` pass; results and unresolved hotspots are recorded.
+
+## Source-parity responsiveness and recovery pass
+
+- [x] Make Photos lazily prepare face tools before opening the face-region editor.
+  Contract: **Edit Face Regions** is available from Photos even before Faces or Names has been opened; preparation is cancellable, visible in Jobs, and resumes or reports the requested edit without blocking Qt.
+  Validation: focused offscreen tests cover Photos and main-gallery lazy requests, callback success/failure, and read-only safety mode.
+- [x] Guard Faces initialization against obsolete UI state.
+  Contract: changing away from Faces, switching to an unsupported-resolution screen, or closing the window cancels pending initialization; a late worker result cannot create or update deleted/replaced widgets.
+  Validation: focused lifecycle tests simulate a workspace change while a face service is blocked and verify cancellation plus generation-guarded non-publication.
+- [x] Recover thumbnail-cache indexes after interrupted or corrupt state.
+  Contract: a missing/corrupt SQLite index is rebuilt from valid WebP thumbnails, stale rows and orphan files reconcile deterministically, and pruning remains safe under concurrent readers.
+  Validation: temporary-cache tests cover missing/corrupt indexes, orphan reconciliation, interrupted cache writes, and concurrent readers.
+- [x] Add a no-download startup readiness gate for runtime and local models.
+  Contract: a visible background job checks the selected CPU/CUDA policy and locally installed clustering/face models; dependent actions stay disabled until the result is known, errors remain actionable, and **Rescan Available Resources** refreshes the gate without changing settings.
+  Validation: deterministic service and offscreen production tests cover missing assets, unavailable explicit CUDA, successful local CPU readiness, action gating, and the rescan completion signal.
+
 ## Names workspace visibility, recovery, and non-blocking pass
 
 - [x] Port the shared job presentation and recovery contract into the Names checkout.
@@ -25,7 +76,7 @@
   Validation: `bash scripts/benchmark.sh` measured the generated eight-region JPEG fixture; `bash scripts/build.sh`, focused service/UI tests, compilation, and whitespace checks passed.
 - [ ] Resolve the existing order-sensitive full-suite fixture failure before claiming a green full run.
   Contract: `bash scripts/test.sh` must complete without sharing mutable model-asset state between production-support tests.
-  Validation: the 2026-09-13 full run stopped at `test_production_offline_model_mode_skips_download_prompt_and_falls_back` because `fast_preview` already existed under the shared temporary runtime; the same test passes alone. This is outside the per-face metadata change and remains visible here rather than being masked.
+  Validation: the 2026-09-13 isolated rerun reached 67% after all production-support, service, startup-readiness, and early UI-smoke checks, then ended without a pytest summary while UI smoke was still running. Focused production (46), service plus UX-acceptance (188), build, compilation, and whitespace checks pass. This remains visible rather than being presented as a green full run.
 
 ## GPU HDBSCAN and clustering tuning
 
@@ -249,3 +300,11 @@
 - [x] Remove the stale model-inventory update for the deleted Settings license panel.
   Contract: model inventory updates the Clustering Models table without accessing removed widgets.
   Validation: clean application startup and production Settings acceptance test.
+## Measured performance pass
+
+- [x] Establish a deterministic baseline and profile the current hot path.
+  Contract: use generated, seeded inputs only; identify a CPU/GPU, memory, I/O, or contention bottleneck without reading user photos or caches.
+  Validation: `bash scripts/benchmark.sh --thumbnail-index-only` used 1,024 generated WebP entries and four independently created services in a temporary directory. Before the change, four opens took a 200.411 ms median; the profile spent 0.474 s reconciling the same cache four times. Evidence and environment constraints are recorded in `BENCHMARKS.md` and `HOTSPOTS.md`.
+- [x] Apply the smallest safe optimization to the measured bottleneck.
+  Contract: preserve deterministic memberships/results and existing CPU/GPU fallback semantics; keep all work off the Qt UI thread.
+  Validation: one process-wide, bounded ready state shares completed recovery only while the WebP/index fingerprint matches. The same fixture measured 43.321 ms median for four opens (4.63× faster); corruption, missing-index, orphan, concurrent-reader, and shared-reconciliation tests, build, syntax, and whitespace checks pass. Results are documented in `BENCHMARKS.md` and `HOTSPOTS.md`.

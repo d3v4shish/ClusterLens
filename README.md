@@ -15,6 +15,21 @@ This repository is source-only. It intentionally excludes generated runtime data
 
 Runtime data is created under the user's application data directory, such as `~/.local/share/ClusterLens` on Linux.
 
+## Maintenance and release evidence
+
+Settings → Storage lists the managed generated-data categories, their paths, and their sizes. Each clear action is explicit and runs in the background; source photos, tags, durable face labels, recovery history, and settings are never part of a category clear. The safe command-line cleanup preview remains available through `python scripts/cleanup_production_runtime.py`.
+
+Create deterministic, non-private release inputs and evidence with:
+
+```bash
+uv run python scripts/create_release_fixture.py --output-dir /tmp/release_fixture --photos 128
+uv run python scripts/verify_trash_recovery.py --fixture-dir /tmp/trash_fixture --report-dir /tmp/trash_report
+uv run python scripts/verify_packaged_launch.py --executable /path/to/ClusterLens --runtime-root /tmp/launch_runtime --report-path /tmp/launch_report.json
+uv run python scripts/verify_native_display.py --report-dir /tmp/native_display_report
+```
+
+The launch and native-display checks are release/clean-VM commands: they require a built executable or a real display, use a fresh runtime root, and refuse to overwrite prior evidence.
+
 ## Run From Source
 
 ```bash
@@ -39,7 +54,7 @@ bash scripts/run_app_gpu.sh
 
 This uses the CUDA 12.1 ONNX Runtime wheel compatible with the bundled Torch 2.2.2/cuDNN 8 stack plus pinned RAPIDS cuML 25.10 for GPU HDBSCAN. It does not download or move face models; the GPU launch still uses `~/.local/share/ClusterLens` for managed model files. Image decoding, thumbnail generation, storage, SQLite, and filesystem work remain on CPU.
 
-SCRFD/ArcFace face indexing uses the GPU only when the active runtime reports `CUDAExecutionProvider`; a CUDA Torch device alone does not move those ONNX models off CPU. The Faces status strip reports the detector and embedder device separately in its tooltip. If a GPU or driver becomes available after startup, click the runtime badge, then **Rescan Available Resources** in Support. The rescan runs in a background worker and does not install packages or change the saved compute preference. Package/runtime changes still require restarting with `scripts/run_app_gpu.sh`.
+SCRFD/ArcFace face indexing uses the GPU only when the active runtime reports `CUDAExecutionProvider`; a CUDA Torch device alone does not move those ONNX models off CPU. The Faces status strip reports the detector and embedder device separately in its tooltip. After local startup recovery, ClusterLens visibly checks the selected CPU/CUDA policy and installed clustering/face models without downloading or constructing inference models; model-dependent actions stay disabled with an actionable status until that check finishes. If a GPU or driver becomes available after startup, click the runtime badge, then **Rescan Available Resources** in Support. The rescan and the follow-up readiness check run in background workers and do not install packages or change the saved compute preference. Package/runtime changes still require restarting with `scripts/run_app_gpu.sh`.
 
 The verified execution policy is shared by embedding, face, clustering, and similarity services. With CUDA available, semantic PCA, cosine K-means, cuML HDBSCAN, cluster-quality scoring, graph-neighbor search, image/face similarity matrices, identity propagation, and duplicate-identity comparison use the GPU. The file-clustering HDBSCAN panel exposes minimum cluster size, automatic or explicit minimum samples, merge epsilon, and single-cluster allowance. Faces exposes K-means restarts, maximum iterations, and seed. CUDA failures are reported visibly and fall back to contiguous NumPy/OpenBLAS, native scikit-learn, or native HDBSCAN execution; fallback results are not cached under a GPU signature. The CPU runtime diagnostics show detected SIMD dispatch, BLAS threads, and libjpeg-turbo support.
 
@@ -54,6 +69,18 @@ Run the seeded synthetic CPU/GPU vector benchmark without reading user photos or
 ```bash
 bash scripts/benchmark.sh
 CLUSTERLENS_BENCHMARK_PYTHON="$PWD/.venv-gpu-cu121/bin/python" bash scripts/benchmark.sh
+```
+
+To run only the generated thumbnail-index recovery fixture, which measures four independently created gallery/preview services against one temporary cache directory:
+
+```bash
+bash scripts/benchmark.sh --thumbnail-index-only
+```
+
+To run only the generated SQLite tag-workspace fixture (no media files are created or read):
+
+```bash
+bash scripts/benchmark.sh --tag-workspace-only
 ```
 
 ## Model Downloads
@@ -72,9 +99,11 @@ In **Find**, **Find by Face** uses a supplied photo as the example. **Find by Na
 
 The top-level **Names** workspace is the durable-name browser and editor. Its sidebar lists saved people globally with a name and compact face/photo count; hover a name to see a contact-sheet preview without changing the current selection. Selecting a name shows each unique photo containing a face explicitly saved with that name. Select photos with Ctrl-click, Shift-click, or their checkboxes, then right-click any selected photo for **Rename Selected** or **Unlabel Selected**. Before either action, choose the actual face-region name found in the selected files; this handles photos containing more than one named person. Selection is by photo, but every change is face-level: Rename and Unlabel change only matching regions, so other people detected in the same photo remain unchanged. The durable global mapping and open Faces views refresh after each completed action. Names does not include pending proposals or visually similar, unlabeled faces—use **Faces → Find by Name + Similar** for those. On the first global label refresh, ClusterLens also recovers legacy `manual_selected_faces` proposals created by older versions, without overwriting a conflicting durable label.
 
-The **Photos** workspace and the main gallery offer **Edit Face Regions** when face indexing is available. In the inspector, scan or draw a box, save it, select that face region, then use **Name Selected Face(s)**, **Rename Selected**, or **Unlabel Selected**. A JPEG receives standard MWG/XMP face regions plus a ClusterLens EXIF mirror; PNG and other formats, or an image with an existing `.xmp` sidecar, use that sidecar without rewriting pixels. On re-index, an existing durable database label wins over a conflicting external XMP name.
+The top-level **Tags** workspace is the durable photo-tag hub. It pages tags from the local tag database globally or within the current folder and shows the selected tag's photos without scanning source media. Use it to rename/merge or delete tags globally in the database; these bulk operations deliberately do not rewrite EXIF. Gallery tag editing remains available for per-photo edits. Add one or more selected tags to the Tags filter, choose **Any** or **All**, and run the existing tag-filtered clustering flow. Tags also contains the selected-cluster suggestion controls: generation is explicit and runs in Jobs, and applying model suggestions writes only the app tag database. Open Tags after selecting a cluster in Clustering to generate or apply its suggestions.
 
-Downloaded face and clustering models are not part of **Clear Rebuildable Caches**. On startup ClusterLens performs a local-only reconciliation before showing model selectors: it promotes a fully staged face install, restores a missing managed face bundle from its verified retained download archive when possible, and repairs a stale Hugging Face snapshot reference. It never downloads during this recovery. **Clear Model Caches** remains the explicit action that removes downloaded model files.
+The **Photos** workspace and the main gallery always expose **Edit Face Regions** outside read-only mode, even before Faces or Names has been opened. The requested local face service prepares through the visible Jobs flow and either opens the inspector or explains the missing local requirement; it never blocks the window. In the inspector, scan or draw a box, save it, select that face region, then use **Name Selected Face(s)**, **Rename Selected**, or **Unlabel Selected**. A JPEG receives standard MWG/XMP face regions plus a ClusterLens EXIF mirror; PNG and other formats, or an image with an existing `.xmp` sidecar, use that sidecar without rewriting pixels. On re-index, an existing durable database label wins over a conflicting external XMP name.
+
+Downloaded face and clustering models are not part of **Clear Rebuildable Caches**. On startup ClusterLens performs a local-only reconciliation before showing model selectors: it promotes a fully staged face install, restores a missing managed face bundle from its verified retained download archive when possible, and repairs a stale Hugging Face snapshot reference. It never downloads during this recovery. The rebuildable thumbnail SQLite index likewise reconciles only its own cache directory after missing/corrupt/interrupted state; it never touches source photos. **Clear Model Caches** remains the explicit action that removes downloaded model files.
 
 See `BUILD.md` for deterministic build/run/test commands and `ARCHITECTURE.md` for storage and concurrency boundaries.
 

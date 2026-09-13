@@ -51,6 +51,18 @@ class TagInventoryItem:
     sources: tuple[tuple[str, int], ...] = ()
 
 
+@dataclass(frozen=True)
+class TagInventoryPage:
+    items: tuple[TagInventoryItem, ...] = ()
+    total_count: int | None = 0
+
+
+@dataclass(frozen=True)
+class TagPathPage:
+    paths: tuple[str, ...] = ()
+    total_count: int | None = 0
+
+
 class ImageTagService:
     exif_key = "ic_tags"
 
@@ -108,6 +120,9 @@ class ImageTagService:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_image_tags_path ON image_tags(image_path)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_image_tags_tag_path ON image_tags(tag_norm, image_path)"
             )
 
     def _quarantine_corrupt_database(self) -> bool:
@@ -386,6 +401,129 @@ class ImageTagService:
             )
             for item in sorted(grouped.values(), key=lambda value: str(value["display_tag"]).casefold())
         ]
+
+    @staticmethod
+    def _scope_sql(scope_path: str | Path | None) -> tuple[str, list[object]]:
+        """Return a portable directory-prefix clause for canonical database paths."""
+
+        scope = ImageTagService._canonical_path(str(scope_path or ""))
+        if not scope:
+            return "", []
+        prefix = scope.rstrip("/\\") + os.sep
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return "(image_path = ? OR image_path LIKE ? ESCAPE '\\')", [scope, f"{escaped}%"]
+
+    def query_tag_inventory(
+        self,
+        *,
+        query: str = "",
+        scope_path: str | Path | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        include_total: bool = True,
+    ) -> TagInventoryPage:
+        """Return one deterministic inventory page without touching source media."""
+
+        clauses: list[str] = []
+        params: list[object] = []
+        text = self.normalize_tag(query)
+        if text:
+            clauses.append("(tag_norm LIKE ? ESCAPE '\\' OR display_tag LIKE ? ESCAPE '\\')")
+            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
+        scope_clause, scope_params = self._scope_sql(scope_path)
+        if scope_clause:
+            clauses.append(scope_clause)
+            params.extend(scope_params)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        page_size = max(1, min(500, int(limit)))
+        page_offset = max(0, int(offset))
+        with self._connection() as connection:
+            total_count = None
+            if include_total:
+                total_count = int(
+                    connection.execute(
+                        f"SELECT COUNT(DISTINCT tag_norm) FROM image_tags {where}", params
+                    ).fetchone()[0]
+                    or 0
+                )
+            rows = connection.execute(
+                f"""
+                SELECT tag_norm, MIN(display_tag) AS display_tag, COUNT(DISTINCT image_path) AS image_count
+                FROM image_tags
+                {where}
+                GROUP BY tag_norm
+                ORDER BY display_tag COLLATE NOCASE, tag_norm
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, page_offset],
+            ).fetchall()
+            norms = [str(row[0]) for row in rows]
+            sources_by_norm: dict[str, list[tuple[str, int]]] = {norm: [] for norm in norms}
+            if norms:
+                placeholders = ",".join("?" for _ in norms)
+                source_clauses = [f"tag_norm IN ({placeholders})"]
+                source_params: list[object] = list(norms)
+                if scope_clause:
+                    source_clauses.append(scope_clause)
+                    source_params.extend(scope_params)
+                source_rows = connection.execute(
+                    f"""
+                    SELECT tag_norm, source, COUNT(DISTINCT image_path)
+                    FROM image_tags
+                    WHERE {' AND '.join(source_clauses)}
+                    GROUP BY tag_norm, source
+                    ORDER BY tag_norm, source COLLATE NOCASE
+                    """,
+                    source_params,
+                ).fetchall()
+                for tag_norm, source, count in source_rows:
+                    sources_by_norm.setdefault(str(tag_norm), []).append((str(source or "user"), int(count)))
+        return TagInventoryPage(
+            items=tuple(
+                TagInventoryItem(
+                    display_tag=str(display_tag),
+                    normalized_tag=str(tag_norm),
+                    image_count=int(image_count),
+                    sources=tuple(sources_by_norm.get(str(tag_norm), ())),
+                )
+                for tag_norm, display_tag, image_count in rows
+            ),
+            total_count=total_count,
+        )
+
+    def query_tagged_paths(
+        self,
+        tag: str,
+        *,
+        scope_path: str | Path | None = None,
+        limit: int = 200,
+        offset: int = 0,
+        include_total: bool = True,
+    ) -> TagPathPage:
+        """Return a bounded page of database-backed photo paths for one tag."""
+
+        normalized = self.normalize_tag(tag)
+        if not normalized:
+            return TagPathPage()
+        clauses = ["tag_norm = ?"]
+        params: list[object] = [normalized]
+        scope_clause, scope_params = self._scope_sql(scope_path)
+        if scope_clause:
+            clauses.append(scope_clause)
+            params.extend(scope_params)
+        where = " AND ".join(clauses)
+        page_size = max(1, min(500, int(limit)))
+        page_offset = max(0, int(offset))
+        with self._connection() as connection:
+            total_count = None
+            if include_total:
+                total_count = int(connection.execute(f"SELECT COUNT(*) FROM image_tags WHERE {where}", params).fetchone()[0] or 0)
+            rows = connection.execute(
+                f"SELECT image_path FROM image_tags WHERE {where} ORDER BY image_path COLLATE NOCASE LIMIT ? OFFSET ?",
+                [*params, page_size, page_offset],
+            ).fetchall()
+        return TagPathPage(paths=tuple(str(row[0]) for row in rows), total_count=total_count)
 
     def rename_tag(self, old_tag: str, new_tag: str) -> int:
         old_norm = self.normalize_tag(old_tag)

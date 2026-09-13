@@ -253,6 +253,9 @@ class GalleryPane(QWidget):
         self.inspector_context_provider = None  # optional callable(path) -> dict
         self.inspector_display_mode = "advanced"
         self.face_edit_service_provider = None
+        # Optional production-shell hook used when face services are lazy.
+        # Signature: (image_path, on_ready, on_failed) -> None.
+        self.face_edit_request_handler = None
         self.face_edit_saved_callback = None
         self.face_draft_provider = None
         self.face_draft_updated_callback = None
@@ -459,16 +462,20 @@ class GalleryPane(QWidget):
         if not image_path:
             return
         inspector_context = self._inspector_context_for_path(str(image_path))
-        can_edit_faces = bool(
+        can_request_face_edit = bool(
             not self.read_only_mode
-            and self._active_face_edit_service() is not None
+            and (
+                self._active_face_edit_service() is not None
+                or callable(self.face_edit_request_handler)
+            )
         )
+        can_edit_faces = bool(can_request_face_edit and self._active_face_edit_service() is not None)
         can_remove_all_faces = bool(can_edit_faces and callable(self.face_remove_all_callback))
         can_reset_face_draft = bool(can_edit_faces and callable(self.face_reset_draft_callback))
         can_auto_clean_faces = bool(can_edit_faces and callable(self.face_auto_clean_callback))
         menu = QMenu(self)
         open_inspector = menu.addAction("Open Inspector")
-        edit_faces = menu.addAction("Edit Faces") if can_edit_faces else None
+        edit_faces = menu.addAction("Edit Face Regions") if can_request_face_edit else None
         auto_clean_faces = menu.addAction("Auto-Clean This Image") if can_auto_clean_faces else None
         remove_all_faces = menu.addAction("Remove All Face Boxes From This Image") if can_remove_all_faces else None
         reset_face_draft = menu.addAction("Reset Face Draft For This Image") if can_reset_face_draft else None
@@ -510,7 +517,7 @@ class GalleryPane(QWidget):
         elif action == open_inspector:
             self.on_item_double_clicked(index)
         elif edit_faces is not None and action == edit_faces:
-            self._open_inspector(index, allow_face_edit=True)
+            self._request_face_edit(index)
         elif auto_clean_faces is not None and action == auto_clean_faces:
             try:
                 self.face_auto_clean_callback(str(image_path))
@@ -1444,6 +1451,41 @@ class GalleryPane(QWidget):
             except Exception:
                 return None
         return None
+
+    def _request_face_edit(self, index) -> None:
+        """Open the face editor now, or prepare its lazy service first."""
+
+        image_path = str(index.data(self.model.PathRole) or "")
+        if not image_path or self.read_only_mode:
+            return
+        if self._active_face_edit_service() is not None:
+            self._open_inspector(index, allow_face_edit=True)
+            return
+        handler = self.face_edit_request_handler
+        if not callable(handler):
+            self.status_label.setText("Face tools are unavailable. Open Faces or Names to configure a face model.")
+            return
+
+        def _ready() -> None:
+            self._open_inspector_for_path(image_path, allow_face_edit=True)
+
+        def _failed(message: str) -> None:
+            self.status_label.setText(f"Face tools could not be prepared: {str(message or 'unknown error')}")
+
+        self.status_label.setText("Preparing face tools for this photo…")
+        try:
+            handler(image_path, _ready, _failed)
+        except Exception as exc:
+            _failed(str(exc))
+
+    def _open_inspector_for_path(self, image_path: str, *, allow_face_edit: bool) -> None:
+        try:
+            row = list(self.images).index(str(image_path))
+        except ValueError:
+            return
+        index = self.model.index(row, 0)
+        if index.isValid():
+            self._open_inspector(index, allow_face_edit=allow_face_edit)
 
     def _open_inspector(self, index, *, allow_face_edit: bool | None = None) -> None:
         image_path = index.data(self.model.PathRole)

@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from types import SimpleNamespace
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -269,6 +270,125 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertEqual(1, window.faces_pane.face_mode_combo.count())
                 self.assertTrue(window.faces_workspace_button.isChecked())
                 self.assertFalse(window.clustering_workspace_button.isChecked())
+                window.close()
+
+    def test_direct_photo_face_tools_are_lazy_retryable_and_read_only_safe(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionDirectPhotoFaceToolsTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                # This isolated path is about Photos wiring, not model probing.
+                window._startup_readiness_report = SimpleNamespace(face_ready=True)
+                requested_loads: list[bool] = []
+                ready: list[bool] = []
+                failures: list[str] = []
+                window._start_faces_workspace_load = lambda: requested_loads.append(True)  # type: ignore[method-assign]
+
+                window._request_photo_face_tools("/photo.jpg", lambda: ready.append(True), failures.append)
+
+                self.assertEqual([True], requested_loads)
+                self.assertEqual([], ready)
+                self.assertEqual([], failures)
+                window._finish_pending_photo_face_tool_requests(error="Face model is unavailable")
+                self.assertEqual(["Face model is unavailable"], failures)
+
+                window._request_photo_face_tools("/photo.jpg", lambda: ready.append(True), failures.append)
+                window._finish_pending_photo_face_tool_requests()
+                self.assertEqual([True], ready)
+
+                with patch.object(window, "_read_only_mode", return_value=True):
+                    window._request_photo_face_tools("/photo.jpg", lambda: ready.append(True), failures.append)
+                self.assertEqual("Face editing is disabled by read-only safety mode.", failures[-1])
+                window.close()
+
+    def test_workspace_switch_cancels_stale_faces_initialization(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        started = Event()
+        release = Event()
+
+        class _SlowFaceIndexService:
+            def __init__(self, **_kwargs):
+                if not started.is_set():
+                    started.set()
+                    release.wait(timeout=5.0)
+
+        fake_face_search = SimpleNamespace(
+            DEFAULT_HUMAN_FACE_DETECTOR_ID="builtin-detector",
+            DEFAULT_HUMAN_FACE_EMBEDDER_ID="builtin-embedder",
+            BUILTIN_HUMAN_DETECTOR_ID="builtin-detector",
+            BUILTIN_HUMAN_EMBEDDER_ID="builtin-embedder",
+            resolve_ready_face_pipeline_ids=lambda *_args: ("builtin-detector", "builtin-embedder"),
+            FaceIndexService=_SlowFaceIndexService,
+        )
+        policy = SimpleNamespace(cuda_required_unavailable=False)
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionFacesWorkspaceSwitchTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                with (
+                    patch("apps.pyqt_production.app._face_search_api", return_value=fake_face_search),
+                    patch.object(window.runtime_service, "select_policy", return_value=policy),
+                    patch.object(window.runtime_service, "detect", return_value=SimpleNamespace()),
+                ):
+                    window.set_active_workspace("faces")
+                    self._wait_for(started.is_set, timeout_s=5.0)
+                    init_job = window._faces_init_job
+
+                    window.set_active_workspace("clustering")
+
+                    self.assertIsNotNone(init_job)
+                    self.assertTrue(init_job._cancel_requested)
+                    self.assertEqual("clustering", window._active_workspace)
+                    self.assertIs(window.workspace_stack.currentWidget(), window.clustering_workspace)
+                    release.set()
+                    self._wait_for(lambda: window._faces_init_thread is None, timeout_s=5.0)
+
+                self.assertIsNone(window.faces_pane)
+                self.assertEqual("clustering", window._active_workspace)
+                self.assertIs(window.workspace_stack.currentWidget(), window.clustering_workspace)
+                window.close()
+
+    def test_startup_readiness_gate_controls_model_bound_actions(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionStartupReadinessGateTest")
+                window = ProductionClusterApp(layout)
+                unavailable = SimpleNamespace(
+                    clustering_ready=False,
+                    clustering_message="Install the selected clustering model.",
+                    face_ready=False,
+                    face_message="Install FaceNet.",
+                )
+                window._startup_readiness_report = unavailable
+                window._startup_readiness_error = ""
+                window._apply_startup_workflow_gate()
+
+                self.assertFalse(window.source_pane.basic_run_button.isEnabled())
+                self.assertFalse(window.clustering_pane.cluster_button.isEnabled())
+                self.assertIn("Install the selected clustering model", window.clustering_pane.cluster_button.toolTip())
+
+                ready = SimpleNamespace(
+                    clustering_ready=True,
+                    clustering_message="CPU and clustering models are ready.",
+                    face_ready=True,
+                    face_message="Face pipeline ready.",
+                )
+                window._startup_readiness_report = ready
+                window._apply_startup_workflow_gate()
+
+                self.assertTrue(window.source_pane.basic_run_button.isEnabled())
+                self.assertTrue(window.clustering_pane.cluster_button.isEnabled())
                 window.close()
 
     def test_production_window_switches_to_names_workspace_without_opening_faces(self):
@@ -1012,8 +1132,7 @@ class ProductionSupportTests(unittest.TestCase):
             "metadata_menu_button", "file_ops_menu_button", "more_menu_button",
         ):
             self.assertFalse(hasattr(window.gallery_pane, legacy_name))
-        self.assertFalse(window.tag_manager_button.isVisible())
-        self.assertFalse(window.suggest_tags_button.isVisible())
+        self.assertTrue(window.tags_workspace_button.isVisible())
         self.assertTrue(window.cluster_pane.details_scroll.isHidden())
         self.assertTrue(window.cluster_pane.meaning_label.isHidden())
         self.assertTrue(window.cluster_pane.shape_widget.isHidden())
@@ -1027,9 +1146,7 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertTrue(window.gallery_pane.metadata_menu.menuAction().isVisible())
         self.assertTrue(window.gallery_pane.file_ops_menu.menuAction().isVisible())
         self.assertEqual("advanced", window.gallery_pane.inspector_display_mode)
-        self.assertFalse(window.tag_manager_button.isVisible())
-        self.assertFalse(window.suggest_tags_button.isVisible())
-        self.assertTrue(window.cluster_actions_menu_action.isVisible())
+        self.assertTrue(window.tags_workspace_button.isVisible())
         self.assertFalse(window.cluster_pane.details_scroll.isHidden())
         self.assertFalse(window.cluster_pane.meaning_label.isHidden())
         self.assertFalse(window.cluster_pane.shape_widget.isHidden())
@@ -1169,7 +1286,7 @@ class ProductionSupportTests(unittest.TestCase):
     def test_production_settings_dialog_uses_production_owned_copy(self):
         from apps.pyqt_production.app import RUNTIME_LAYOUT
         from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
-        from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary
+        from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
 
         store = QSettings("ClusterLensTests", "ProductionSettingsDialog")
         dialog = ProductionSettingsDialog(
@@ -1180,7 +1297,33 @@ class ProductionSupportTests(unittest.TestCase):
                 target_bytes={"embeddings.sqlite3": 0, "cluster_results/": 0},
                 total_bytes=0,
             ),
+            describe_generated_storage=lambda: GeneratedStorageSummary(
+                runtime_root=str(RUNTIME_LAYOUT.root),
+                config_location="test-settings.ini",
+                cache_root=str(RUNTIME_LAYOUT.cache_dir),
+                target_bytes={
+                    "logs": 0,
+                    "thumbnails": 0,
+                    "rebuildable_caches": 0,
+                    "face_databases": 0,
+                    "ann_files": 0,
+                    "model_caches": 0,
+                    "temp_files": 0,
+                    "crash_reports": 0,
+                    "support_bundles": 0,
+                    "benchmarks": 0,
+                    "model_assets": 0,
+                },
+                target_paths={},
+                total_bytes=0,
+            ),
             clear_rebuildable_caches=lambda: CacheClearResult((), 0, ()),
+            clear_runtime_temp_files=lambda: CacheClearResult((), 0, ()),
+            clear_face_storage=lambda: CacheClearResult((), 0, ()),
+            clear_model_caches=lambda: CacheClearResult((), 0, ()),
+            clear_logs=lambda: CacheClearResult((), 0, ()),
+            clear_runtime_reports=lambda: CacheClearResult((), 0, ()),
+            clear_model_assets=lambda: CacheClearResult((), 0, ()),
             can_clear_rebuildable_caches=lambda: True,
             runtime_layout=RUNTIME_LAYOUT,
             support_metadata_provider=lambda: {},
@@ -1199,6 +1342,12 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertIn("Cosine K-means:", dialog.runtime_text.toPlainText())
         self.assertIn("CPU SIMD dispatch:", dialog.runtime_text.toPlainText())
         self.assertIn("CPU BLAS:", dialog.runtime_text.toPlainText())
+        self.assertIn("Face databases", dialog.generated_storage_text.toPlainText())
+        self.assertEqual("Clear Reports", dialog.clear_runtime_reports_button.text())
+        self.assertEqual("Clear Installed Model Assets", dialog.clear_model_assets_button.text())
+        self.assertTrue(dialog.clear_runtime_temp_button.isEnabled())
+        self.assertTrue(dialog.clear_runtime_reports_button.isEnabled())
+        self.assertTrue(dialog.clear_model_assets_button.isEnabled())
         self.assertNotIn("face/search", combined_text)
         self.assertNotIn("convnext", combined_text)
         dialog.close()
@@ -1216,6 +1365,8 @@ class ProductionSupportTests(unittest.TestCase):
             support_metadata_provider=lambda: {},
         )
         preferred_mode = str(dialog.execution_mode.currentData() or "auto")
+        rescanned: list[bool] = []
+        dialog.runtime_rescanned.connect(lambda: rescanned.append(True))
         with patch.object(service, "diagnostics", wraps=service.diagnostics) as diagnostics:
             dialog.refresh_runtime_button.click()
             self.assertFalse(dialog.refresh_runtime_button.isEnabled())
@@ -1226,6 +1377,7 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertTrue(dialog.refresh_runtime_button.isEnabled())
         self.assertTrue(dialog.verify_runtime_button.isEnabled())
         self.assertIn("face indexing:", dialog.runtime_text.toPlainText().lower())
+        self.assertEqual([True], rescanned)
         dialog.close()
 
     def test_production_pane_hide_buttons_and_toolbar_toggles_work(self):
@@ -1302,6 +1454,9 @@ class ProductionSupportTests(unittest.TestCase):
                     cluster_meanings=window.cluster_meanings,
                 )
                 window.cluster_pane.on_cluster_selected(window.cluster_pane._grid_model.index(0, 0))
+                window.set_active_workspace("tags")
+                self.assertTrue(window.tags_pane.apply_suggestions_button.isEnabled())
+                self.assertIn("food", window.tags_pane.suggestion_label.text())
 
                 with patch("apps.pyqt_production.app.confirmBox", return_value=True), patch(
                     "apps.pyqt_production.app.infoBox"
@@ -1316,6 +1471,138 @@ class ProductionSupportTests(unittest.TestCase):
                 tags_by_path = window.image_tag_service.load_tags_for_paths(paths, import_missing_exif=False)
                 self.assertEqual(("food", "party"), tags_by_path[paths[0]])
                 self.assertEqual(("food", "party"), tags_by_path[paths[1]])
+                window.close()
+
+    def test_production_tags_generate_selected_cluster_suggestions_on_demand(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.services.cluster_meanings import ClusterMeaning, ClusterMeaningLabel, ClusterMeaningService
+
+        with TemporaryDirectory() as tmp:
+            runtime_root = Path(tmp) / "runtime"
+            images_root = Path(tmp) / "images"
+            images_root.mkdir(parents=True, exist_ok=True)
+            image_path = images_root / "a.jpg"
+            Image.new("RGB", (24, 24), (20, 30, 40)).save(image_path)
+            key = "dino::semantic::hdbscan"
+            paths = [str(image_path)]
+            meaning = ClusterMeaning(
+                cluster_id=3,
+                labels=(ClusterMeaningLabel("beach", "a photo of a beach", 0.9),),
+                confidence="High",
+                explanation_model="clip",
+                image_count_used=1,
+                status="ok",
+            )
+
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": str(runtime_root)}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionGenerateTagsTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                window.cluster_data = {key: {3: paths}}
+                window.cluster_pane.update_clusters(window.cluster_data)
+                window.cluster_pane.on_cluster_selected(window.cluster_pane._grid_model.index(0, 0))
+                window.set_active_workspace("tags")
+                self.assertTrue(window.tags_pane.generate_suggestions_button.isEnabled())
+
+                with patch.object(
+                    ClusterMeaningService,
+                    "generate",
+                    return_value=({key: {3: meaning}}, {"cluster_meaning_status": "ok"}),
+                ) as generate:
+                    window.generate_cluster_tag_suggestions()
+                    self._wait_for(lambda: window._tag_suggestion_thread is None, timeout_s=5.0)
+
+                generate.assert_called_once()
+                self.assertEqual(meaning, window.cluster_meanings[key][3])
+                self.assertTrue(window.tags_pane.apply_suggestions_button.isEnabled())
+                self.assertIn("beach", window.tags_pane.suggestion_label.text())
+                window.close()
+
+    def test_production_tags_workspace_pages_current_folder_without_media_scan(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            runtime_root = Path(tmp) / "runtime"
+            images_root = Path(tmp) / "images"
+            other_root = Path(tmp) / "other"
+            images_root.mkdir(parents=True, exist_ok=True)
+            other_root.mkdir(parents=True, exist_ok=True)
+            image_a = images_root / "a.jpg"
+            image_b = images_root / "b.jpg"
+            image_c = other_root / "c.jpg"
+            for image_path in (image_a, image_b, image_c):
+                Image.new("RGB", (24, 24), (20, 30, 40)).save(image_path)
+
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": str(runtime_root)}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionTagsWorkspaceTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                window.source_pane.selected_directory = ""
+                window._on_directory_changed("")
+                window.set_active_workspace("tags")
+                window.tags_pane.scope_combo.setCurrentIndex(1)
+                window.tags_pane.refresh()
+                self._wait_for(
+                    lambda: (
+                        window.tags_pane.inventory_model.rowCount() == 0
+                        and not window.tags_pane._inventory_loading
+                        and "Choose a folder" in window.tags_pane.status_label.text()
+                    ),
+                    timeout_s=5.0,
+                )
+                window.source_pane.set_selected_directory(str(images_root))
+                window.image_tag_service.apply_tag_edit([str(image_a), str(image_b)], add_tags=["Beach"], mirror_to_exif=False)
+                window.image_tag_service.apply_tag_edit([str(image_c)], add_tags=["City"], mirror_to_exif=False)
+                window.tags_pane.refresh()
+                self._wait_for(lambda: window.tags_pane.inventory_model.rowCount() == 1, timeout_s=5.0)
+                entry = window.tags_pane.inventory_model.item_at(0)
+                self.assertEqual("Beach", entry.title)
+                window.tags_pane.inventory_list.setCurrentIndex(window.tags_pane.inventory_model.index(0, 0))
+                self._wait_for(
+                    lambda: window.tags_pane.gallery.images == [str(image_a), str(image_b)], timeout_s=5.0
+                )
+                self.assertEqual(2, window.tags_pane._photo_total)
+                window.close()
+
+    def test_production_tags_workspace_coalesces_rapid_page_and_selection_requests(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            runtime_root = Path(tmp) / "runtime"
+            images_root = Path(tmp) / "images"
+            images_root.mkdir(parents=True, exist_ok=True)
+            image_a = images_root / "a.jpg"
+            image_b = images_root / "b.jpg"
+            for image_path in (image_a, image_b):
+                Image.new("RGB", (24, 24), (20, 30, 40)).save(image_path)
+
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": str(runtime_root)}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionTagsCoalesceTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                window.source_pane.set_selected_directory(str(images_root))
+                window.image_tag_service.apply_tag_edit([str(image_a)], add_tags=["Beach"], mirror_to_exif=False)
+                window.image_tag_service.apply_tag_edit([str(image_b)], add_tags=["Family"], mirror_to_exif=False)
+                pane = window.tags_pane
+                pane.INVENTORY_PAGE_SIZE = 1
+                pane.PHOTO_PAGE_SIZE = 1
+                pane.scope_combo.setCurrentIndex(1)
+                window.set_active_workspace("tags")
+                pane.refresh()
+                self._wait_for(lambda: pane.inventory_model.rowCount() == 1 and pane._inventory_total == 2, timeout_s=5.0)
+
+                pane._load_more_inventory()
+                pane._load_more_inventory()
+                self._wait_for(lambda: pane.inventory_model.rowCount() == 2 and not pane._inventory_loading, timeout_s=5.0)
+                self.assertEqual(["Beach", "Family"], [pane.inventory_model.item_at(index).title for index in range(2)])
+
+                pane.inventory_list.setCurrentIndex(pane.inventory_model.index(0, 0))
+                pane.inventory_list.setCurrentIndex(pane.inventory_model.index(1, 0))
+                self._wait_for(lambda: pane.gallery.images == [str(image_b)] and not pane._photo_loading, timeout_s=5.0)
+                self.assertEqual("Family", pane._selected_tag)
                 window.close()
 
     def test_production_preflight_moves_tag_filter_discovery_off_gui_thread(self):
@@ -1337,8 +1624,13 @@ class ProductionSupportTests(unittest.TestCase):
                 self._wait_for_storage_idle(window)
                 window.source_pane.set_selected_directory(str(images_root))
                 window.image_tag_service.apply_tag_edit([str(path) for path in image_paths], add_tags=["selfie"], mirror_to_exif=False)
-                window.clustering_pane.tag_filter_field.setText("selfie")
-                window.clustering_pane.tag_match_combobox.setCurrentText("Any")
+                window.tags_pane.set_filter(["selfie"], "Any")
+                window._startup_readiness_report = SimpleNamespace(
+                    clustering_ready=True,
+                    clustering_message="Clustering ready.",
+                    face_ready=False,
+                    face_message="Face setup is not part of this preflight test.",
+                )
 
                 discovery_thread_flags: list[bool] = []
                 captured_requests: list[object] = []

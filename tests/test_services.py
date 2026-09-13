@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -503,6 +504,121 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(thumb.isNull())
             self.assertEqual(80, thumb.width())
             self.assertEqual(80, thumb.height())
+
+    @staticmethod
+    def _thumbnail_service_for_cache(cache_dir: Path, *, max_bytes: int = 1024 * 1024) -> ThumbnailService:
+        service = ThumbnailService()
+        service.settings = SimpleNamespace(
+            thumbnail_cache_dir=cache_dir,
+            thumbnail_cache_max_bytes=max_bytes,
+        )
+        return service
+
+    @staticmethod
+    def _thumbnail_index_paths(service: ThumbnailService) -> set[str]:
+        connection = service._connect_disk_index()
+        try:
+            return {
+                str(path)
+                for (path,) in connection.execute("SELECT cache_path FROM thumbnail_cache_entries")
+            }
+        finally:
+            connection.close()
+
+    def test_thumbnail_index_rebuilds_after_missing_and_corrupt_database(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.png"
+            Image.new("RGB", (40, 40), (30, 60, 90)).save(source)
+
+            for cache_name, corrupt in (("missing", False), ("corrupt", True)):
+                cache_dir = root / cache_name
+                original = self._thumbnail_service_for_cache(cache_dir)
+                thumbnail = original.ensure_thumbnail(str(source), 48)
+                index_path = original._disk_index_path()
+                for path in (index_path, Path(f"{index_path}-wal"), Path(f"{index_path}-shm")):
+                    path.unlink(missing_ok=True)
+                if corrupt:
+                    index_path.write_bytes(b"not a sqlite database")
+
+                repaired = self._thumbnail_service_for_cache(cache_dir)
+                repaired.prune_cache()
+
+                self.assertTrue(thumbnail.exists())
+                self.assertTrue(index_path.exists())
+                self.assertEqual({str(thumbnail)}, self._thumbnail_index_paths(repaired))
+
+    def test_thumbnail_index_reconciles_orphans_and_prunes_interrupted_cache_writes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.png"
+            Image.new("RGB", (40, 40), (120, 60, 30)).save(source)
+            cache_dir = root / "thumbnails"
+            original = self._thumbnail_service_for_cache(cache_dir)
+            original_thumbnail = original.ensure_thumbnail(str(source), 48)
+            orphan = cache_dir / "interrupted-write.webp"
+            Image.new("RGB", (48, 48), (60, 120, 30)).save(orphan, format="WEBP")
+
+            recovered = self._thumbnail_service_for_cache(cache_dir, max_bytes=1024 * 1024)
+            self.assertEqual({str(original_thumbnail), str(orphan)}, self._thumbnail_index_paths(recovered))
+
+            recovered.settings.thumbnail_cache_max_bytes = 0
+            recovered.prune_cache()
+
+            self.assertEqual([], list(cache_dir.glob("*.webp")))
+            self.assertEqual(set(), self._thumbnail_index_paths(recovered))
+
+    def test_thumbnail_index_reconciliation_is_shared_by_services_for_one_cache_directory(self):
+        with TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "thumbnails"
+            cache_dir.mkdir()
+            Image.new("RGB", (16, 16), (30, 60, 90)).save(cache_dir / "interrupted-write.webp", format="WEBP")
+            first = self._thumbnail_service_for_cache(cache_dir)
+            second = self._thumbnail_service_for_cache(cache_dir)
+            calls: list[ThumbnailService] = []
+            original = ThumbnailService._reconcile_disk_index
+
+            def _reconcile(service: ThumbnailService, connection) -> None:
+                calls.append(service)
+                original(service, connection)
+
+            with patch.object(
+                ThumbnailService,
+                "_reconcile_disk_index",
+                autospec=True,
+                side_effect=_reconcile,
+            ):
+                first_connection = first._connect_disk_index()
+                first_connection.close()
+                second_connection = second._connect_disk_index()
+                second_connection.close()
+
+            self.assertEqual([first], calls)
+            self.assertEqual({str(cache_dir / "interrupted-write.webp")}, self._thumbnail_index_paths(second))
+
+    def test_thumbnail_index_concurrent_readers_keep_valid_cached_thumbnail_usable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.png"
+            Image.new("RGB", (80, 48), (30, 90, 150)).save(source)
+            cache_dir = root / "thumbnails"
+            writer = self._thumbnail_service_for_cache(cache_dir)
+            thumbnail = writer.ensure_thumbnail(str(source), 64)
+
+            def _read_cached_thumbnail(_index: int) -> bool:
+                reader = self._thumbnail_service_for_cache(cache_dir)
+                for _ in range(8):
+                    image = reader.load_qimage(str(source), 64)
+                    if image.isNull():
+                        return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(_read_cached_thumbnail, range(8)))
+
+            self.assertEqual([True] * 8, results)
+            self.assertTrue(thumbnail.exists())
+            self.assertEqual({str(thumbnail)}, self._thumbnail_index_paths(writer))
 
     def test_clustering_service_builds_cluster_explanations_for_cohesive_clusters(self):
         service = ClusteringService()
@@ -1137,6 +1253,42 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(2, service.delete_tag("Ocean"))
             self.assertEqual([], service.list_tag_inventory())
 
+    def test_image_tag_query_pages_are_scoped_ordered_and_media_free(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            image_a = first / "a.jpg"
+            image_b = first / "b.jpg"
+            image_c = second / "c.jpg"
+            for image_path in (image_a, image_b, image_c):
+                Image.new("RGB", (24, 24), (10, 20, 30)).save(image_path)
+            service = ImageTagService(db_path=root / "tags.sqlite3")
+            service.apply_tag_edit([str(image_a), str(image_b)], add_tags=["Beach"], mirror_to_exif=False)
+            service.apply_tag_edit([str(image_a)], add_tags=["Percent%Tag"], mirror_to_exif=False)
+            service.apply_tag_edit([str(image_c)], add_tags=["City"], mirror_to_exif=False)
+
+            page = service.query_tag_inventory(scope_path=first, limit=1, offset=0)
+            self.assertEqual(2, page.total_count)
+            self.assertEqual(["Beach"], [item.display_tag for item in page.items])
+            self.assertEqual((('user', 2),), page.items[0].sources)
+            second_page = service.query_tag_inventory(scope_path=first, limit=1, offset=1)
+            self.assertEqual(["Percent%Tag"], [item.display_tag for item in second_page.items])
+            followup_page = service.query_tag_inventory(scope_path=first, limit=1, offset=1, include_total=False)
+            self.assertIsNone(followup_page.total_count)
+            self.assertEqual(["Percent%Tag"], [item.display_tag for item in followup_page.items])
+            self.assertEqual(
+                ["Percent%Tag"],
+                [item.display_tag for item in service.query_tag_inventory(query="%", scope_path=first).items],
+            )
+            paths = service.query_tagged_paths("beach", scope_path=first, limit=1)
+            self.assertEqual(2, paths.total_count)
+            self.assertEqual((str(image_a),), paths.paths)
+            self.assertIsNone(service.query_tagged_paths("beach", scope_path=first, limit=1, offset=1, include_total=False).total_count)
+            self.assertEqual((), service.query_tagged_paths("beach", scope_path=second).paths)
+
     def test_metadata_sidecar_round_trip_preserves_source_images_by_default(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1590,6 +1742,72 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("tmp/", cleared_temp)
             self.assertTrue(temp_dir.exists())
             self.assertEqual([], list(temp_dir.iterdir()))
+
+    def test_cache_maintenance_category_clear_keeps_unselected_and_durable_storage(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_root = root / "cache"
+            log_dir = root / "logs"
+            thumbnail_dir = cache_root / "thumbnails"
+            cluster_dir = cache_root / "cluster_results"
+            crash_dir = root / "crash"
+            for directory in (log_dir, thumbnail_dir, cluster_dir, crash_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            (thumbnail_dir / "thumb.webp").write_bytes(b"thumbnail")
+            (cluster_dir / "cluster.json").write_bytes(b"cluster")
+            (log_dir / "app.log").write_bytes(b"log")
+            (log_dir / "file_operations.sqlite3").write_bytes(b"recovery journal")
+            (crash_dir / "last_crash.json").write_bytes(b"crash")
+            embedding_db = cache_root / "embeddings.sqlite3"
+            embedding_db.write_bytes(b"embedding")
+            tags_db = cache_root / "image_tags.sqlite3"
+            tags_db.write_bytes(b"tags")
+            settings = SimpleNamespace(
+                base_dir=root,
+                cache_dir=cache_root,
+                log_dir=log_dir,
+                embedding_cache_db=embedding_db,
+                thumbnail_cache_dir=thumbnail_dir,
+                image_tags_db=tags_db,
+            )
+            runtime_layout = SimpleNamespace(
+                root=root,
+                crash_dir=crash_dir,
+                support_dir=root / "support",
+                benchmarks_dir=root / "benchmarks",
+                model_assets_dir=root / "model_assets",
+            )
+            service = CacheMaintenanceService(settings=settings)
+
+            summary = service.describe_generated_storage(runtime_layout=runtime_layout)
+            self.assertEqual(str(root), summary.runtime_root)
+            self.assertIn("crash_reports", summary.target_bytes)
+            self.assertGreater(summary.target_bytes["crash_reports"], 0)
+
+            cleared, failures = service.clear_generated_storage_category(
+                "rebuildable_caches", runtime_layout=runtime_layout
+            )
+            self.assertEqual((), failures)
+            self.assertTrue(cleared)
+            self.assertFalse(embedding_db.exists())
+            self.assertFalse((cluster_dir / "cluster.json").exists())
+            self.assertTrue((thumbnail_dir / "thumb.webp").exists())
+            self.assertTrue(tags_db.exists())
+            self.assertTrue((log_dir / "file_operations.sqlite3").exists())
+
+            cleared_logs, log_failures = service.clear_generated_storage_category("logs", runtime_layout=runtime_layout)
+            self.assertEqual((), log_failures)
+            self.assertTrue(cleared_logs)
+            self.assertFalse((log_dir / "app.log").exists())
+            self.assertTrue((log_dir / "file_operations.sqlite3").exists())
+
+            cleared_crashes, crash_failures = service.clear_generated_storage_category(
+                "crash_reports", runtime_layout=runtime_layout
+            )
+            self.assertEqual((), crash_failures)
+            self.assertTrue(cleared_crashes)
+            self.assertTrue(crash_dir.exists())
+            self.assertEqual([], list(crash_dir.iterdir()))
 
     def test_model_asset_service_detects_bundled_fallback_for_missing_download_model(self):
         with TemporaryDirectory() as tmp:

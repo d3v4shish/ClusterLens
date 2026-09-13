@@ -1,5 +1,35 @@
 # Benchmarks
 
+## 2026-09-13 operational-safety validation
+
+This pass changed storage/release behavior, not an algorithmic hot path, so it makes no throughput claim. The release fixture is seeded synthetic PNG data with a checksum manifest; category-clear, manifest-tamper, trash collision/restart/restore, and packaged-report validation run in temporary directories only. The offscreen source smoke wrote its expected non-frozen report and exited 0.702 seconds after the window-show log; this validates smoke teardown only, not packaged startup performance. A real frozen executable and native-display/clean-VM evidence remain required for release qualification.
+
+## 2026-09-13 Tags paging audit
+
+Method: the same isolated `bash scripts/benchmark.sh --tag-workspace-only` fixture was extended with matched global follow-up pages at offset 100. Each pair runs seven warm repetitions against the identical 25,000-path / 75,000-row SQLite database; the only difference is whether the already-known total is counted again. A cProfile run spent 0.552 of 0.842 seconds in SQLite `Connection.execute`, confirming SQL rather than Python conversion or connection setup as the target.
+
+The normal first global inventory page measured 35.554 ms median. On a later inventory page, retaining the known total avoided the redundant `COUNT(DISTINCT tag_norm)` query: 33.333 ms median versus 36.741 ms with the count (9.3% lower on this fixture). A 50-row global tagged-photo follow-up page measured 0.117 ms without a repeated count versus 0.131 ms with one (10.7% lower). First pages still compute totals for correct paging controls; these results apply only to follow-up pages and do not claim end-to-end gallery performance.
+
+## 2026-09-13 Tags workspace SQLite baseline
+
+Method: `bash scripts/benchmark.sh --tag-workspace-only` creates a temporary SQLite tag database with a fixed 25,000 generated path rows, 500 normalized tags, and exactly three tag rows per path (75,000 rows total). It creates no photo files and performs no EXIF, thumbnail, model, cache, GPU, or network work. After one warm-up, it measures seven pages of 100 inventory rows and one 200-row tagged-photo page.
+
+On the current local `.venv`, global inventory pagination measured 35.388 ms median (34.485–36.325 ms), current-folder inventory pagination measured 24.429 ms median (23.788–26.466 ms), and a current-folder tagged-photo page measured 0.164 ms median (0.153–0.199 ms). The fixture's queried folder had 150 tags and the selected tag had 50 photos. This is a baseline rather than an improvement claim; it validates that opening/browsing Tags is bounded SQLite work and does not depend on media scans.
+
+## 2026-09-13 thumbnail-index reconciliation
+
+Method: `bash scripts/benchmark.sh --thumbnail-index-only` creates five temporary directories, each with 1,024 valid generated 8 × 8 WebP files, then opens four separately constructed `ThumbnailService` instances against each directory. It measures the first index open and the sum of all four opens; an additional generated directory supplies the profile. The fixture has no source photos, model files, persistent runtime cache, GPU computation, or network input.
+
+Before this pass, the four-service median was 200.411 ms (200.224–207.382 ms); the first service alone was 30.299 ms median. Its profile spent 0.475 s in four `_reconcile_disk_index` calls, including 0.431 s validating cache paths and 0.379 s in `Path.resolve`. This identified duplicate interruption-recovery scans from independently owned gallery/preview thumbnail services as the bottleneck.
+
+After sharing a bounded, process-local completed-recovery state for a cache directory while its WebP/index fingerprint matches, the four-service median was 43.321 ms (42.401–43.607 ms), a 4.63× throughput improvement for this multiple-view workload. The post-change profile performed one reconciliation rather than four (0.071 s), with 1,024 rather than 7,168 managed-path validations. The first-service median was 36.399 ms on this separate run, so this is specifically a redundant-reconciliation improvement rather than a claim that initial recovery is faster. Missing/corrupt-index, orphan, safe-prune, and concurrent-reader tests continue to cover recovery correctness.
+
+## 2026-09-13 recovery/readiness validation rerun
+
+Method: `bash scripts/benchmark.sh` used its generated seeded vector and JPEG fixtures in a fresh temporary runtime after the thumbnail-recovery and startup-readiness changes. This pass changes recovery and UI scheduling rather than a vector or metadata algorithm, so these numbers are a reproducibility check and not a performance-improvement claim.
+
+On the current local `.venv`, the generated 20,000 × 128 cosine K-means fixture measured 1203.728 ms median for the explicit CPU control and 138.809 ms for the selected CUDA path; both produced deterministic memberships. The generated 10,000 × 32 HDBSCAN fixture measured 403.828 ms median for explicit CPU. The selected CUDA policy reported a visible CPU fallback because that environment lacked `cuml`, with a 380.252 ms median and deterministic membership. The generated eight-region 1600 × 1200 JPEG metadata merge/readback fixture measured 11.189 ms median. No user photos, downloaded models, or persistent caches were read or changed.
+
 ## 2026-09-13 per-face metadata baseline
 
 Method: `bash scripts/benchmark.sh` created a temporary 1600 × 1200 JPEG with eight deterministic normalized face rectangles, performed one warm-up, then measured five embedded MWG/XMP region merges followed by readback. The command also creates a temporary runtime and reads no user photos, global face labels, model files, or persistent application caches.
