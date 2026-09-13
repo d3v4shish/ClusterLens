@@ -63,6 +63,7 @@ from infra.performance import select_performance_profile
 from infra.runtime import ExecutionPolicy, RuntimeCapabilities, RuntimeCapabilityService
 from ml.clustering import ClusteringService
 from ml.embeddings import EmbeddingService, ModelManager
+from ml.vector_compute import VectorComputeInfo, VectorComputeService
 
 
 class FakeEmbeddingService:
@@ -92,14 +93,24 @@ class FakeEmbeddingService:
 class FakeClusteringService:
     def __init__(self):
         self.prepare_calls = 0
+        self.cluster_calls = []
         self._delegate = ClusteringService()
 
     def prepare_matrix(self, embeddings, pca_dim=None, similarity_mode="semantic"):
         self.prepare_calls += 1
         return np.asarray(embeddings, dtype=np.float32)
 
-    def cluster_prepared(self, embeddings, num_clusters, backend="cosine-kmeans", outlier_policy="assign", performance_profile=None):
+    def cluster_prepared(
+        self,
+        embeddings,
+        num_clusters,
+        backend="cosine-kmeans",
+        outlier_policy="assign",
+        performance_profile=None,
+        backend_options=None,
+    ):
         _ = performance_profile
+        self.cluster_calls.append({"backend": backend, "backend_options": dict(backend_options or {})})
         if backend == "graph":
             return {10: [0, 1], 11: [2, 3]}, {"backend": backend, "cluster_quality_score": 0.91, "outlier_count": 0}
         return {0: [0, 1], 1: [2, 3]}, {"backend": backend, "cluster_quality_score": 0.83, "outlier_count": 0}
@@ -517,6 +528,203 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(1, explanations[0].nearest_cluster_id)
         self.assertIsNotNone(explanations[0].separation_margin)
         self.assertEqual(0.82, explanations[0].cluster_quality_score)
+
+    def test_clustering_service_uses_cuda_vector_backend_from_execution_policy(self):
+        policy = ExecutionPolicy(
+            preferred_mode="auto",
+            effective_mode="cuda",
+            torch_device="cuda",
+            onnx_provider="CUDAExecutionProvider",
+        )
+        service = ClusteringService(execution_policy=policy)
+        matrix = np.asarray(
+            [[1.0, 0.0], [0.98, 0.02], [0.0, 1.0], [0.02, 0.98]],
+            dtype=np.float32,
+        )
+        with patch.object(
+            service.vector_compute,
+            "kmeans_labels",
+            return_value=(
+                np.asarray([0, 0, 1, 1], dtype=np.int32),
+                VectorComputeInfo("cuda", "torch-cuda-kmeans"),
+            ),
+        ) as gpu_kmeans, patch.object(
+            service.vector_compute,
+            "silhouette_score",
+            return_value=(0.75, VectorComputeInfo("cuda", "torch-cuda-silhouette")),
+        ):
+            clusters, metrics = service.cluster_prepared(
+                matrix,
+                2,
+                backend="cosine-kmeans",
+                outlier_policy="assign",
+                backend_options={"n_init": 7, "max_iter": 123, "seed": 9},
+            )
+
+        self.assertEqual({0, 1}, set(clusters))
+        self.assertEqual("cuda", metrics["compute_device"])
+        self.assertEqual("torch-cuda-kmeans", metrics["compute_implementation"])
+        self.assertEqual("cuda", metrics["quality_compute_device"])
+        gpu_kmeans.assert_called_once()
+        self.assertEqual(
+            {"seed": 9, "max_iter": 123, "n_init": 7},
+            gpu_kmeans.call_args.kwargs,
+        )
+        self.assertEqual(
+            {"n_init": 7, "max_iter": 123, "seed": 9},
+            metrics["backend_options"],
+        )
+
+    def test_vector_compute_uses_cuml_hdbscan_and_forwards_options(self):
+        policy = ExecutionPolicy(preferred_mode="cuda", effective_mode="cuda", torch_device="cuda")
+        service = VectorComputeService(policy)
+        captured: dict[str, object] = {}
+
+        class _FakeCumlHdbscan:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def fit_predict(self, matrix):
+                captured["c_contiguous"] = bool(matrix.flags.c_contiguous)
+                return np.asarray([0, 0, 1, 1], dtype=np.int32)
+
+        matrix = np.asfortranarray(
+            np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]], dtype=np.float32)
+        )
+        with patch("ml.vector_compute._load_cuml_hdbscan", return_value=_FakeCumlHdbscan), patch.object(
+            service,
+            "_verified_cuda_torch",
+            return_value=object(),
+        ), patch.object(service, "_release_cuda_cache"):
+            labels, info = service.hdbscan_labels(
+                matrix,
+                min_cluster_size=3,
+                min_samples=2,
+                cluster_selection_epsilon=0.125,
+                allow_single_cluster=True,
+            )
+
+        np.testing.assert_array_equal(labels, np.asarray([0, 0, 1, 1], dtype=np.int32))
+        self.assertEqual("cuda", info.device)
+        self.assertEqual("cuml-hdbscan", info.implementation)
+        self.assertEqual(3, captured["min_cluster_size"])
+        self.assertEqual(2, captured["min_samples"])
+        self.assertAlmostEqual(0.125, float(captured["cluster_selection_epsilon"]), places=6)
+        self.assertTrue(captured["allow_single_cluster"])
+        self.assertTrue(captured["c_contiguous"])
+
+    def test_clustering_hdbscan_reports_cuda_failure_and_uses_native_cpu(self):
+        policy = ExecutionPolicy(preferred_mode="cuda", effective_mode="cuda", torch_device="cuda")
+        service = ClusteringService(execution_policy=policy)
+        fallback = VectorComputeInfo(
+            "cpu",
+            "hdbscan-native",
+            "CUDA HDBSCAN failed; using the vectorized CPU fallback: fixture failure",
+        )
+
+        class _FakeNativeHdbscan:
+            def __init__(self, **_kwargs):
+                pass
+
+            def fit_predict(self, _matrix):
+                return np.asarray([0, 0, 1, 1], dtype=np.int32)
+
+        with patch.object(service.vector_compute, "hdbscan_labels", return_value=(None, fallback)), patch(
+            "ml.clustering.hdbscan",
+            SimpleNamespace(HDBSCAN=_FakeNativeHdbscan),
+        ), patch.object(
+            service.vector_compute,
+            "silhouette_score",
+            return_value=(None, VectorComputeInfo("cpu", "sklearn-silhouette")),
+        ):
+            _clusters, metrics = service.cluster_prepared(
+                np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]], dtype=np.float32),
+                2,
+                backend="hdbscan",
+                outlier_policy="keep",
+            )
+
+        self.assertEqual("cpu", metrics["compute_device"])
+        self.assertEqual("hdbscan-native", metrics["compute_implementation"])
+        self.assertIn("fixture failure", metrics["compute_fallback_reason"])
+
+    def test_clustering_service_reports_operation_level_cuda_fallback(self):
+        policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
+        service = ClusteringService(execution_policy=policy)
+        matrix = np.asarray(
+            [[1.0, 0.0], [0.98, 0.02], [0.0, 1.0], [0.02, 0.98]],
+            dtype=np.float32,
+        )
+        fallback = VectorComputeInfo(
+            "cpu",
+            "sklearn-native-kmeans",
+            "CUDA cosine K-means failed; using the vectorized CPU fallback: test failure",
+        )
+        with patch.object(service.vector_compute, "kmeans_labels", return_value=(None, fallback)), patch.object(
+            service.vector_compute,
+            "silhouette_score",
+            return_value=(None, VectorComputeInfo("cpu", "sklearn-silhouette", fallback.fallback_reason)),
+        ):
+            _clusters, metrics = service.cluster_prepared(
+                matrix,
+                2,
+                backend="cosine-kmeans",
+                outlier_policy="assign",
+            )
+
+        self.assertEqual("cpu", metrics["compute_device"])
+        self.assertEqual("sklearn-kmeans", metrics["compute_implementation"])
+        self.assertIn("test failure", metrics["compute_fallback_reason"])
+
+    def test_semantic_preparation_uses_cuda_pca_when_policy_allows_it(self):
+        policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
+        service = ClusteringService(execution_policy=policy)
+        matrix = np.arange(24, dtype=np.float32).reshape(6, 4)
+        projected = np.asarray(
+            [[1.0, 0.0], [0.8, 0.2], [0.6, 0.4], [0.4, 0.6], [0.2, 0.8], [0.0, 1.0]],
+            dtype=np.float32,
+        )
+        with patch.object(
+            service.vector_compute,
+            "pca_project",
+            return_value=(projected, VectorComputeInfo("cuda", "torch-cuda-svd-pca")),
+        ) as gpu_pca:
+            prepared, info = service.prepare_matrix_with_info(matrix, pca_dim=2, similarity_mode="semantic")
+
+        self.assertEqual((6, 2), prepared.shape)
+        self.assertEqual("cuda", info.compute_device)
+        self.assertEqual("torch-cuda-svd-pca", info.compute_implementation)
+        gpu_pca.assert_called_once()
+
+    def test_cpu_dense_scoring_is_contiguous_batched_blas(self):
+        service = VectorComputeService(ExecutionPolicy(preferred_mode="cpu", effective_mode="cpu"))
+        matrix = np.asfortranarray(
+            np.asarray([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]], dtype=np.float32)
+        )
+        scores, info = service.cosine_scores(matrix, np.asarray([1.0, 0.0], dtype=np.float32))
+
+        np.testing.assert_allclose(scores, np.asarray([1.0, 0.5, 0.0], dtype=np.float32))
+        self.assertEqual("cpu", info.device)
+        self.assertEqual("numpy-blas-matmul", info.implementation)
+        normalized_scores, _normalized_info = service.cosine_scores(
+            np.asarray([[2.0, 0.0], [0.0, 4.0]], dtype=np.float32),
+            np.asarray([3.0, 0.0], dtype=np.float32),
+            normalize=True,
+        )
+        np.testing.assert_allclose(normalized_scores, np.asarray([1.0, 0.0], dtype=np.float32))
+
+    def test_dense_scoring_falls_back_if_cuda_disappears_after_selection(self):
+        policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
+        service = VectorComputeService(policy)
+        with patch.object(service, "_verified_cuda_torch", side_effect=RuntimeError("device removed")):
+            scores, info = service.cosine_scores(
+                np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+                np.asarray([1.0, 0.0], dtype=np.float32),
+            )
+
+        np.testing.assert_allclose(scores, np.asarray([1.0, 0.0], dtype=np.float32))
+        self.assertEqual("cpu", info.device)
+        self.assertIn("device removed", info.fallback_reason)
 
     def test_clustering_service_cluster_explanations_handle_single_cluster_and_outliers(self):
         service = ClusteringService()
@@ -1136,8 +1344,15 @@ class ServiceTests(unittest.TestCase):
         current_key = service.build_result_key(**common)
         old_key = service.build_result_key(**common, similarity_space_version="old-semantic-cosine")
         revised_key = service.build_result_key(**common, embedding_signature="clip:revision-two")
+        gpu_key = service.build_result_key(**common, compute_signature="vector-compute-v1:cuda")
+        tuned_key = service.build_result_key(
+            **common,
+            backend_options={"n_init": 5, "max_iter": 120, "seed": 42},
+        )
         self.assertNotEqual(current_key, old_key)
         self.assertNotEqual(current_key, revised_key)
+        self.assertNotEqual(current_key, gpu_key)
+        self.assertNotEqual(current_key, tuned_key)
 
     def test_cache_maintenance_clears_only_rebuildable_targets_and_recreates_directories(self):
         with TemporaryDirectory() as tmp:
@@ -1703,6 +1918,39 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(labels[2], labels[3])
         self.assertNotEqual(labels[0], labels[2])
 
+    def test_similarity_graph_uses_cuda_neighbor_results_when_available(self):
+        policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
+        service = SimilarityGraphService(policy)
+        vectors = np.asarray(
+            [[1.0, 0.0], [0.99, 0.01], [0.0, 1.0], [0.01, 0.99]],
+            dtype=np.float32,
+        )
+        distances = np.asarray(
+            [[0.0, 0.01], [0.0, 0.01], [0.0, 0.01], [0.0, 0.01]],
+            dtype=np.float32,
+        )
+        indices = np.asarray([[0, 1], [1, 0], [2, 3], [3, 2]], dtype=np.int64)
+        with patch.object(
+            service.vector_compute,
+            "cosine_neighbors",
+            return_value=(
+                distances,
+                indices,
+                VectorComputeInfo("cuda", "torch-cuda-chunked-topk"),
+            ),
+        ):
+            labels, info = service.graph_cluster_with_info(
+                vectors,
+                min_similarity=0.95,
+                min_cluster_size=2,
+                k_neighbors=2,
+            )
+
+        self.assertEqual(labels[0], labels[1])
+        self.assertEqual(labels[2], labels[3])
+        self.assertNotEqual(labels[0], labels[2])
+        self.assertEqual("cuda", info.device)
+
     def test_phash_dhash_whash_index_returns_exact_match(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "same.png"
@@ -1751,6 +1999,8 @@ class ServiceTests(unittest.TestCase):
                 )
             )
             self.assertEqual([str(image_b)], [result.image_path for result in results])
+            self.assertEqual("cpu", service.last_search_metrics["compute_device"])
+            self.assertEqual("numpy-blas-matmul", service.last_search_metrics["compute_implementation"])
             del service
             del index
             gc.collect()
@@ -1895,6 +2145,43 @@ class ServiceTests(unittest.TestCase):
     def test_face_cluster_backend_choices_follow_shared_production_set(self):
         backend_ids = [item_id for item_id, _label in face_cluster_backend_choices()]
         self.assertEqual(["cosine-kmeans", "hdbscan", "graph"], backend_ids)
+
+    def test_face_index_propagates_execution_policy_to_clustering(self):
+        policy = ExecutionPolicy(
+            preferred_mode="auto",
+            effective_mode="cuda",
+            torch_device="cuda",
+            onnx_provider="CUDAExecutionProvider",
+        )
+        with TemporaryDirectory() as tmp:
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                execution_policy=policy,
+                db_path=Path(tmp) / "faces.sqlite3",
+            )
+
+            self.assertIs(policy, service.clustering_service.execution_policy)
+            self.assertTrue(service.clustering_service.vector_compute.cuda_enabled)
+            self.assertEqual("cosine-kmeans", service._default_cluster_backend())
+            self.assertEqual(["cosine-kmeans"], service._normalized_face_cluster_backends(None))
+
+            with patch.object(
+                service,
+                "_search_by_embedding_bruteforce",
+                return_value=[],
+            ) as dense_search, patch.object(
+                service,
+                "_load_ann_index",
+                side_effect=AssertionError("CPU FAISS should not run under the CUDA vector policy"),
+            ):
+                service._search_by_embedding(
+                    np.asarray([1.0, 0.0], dtype=np.float32),
+                    min_face_score=0.5,
+                    top_k=5,
+                )
+
+            dense_search.assert_called_once()
 
     def test_clustering_service_hdbscan_backend_options_are_forwarded(self):
         service = ClusteringService()
@@ -3583,6 +3870,31 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("cpu", policy.torch_device)
         self.assertEqual("CPUExecutionProvider", policy.onnx_provider)
 
+    def test_runtime_diagnostics_refresh_reprobes_capabilities_and_provider(self):
+        service = RuntimeCapabilityService()
+        capabilities = RuntimeCapabilities(
+            torch_version="2.2.2+cu121",
+            torch_cuda_build=True,
+            torch_cuda_available=True,
+            cuda_device_count=1,
+            cuda_device_name="Test GPU",
+            onnx_available=True,
+            onnx_version="1.18.0",
+            onnx_providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
+        )
+
+        with patch.object(service, "detect", return_value=capabilities) as detect, patch.object(
+            service,
+            "_onnx_provider_usable",
+            return_value=True,
+        ) as provider_probe:
+            details = service.diagnostics("auto", refresh=True)
+
+        self.assertEqual("CUDAExecutionProvider", details["policy"].onnx_provider)
+        self.assertGreaterEqual(detect.call_count, 2)
+        self.assertTrue(all(call.kwargs.get("refresh") is True for call in detect.call_args_list))
+        provider_probe.assert_called_once_with("CUDAExecutionProvider", refresh=True)
+
     def test_runtime_policy_cpu_request_does_not_probe_cuda_provider(self):
         service = RuntimeCapabilityService()
         service._cached = RuntimeCapabilities(
@@ -4804,6 +5116,21 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual("cosine-kmeans-fast", metrics["backend"])
 
+    def test_pipeline_propagates_embedding_execution_policy_to_clustering(self):
+        policy = ExecutionPolicy(
+            preferred_mode="auto",
+            effective_mode="cuda",
+            torch_device="cuda",
+            onnx_provider="CUDAExecutionProvider",
+        )
+        embedding_service = FakeEmbeddingService()
+        embedding_service.model_manager = SimpleNamespace(execution_policy=policy)
+
+        pipeline = ClusteringPipelineService(embedding_service=embedding_service)
+
+        self.assertIs(policy, pipeline.clustering_service.execution_policy)
+        self.assertTrue(pipeline.clustering_service.vector_compute.cuda_enabled)
+
     def test_main_import_does_not_pull_face_search_stack(self):
         script = (
             "import sys; "
@@ -5077,6 +5404,75 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual("disabled", metrics["embedding_cache_lookup"])
             self.assertEqual(1, clustering_service.prepare_calls)
 
+    def test_pipeline_does_not_cache_cuda_fallback_under_gpu_signature(self):
+        class _FallbackClusteringService(FakeClusteringService):
+            @staticmethod
+            def result_cache_signature(_backend, _mode, _profile, backend_options=None):
+                _ = backend_options
+                return "clustering-v2:cuda-cuml-hdbscan"
+
+            def cluster_prepared(self, embeddings, num_clusters, **kwargs):
+                _ = (embeddings, num_clusters, kwargs)
+                return {0: [0], 1: [1]}, {
+                    "compute_device": "cpu",
+                    "compute_implementation": "hdbscan-native",
+                    "compute_fallback_reason": "CUDA HDBSCAN failed: fixture failure",
+                }
+
+        class _MissCache:
+            def __init__(self):
+                self.keys = []
+                self.save_calls = []
+
+            def build_result_key(self, **kwargs):
+                self.keys.append(kwargs)
+                return json.dumps(kwargs, sort_keys=True)
+
+            @staticmethod
+            def load(_key):
+                return None
+
+            def save(self, *args):
+                self.save_calls.append(args)
+
+        with TemporaryDirectory() as tmp:
+            paths = []
+            for index in range(2):
+                image_path = Path(tmp) / f"fallback_{index}.png"
+                Image.new("RGB", (8, 8), (index * 20, 0, 0)).save(image_path)
+                paths.append(str(image_path))
+            cache = _MissCache()
+            pipeline = ClusteringPipelineService(
+                discovery_service=FakeDiscoveryService(paths),
+                embedding_service=FakeEmbeddingService(),
+                clustering_service=_FallbackClusteringService(),
+                embedding_index_service=EmbeddingIndexService(),
+                result_cache_service=cache,
+            )
+
+            result, _metrics = pipeline.run(
+                ClusteringRequest(
+                    directory=str(tmp),
+                    embedding_models=["fake"],
+                    num_clusters=2,
+                    clustering_backends=["hdbscan"],
+                    recursive=True,
+                    similarity_mode="cosine",
+                    outlier_policy="keep",
+                    use_onnx=False,
+                    reuse_result_cache=True,
+                    backend_options_by_backend={"hdbscan": {"min_cluster_size": 3}},
+                )
+            )
+
+            self.assertEqual([], cache.save_calls)
+            self.assertEqual(
+                {"min_cluster_size": 3},
+                result.metrics_by_key["fake::cosine::hdbscan"]["backend_options"],
+            )
+            self.assertTrue(cache.keys)
+            self.assertTrue(all(item["backend_options"] == {"min_cluster_size": 3} for item in cache.keys))
+
     def test_pipeline_full_result_cache_hit_skips_embedding_prepare_and_index_for_basic_runs(self):
         with TemporaryDirectory() as tmp:
             paths = []
@@ -5167,6 +5563,9 @@ class ServiceTests(unittest.TestCase):
                     use_onnx=False,
                     reuse_result_cache=False,
                     use_embedding_cache_lookup=False,
+                    backend_options_by_backend={
+                        "cosine-kmeans": {"n_init": 6, "max_iter": 150, "seed": 11}
+                    },
                 )
             )
 
@@ -5176,6 +5575,23 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([False], embedding_service.use_cache_lookup_values)
             self.assertEqual(2, clustering_service.prepare_calls)
             self.assertEqual("semantic, cosine", metrics["similarity_modes"])
+            self.assertEqual(
+                [
+                    {
+                        "backend": "cosine-kmeans",
+                        "backend_options": {"n_init": 6, "max_iter": 150, "seed": 11},
+                    },
+                    {
+                        "backend": "cosine-kmeans",
+                        "backend_options": {"n_init": 6, "max_iter": 150, "seed": 11},
+                    },
+                ],
+                clustering_service.cluster_calls,
+            )
+            self.assertEqual(
+                {"n_init": 6, "max_iter": 150, "seed": 11},
+                result.metrics_by_key["fake::semantic::cosine-kmeans"]["backend_options"],
+            )
             self.assertEqual(2, metrics["prepared_matrix_dim[fake::semantic]"])
             self.assertEqual(2, metrics["prepared_matrix_dim[fake::cosine]"])
             self.assertIn("semantic full vector", metrics["similarity_space[fake::semantic]"])

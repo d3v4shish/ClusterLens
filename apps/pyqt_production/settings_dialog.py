@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QHeaderView,
     QScrollArea,
@@ -235,6 +236,12 @@ class ProductionSettingsDialog(QDialog):
         self._build_safety_tab()
         self._build_updates_tab()
         self._build_diagnostics_tab()
+
+        self.operation_progress_bar = QProgressBar(self)
+        self.operation_progress_bar.setTextVisible(False)
+        self.operation_progress_bar.setAccessibleName("Settings operation progress")
+        self.operation_progress_bar.hide()
+        layout.addWidget(self.operation_progress_bar)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=self)
         self.cancel_settings_tasks_button = buttons.addButton(
@@ -592,7 +599,10 @@ class ProductionSettingsDialog(QDialog):
         open_journal = QPushButton("Open operation journal")
         export_bundle = QPushButton("Export Support Bundle")
         view_crash = QPushButton("View Last Crash")
-        self.refresh_runtime_button = QPushButton("Refresh Diagnostics")
+        self.refresh_runtime_button = QPushButton("Rescan Available Resources")
+        self.refresh_runtime_button.setToolTip(
+            "Re-probe CPU, CUDA, and ONNX providers. This does not install packages or change the saved compute preference."
+        )
         self.verify_runtime_button = QPushButton("Verify Runtime")
         buttons.addWidget(open_logs)
         buttons.addWidget(open_cache)
@@ -627,7 +637,7 @@ class ProductionSettingsDialog(QDialog):
         open_journal.clicked.connect(lambda: self._open_path(self.gallery_action_service.journal_path))
         export_bundle.clicked.connect(self._export_support_bundle)
         view_crash.clicked.connect(self._view_last_crash)
-        self.refresh_runtime_button.clicked.connect(self.refresh_runtime_diagnostics)
+        self.refresh_runtime_button.clicked.connect(self._rescan_runtime_resources)
         self.verify_runtime_button.clicked.connect(self._verify_gpu)
         self.refresh_log_button.clicked.connect(self.refresh_log_viewer)
         self.open_app_log_button.clicked.connect(lambda: self._open_path(self.runtime_layout.app_log))
@@ -1418,14 +1428,19 @@ class ProductionSettingsDialog(QDialog):
             size /= 1024.0
         return f"{size_bytes} B"
 
-    def refresh_runtime_diagnostics(self) -> None:
-        details = self.runtime_service.diagnostics(str(self.execution_mode.currentData() or "auto"))
+    def refresh_runtime_diagnostics(self, details: dict[str, object] | None = None) -> None:
+        if details is None:
+            details = self.runtime_service.diagnostics(str(self.execution_mode.currentData() or "auto"))
         capabilities = details["capabilities"]
         policy = details["policy"]
         packages = details.get("packages") or {}
         optional_details = details.get("optional_details") or {}
+        cpu_details = details.get("cpu_details") or {}
         remediation = list(details.get("remediation") or [])
         profile = select_performance_profile(str(self.performance_profile.currentData() or "balanced"), self.system_resources)
+        vector_device = "GPU (Torch CUDA)" if policy.torch_device == "cuda" else "CPU (NumPy/BLAS)"
+        hdbscan_device = "GPU (cuML)" if policy.torch_device == "cuda" and packages.get("cuml") else "CPU (native HDBSCAN)"
+        simd_features = ", ".join(cpu_details.get("numpy_simd") or ()) or "runtime dispatch unavailable"
 
         text = [
             f"Preferred mode: {policy.preferred_mode}",
@@ -1443,11 +1458,22 @@ class ProductionSettingsDialog(QDialog):
             f"- onnx: {packages.get('onnx') or '-'}",
             f"- onnxruntime: {packages.get('onnxruntime') or '-'}",
             f"- onnxruntime-gpu: {packages.get('onnxruntime-gpu') or '-'}",
+            f"- cuml: {packages.get('cuml') or '-'}",
+            f"- cupy: {packages.get('cupy') or '-'}",
             f"- hf_xet: {packages.get('hf_xet') or '-'}",
             f"- flash-attn: {packages.get('flash-attn') or '-'}",
             "",
             f"Torch device: {policy.torch_device}",
             f"ONNX provider: {policy.onnx_provider}",
+            f"ONNX face indexing: {'GPU (CUDA)' if policy.onnx_provider == 'CUDAExecutionProvider' else 'CPU'}",
+            f"Built-in Torch face indexing: {'GPU (CUDA)' if policy.torch_device == 'cuda' else 'CPU'}",
+            f"Semantic PCA: {vector_device}",
+            f"Cosine K-means: {vector_device}",
+            f"HDBSCAN: {hdbscan_device}",
+            f"Cluster quality scoring: {vector_device}",
+            f"Graph neighbor search: {vector_device}",
+            f"Dense similarity scoring: {vector_device}",
+            f"Face similarity and identity matrices: {vector_device}",
             f"CUDA build: {capabilities.torch_cuda_build}",
             f"CUDA available: {capabilities.torch_cuda_available}",
             f"CUDA device: {capabilities.cuda_device_name or '-'}",
@@ -1460,6 +1486,9 @@ class ProductionSettingsDialog(QDialog):
             f"Embedding preprocess workers: {profile.embedding_preprocess_workers}",
             f"Embedding cache entries: {profile.embedding_memory_cache_size}",
             f"Pixmap cache entries: {profile.pixmap_cache_size}",
+            f"CPU SIMD dispatch: {simd_features}",
+            f"CPU BLAS: {cpu_details.get('blas') or '-'} ({int(cpu_details.get('blas_threads') or 0)} threads)",
+            f"CPU JPEG decode: {'libjpeg-turbo' if cpu_details.get('libjpeg_turbo') else 'standard Pillow codec'}",
             "",
             "Optional accelerators:",
             f"- hf_xet download accelerator: {'installed' if optional_details.get('hf_xet_installed') else 'missing'}",
@@ -1490,6 +1519,8 @@ class ProductionSettingsDialog(QDialog):
                 "",
                 "Production notes:",
                 "- CUDA acceleration requires a CUDA-enabled Torch build plus NVIDIA drivers.",
+                "- HDBSCAN uses cuML on the pinned Linux CUDA runtime and reports a native-CPU fallback if cuML is missing or fails. Perceptual hashes, ORB, image decode, SQLite, filesystem I/O, and Qt event handling remain CPU work.",
+                "- CPU vector fallbacks use contiguous batches through NumPy/BLAS; image, embedding, thumbnail, pixmap, and clustering-result caches remain bounded by the selected performance profile.",
                 "- Keep worker warm is fastest for repeated clustering, but leaves the worker process and loaded model memory resident until disabled or app exit.",
                 "- low_memory disables aggressive parallelism/caching; max_speed increases caches, allows all selected backends to run concurrently, and uses a faster, slightly less exact KMeans path on larger folders.",
                 "- hf_xet is optional but improves Hugging Face download speed; include it in the packaged runtime if you ship an exe.",
@@ -1498,6 +1529,45 @@ class ProductionSettingsDialog(QDialog):
             ]
         )
         self.runtime_text.setPlainText("\n".join(text))
+
+    def _update_runtime_action_state(self) -> None:
+        busy = self._thread_is_running(self._verify_thread)
+        self.refresh_runtime_button.setEnabled(not busy)
+        self.verify_runtime_button.setEnabled(not busy)
+
+    def _rescan_runtime_resources(self) -> None:
+        if self._thread_is_running(self._verify_thread):
+            return
+
+        preferred_mode = str(self.execution_mode.currentData() or "auto")
+
+        def _run(progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            progress(-1, "Rescanning CPU, CUDA, and ONNX resources...")
+            result = self.runtime_service.diagnostics(preferred_mode, refresh=True)
+            raise_if_cancelled(cancel_check)
+            return result
+
+        job = AsyncJob(_run)
+        self._verify_job = job
+
+        def _done(result: object) -> None:
+            self._last_verify = None
+            details = result if isinstance(result, dict) else None
+            self.refresh_runtime_diagnostics(details)
+
+        job.progress.connect(lambda _value, text: self.runtime_text.setPlainText(str(text)))
+        job.completed.connect(_done)
+        job.failed.connect(lambda message: errorBox("Runtime rescan failed", str(message)))
+        job.cancelled.connect(
+            lambda: self.runtime_text.setPlainText(
+                "Runtime rescan cancelled. No execution settings were changed."
+            )
+        )
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="runtime_rescan")
+        self._verify_thread = thread
+        self._update_runtime_action_state()
 
     def _apply_profile_preview(self, *, update_tuning: bool = True) -> None:
         profile = select_performance_profile(str(self.performance_profile.currentData() or "balanced"), self.system_resources)
@@ -1682,6 +1752,7 @@ class ProductionSettingsDialog(QDialog):
         thread = start_job_in_thread(job)
         self._track_thread(thread, job, role="verify")
         self._verify_thread = thread
+        self._update_runtime_action_state()
 
     def _open_path(self, path: Path) -> None:
         try:
@@ -1734,6 +1805,8 @@ class ProductionSettingsDialog(QDialog):
                 f"- torch: {packages.get('torch') or '-'}",
                 f"- onnxruntime: {packages.get('onnxruntime') or '-'}",
                 f"- onnx: {packages.get('onnx') or '-'}",
+                f"- cuml: {packages.get('cuml') or '-'}",
+                f"- cupy: {packages.get('cupy') or '-'}",
                 f"- hf_xet: {packages.get('hf_xet') or '-'}",
                 f"- flash-attn: {packages.get('flash-attn') or '-'}",
                 "",
@@ -1786,6 +1859,7 @@ class ProductionSettingsDialog(QDialog):
                 "cache_usage": "Scanning cache usage",
                 "cache_clear": "Clearing rebuildable caches",
                 "verify": "Verifying runtime",
+                "runtime_rescan": "Rescanning runtime resources",
                 "model": "Installing model",
                 "model_delete": "Deleting cached model",
                 "model_inventory": "Refreshing model inventory",
@@ -1795,7 +1869,11 @@ class ProductionSettingsDialog(QDialog):
                 "journal_restore": "Recovering files",
                 "journal_refresh": "Refreshing recovery history",
             }.get(str(role), "Settings task")
-            job_id = self.job_manager.register_job(label, cancel_fn=getattr(job, "cancel", None))
+            job_id = self.job_manager.register_job(
+                label,
+                cancel_fn=getattr(job, "cancel", None),
+                origin="Settings",
+            )
             self._settings_job_ids[thread] = job_id
             progress_signal = getattr(job, "progress", None)
             if progress_signal is not None:
@@ -1806,6 +1884,7 @@ class ProductionSettingsDialog(QDialog):
                         text=text,
                     )
                 )
+                progress_signal.connect(self._on_settings_job_progress)
             getattr(job, "completed").connect(
                 lambda _result, job_id=job_id: self.job_manager.finish(job_id, status="finished")
             )
@@ -1815,11 +1894,21 @@ class ProductionSettingsDialog(QDialog):
             getattr(job, "cancelled").connect(
                 lambda job_id=job_id: self.job_manager.finish(job_id, status="cancelled")
             )
+            self.operation_progress_bar.setRange(0, 0)
+            self.operation_progress_bar.show()
         thread.finished.connect(
             lambda thread=thread: self._on_async_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
         self._update_settings_cancel_state()
+
+    def _on_settings_job_progress(self, value: int, _text: str) -> None:
+        if int(value) < 0:
+            self.operation_progress_bar.setRange(0, 0)
+        else:
+            self.operation_progress_bar.setRange(0, 100)
+            self.operation_progress_bar.setValue(max(0, min(100, int(value))))
+        self.operation_progress_bar.show()
 
     def _release_finished_thread(self, thread) -> None:
         if thread is None:
@@ -1838,10 +1927,11 @@ class ProductionSettingsDialog(QDialog):
                 self._cache_clear_job = None
             self._update_cache_action_state()
             return
-        if role == "verify" and self._verify_thread is thread:
+        if role in {"verify", "runtime_rescan"} and self._verify_thread is thread:
             self._verify_thread = None
             if self._verify_job is job:
                 self._verify_job = None
+            self._update_runtime_action_state()
             return
         if role in {"model", "model_delete"} and self._model_thread is thread:
             self._model_thread = None
@@ -1871,10 +1961,13 @@ class ProductionSettingsDialog(QDialog):
             self._journal_refresh_thread = None
             if self._journal_refresh_job is job:
                 self._journal_refresh_job = None
-            return
+        if not self._settings_job_ids:
+            self.operation_progress_bar.hide()
 
     def _on_async_thread_finished(self, thread=None) -> None:
         self._release_finished_thread(thread)
+        if not self._settings_job_ids:
+            self.operation_progress_bar.hide()
         self._update_settings_cancel_state()
 
     def _active_settings_jobs(self) -> tuple[object, ...]:

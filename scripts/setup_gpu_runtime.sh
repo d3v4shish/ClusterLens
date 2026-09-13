@@ -26,6 +26,10 @@ if [[ "$("$runtime_python" -c 'import sys; print(f"{sys.version_info.major}.{sys
     exit 2
 fi
 
-uv pip install --python "$runtime_python" --upgrade -r "$repo_root/packaging/requirements-build-gpu-cu121.txt"
+uv pip install \
+    --python "$runtime_python" \
+    --upgrade \
+    --index-strategy unsafe-best-match \
+    -r "$repo_root/packaging/requirements-build-gpu-cu121.txt"
 uv pip install --python "$runtime_python" --no-deps --editable "$repo_root"
 "$runtime_python" "$repo_root/scripts/verify_gpu_runtime.py"

@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QPushButton, QSplitter, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QVBoxLayout, QWidget
 
 from app.services.thumbnails import ThumbnailService
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.common import HelpIconButton
 from ui.error_mbox import confirmBox
 from ui.gallery_pane import GalleryPane
+from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
 from ui.theme import COLORS
 
@@ -109,9 +110,16 @@ class NamesPane(QWidget):
 
     face_labels_changed = pyqtSignal()
 
-    def __init__(self, face_service_provider: Callable[[], "FaceIndexService"], parent=None) -> None:
+    def __init__(
+        self,
+        face_service_provider: Callable[[], "FaceIndexService"],
+        parent=None,
+        *,
+        job_manager: JobManager | None = None,
+    ) -> None:
         super().__init__(parent)
         self._face_service_provider = face_service_provider
+        self.job_manager = job_manager
         self._entries: list[ListEntry] = []
         self._selected_name = ""
         self._refresh_token = 0
@@ -134,6 +142,8 @@ class NamesPane(QWidget):
         self._hover_preview_thread = None
         self._retained_hover_preview_refs: list[tuple[object | None, object | None]] = []
         self._hover_preview_cache: OrderedDict[tuple[object, ...], QImage] = OrderedDict()
+        self._operation_job_ids: dict[str, int] = {}
+        self._visible_operation_slot = ""
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -159,6 +169,11 @@ class NamesPane(QWidget):
         self.status_label = QLabel("Open Names to load saved face labels.")
         self.status_label.setToolTip(NAMES_HELP)
         layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setAccessibleName("Names workspace operation progress")
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -221,6 +236,28 @@ class NamesPane(QWidget):
         splitter.setStretchFactor(1, 9)
         splitter.setSizes([280, 1060])
         layout.addWidget(splitter, stretch=1)
+
+    def set_job_manager(self, job_manager: JobManager | None) -> None:
+        """Attach the shared Jobs registry after lazy workspace construction."""
+
+        self.job_manager = job_manager
+
+    def _set_operation_progress(self, slot: str, value: int, text: str) -> None:
+        self._visible_operation_slot = str(slot)
+        if int(value) < 0:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(max(0, min(100, int(value))))
+        self.progress_bar.show()
+        if text:
+            self.status_label.setText(str(text))
+
+    def _finish_operation_progress(self, slot: str) -> None:
+        if self._visible_operation_slot != str(slot):
+            return
+        self.progress_bar.hide()
+        self._visible_operation_slot = ""
 
     def set_read_only_mode(self, enabled: bool) -> None:
         self._read_only_mode = bool(enabled)
@@ -560,9 +597,11 @@ class NamesPane(QWidget):
         ]
 
     def _rename_selected_images(self) -> None:
-        source = self._current_name() or self._selected_name
         paths = self._selected_image_paths()
-        if not source or not paths:
+        if not paths:
+            return
+        source = self._choose_metadata_source_name(paths, preferred=self._current_name() or self._selected_name)
+        if not source:
             return
         name, accepted = QInputDialog.getText(
             self,
@@ -580,9 +619,11 @@ class NamesPane(QWidget):
         )
 
     def _unlabel_selected_images(self) -> None:
-        source = self._current_name() or self._selected_name
         paths = self._selected_image_paths()
-        if not source or not paths:
+        if not paths:
+            return
+        source = self._choose_metadata_source_name(paths, preferred=self._current_name() or self._selected_name)
+        if not source:
             return
         if not confirmBox(
             "Unlabel selected faces",
@@ -598,6 +639,55 @@ class NamesPane(QWidget):
             source_name=source,
             image_paths=paths,
         )
+
+    def _choose_metadata_source_name(self, paths: list[str], *, preferred: str = "") -> str:
+        """Choose a name physically present in the selected photos' regions."""
+
+        service = self._face_service_provider()
+        names_by_path: dict[str, tuple[str, ...]] = {}
+        list_names = getattr(service, "face_region_names_for_paths", None)
+        if not callable(list_names):
+            return str(preferred or "").strip()
+        try:
+            names_by_path = dict(list_names(paths) or {})
+        except Exception:
+            names_by_path = {}
+        counts: dict[str, tuple[int, int]] = {}
+        for path, names in names_by_path.items():
+            region_names = [str(value or "").strip() for value in names if str(value or "").strip()]
+            for name in region_names:
+                face_count, photo_count = counts.get(name, (0, 0))
+                counts[name] = (face_count + 1, photo_count)
+            for name in set(region_names):
+                face_count, photo_count = counts.get(name, (0, 0))
+                counts[name] = (face_count, photo_count + 1)
+        preferred = str(preferred or "").strip()
+        if preferred and preferred not in counts:
+            # A legacy database label has no region yet. Keeping it available
+            # lets the next mutation migrate it into face metadata.
+            counts[preferred] = (0, 0)
+        if not counts:
+            return ""
+        names = sorted(counts, key=lambda value: (value.casefold(), value))
+        labels = [
+            f"{name} — {counts[name][0]} region(s) in {counts[name][1]} photo(s)" if counts[name][0] else f"{name} — saved legacy label"
+            for name in names
+        ]
+        selected_index = names.index(preferred) if preferred in names else 0
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Choose face-region name",
+            "Name currently stored in selected photo regions:",
+            labels,
+            selected_index,
+            False,
+        )
+        if not accepted:
+            return ""
+        try:
+            return names[labels.index(str(selected))]
+        except ValueError:
+            return ""
 
     def _start_selected_image_mutation(
         self,
@@ -620,13 +710,18 @@ class NamesPane(QWidget):
             if operation == "name":
                 return service.label_unlabeled_faces_in_images(target_name, paths)
             if operation == "rename":
-                return service.rename_labeled_faces_in_images(source_name, target_name, paths)
-            return service.unlabel_labeled_faces_in_images(source_name, paths)
+                rename_regions = getattr(service, "rename_face_regions_in_images", None)
+                return rename_regions(source_name, target_name, paths) if callable(rename_regions) else service.rename_labeled_faces_in_images(source_name, target_name, paths)
+            unlabel_regions = getattr(service, "unlabel_face_regions_in_images", None)
+            return unlabel_regions(source_name, paths) if callable(unlabel_regions) else service.unlabel_labeled_faces_in_images(source_name, paths)
 
-        def _done(count) -> None:
-            changed = int(count or 0)
+        def _done(result) -> None:
+            refs = list(getattr(result, "affected_refs", ()) or ())
+            changed = len(refs) if refs else int(result or 0) if isinstance(result, int) else 0
+            failures = len(getattr(result, "failures", ()) or ())
             label = {"name": "Named", "rename": "Renamed", "unlabel": "Unlabeled"}.get(operation, "Updated")
-            self.status_label.setText(f"{label} {changed} face(s). Refreshing saved names...")
+            suffix = f" ({failures} metadata failure(s))" if failures else ""
+            self.status_label.setText(f"{label} {changed} face region(s){suffix}. Refreshing saved names...")
             self._selected_name = target_name if target_name else source_name
             self.face_labels_changed.emit()
             self.refresh_names(preserve_name=self._selected_name)
@@ -641,12 +736,46 @@ class NamesPane(QWidget):
     def _start_job(self, slot: str, fn, on_completed, on_failed) -> None:
         old_job = getattr(self, f"_{slot}_job", None)
         if old_job is not None:
+            old_job_id = self._operation_job_ids.pop(str(slot), None)
+            if old_job_id is not None and self.job_manager is not None:
+                self.job_manager.finish(old_job_id, status="cancelled")
             try:
                 old_job.cancel()
             except Exception:
                 pass
         job = AsyncJob(fn)
         setattr(self, f"_{slot}_job", job)
+        job_id: int | None = None
+        if self.job_manager is not None:
+            label = {
+                "refresh": "Loading saved names",
+                "photos": "Loading named photos",
+                "mutation": "Saving face-region names",
+            }.get(str(slot), "Names workspace work")
+            job_id = self.job_manager.register_job(
+                label,
+                cancel_fn=job.cancel,
+                origin="Names",
+                foreground=str(slot) in {"refresh", "mutation"},
+            )
+            self._operation_job_ids[str(slot)] = job_id
+            job.progress.connect(
+                lambda value, text, job_id=job_id: self.job_manager.update(
+                    job_id,
+                    progress=value,
+                    text=str(text),
+                )
+            )
+        job.progress.connect(
+            lambda value, text, slot=slot: self._set_operation_progress(str(slot), int(value), str(text))
+        )
+
+        def _finish_registered_job(status: str, error: str = "") -> None:
+            current_job_id = self._operation_job_ids.pop(str(slot), None)
+            if current_job_id is not None and self.job_manager is not None:
+                self.job_manager.finish(current_job_id, status=status, error=error)
+            self._finish_operation_progress(str(slot))
+
         if slot == "refresh":
             self.refresh_button.setEnabled(False)
 
@@ -656,6 +785,7 @@ class NamesPane(QWidget):
             setattr(self, f"_{slot}_job", None)
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
+            _finish_registered_job("finished")
             on_completed(result)
 
         def _fail(message: str) -> None:
@@ -664,6 +794,7 @@ class NamesPane(QWidget):
             setattr(self, f"_{slot}_job", None)
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
+            _finish_registered_job("failed", str(message))
             on_failed(message)
 
         def _cancel() -> None:
@@ -671,6 +802,7 @@ class NamesPane(QWidget):
                 setattr(self, f"_{slot}_job", None)
                 if slot == "refresh":
                     self.refresh_button.setEnabled(True)
+                _finish_registered_job("cancelled")
 
         job.completed.connect(_complete)
         job.failed.connect(_fail)

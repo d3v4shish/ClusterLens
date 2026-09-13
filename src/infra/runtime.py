@@ -147,6 +147,46 @@ def _optional_runtime_details() -> dict[str, object]:
     }
 
 
+def _cpu_runtime_details() -> dict[str, object]:
+    details: dict[str, object] = {
+        "numpy_simd": (),
+        "blas": "",
+        "blas_threads": 0,
+        "libjpeg_turbo": False,
+    }
+    try:
+        import numpy as np
+
+        feature_map = getattr(getattr(np, "core", None), "_multiarray_umath", None)
+        feature_map = getattr(feature_map, "__cpu_features__", {})
+        priority = ("AVX512_ICL", "AVX512_SKX", "AVX512F", "AVX2", "FMA3", "AVX", "SSE42", "SSE2")
+        details["numpy_simd"] = tuple(name for name in priority if bool(feature_map.get(name)))
+    except Exception:
+        pass
+    try:
+        from threadpoolctl import threadpool_info
+
+        blas_runtime = next(
+            (item for item in threadpool_info() if str(item.get("user_api", "")) == "blas"),
+            {},
+        )
+        details["blas"] = str(
+            blas_runtime.get("internal_api")
+            or blas_runtime.get("prefix")
+            or ""
+        )
+        details["blas_threads"] = int(blas_runtime.get("num_threads") or 0)
+    except Exception:
+        pass
+    try:
+        from PIL import features
+
+        details["libjpeg_turbo"] = bool(features.check_feature("libjpeg_turbo"))
+    except Exception:
+        pass
+    return details
+
+
 def _build_remediation(
     *,
     capabilities: "RuntimeCapabilities",
@@ -163,6 +203,8 @@ def _build_remediation(
         remediation.append("Install onnx (python package) to export models for ONNX Runtime CUDA/CPU inference.")
     if not capabilities.has_onnx_cuda:
         remediation.append("Install an ONNX Runtime GPU build (onnxruntime-gpu) for CUDA ONNX inference.")
+    if capabilities.torch_cuda_available and not packages.get("cuml"):
+        remediation.append("Install the pinned RAPIDS cuML CUDA runtime to accelerate HDBSCAN; native HDBSCAN remains the CPU fallback.")
     if not bool(optional_details.get("hf_xet_installed")):
         remediation.append(
             "Install hf_xet (or huggingface_hub[hf_xet]) for faster Hugging Face downloads, and include it in the packaged exe if you ship one."
@@ -393,18 +435,21 @@ class RuntimeCapabilityService:
         self._provider_probe_cache[cache_key] = usable
         return usable
 
-    def diagnostics(self, preferred_mode: str = "auto") -> dict[str, object]:
-        capabilities = self.detect()
-        policy = self.select_policy(preferred_mode=preferred_mode)
+    def diagnostics(self, preferred_mode: str = "auto", *, refresh: bool = False) -> dict[str, object]:
+        capabilities = self.detect(refresh=refresh)
+        policy = self.select_policy(preferred_mode=preferred_mode, refresh=refresh)
         packages = {
             "torch": _package_version("torch") or capabilities.torch_version,
             "onnxruntime": _package_version("onnxruntime") or capabilities.onnx_version,
             "onnx": _package_version("onnx"),
             "onnxruntime-gpu": _package_version("onnxruntime-gpu"),
+            "cuml": _first_package_version("cuml-cu12", "cuml"),
+            "cupy": _first_package_version("cupy-cuda12x", "cupy"),
             "hf_xet": _first_package_version("hf_xet", "hf-xet"),
             "flash-attn": _first_package_version("flash-attn", "flash_attn"),
         }
         optional_details = _optional_runtime_details()
+        cpu_details = _cpu_runtime_details()
         remediation = _build_remediation(
             capabilities=capabilities,
             packages=packages,
@@ -416,6 +461,7 @@ class RuntimeCapabilityService:
             "policy": policy,
             "packages": packages,
             "optional_details": optional_details,
+            "cpu_details": cpu_details,
             "remediation": remediation,
         }
 
@@ -428,10 +474,13 @@ class RuntimeCapabilityService:
             "onnxruntime": _package_version("onnxruntime") or capabilities.onnx_version,
             "onnx": _package_version("onnx"),
             "onnxruntime-gpu": _package_version("onnxruntime-gpu"),
+            "cuml": _first_package_version("cuml-cu12", "cuml"),
+            "cupy": _first_package_version("cupy-cuda12x", "cupy"),
             "hf_xet": _first_package_version("hf_xet", "hf-xet"),
             "flash-attn": _first_package_version("flash-attn", "flash_attn"),
         }
         optional_details = _optional_runtime_details()
+        cpu_details = _cpu_runtime_details()
 
         torch = _torch_module()
         ort = _onnx_runtime_module()
@@ -509,6 +558,7 @@ class RuntimeCapabilityService:
             "policy": policy,
             "packages": packages,
             "optional_details": optional_details,
+            "cpu_details": cpu_details,
             "torch_smoke": torch_smoke,
             "onnx_smoke": onnx_smoke,
             "flash_attention_smoke": flash_attention_smoke,

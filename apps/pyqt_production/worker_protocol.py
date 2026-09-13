@@ -54,12 +54,19 @@ class ProductionClusterRequest:
     generate_cluster_explanations: bool = True
     cluster_meaning_model: str = "auto"
     allow_model_downloads: bool = True
+    backend_options_by_backend: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         modes = _normalize_similarity_modes(self.similarity_modes, self.similarity_mode)
         object.__setattr__(self, "similarity_modes", modes)
         object.__setattr__(self, "similarity_mode", modes[0])
         object.__setattr__(self, "allow_model_downloads", bool(self.allow_model_downloads))
+        normalized_options = {
+            str(backend): {str(key): value for key, value in dict(options or {}).items()}
+            for backend, options in dict(self.backend_options_by_backend or {}).items()
+            if isinstance(options, dict)
+        }
+        object.__setattr__(self, "backend_options_by_backend", normalized_options)
         for field_name in ("batch_size_cpu", "batch_size_gpu", "preprocess_workers", "vram_headroom_mb"):
             object.__setattr__(self, field_name, max(0, int(getattr(self, field_name, 0) or 0)))
 

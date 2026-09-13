@@ -1,5 +1,74 @@
 # Current implementation plan
 
+## Names workspace visibility, recovery, and non-blocking pass
+
+- [x] Port the shared job presentation and recovery contract into the Names checkout.
+  Contract: explicit work appears in the global footer/header and Jobs with its origin, progress, outcome, and cancellation; passive work remains visible in its owning view without stealing foreground progress.
+  Validation: deterministic offscreen tests cover concurrent foreground/background work, Names refresh/mutation progress, stale results, cancellation, and recovery after a failed worker; the 209-test UI smoke suite and 41-test production-support suite pass independently.
+- [ ] Keep every Names, Photos, Faces, Inspector, Settings, startup-maintenance, metadata, clustering, and storage action off the Qt UI thread.
+  Contract: affected controls and inline feedback remain responsive while work executes; source-specific results cannot overwrite a newer selection or refresh.
+  Validation: focused worker lifecycle tests, compilation, and whitespace checks pass. The documented full-script run remains outstanding because its fresh offscreen runtime can stall while Qt drains queued worker events across the broad UI fixture; this is retained visibly rather than treated as a green full run.
+
+## Per-face XMP metadata and naming
+
+- [x] Add a face-region metadata service that reads and merges standard MWG/XMP face regions, writes embedded JPEG XMP or an XMP sidecar as appropriate, and retains a ClusterLens metadata mirror.
+  Contract: one image can hold independently named face boxes; updating one region preserves all other regions and unrelated metadata.
+  Validation: deterministic temporary-image tests cover two regions, embedded/sidecar round trips, legacy metadata fallback, and write failures.
+- [x] Make durable face-label mutations metadata-aware.
+  Contract: naming, renaming, and unlabeling update exactly the requested face regions and durable `(image_path, face_index)` rows; a metadata write failure does not commit that face's database change; existing database labels win over conflicting external metadata.
+  Validation: isolated SQLite tests cover conflict precedence, re-index preservation, and mixed-person photos.
+- [x] Wire per-region naming through Faces clusters, Names, and the Photos inspector.
+  Contract: cluster naming updates every displayed cluster member's face region; Names lets users select a source metadata name; Photos can draw/scan/select a face region and name it.
+  Validation: offscreen UI tests cover the source-name chooser, selected photo regions, and multiple cluster faces from the same photo.
+- [x] Benchmark and document metadata operations.
+  Contract: the benchmark uses generated local fixtures only and makes no hardware-independent timing claim.
+  Validation: `bash scripts/benchmark.sh` measured the generated eight-region JPEG fixture; `bash scripts/build.sh`, focused service/UI tests, compilation, and whitespace checks passed.
+- [ ] Resolve the existing order-sensitive full-suite fixture failure before claiming a green full run.
+  Contract: `bash scripts/test.sh` must complete without sharing mutable model-asset state between production-support tests.
+  Validation: the 2026-09-13 full run stopped at `test_production_offline_model_mode_skips_download_prompt_and_falls_back` because `fast_preview` already existed under the shared temporary runtime; the same test passes alone. This is outside the per-face metadata change and remains visible here rather than being masked.
+
+## GPU HDBSCAN and clustering tuning
+
+- [x] Add cuML HDBSCAN to the pinned Linux CUDA runtime without replacing the verified Torch/ONNX CUDA 12.1 libraries.
+  Contract: the existing `hdbscan` backend uses cuML on a verified CUDA policy, uses native HDBSCAN on CPU, and reports any GPU-to-CPU fallback without caching it as a GPU result.
+  Validation: the corrected dependency dry-run resolved 122 packages; the physical RTX 4090 same-process verifier selected CUDA for Torch, ONNX, and cuML HDBSCAN with no failures; the seeded benchmark was deterministic on CPU and GPU; the GPU source app entered its event loop after implementation.
+- [x] Carry validated backend options through the production request, worker, clustering service, metrics, and result-cache key.
+  Contract: HDBSCAN and K-means option changes cannot reuse incompatible cached memberships; older request payloads retain existing defaults.
+  Validation: all 176 service tests passed, covering option forwarding, cache-key separation, cuML selection, native fallback, and no cache write under a failed GPU signature; production protocol/request tests passed.
+- [x] Add HDBSCAN controls to file clustering and K-means controls to face clustering.
+  Contract: file HDBSCAN exposes minimum cluster size, automatic/explicit minimum samples, merge epsilon, and single-cluster allowance; Faces cosine K-means exposes restarts, maximum iterations, and deterministic seed in every face-clustering entry point.
+  Validation: six focused production/offscreen UI tests passed for visibility, request values, state persistence, and both face-clustering actions. The broad non-blocking run passed 473 tests with four pre-existing state-sensitive tests excluded and retained two documented unrelated UI failures.
+- [x] Benchmark and document the completed implementation.
+  Contract: results use a seeded synthetic fixture and distinguish CPU from GPU execution; no user photos or mutable application caches are read.
+  Validation: the seeded 10,000 × 32 fixture measured 32.496 ms cuML versus 390.741 ms native CPU median (12.02× throughput); `BENCHMARKS.md`, `HOTSPOTS.md`, `ARCHITECTURE.md`, `BUILD.md`, and `README.md` record the method, results, runtime pins, cache contract, and remaining CPU boundaries.
+
+## Application-wide compute acceleration
+
+- [x] Route GPU-suitable vector workloads through the verified runtime policy.
+  Contract: Torch/ONNX inference, cosine K-means, graph-neighbor search, and dense similarity scoring use CUDA when a compatible Torch CUDA device is verified; an operation-level CUDA failure falls back safely and is reported in metrics/logs.
+  Validation: deterministic policy/mocked-failure service tests passed; the physical-GPU verifier selected CUDA for inference, PCA, K-means, silhouette, graph top-k, and dense scoring with no failures.
+- [x] Make the CPU fallback explicitly vectorized and cache-conscious.
+  Contract: CPU similarity scoring uses contiguous batched NumPy/BLAS operations; clustering retains native scikit-learn/NumPy execution; existing embedding, thumbnail, and result caches remain bounded and reusable.
+  Validation: all 173 service tests passed; runtime inspection recorded OpenBLAS with 16 threads, libjpeg-turbo, AVX2/FMA3, and available AVX-512 dispatch paths. Result-cache schema 3 separates compute implementations.
+- [x] Propagate one execution policy through production, benchmark, face, and legacy service stacks.
+  Contract: a run does not silently create a CPU-only clustering service beside a CUDA embedding service; standard presets and Faces grouping choose CUDA-capable backends, while CPU-only algorithms and I/O/UI boundaries remain identified rather than being mislabeled GPU.
+  Validation: focused construction, CUDA-default, resource-rescan, and production diagnostics tests passed; the updated GPU source app entered its event loop and loaded the saved Names/Faces data.
+- [x] Measure the fixed synthetic vector workload before and after the change and update architecture/performance documentation.
+  Contract: measurements use a seeded, generated matrix and distinguish transfer/initialization costs from warm computation; no user files or mutable caches are involved.
+  Validation: the final five-repeat fixture measured 111.439 ms CUDA versus 424.828 ms CPU median with deterministic memberships; exact method/results are in `BENCHMARKS.md`, and remaining CPU-only work is in `HOTSPOTS.md`.
+
+## GPU face indexing and runtime rescan
+
+- [x] Report the device used by the active face detector/embedder accurately.
+  Contract: ONNX face pipelines show GPU only when the verified `CUDAExecutionProvider` is active; Torch-backed face pipelines continue to follow the selected Torch device.
+  Validation: the focused status-strip test passed for CUDA Torch with CPU ONNX and for verified CUDA ONNX; the existing CPU status checks also passed.
+- [x] Add a user-triggered available-resource rescan to Support settings.
+  Contract: rescanning re-probes CUDA/ONNX resources off the Qt UI thread, reports the resulting face-indexing device, and does not install packages or silently change the saved compute preference.
+  Validation: focused service and production Settings tests verify `refresh=True`, provider revalidation, disabled actions while busy, result reporting, and clean thread shutdown; both targeted test runs passed all eight selected checks.
+- [x] Validate the dedicated GPU face-indexing runtime and document the measured probe.
+  Contract: the existing CPU fallback remains usable, while the CUDA source runtime selects `CUDAExecutionProvider` for SCRFD/ArcFace face indexing when available.
+  Validation: 8 focused checks passed, followed by 8 expanded runtime checks; the broad run finished with 400 passed and the same 9 pre-existing failures recorded below. The GPU verifier passed on the RTX 4090, and direct installed-model checks selected `CUDAExecutionProvider` for both SCRFD 10G and ArcFace R100. Python compilation, `git diff --check`, and the resource-probe measurements recorded in `BENCHMARKS.md` passed.
+
 ## Cluster comparison typography
 
 - [x] Replace the default one-line cluster-table renderer with compact two-line cluster rows and readable comparison headers.

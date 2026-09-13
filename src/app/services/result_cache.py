@@ -12,7 +12,7 @@ from .similarity_modes import SIMILARITY_SPACE_VERSION
 
 
 LOGGER = logging.getLogger(__name__)
-RESULT_CACHE_SCHEMA_VERSION = 2
+RESULT_CACHE_SCHEMA_VERSION = 4
 
 
 class ResultCacheService:
@@ -32,6 +32,8 @@ class ResultCacheService:
         use_onnx: bool,
         embedding_signature: str = "",
         similarity_space_version: str = SIMILARITY_SPACE_VERSION,
+        compute_signature: str = "",
+        backend_options: dict[str, object] | None = None,
     ) -> str:
         payload = json.dumps(
             {
@@ -44,6 +46,8 @@ class ResultCacheService:
                 "outlier_policy": outlier_policy,
                 "use_onnx": use_onnx,
                 "embedding_signature": str(embedding_signature or ""),
+                "compute_signature": str(compute_signature or ""),
+                "backend_options": dict(backend_options or {}),
                 "cache_schema_version": RESULT_CACHE_SCHEMA_VERSION,
             },
             sort_keys=True,

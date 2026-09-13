@@ -67,11 +67,11 @@ ONNX_READY_MODELS = frozenset({"fast_preview", "convnext", "resnet"})
 
 LEGACY_BACKEND_ORDER = ("cosine-kmeans", "hdbscan", "graph", "faiss", "sklearn")
 PRODUCTION_BACKEND_ORDER = ("cosine-kmeans", "hdbscan", "graph")
-DEFAULT_PRODUCTION_BACKENDS = ("hdbscan",)
+DEFAULT_PRODUCTION_BACKENDS = ("cosine-kmeans",)
 
 BACKEND_TOOLTIPS = {
     "cosine-kmeans": "Fast fixed-count clustering. Best default when you want predictable cluster counts.",
-    "hdbscan": "Density-based clustering. Good for natural groups and outliers when the optional dependency is available.",
+    "hdbscan": "Density-based clustering for natural groups and outliers. Uses cuML on the Linux CUDA runtime and native HDBSCAN on CPU.",
     "graph": "Similarity-graph clustering. Useful for tight visual groups without forcing every image into a fixed count.",
     "faiss": "Legacy optional FAISS KMeans path. Hidden from production UI until packaging/runtime validation is complete.",
     "sklearn": "Legacy duplicate KMeans path. Hidden from production UI because cosine-kmeans already covers this behavior.",

@@ -1510,6 +1510,16 @@ class FaceLabelAcceptanceBatch:
 
 
 @dataclass(frozen=True)
+class FaceRegionLabelMutationResult:
+    """The durable rows committed after per-photo metadata writes succeed."""
+
+    person: PersonPrototype | None
+    affected_refs: tuple[tuple[str, int], ...] = ()
+    failed_paths: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class IndexedFaceRecord:
     image_path: str
     face_index: int
@@ -2963,7 +2973,8 @@ class FaceIndexService:
                 runtime_service=self.runtime_service,
             )
         self.fallback_detection_service = self._build_detector_service(self.fallback_detector_id)
-        self.clustering_service = clustering_service or ClusteringService()
+        self.clustering_service = clustering_service or ClusteringService(execution_policy=self.execution_policy)
+        self.last_vector_compute_metrics: dict[str, object] = {}
         self.detector_display_name = str(
             getattr(self.detection_service, "display_name", "") or self._resolved_detector_display_name()
         )
@@ -4402,6 +4413,7 @@ class FaceIndexService:
         hits: list[tuple[FaceSearchResult, IndexedFaceRecord]] = []
         exclude = exclude or set()
         folder_prefix = str(folder_prefix or "").strip()
+        eligible_records: list[IndexedFaceRecord] = []
         for record in self.load_all_records(
             folder_prefix=folder_prefix,
             candidate_paths=candidate_paths,
@@ -4412,11 +4424,29 @@ class FaceIndexService:
                 continue
             if not self._quality_allows(record.quality_status, self.search_quality_min):
                 continue
-            record_embedding = np.asarray(record.embedding, dtype=np.float32)
-            record_norm = float(np.linalg.norm(record_embedding))
-            if record_norm > 1e-12:
-                record_embedding = record_embedding / record_norm
-            score = float(np.dot(query_embedding, record_embedding))
+            eligible_records.append(record)
+        if not eligible_records:
+            return []
+        raise_if_cancelled(cancel_check)
+        embedding_matrix = np.ascontiguousarray(
+            np.stack([record.embedding for record in eligible_records], axis=0),
+            dtype=np.float32,
+        )
+        scores, compute_info = self.clustering_service.vector_compute.cosine_scores(
+            embedding_matrix,
+            query_embedding,
+            normalize=True,
+        )
+        self.last_vector_compute_metrics = {
+            "operation": "face_embedding_search",
+            "candidate_count": len(eligible_records),
+            "compute_device": compute_info.device,
+            "compute_implementation": compute_info.implementation,
+            "compute_fallback_reason": compute_info.fallback_reason,
+        }
+        for record, raw_score in zip(eligible_records, scores):
+            raise_if_cancelled(cancel_check)
+            score = float(raw_score)
             if score < min_face_score:
                 continue
             hits.append(
@@ -4601,6 +4631,7 @@ class FaceIndexService:
                 image_height=image_height,
                 assess_quality=False,
             )
+            self.import_face_region_names([image_path])
             total_faces += len(records)
             done += 1
             _emit_progress(f"{done}/{total} images, extracted {total_faces} faces")
@@ -5955,6 +5986,8 @@ class FaceIndexService:
                     label_rows,
                 )
         saved = self.load_image_faces(image_path, include_tiny_faces=True)
+        self.import_face_region_names([image_path])
+        saved = self.load_image_faces(image_path, include_tiny_faces=True)
         LOGGER.info(
             "FaceIndexService save_image_faces_complete mode=%s db=%s image=%s faces=%s",
             self.mode,
@@ -6123,6 +6156,17 @@ class FaceIndexService:
         query_vector = np.asarray(query_embedding, dtype=np.float32).reshape(1, -1)
         norms = np.linalg.norm(query_vector, axis=1, keepdims=True)
         query_vector = query_vector / np.clip(norms, 1e-12, None)
+        if self.clustering_service.vector_compute.cuda_enabled:
+            return self._search_by_embedding_bruteforce(
+                query_vector[0],
+                min_face_score=min_face_score,
+                top_k=top_k,
+                folder_prefix=folder_prefix,
+                candidate_paths=candidate_paths,
+                exclude=exclude,
+                include_tiny_faces=include_tiny_faces,
+                cancel_check=cancel_check,
+            )
         ann_index, ann_refs, _fingerprint = self._load_ann_index()
         if ann_index is None or not ann_refs:
             return self._search_by_embedding_bruteforce(
@@ -6226,7 +6270,7 @@ class FaceIndexService:
         num_clusters: int = 12,
         min_face_score: float = 0.0,
         *,
-        backend: str = "hdbscan",
+        backend: str | None = None,
         outlier_policy: str = "assign",
         backend_options: dict[str, object] | None = None,
         folder_prefix: str = "",
@@ -6234,12 +6278,13 @@ class FaceIndexService:
         face_refs: list[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
     ) -> dict[int, list[FaceClusterMember]]:
+        backend_id = self._default_cluster_backend() if backend is None else str(backend or "").strip().lower()
         LOGGER.info(
             "FaceIndexService cluster_faces mode=%s db=%s num_clusters=%s backend=%s outlier_policy=%s min_face_score=%s folder_prefix=%s include_tiny=%s",
             self.mode,
             self.db_path,
             num_clusters,
-            backend,
+            backend_id,
             outlier_policy,
             min_face_score,
             folder_prefix,
@@ -6257,15 +6302,15 @@ class FaceIndexService:
         compare = self.cluster_faces_compare(
             num_clusters=num_clusters,
             min_face_score=min_face_score,
-            backends=[backend],
+            backends=[backend_id],
             outlier_policy=outlier_policy,
-            backend_options_by_backend={str(backend or "hdbscan").strip().lower(): dict(backend_options or {})},
+            backend_options_by_backend={backend_id: dict(backend_options or {})},
             folder_prefix=folder_prefix,
             candidate_paths=candidate_paths,
             face_refs=face_refs,
             include_tiny_faces=include_tiny_faces,
         )
-        key = next(iter(compare.clusters_by_key.keys()), str(backend or "hdbscan").strip().lower() or "hdbscan")
+        key = next(iter(compare.clusters_by_key.keys()), backend_id)
         clusters_by_id = dict(compare.clusters_by_key.get(key) or {})
         LOGGER.info(
             "FaceIndexService cluster_faces_complete mode=%s db=%s records=%s clusters=%s",
@@ -6387,15 +6432,17 @@ class FaceIndexService:
             records.append(record)
         return records
 
-    @staticmethod
-    def _normalized_face_cluster_backends(backends: list[str] | tuple[str, ...] | None) -> list[str]:
+    def _default_cluster_backend(self) -> str:
+        return "cosine-kmeans" if self.execution_policy.uses_cuda else "hdbscan"
+
+    def _normalized_face_cluster_backends(self, backends: list[str] | tuple[str, ...] | None) -> list[str]:
         allowed = {item_id for item_id, _label in face_cluster_backend_choices()}
         normalized: list[str] = []
         for backend in backends or ():
             item_id = str(backend or "").strip().lower()
             if item_id in allowed and item_id not in normalized:
                 normalized.append(item_id)
-        return normalized or ["hdbscan"]
+        return normalized or [self._default_cluster_backend()]
 
     def _cluster_prepared_faces_for_backend(
         self,
@@ -6471,7 +6518,18 @@ class FaceIndexService:
             )
             if cluster_embeddings.size <= 0:
                 continue
-            similarity_matrix = cluster_embeddings @ prototype_matrix.T
+            similarity_matrix, compute_info = self.clustering_service.vector_compute.cosine_matrix(
+                cluster_embeddings,
+                prototype_matrix,
+            )
+            self.last_vector_compute_metrics = {
+                "operation": "face_cluster_identity_suggestions",
+                "candidate_count": int(cluster_embeddings.shape[0]),
+                "prototype_count": int(prototype_matrix.shape[0]),
+                "compute_device": compute_info.device,
+                "compute_implementation": compute_info.implementation,
+                "compute_fallback_reason": compute_info.fallback_reason,
+            }
             best_indexes = np.argmax(similarity_matrix, axis=1)
             best_scores = similarity_matrix[np.arange(similarity_matrix.shape[0]), best_indexes]
             scores_by_person: dict[str, list[float]] = defaultdict(list)
@@ -6644,6 +6702,265 @@ class FaceIndexService:
                 connection=connection,
             )
         return person
+
+    def label_indexed_faces_with_metadata(
+        self,
+        person_name: str,
+        face_refs: list[tuple[str, int]],
+        *,
+        similarity_threshold: float = 0.72,
+        source: str = "manual_cluster_name",
+    ) -> FaceRegionLabelMutationResult:
+        """Name exact indexed faces after their metadata regions are durable.
+
+        A metadata failure is intentionally isolated to that photo.  Its face
+        label is not committed, avoiding an internal name that cannot be
+        represented in the selected file/sidecar.
+        """
+
+        from app.services.face_region_metadata import FaceRegionMetadataService, FaceRegionUpdate
+
+        target = str(person_name or "").strip()
+        if not target:
+            raise ValueError("Identity name is required.")
+        records = self._indexed_records_for_refs(face_refs)
+        if not records:
+            raise ValueError("The selected indexed faces do not meet the current prototype quality gate.")
+        metadata = FaceRegionMetadataService()
+        records_by_path: dict[str, list[IndexedFaceRecord]] = defaultdict(list)
+        for record in records:
+            records_by_path[str(record.image_path)].append(record)
+        succeeded_refs: list[tuple[str, int]] = []
+        failed_paths: list[str] = []
+        failures: list[str] = []
+        for image_path, image_records in records_by_path.items():
+            width, height = self._image_dimensions(image_path)
+            updates = [
+                FaceRegionUpdate(region.x, region.y, region.width, region.height, target)
+                for region in [FaceRegionMetadataService.normalized_region_for_bbox(record.face_bbox, (width, height)) for record in image_records]
+            ]
+            write_result = metadata.update(image_path, updates)
+            if write_result.succeeded:
+                succeeded_refs.extend((record.image_path, int(record.face_index)) for record in image_records)
+            else:
+                failed_paths.append(image_path)
+                failures.append(f"{image_path}: {write_result.error}")
+        if not succeeded_refs:
+            return FaceRegionLabelMutationResult(None, (), tuple(failed_paths), tuple(failures))
+        person = self.label_indexed_faces_immediately(
+            target,
+            succeeded_refs,
+            similarity_threshold=similarity_threshold,
+            source=source,
+        )
+        return FaceRegionLabelMutationResult(person, tuple(succeeded_refs), tuple(failed_paths), tuple(failures))
+
+    def face_region_names_for_paths(self, image_paths: list[str]) -> dict[str, tuple[str, ...]]:
+        """Return names physically stored in XMP/EXIF region metadata."""
+
+        from app.services.face_region_metadata import FaceRegionMetadataService
+
+        return FaceRegionMetadataService().names_for_paths(image_paths)
+
+    def unlabel_indexed_faces_with_metadata(
+        self,
+        face_refs: list[tuple[str, int]],
+        *,
+        source: str = "manual_selected_faces",
+    ) -> FaceRegionLabelMutationResult:
+        """Remove names from exactly the selected face regions."""
+
+        from app.services.face_region_metadata import FaceRegionMetadataService, FaceRegionUpdate
+
+        records = self._indexed_records_for_refs(face_refs)
+        if not records:
+            return FaceRegionLabelMutationResult(None)
+        metadata = FaceRegionMetadataService()
+        records_by_path: dict[str, list[IndexedFaceRecord]] = defaultdict(list)
+        for record in records:
+            records_by_path[str(record.image_path)].append(record)
+        succeeded_records: list[IndexedFaceRecord] = []
+        failed_paths: list[str] = []
+        failures: list[str] = []
+        for image_path, image_records in records_by_path.items():
+            width, height = self._image_dimensions(image_path)
+            updates = []
+            for record in image_records:
+                region = metadata.normalized_region_for_bbox(record.face_bbox, (width, height))
+                updates.append(FaceRegionUpdate(region.x, region.y, region.width, region.height, None))
+            write_result = metadata.update(image_path, updates)
+            if write_result.succeeded:
+                succeeded_records.extend(image_records)
+            else:
+                failed_paths.append(image_path)
+                failures.append(f"{image_path}: {write_result.error}")
+        refs_by_name: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for record in succeeded_records:
+            name = str(record.person_name or "").strip()
+            if name:
+                refs_by_name[name].append((record.image_path, int(record.face_index)))
+        for name, refs in refs_by_name.items():
+            self._apply_selected_image_label_change(
+                source_name=name,
+                face_refs=refs,
+                action=str(source or "manual_selected_faces"),
+            )
+        return FaceRegionLabelMutationResult(
+            None,
+            tuple((record.image_path, int(record.face_index)) for record in succeeded_records),
+            tuple(failed_paths),
+            tuple(failures),
+        )
+
+    def import_face_region_names(self, image_paths: list[str]) -> int:
+        """Import external region names only for otherwise-unlabeled matches."""
+
+        from app.services.face_region_metadata import FaceRegionMetadataService
+
+        metadata = FaceRegionMetadataService()
+        refs_by_name: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for image_path in list(dict.fromkeys(str(path) for path in image_paths if str(path or "").strip())):
+            records = self.load_image_faces(image_path, include_tiny_faces=True)
+            if not records:
+                continue
+            width, height = self._image_dimensions(image_path)
+            normalized_records = [metadata.normalized_region_for_bbox(record.face_bbox, (width, height)) for record in records]
+            for region in metadata.read(image_path).named_regions:
+                matching = metadata.best_matching_region(normalized_records, region)
+                if matching is None:
+                    continue
+                record = next(
+                    (
+                        item
+                        for item, normalized in zip(records, normalized_records)
+                        if normalized == matching and not str(item.person_name or "").strip()
+                    ),
+                    None,
+                )
+                if record is not None:
+                    refs_by_name[str(region.name).strip()].append((record.image_path, int(record.face_index)))
+        imported = 0
+        for name, refs in refs_by_name.items():
+            unique_refs = list(dict.fromkeys(refs))
+            if not unique_refs:
+                continue
+            self.label_indexed_faces_immediately(name, unique_refs, source="metadata_region_import")
+            imported += len(unique_refs)
+        return imported
+
+    def rename_face_regions_in_images(
+        self,
+        source_name: str,
+        target_name: str,
+        image_paths: list[str],
+    ) -> FaceRegionLabelMutationResult:
+        return self._mutate_face_regions_in_images(source_name, target_name, image_paths, action="rename_face_regions")
+
+    def unlabel_face_regions_in_images(
+        self,
+        source_name: str,
+        image_paths: list[str],
+    ) -> FaceRegionLabelMutationResult:
+        return self._mutate_face_regions_in_images(source_name, "", image_paths, action="unlabel_face_regions")
+
+    def _indexed_records_for_refs(self, face_refs: list[tuple[str, int]]) -> list[IndexedFaceRecord]:
+        records: list[IndexedFaceRecord] = []
+        for image_path, face_index in list(dict.fromkeys((str(path), int(index)) for path, index in face_refs if str(path or "").strip())):
+            record = self.load_face_record(image_path, face_index)
+            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+                records.append(record)
+        return records
+
+    def _mutate_face_regions_in_images(
+        self,
+        source_name: str,
+        target_name: str,
+        image_paths: list[str],
+        *,
+        action: str,
+    ) -> FaceRegionLabelMutationResult:
+        """Rename/unlabel one actual metadata name across selected photos."""
+
+        from app.services.face_region_metadata import FaceRegionMetadataService, FaceRegionUpdate
+
+        source = str(source_name or "").strip()
+        target = str(target_name or "").strip()
+        if not source:
+            raise ValueError("A source identity name is required.")
+        if action == "rename_face_regions" and not target:
+            raise ValueError("A target identity name is required.")
+        if source == target:
+            return FaceRegionLabelMutationResult(None)
+        metadata = FaceRegionMetadataService()
+        paths = list(dict.fromkeys(str(path) for path in image_paths if str(path or "").strip()))
+        successful_refs: list[tuple[str, int]] = []
+        newly_named_refs: list[tuple[str, int]] = []
+        failed_paths: list[str] = []
+        failures: list[str] = []
+        for image_path in paths:
+            records = self.load_image_faces(image_path, include_tiny_faces=True)
+            width, height = self._image_dimensions(image_path)
+            document = metadata.read(image_path)
+            updates: list[FaceRegionUpdate] = []
+            matched_record_refs: set[tuple[str, int]] = set()
+            for region in document.regions:
+                if str(region.name or "").strip() != source:
+                    continue
+                updates.append(FaceRegionUpdate(region.x, region.y, region.width, region.height, target or None))
+                matched = metadata.best_matching_region(
+                    [metadata.normalized_region_for_bbox(record.face_bbox, (width, height)) for record in records],
+                    region,
+                )
+                if matched is None:
+                    continue
+                for record in records:
+                    candidate = metadata.normalized_region_for_bbox(record.face_bbox, (width, height))
+                    if candidate == matched:
+                        matched_record_refs.add((record.image_path, int(record.face_index)))
+                        break
+            # A database-only label is upgraded into a face region as part of
+            # the same operation, which migrates legacy Names edits safely.
+            for record in records:
+                if str(record.person_name or "").strip() != source:
+                    continue
+                normalized = metadata.normalized_region_for_bbox(record.face_bbox, (width, height))
+                updates.append(FaceRegionUpdate(normalized.x, normalized.y, normalized.width, normalized.height, target or None))
+                matched_record_refs.add((record.image_path, int(record.face_index)))
+            if not updates:
+                continue
+            write_result = metadata.update(image_path, updates)
+            if not write_result.succeeded:
+                failed_paths.append(image_path)
+                failures.append(f"{image_path}: {write_result.error}")
+                continue
+            for ref in sorted(matched_record_refs):
+                record = next((item for item in records if (item.image_path, int(item.face_index)) == ref), None)
+                if record is None:
+                    continue
+                if str(record.person_name or "").strip() == source:
+                    successful_refs.append(ref)
+                elif not str(record.person_name or "").strip() and target:
+                    newly_named_refs.append(ref)
+        if successful_refs:
+            self._apply_selected_image_label_change(
+                source_name=source,
+                target_name=target,
+                face_refs=successful_refs,
+                action=action,
+            )
+        person = None
+        if newly_named_refs and target:
+            person = self.label_indexed_faces_immediately(
+                target,
+                newly_named_refs,
+                source="metadata_region_import",
+            )
+        return FaceRegionLabelMutationResult(
+            person,
+            tuple(dict.fromkeys([*successful_refs, *newly_named_refs])),
+            tuple(failed_paths),
+            tuple(failures),
+        )
 
     def _save_person_prototype(
         self,
@@ -7081,11 +7398,29 @@ class FaceIndexService:
             if np.asarray(prototype.embedding).size > 0
         ]
         warnings: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        if not prototypes:
+            self._cached_duplicate_warnings[threshold] = {}
+            return {}
+        prototype_matrix = np.ascontiguousarray(
+            np.stack([prototype.embedding for prototype in prototypes], axis=0),
+            dtype=np.float32,
+        )
+        similarities, compute_info = self.clustering_service.vector_compute.cosine_matrix(
+            prototype_matrix,
+            prototype_matrix,
+        )
+        self.last_vector_compute_metrics = {
+            "operation": "identity_duplicate_warnings",
+            "prototype_count": len(prototypes),
+            "compute_device": compute_info.device,
+            "compute_implementation": compute_info.implementation,
+            "compute_fallback_reason": compute_info.fallback_reason,
+        }
         for left_index, left in enumerate(prototypes):
-            for right in prototypes[left_index + 1 :]:
+            for right_index, right in enumerate(prototypes[left_index + 1 :], start=left_index + 1):
                 if left.embedding.size <= 0 or right.embedding.size <= 0:
                     continue
-                score = float(np.dot(left.embedding, right.embedding))
+                score = float(similarities[left_index, right_index])
                 if score < threshold:
                     continue
                 warnings[left.person_name].append((right.person_name, score))
@@ -8170,19 +8505,47 @@ class FaceIndexService:
         ]
         if not prototypes or not records:
             return []
+        unlabeled_records = [
+            record
+            for record in records
+            if not str(record.person_name or "").strip()
+        ]
+        if not unlabeled_records:
+            return []
+        record_matrix = np.ascontiguousarray(
+            np.stack([record.embedding for record in unlabeled_records], axis=0),
+            dtype=np.float32,
+        )
+        prototype_matrix = np.ascontiguousarray(
+            np.stack([prototype.embedding for prototype in prototypes], axis=0),
+            dtype=np.float32,
+        )
+        similarity_matrix, compute_info = self.clustering_service.vector_compute.cosine_matrix(
+            record_matrix,
+            prototype_matrix,
+        )
+        thresholds = np.asarray(
+            [
+                max(float(prototype.similarity_threshold), float(self.auto_label_min_score))
+                for prototype in prototypes
+            ],
+            dtype=np.float32,
+        )
+        self.last_vector_compute_metrics = {
+            "operation": "auto_propagate_labels",
+            "candidate_count": len(unlabeled_records),
+            "prototype_count": len(prototypes),
+            "compute_device": compute_info.device,
+            "compute_implementation": compute_info.implementation,
+            "compute_fallback_reason": compute_info.fallback_reason,
+        }
         assignments = []
-        for record in records:
-            if str(record.person_name or "").strip():
-                continue
-            best_person = None
-            best_score = -1.0
-            for prototype in prototypes:
-                score = float(np.dot(record.embedding, prototype.embedding))
-                threshold = max(float(prototype.similarity_threshold), float(self.auto_label_min_score))
-                if score >= threshold and score > best_score:
-                    best_person = prototype.person_name
-                    best_score = score
-            if best_person is not None:
+        for record, scores in zip(unlabeled_records, similarity_matrix):
+            eligible = np.flatnonzero(scores >= thresholds)
+            if eligible.size > 0:
+                best_index = int(eligible[np.argmax(scores[eligible])])
+                best_person = prototypes[best_index].person_name
+                best_score = float(scores[best_index])
                 assignments.append(
                     FaceLabelAssignment(
                         person_name=best_person,

@@ -6,19 +6,27 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QDesktopServices, QGuiApplication
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
+from ui.job_manager import JobManager
 
 
 class SelectionDetailsPane(QWidget):
     add_to_review_requested = pyqtSignal(list)
     open_inspector_requested = pyqtSignal(list, int, object)
 
-    def __init__(self, metadata_service: PhotoMetadataService | None = None, parent=None):
+    def __init__(
+        self,
+        metadata_service: PhotoMetadataService | None = None,
+        parent=None,
+        *,
+        job_manager: JobManager | None = None,
+    ):
         super().__init__(parent)
         self.metadata_service = metadata_service or PhotoMetadataService()
+        self.job_manager = job_manager
         self._active_thread = None
         self._active_job = None
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
@@ -54,6 +62,12 @@ class SelectionDetailsPane(QWidget):
         self.summary_label = QLabel("No image selected.")
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setAccessibleName("Selection metadata loading progress")
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
 
         self.info_text = QTextEdit()
         self.info_text.setReadOnly(True)
@@ -107,6 +121,8 @@ class SelectionDetailsPane(QWidget):
         self._request_id += 1
         request_id = self._request_id
         self.info_text.setPlainText("Loading details...")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
         if self._active_job is not None:
             self._retain_async_refs(self._active_job, self._active_thread)
             self._active_job.cancel()
@@ -132,21 +148,32 @@ class SelectionDetailsPane(QWidget):
             return metadata
 
         job = AsyncJob(_run)
+        if self.job_manager is not None:
+            self.job_manager.bind_async_job(
+                job,
+                "Loading selection details",
+                origin="Details",
+                foreground=False,
+            )
+        job.progress.connect(self._on_metadata_progress)
 
         def _on_completed(metadata: PhotoMetadata) -> None:
             if request_id != self._request_id:
                 return
             self.info_text.setPlainText(self._render_metadata(metadata))
+            self.progress_bar.hide()
 
         def _on_failed(message: str) -> None:
             if request_id != self._request_id:
                 return
             self.info_text.setPlainText(f"Failed to load details: {message}")
+            self.progress_bar.hide()
 
         def _on_cancelled() -> None:
             if request_id != self._request_id:
                 return
             self.info_text.setPlainText("Cancelled.")
+            self.progress_bar.hide()
 
         job.completed.connect(_on_completed)
         job.failed.connect(_on_failed)
@@ -159,6 +186,14 @@ class SelectionDetailsPane(QWidget):
             Qt.ConnectionType.QueuedConnection,
         )
         self._active_thread = thread
+
+    def _on_metadata_progress(self, value: int, _text: str) -> None:
+        if int(value) < 0:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(max(0, min(100, int(value))))
+        self.progress_bar.show()
 
     @staticmethod
     def _thread_is_running(thread) -> bool:

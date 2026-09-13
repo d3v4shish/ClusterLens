@@ -461,8 +461,6 @@ class GalleryPane(QWidget):
         inspector_context = self._inspector_context_for_path(str(image_path))
         can_edit_faces = bool(
             not self.read_only_mode
-            and
-            isinstance(inspector_context.get("face_review"), dict)
             and self._active_face_edit_service() is not None
         )
         can_remove_all_faces = bool(can_edit_faces and callable(self.face_remove_all_callback))
@@ -615,7 +613,7 @@ class GalleryPane(QWidget):
         job.progress.connect(self._on_action_progress)
         job_id: int | None = None
         if self.job_manager is not None:
-            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel)
+            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin="Photos")
             self._active_action_job_id = job_id
             job.progress.connect(
                 lambda value, text, job_id=job_id: self.job_manager.update(
@@ -1023,12 +1021,19 @@ class GalleryPane(QWidget):
             self.status_label.setText("Path export cancelled.")
             return
         source_paths = target.as_list()
-        try:
+
+        def _run(progress, cancel_check):
+            progress(-1, "Writing selected image paths…")
+            _ = cancel_check
             Path(export_path).write_text("\n".join(source_paths) + "\n", encoding="utf-8")
+            progress(100, "Path export complete")
+            return len(source_paths)
+
+        def _done(count: int) -> None:
             self.status_label.setText(f"Exported {len(source_paths)} path(s) from {target.label}.")
-            infoBox("Path export complete", f"Exported {len(source_paths)} path(s) to:\n{export_path}")
-        except Exception as exc:
-            errorBox("Path export failed", str(exc))
+            infoBox("Path export complete", f"Exported {int(count)} path(s) to:\n{export_path}")
+
+        self._start_action_job("Exporting image paths", _run, _done)
 
     def slotCopySelected(self) -> None:
         if not self._require_write_enabled("copy photos"):
@@ -1449,7 +1454,7 @@ class GalleryPane(QWidget):
         current_context = self._inspector_context_for_path(str(image_path))
         edit_enabled = bool(
             face_service is not None
-            and isinstance(current_context.get("face_review"), dict)
+            and not self.read_only_mode
             and (allow_face_edit is True or allow_face_edit is None)
         )
 
@@ -1467,6 +1472,7 @@ class GalleryPane(QWidget):
             face_draft_updated_callback=self.face_draft_updated_callback,
             face_edit_saved_callback=self.face_edit_saved_callback,
             face_auto_clean_callback=self.face_auto_clean_callback,
+            job_manager=self.job_manager,
             parent=self,
         )
         dialog.exec()

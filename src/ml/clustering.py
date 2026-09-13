@@ -11,7 +11,9 @@ from app.services.cluster_explanations import ClusterExplanation
 from app.services.similarity_modes import SUPPORTED_SIMILARITY_MODES
 from app.services.similarity_graph import SimilarityGraphService
 from infra.logging_config import get_logger
+from infra.runtime import ExecutionPolicy
 from infra.settings import get_settings
+from ml.vector_compute import VectorComputeInfo, VectorComputeService
 
 LOGGER = get_logger(__name__)
 DEFAULT_SEMANTIC_PCA_DIM = 50
@@ -27,6 +29,9 @@ class PreparedMatrixInfo:
     pca_components: int | None
     normalized: bool
     space_label: str
+    compute_device: str = "cpu"
+    compute_implementation: str = "numpy-blas-normalize"
+    compute_fallback_reason: str = ""
 
     @classmethod
     def from_matrix(cls, matrix: np.ndarray, similarity_mode: str) -> "PreparedMatrixInfo":
@@ -79,9 +84,36 @@ def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
 
 
 class ClusteringService:
-    def __init__(self) -> None:
+    def __init__(self, execution_policy: ExecutionPolicy | None = None) -> None:
         self.settings = get_settings()
-        self.graph_service = SimilarityGraphService()
+        self.execution_policy = execution_policy or ExecutionPolicy()
+        self.vector_compute = VectorComputeService(self.execution_policy)
+        self.graph_service = SimilarityGraphService(self.execution_policy)
+
+    def result_cache_signature(
+        self,
+        backend: str,
+        similarity_mode: str,
+        performance_profile: str | None = None,
+        backend_options: dict[str, object] | None = None,
+    ) -> str:
+        device = "cuda" if self.vector_compute.cuda_enabled else "cpu"
+        preparation = f"{device}-svd-pca" if _normalize_similarity_mode(similarity_mode) == "semantic" else "cpu-normalize"
+        normalized_backend = str(backend or "cosine-kmeans").strip().lower()
+        if normalized_backend in {"cosine-kmeans", "sklearn"}:
+            implementation = f"{device}-kmeans"
+        elif normalized_backend == "hdbscan":
+            implementation = "cuda-cuml-hdbscan" if self.vector_compute.cuda_enabled and self.vector_compute.cuml_hdbscan_available else "cpu-hdbscan"
+        elif normalized_backend == "graph":
+            implementation = f"{device}-neighbors"
+        else:
+            implementation = f"cpu-{normalized_backend}"
+        profile = str(performance_profile or "balanced").strip().lower()
+        option_signature = ",".join(
+            f"{key}={value}"
+            for key, value in sorted(dict(backend_options or {}).items())
+        )
+        return f"vector-compute-v2:{preparation}:{implementation}:{profile}:{option_signature}"
 
     def cluster(
         self,
@@ -138,21 +170,35 @@ class ClusteringService:
         performance_profile: str | None = None,
         backend_options: dict[str, object] | None = None,
     ) -> tuple[dict[int, list[int]], dict]:
-        labels, used_backend = self._labels_for_backend(
+        effective_options = self._effective_backend_options(
+            metric_matrix,
+            backend,
+            backend_options,
+            performance_profile=performance_profile,
+        )
+        labels, used_backend, compute_info = self._labels_for_backend(
             metric_matrix,
             num_clusters,
             backend,
             performance_profile=performance_profile,
-            backend_options=backend_options,
+            backend_options=effective_options,
         )
         clusters = self._clusters_from_labels(metric_matrix, labels, num_clusters, outlier_policy)
         clusters = self._merge_tiny_clusters(metric_matrix, clusters)
         clusters = self._rerank_cluster_members(metric_matrix, clusters)
+        quality_score, quality_compute_info = self._cluster_quality(metric_matrix, labels)
 
         metrics = {
             "backend": used_backend,
             "outlier_count": len(clusters.get(-1, [])),
-            "cluster_quality_score": self._cluster_quality(metric_matrix, labels),
+            "cluster_quality_score": quality_score,
+            "compute_device": compute_info.device,
+            "compute_implementation": compute_info.implementation,
+            "compute_fallback_reason": compute_info.fallback_reason,
+            "quality_compute_device": quality_compute_info.device,
+            "quality_compute_implementation": quality_compute_info.implementation,
+            "quality_compute_fallback_reason": quality_compute_info.fallback_reason,
+            "backend_options": effective_options,
         }
         return clusters, metrics
 
@@ -254,25 +300,34 @@ class ClusteringService:
         input_dimension = int(matrix.shape[1]) if matrix.ndim == 2 else 0
         pca_components = None
         pca_applied = False
+        normalized = False
+        compute_info = VectorComputeInfo("cpu", "numpy-blas-normalize")
 
         if mode == "semantic":
             target_dim = int(pca_dim or DEFAULT_SEMANTIC_PCA_DIM)
             pca_components = _safe_semantic_pca_components(matrix, target_dim)
             if pca_components is not None:
-                try:
-                    matrix = PCA(n_components=pca_components, random_state=42).fit_transform(matrix)
+                projected, compute_info = self.vector_compute.pca_project(matrix, pca_components)
+                if projected is not None:
+                    matrix = projected
                     pca_applied = True
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Semantic PCA projection failed; falling back to full normalized vectors: samples=%s input_dim=%s target_dim=%s error=%s",
-                        matrix.shape[0],
-                        input_dimension,
-                        target_dim,
-                        exc,
-                    )
-                    pca_components = None
+                    normalized = True
+                else:
+                    try:
+                        matrix = PCA(n_components=pca_components, random_state=42).fit_transform(matrix)
+                        pca_applied = True
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Semantic PCA projection failed; falling back to full normalized vectors: samples=%s input_dim=%s target_dim=%s error=%s",
+                            matrix.shape[0],
+                            input_dimension,
+                            target_dim,
+                            exc,
+                        )
+                        pca_components = None
 
-        matrix = _l2_normalize(matrix)
+        if not normalized:
+            matrix = _l2_normalize(np.ascontiguousarray(matrix, dtype=np.float32))
         prepared_dimension = int(matrix.shape[1]) if matrix.ndim == 2 else 0
         if mode == "semantic" and pca_applied:
             space_label = (
@@ -294,6 +349,9 @@ class ClusteringService:
             pca_components=pca_components if pca_applied else None,
             normalized=True,
             space_label=space_label,
+            compute_device=compute_info.device,
+            compute_implementation=compute_info.implementation,
+            compute_fallback_reason=compute_info.fallback_reason,
         )
         return np.asarray(matrix, dtype=np.float32), info
 
@@ -305,66 +363,139 @@ class ClusteringService:
         *,
         performance_profile: str | None = None,
         backend_options: dict[str, object] | None = None,
-    ) -> tuple[np.ndarray, str]:
+    ) -> tuple[np.ndarray, str, VectorComputeInfo]:
         profile = str(performance_profile or "balanced").strip().lower()
+        unavailable_backend_reason = ""
+        if backend == "faiss" and faiss is None:
+            unavailable_backend_reason = "FAISS is unavailable; using scikit-learn K-means."
+        elif backend == "hdbscan" and hdbscan is None and not self.vector_compute.cuda_enabled:
+            unavailable_backend_reason = "HDBSCAN is unavailable; using scikit-learn K-means."
+        compute_info = VectorComputeInfo(
+            "cpu",
+            "sklearn-native-kmeans",
+            unavailable_backend_reason,
+        )
         if backend == "faiss" and faiss is not None:
             LOGGER.info("Clustering with FAISS KMeans")
-            return self._faiss_kmeans(matrix, num_clusters), "faiss"
-        if backend == "hdbscan" and hdbscan is not None:
-            LOGGER.info("Clustering with HDBSCAN")
-            options = dict(backend_options or {})
-            min_cluster_size = max(
-                2,
-                self._backend_option_int(
-                    options,
-                    "min_cluster_size",
-                    self.settings.min_graph_cluster_size,
-                    minimum=2,
+            return (
+                self._faiss_kmeans(np.ascontiguousarray(matrix, dtype=np.float32), num_clusters),
+                "faiss",
+                VectorComputeInfo(
+                    "cpu",
+                    "faiss-native-kmeans",
+                    "The installed FAISS backend does not expose a CUDA index."
+                    if self.vector_compute.cuda_enabled
+                    else "",
                 ),
             )
-            min_samples_value = self._backend_option_int(options, "min_samples", 0, minimum=0)
+        if backend == "hdbscan":
+            options = dict(backend_options or {})
+            min_cluster_size = int(options["min_cluster_size"])
+            min_samples_value = int(options["min_samples"])
             min_samples = None if min_samples_value <= 0 else min_samples_value
-            cluster_selection_epsilon = self._backend_option_float(options, "cluster_selection_epsilon", 0.0, minimum=0.0)
-            allow_single_cluster = self._backend_option_bool(options, "allow_single_cluster", False)
-            labels = hdbscan.HDBSCAN(
-                min_cluster_size=min_cluster_size,
-                min_samples=min_samples,
-                metric="euclidean",
-                cluster_selection_epsilon=cluster_selection_epsilon,
-                cluster_selection_method="eom",
-                allow_single_cluster=allow_single_cluster,
-            ).fit_predict(matrix)
-            return labels.astype(np.int32), "hdbscan"
+            cluster_selection_epsilon = float(options["cluster_selection_epsilon"])
+            allow_single_cluster = bool(options["allow_single_cluster"])
+            if self.vector_compute.cuda_enabled:
+                LOGGER.info("Clustering with CUDA cuML HDBSCAN")
+                labels, compute_info = self.vector_compute.hdbscan_labels(
+                    matrix,
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                    cluster_selection_epsilon=cluster_selection_epsilon,
+                    allow_single_cluster=allow_single_cluster,
+                )
+                if labels is not None:
+                    return labels, "hdbscan", compute_info
+            else:
+                compute_info = VectorComputeInfo("cpu", "hdbscan-native")
+            if hdbscan is not None:
+                LOGGER.info("Clustering with native CPU HDBSCAN")
+                labels = hdbscan.HDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                    metric="euclidean",
+                    cluster_selection_epsilon=cluster_selection_epsilon,
+                    cluster_selection_method="eom",
+                    allow_single_cluster=allow_single_cluster,
+                ).fit_predict(matrix)
+                return labels.astype(np.int32), "hdbscan", VectorComputeInfo(
+                    "cpu",
+                    "hdbscan-native",
+                    compute_info.fallback_reason,
+                )
+            unavailable_backend_reason = compute_info.fallback_reason or "HDBSCAN is unavailable; using scikit-learn K-means."
+            compute_info = VectorComputeInfo("cpu", "sklearn-native-kmeans", unavailable_backend_reason)
         if backend == "graph":
             LOGGER.info("Clustering with kNN graph")
-            labels = self.graph_service.graph_cluster(
+            labels, compute_info = self.graph_service.graph_cluster_with_info(
                 matrix,
                 min_similarity=self.settings.min_graph_similarity,
                 min_cluster_size=self.settings.min_graph_cluster_size,
             )
-            return labels.astype(np.int32), "graph"
+            return labels.astype(np.int32), "graph", compute_info
         if backend == "cosine-kmeans":
-            LOGGER.info("Clustering with cosine MiniBatch/KMeans")
-            matrix = np.asarray(matrix, dtype=np.float32)
+            LOGGER.info("Clustering with CUDA-first cosine MiniBatch/KMeans")
+        matrix = np.ascontiguousarray(matrix, dtype=np.float32)
+        options = (
+            dict(backend_options or {})
+            if backend in {"cosine-kmeans", "sklearn"}
+            else self._effective_backend_options(
+                matrix,
+                "cosine-kmeans",
+                None,
+                performance_profile=performance_profile,
+            )
+        )
+        if backend in {"cosine-kmeans", "sklearn"}:
+            labels, compute_info = self.vector_compute.kmeans_labels(
+                matrix,
+                num_clusters,
+                seed=int(options["seed"]),
+                max_iter=int(options["max_iter"]),
+                n_init=int(options["n_init"]),
+            )
+            if labels is not None:
+                used_backend = "sklearn" if backend == "sklearn" else backend
+                if profile == "max_speed":
+                    used_backend = "minibatch-kmeans-fast" if backend == "sklearn" else "cosine-kmeans-fast"
+                return labels, used_backend, compute_info
         if profile == "max_speed" and backend in {"cosine-kmeans", "sklearn"} and matrix.shape[0] >= 512:
             labels = MiniBatchKMeans(
                 n_clusters=num_clusters,
-                random_state=42,
+                random_state=int(options["seed"]),
                 batch_size=max(1024, num_clusters * 32),
-                n_init=3,
-                max_iter=80,
+                n_init=int(options["n_init"]),
+                max_iter=int(options["max_iter"]),
             ).fit_predict(matrix)
-            return labels.astype(np.int32), "minibatch-kmeans-fast" if backend == "sklearn" else "cosine-kmeans-fast"
+            return (
+                labels.astype(np.int32),
+                "minibatch-kmeans-fast" if backend == "sklearn" else "cosine-kmeans-fast",
+                VectorComputeInfo("cpu", "sklearn-minibatch-kmeans", compute_info.fallback_reason),
+            )
         if matrix.shape[0] >= self.settings.minibatch_kmeans_threshold:
             labels = MiniBatchKMeans(
                 n_clusters=num_clusters,
-                random_state=42,
+                random_state=int(options["seed"]),
                 batch_size=max(1024, num_clusters * 16),
-                n_init="auto",
+                n_init=int(options["n_init"]),
+                max_iter=int(options["max_iter"]),
             ).fit_predict(matrix)
-            return labels.astype(np.int32), "minibatch-kmeans" if backend == "sklearn" else backend
-        labels = KMeans(n_clusters=num_clusters, random_state=42, n_init=10).fit_predict(matrix)
-        return labels.astype(np.int32), "sklearn" if backend == "sklearn" else backend
+            return (
+                labels.astype(np.int32),
+                "minibatch-kmeans" if backend == "sklearn" else backend,
+                VectorComputeInfo("cpu", "sklearn-minibatch-kmeans", compute_info.fallback_reason),
+            )
+        labels = KMeans(
+            n_clusters=num_clusters,
+            random_state=int(options["seed"]),
+            n_init=int(options["n_init"]),
+            max_iter=int(options["max_iter"]),
+        ).fit_predict(matrix)
+        return (
+            labels.astype(np.int32),
+            "sklearn" if backend == "sklearn" else backend,
+            VectorComputeInfo("cpu", "sklearn-kmeans", compute_info.fallback_reason),
+        )
 
     @staticmethod
     def _backend_option_int(
@@ -373,13 +504,16 @@ class ClusteringService:
         default: int,
         *,
         minimum: int | None = None,
+        maximum: int | None = None,
     ) -> int:
         try:
-            value = int(options.get(key, default) or default)
+            value = int(options[key] if key in options else default)
         except Exception:
             value = int(default)
         if minimum is not None:
             value = max(int(minimum), value)
+        if maximum is not None:
+            value = min(int(maximum), value)
         return value
 
     @staticmethod
@@ -389,6 +523,7 @@ class ClusteringService:
         default: float,
         *,
         minimum: float | None = None,
+        maximum: float | None = None,
     ) -> float:
         try:
             value = float(options.get(key, default) or default)
@@ -396,6 +531,8 @@ class ClusteringService:
             value = float(default)
         if minimum is not None:
             value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
         return value
 
     @staticmethod
@@ -409,6 +546,66 @@ class ClusteringService:
         if text in {"0", "false", "no", "off"}:
             return False
         return bool(default)
+
+    def _effective_backend_options(
+        self,
+        matrix: np.ndarray,
+        backend: str,
+        options: dict[str, object] | None,
+        *,
+        performance_profile: str | None,
+    ) -> dict[str, object]:
+        values = dict(options or {})
+        backend_id = str(backend or "cosine-kmeans").strip().lower()
+        if backend_id == "hdbscan":
+            return {
+                "min_cluster_size": self._backend_option_int(
+                    values,
+                    "min_cluster_size",
+                    self.settings.min_graph_cluster_size,
+                    minimum=2,
+                    maximum=10_000,
+                ),
+                "min_samples": self._backend_option_int(
+                    values,
+                    "min_samples",
+                    0,
+                    minimum=0,
+                    maximum=10_000,
+                ),
+                "cluster_selection_epsilon": self._backend_option_float(
+                    values,
+                    "cluster_selection_epsilon",
+                    0.0,
+                    minimum=0.0,
+                    maximum=2.0,
+                ),
+                "allow_single_cluster": self._backend_option_bool(
+                    values,
+                    "allow_single_cluster",
+                    False,
+                ),
+            }
+        if backend_id in {"cosine-kmeans", "sklearn"}:
+            profile = str(performance_profile or "balanced").strip().lower()
+            return {
+                "n_init": self._backend_option_int(values, "n_init", 3, minimum=1, maximum=50),
+                "max_iter": self._backend_option_int(
+                    values,
+                    "max_iter",
+                    80 if profile == "max_speed" else 100,
+                    minimum=1,
+                    maximum=1000,
+                ),
+                "seed": self._backend_option_int(
+                    values,
+                    "seed",
+                    42,
+                    minimum=0,
+                    maximum=2_147_483_647,
+                ),
+            }
+        return {}
 
     def _clusters_from_labels(
         self,
@@ -432,21 +629,25 @@ class ClusteringService:
 
     def _isolate_outliers(self, matrix: np.ndarray, clusters: dict[int, list[int]]) -> dict[int, list[int]]:
         centroids = self._cluster_centroids(matrix, clusters)
-        all_scores = []
-        owner = {}
+        all_scores: list[float] = []
+        owner: dict[int, int] = {}
+        scores_by_index: dict[int, float] = {}
         for cluster_id, members in clusters.items():
             centroid = centroids[cluster_id]
-            for index in members:
-                score = float(np.dot(matrix[index], centroid))
+            member_indices = np.asarray(members, dtype=np.int32)
+            member_scores = np.asarray(matrix[member_indices] @ centroid, dtype=np.float32)
+            for index, raw_score in zip(members, member_scores):
+                score = float(raw_score)
                 all_scores.append(score)
                 owner[index] = cluster_id
+                scores_by_index[index] = score
         if not all_scores:
             return clusters
         threshold = np.quantile(np.asarray(all_scores), 1.0 - self.settings.outlier_quantile)
         updated = {cluster_id: [] for cluster_id in clusters}
         updated[-1] = []
         for index, cluster_id in owner.items():
-            if float(np.dot(matrix[index], centroids[cluster_id])) < threshold:
+            if scores_by_index[index] < threshold:
                 updated[-1].append(index)
             else:
                 updated[cluster_id].append(index)
@@ -463,9 +664,16 @@ class ClusteringService:
         if not any(cluster_id != -1 for cluster_id in large):
             return clusters
         centroids = self._cluster_centroids(matrix, {k: v for k, v in large.items() if k != -1})
+        centroid_ids = list(centroids)
+        centroid_matrix = np.ascontiguousarray(
+            np.stack([centroids[cluster_id] for cluster_id in centroid_ids], axis=0),
+            dtype=np.float32,
+        )
         for members in tiny.values():
-            for index in members:
-                target = self._nearest_cluster(matrix[index], centroids)
+            member_indices = np.asarray(members, dtype=np.int32)
+            similarities = np.ascontiguousarray(matrix[member_indices], dtype=np.float32) @ centroid_matrix.T
+            for index, target_offset in zip(members, np.argmax(similarities, axis=1).tolist()):
+                target = centroid_ids[int(target_offset)]
                 large.setdefault(target, []).append(index)
         return {cluster_id: members for cluster_id, members in large.items() if members}
 
@@ -477,22 +685,42 @@ class ClusteringService:
                 reranked[cluster_id] = members
                 continue
             centroid = centroids[cluster_id]
-            reranked[cluster_id] = sorted(
-                members,
-                key=lambda index: float(np.dot(matrix[index], centroid)),
-                reverse=True,
-            )
+            member_indices = np.asarray(members, dtype=np.int32)
+            scores = np.asarray(matrix[member_indices] @ centroid, dtype=np.float32)
+            order = np.argsort(-scores, kind="stable")
+            reranked[cluster_id] = [members[int(offset)] for offset in order]
         return reranked
 
-    def _cluster_quality(self, matrix: np.ndarray, labels: np.ndarray) -> float | None:
+    def _cluster_quality(
+        self,
+        matrix: np.ndarray,
+        labels: np.ndarray,
+    ) -> tuple[float | None, VectorComputeInfo]:
         unique_labels = {int(label) for label in labels if int(label) != -1}
         if len(unique_labels) < 2 or matrix.shape[0] <= len(unique_labels):
-            return None
+            return None, VectorComputeInfo("cpu", "skipped")
+        gpu_score, compute_info = self.vector_compute.silhouette_score(
+            matrix,
+            labels,
+            sample_size=self.settings.silhouette_sample_size,
+            seed=42,
+        )
+        if gpu_score is not None:
+            return gpu_score, compute_info
         try:
             sample_size = min(self.settings.silhouette_sample_size, matrix.shape[0])
-            return float(silhouette_score(matrix, labels, sample_size=sample_size, random_state=42))
+            score = float(silhouette_score(matrix, labels, sample_size=sample_size, random_state=42))
+            return score, VectorComputeInfo(
+                "cpu",
+                "sklearn-silhouette",
+                compute_info.fallback_reason,
+            )
         except Exception:
-            return None
+            return None, VectorComputeInfo(
+                "cpu",
+                "sklearn-silhouette",
+                compute_info.fallback_reason,
+            )
 
     @staticmethod
     def _cluster_centroids(matrix: np.ndarray, clusters: dict[int, list[int]]) -> dict[int, np.ndarray]:

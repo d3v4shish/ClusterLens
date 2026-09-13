@@ -180,9 +180,16 @@ if sys.argv[1] == "gpu-cu121":
     if "CUDAExecutionProvider" not in ort.get_available_providers():
         print("GPU build environment does not advertise CUDAExecutionProvider.", file=sys.stderr)
         raise SystemExit(7)
+    try:
+        import cupy
+        from cuml.cluster import HDBSCAN
+    except Exception as exc:
+        print(f"Unable to import the RAPIDS HDBSCAN runtime: {exc}", file=sys.stderr)
+        raise SystemExit(8)
     print(f"torch_cuda_build={torch.version.cuda}")
     print(f"torchvision={torchvision.__version__}")
     print(f"onnxruntime={ort.__version__} providers={ort.get_available_providers()}")
+    print(f"cuml_hdbscan={HDBSCAN.__module__} cupy={cupy.__version__}")
 """
     run([str(python), "-c", script, variant.name], dry_run=dry_run)
 

@@ -249,6 +249,10 @@ def _run_cluster_request(request: ProductionClusterRequest, *, runtime: Persiste
                 generate_cluster_meanings=bool(request.generate_cluster_meanings),
                 generate_cluster_explanations=bool(request.generate_cluster_explanations),
                 cluster_meaning_model=request.cluster_meaning_model,
+                backend_options_by_backend={
+                    str(backend): dict(options or {})
+                    for backend, options in request.backend_options_by_backend.items()
+                },
             ),
             progress_callback=_progress,
         )

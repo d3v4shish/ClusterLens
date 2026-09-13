@@ -31,6 +31,7 @@ from ui.cluster_pane import ClusterPane
 from ui.error_mbox import errorBox, infoBox
 from ui.footer_bar import WorkspaceFooter
 from ui.job_manager import JobManager
+from ui.job_presentation import JobPresentationController
 from ui.job_widgets import JobIndicatorWidget
 from ui.recent_folders import RecentFolderHistory
 from ui.mode_panes import ClusteringOptionsPane, SourcePane
@@ -142,6 +143,7 @@ class ClusterGalleryApp(QMainWindow):
         self._clustering_job_id: int | None = None
         self._tag_context_thread = None
         self._tag_context_job = None
+        self._tag_context_job_id: int | None = None
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
         self._async_thread_roles: dict[object, tuple[str, object | None]] = {}
         self._tag_context_generation = 0
@@ -263,6 +265,8 @@ class ClusterGalleryApp(QMainWindow):
         self.gallery_pane.image_tag_service = self.image_tag_service
         self.gallery_pane.review_action_mode = "disabled"
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
+        self.gallery_pane.face_edit_service_provider = lambda: self.face_service_global
+        self.gallery_pane.face_edit_saved_callback = self._on_main_gallery_face_labels_changed
         self.gallery_pane.first_paint_ready.connect(self.on_gallery_first_paint)
         self.gallery_pane.image_selected.connect(self.on_center_gallery_image_selected)
         self.gallery_pane.paths_removed.connect(self.on_gallery_paths_removed)
@@ -330,7 +334,14 @@ class ClusterGalleryApp(QMainWindow):
         self.faces_pane.set_active_face_mode(self._preferred_face_mode(), refresh=False)
         self._refresh_recent_folder_menus()
 
-        self.names_pane = NamesPane(lambda: self.face_service_global, self.workspace_stack)
+        self.names_pane = NamesPane(
+            lambda: self.face_service_global,
+            self.workspace_stack,
+            job_manager=self.job_manager,
+        )
+        self.names_pane.gallery.job_manager = self.job_manager
+        self.names_pane.gallery.metadata_service = self.photo_metadata_service
+        self.names_pane.gallery.image_tag_service = self.image_tag_service
         self.faces_pane.face_labels_changed.connect(self.names_pane.refresh_names)
         self.names_pane.face_labels_changed.connect(self._on_names_face_labels_changed)
 
@@ -355,6 +366,7 @@ class ClusterGalleryApp(QMainWindow):
         self.main_splitter.setStretchFactor(1, 11)
 
         self.footer_bar = WorkspaceFooter(self)
+        self.job_presentation = JobPresentationController(self.job_manager, self.footer_bar, self)
         self.job_manager.job_added.connect(lambda _job_id: self._update_metrics_overlay())
         self.job_manager.job_updated.connect(lambda _job_id: self._update_metrics_overlay())
         self.job_manager.job_finished.connect(lambda _job_id: self._update_metrics_overlay())
@@ -759,6 +771,12 @@ class ClusterGalleryApp(QMainWindow):
         self.faces_pane.refresh_face_library(reason="labels changed in Names")
         self.faces_pane.refresh_face_album(reason="labels changed in Names", force_refresh=True)
 
+    def _on_main_gallery_face_labels_changed(self, _image_path: str) -> None:
+        """Synchronize Photos inspector region edits with Names and Faces."""
+
+        self.names_pane.refresh_names()
+        self._on_names_face_labels_changed()
+
     @staticmethod
     def _normalize_ui_mode(mode: str) -> str:
         return "advanced" if str(mode or "").strip().lower() == "advanced" else "basic"
@@ -1098,7 +1116,6 @@ class ClusterGalleryApp(QMainWindow):
     def maybe_warm_runtime(self) -> None:
         if self._active_workspace != "clustering":
             self._warmup_state = "deferred"
-            self.footer_bar.set_progress(None)
             self._update_metrics_overlay()
             return
         if not self.settings_store.value("runtime/allow_gpu_warmup", self.settings.allow_gpu_warmup, bool):
@@ -1133,7 +1150,6 @@ class ClusterGalleryApp(QMainWindow):
         if not local_model_ready:
             self._warmup_state = f"skipped ({model_name} requires download)"
             self.footer_bar.set_status(f"Warm-up skipped for {model_name}; model is not cached locally.")
-            self.footer_bar.set_progress(None)
             self._update_metrics_overlay()
             return
         if self._warmup_thread is not None:
@@ -1152,10 +1168,13 @@ class ClusterGalleryApp(QMainWindow):
 
         self._warmup_state = f"warming ({model_name})"
         self.footer_bar.set_status(f"Warming {model_name}...")
-        self.footer_bar.set_progress(-1, f"Warming {model_name}...")
         self._update_metrics_overlay()
         job = AsyncJob(_run)
-        self._warmup_job_id = self.job_manager.register_job("Runtime warm-up", cancel_fn=job.cancel)
+        self._warmup_job_id = self.job_manager.register_job(
+            "Runtime warm-up",
+            cancel_fn=job.cancel,
+            origin="Clustering",
+        )
         job.progress.connect(lambda value, text: self.job_manager.update(self._warmup_job_id or -1, progress=value, text=text))
 
         def _finish(status: str, error: str = "") -> None:
@@ -1169,21 +1188,18 @@ class ClusterGalleryApp(QMainWindow):
                 self._warmup_signature = result
             self._warmup_state = f"ready ({model_name})"
             self.footer_bar.set_status(f"Runtime warm and ready for {model_name}.")
-            self.footer_bar.set_progress(None)
             self._update_metrics_overlay()
             _finish("finished")
 
         def _failed(message: str) -> None:
             self._warmup_state = f"failed ({message})"
             self.footer_bar.set_status(f"Warm-up failed: {message}")
-            self.footer_bar.set_progress(None)
             self._update_metrics_overlay()
             _finish("failed", message)
 
         def _cancelled() -> None:
             self._warmup_state = "cancelled"
             self.footer_bar.set_status("Warm-up cancelled.")
-            self.footer_bar.set_progress(None)
             self._update_metrics_overlay()
             _finish("cancelled")
 
@@ -1426,7 +1442,6 @@ class ClusterGalleryApp(QMainWindow):
         self._main_gallery_context_overrides = {}
         self.clustering_pane.update_metrics({})
         self.footer_bar.set_metrics("")
-        self.footer_bar.set_progress(0, "Preparing clustering run...")
         self.cluster_data = {}
         self.membership_by_image = {}
         self.metrics_by_backend = {}
@@ -1471,7 +1486,12 @@ class ClusterGalleryApp(QMainWindow):
             self.on_clustering_cancelled,
             Qt.ConnectionType.QueuedConnection,
         )
-        self._clustering_job_id = self.job_manager.register_job("Clustering", cancel_fn=self.worker.cancel)
+        self._clustering_job_id = self.job_manager.register_job(
+            "Clustering",
+            cancel_fn=self.worker.cancel,
+            origin="Clustering",
+        )
+        self.job_manager.update(self._clustering_job_id, progress=0, text="Preparing clustering run")
         self.worker.start()
 
     def run_clustering(self) -> None:
@@ -1522,7 +1542,6 @@ class ClusterGalleryApp(QMainWindow):
         if self._clustering_job_id is None:
             return
         self.job_manager.update(self._clustering_job_id, progress=int(value), text=str(status))
-        self.footer_bar.set_progress(int(value), str(status))
 
     def cancel_clustering(self) -> None:
         if self.worker and self.worker.isRunning():
@@ -1546,7 +1565,6 @@ class ClusterGalleryApp(QMainWindow):
         self.last_run_metrics["runtime_reason"] = self.execution_policy.reason
         self.clustering_pane.set_running(False)
         self.source_pane.set_running(False)
-        self.footer_bar.set_progress(None)
         self.image_tags_by_path = {}
         self.cluster_tag_summaries = {}
         self.gallery_extra_context_by_path = {}
@@ -1571,7 +1589,6 @@ class ClusterGalleryApp(QMainWindow):
     def on_clustering_failed(self, message: str) -> None:
         self.clustering_pane.set_running(False)
         self.source_pane.set_running(False)
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status(f"Clustering failed: {message}")
         errorBox("Clustering failed", message)
         if self._clustering_job_id is not None:
@@ -1581,7 +1598,6 @@ class ClusterGalleryApp(QMainWindow):
     def on_clustering_cancelled(self) -> None:
         self.clustering_pane.set_running(False)
         self.source_pane.set_running(False)
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status("Clustering cancelled.")
         self.last_run_metrics = {
             "status": "cancelled",
@@ -1698,9 +1714,13 @@ class ClusterGalleryApp(QMainWindow):
     def _cancel_cluster_tag_context_refresh(self) -> None:
         job = self._tag_context_job
         thread = self._tag_context_thread
+        job_id = self._tag_context_job_id
         self._retain_async_refs(job, thread)
         self._tag_context_job = None
         self._tag_context_thread = None
+        self._tag_context_job_id = None
+        if job_id is not None:
+            self.job_manager.finish(job_id, status="cancelled")
         if job is None:
             return
         self._tag_context_generation += 1
@@ -1779,12 +1799,29 @@ class ClusterGalleryApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._tag_context_job = job
-        self.footer_bar.set_progress(-1, "Loading cluster tag summaries...")
+        job_id = self.job_manager.register_job(
+            "Loading cluster tag summaries",
+            cancel_fn=job.cancel,
+            origin="Clustering",
+            foreground=False,
+        )
+        self._tag_context_job_id = job_id
+        job.progress.connect(
+            lambda value, text, job_id=job_id: self.job_manager.update(
+                job_id, progress=value, text=str(text)
+            )
+        )
+
+        def _finish_job(status: str, error: str = "") -> None:
+            self.job_manager.finish(job_id, status=status, error=error)
+            if self._tag_context_job_id == job_id:
+                self._tag_context_job_id = None
 
         def _current_generation() -> bool:
             return generation == self._tag_context_generation
 
         def _done(payload: object) -> None:
+            _finish_job("finished")
             if not _current_generation() or not isinstance(payload, ClusterTagContextPayload):
                 return
             self.image_tags_by_path = dict(payload.image_tags_by_path)
@@ -1805,23 +1842,21 @@ class ClusterGalleryApp(QMainWindow):
                 self.cluster_meanings,
                 preserve_selection=True,
             )
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Clustering finished.")
 
         def _failed(message: str) -> None:
+            _finish_job("failed", message)
             if not _current_generation():
                 return
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status(f"Clustering finished. Tag summary refresh failed: {message}")
             LOGGER.warning("Cluster tag context refresh failed: %s", message)
 
         def _cancelled() -> None:
+            _finish_job("cancelled")
             if not _current_generation():
                 return
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Clustering finished.")
 
-        job.progress.connect(self.footer_bar.set_progress)
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
@@ -1830,30 +1865,8 @@ class ClusterGalleryApp(QMainWindow):
         self._tag_context_thread = thread
 
     def _refresh_cluster_tag_context(self) -> None:
-        self._cancel_cluster_tag_context_refresh()
-        all_paths = self._all_cluster_paths()
-        if not all_paths:
-            self.image_tags_by_path = {}
-            self.cluster_tag_summaries = {}
-            self.gallery_extra_context_by_path = {}
-            return
-        self.image_tags_by_path = self.image_tag_service.load_tags_for_paths(all_paths)
-        self.cluster_tag_summaries = {
-            comparison_key: {
-                int(cluster_id): self.image_tag_service.summarize_paths(image_paths, tags_by_path=self.image_tags_by_path)
-                for cluster_id, image_paths in clusters.items()
-            }
-            for comparison_key, clusters in self.cluster_data.items()
-        }
-        self.gallery_extra_context_by_path = {}
-        for image_path in all_paths:
-            context: dict[str, object] = {"tags": list(self.image_tags_by_path.get(image_path, ()))}
-            if self.current_run_origin:
-                context["run_origin"] = self.current_run_origin
-            if self.current_tag_filter:
-                context["tag_filter"] = list(self.current_tag_filter)
-                context["tag_match"] = self.current_tag_match or "Any"
-            self.gallery_extra_context_by_path[image_path] = context
+        """Refresh tag context through the visible background-work path."""
+        self._start_cluster_tag_context_refresh()
 
     def _capture_face_context(self, paths: list[str]) -> dict[str, dict[str, object]]:
         return {

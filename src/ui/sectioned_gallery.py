@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QProgressBar,
     QPushButton,
     QStyle,
     QStyledItemDelegate,
@@ -26,6 +27,7 @@ from app.services.photo_metadata import PhotoMetadataService
 from app.services.thumbnails import ThumbnailService
 from ui.gallery_model import GalleryImageModel
 from ui.gallery_pane import GalleryPane
+from ui.job_manager import JobManager
 from ui.photo_inspector_dialog import PhotoInspectorDialog
 from ui.theme import COLORS
 
@@ -462,11 +464,23 @@ class SectionedGallery(QWidget):
         super().__init__(parent)
         self._tile_size = 190
         self._thumbnail_service = ThumbnailService()
+        # Keep decode work owned by this view so its signals cannot target a
+        # deleted gallery during shutdown.
+        self._job_pool = QThreadPool(self)
+        self._job_pool.setMaxThreadCount(2)
+        self._shutting_down = False
         self._metadata_service = PhotoMetadataService()
         self._loading_paths: set[str] = set()
         self._label_paths: set[str] = set()
+        self._job_manager: JobManager | None = None
+        self._viewport_job_id: int | None = None
+        self._viewport_job_generation = -1
+        self._viewport_tasks: set[tuple[str, str]] = set()
+        self._viewport_completed_tasks: set[tuple[str, str]] = set()
         self._generation = 0
         self._read_only = False
+        self.face_service_provider = None
+        self.face_edit_saved_callback = None
         self._model = SectionedGalleryModel(self)
         self._delegate = _SectionedPhotoDelegate(self._tile_size, self)
         self._hover_popup = _GroupHoverPreviewPopup(self)
@@ -486,6 +500,10 @@ class SectionedGallery(QWidget):
         toolbar = QHBoxLayout()
         self.status_label = QLabel("Choose a folder to show its photos.")
         self.status_label.setWordWrap(True)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setAccessibleName("Visible photo loading progress")
+        self.progress_bar.hide()
         self.organize_button = QPushButton("Organize")
         self.organize_button.setToolTip("Arrange this folder using the current Clustering settings.")
         self.organize_button.clicked.connect(self.organize_requested.emit)
@@ -496,6 +514,7 @@ class SectionedGallery(QWidget):
         self.expand_all_button.clicked.connect(self.expand_all_sections)
         self.collapse_all_button.clicked.connect(self.collapse_all_sections)
         toolbar.addWidget(self.status_label, stretch=1)
+        toolbar.addWidget(self.progress_bar)
         toolbar.addWidget(self.expand_all_button)
         toolbar.addWidget(self.collapse_all_button)
         toolbar.addWidget(self.organize_button)
@@ -549,8 +568,22 @@ class SectionedGallery(QWidget):
         self.table.selectionModel().selectionChanged.connect(lambda *_args: self._refresh_group_bar())
         layout.addWidget(self.table, stretch=1)
 
+    def set_job_manager(self, job_manager: JobManager | None) -> None:
+        """Route visible gallery work to the shared Jobs surface."""
+        self._job_manager = job_manager
+        self._actions.job_manager = job_manager
+
+    def set_loading_state(self, text: str) -> None:
+        """Show folder discovery before thumbnail tasks can begin."""
+        self.status_label.setText(str(text or "Loading photos…"))
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
+
     def set_sections(self, sections: list[GallerySection], *, status: str = "") -> None:
+        if self._shutting_down:
+            return
         self._hide_hover_preview()
+        self._finish_viewport_job(status="cancelled")
         self._generation += 1
         self._loading_paths.clear()
         self._label_paths.clear()
@@ -561,8 +594,11 @@ class SectionedGallery(QWidget):
         QTimer.singleShot(0, self._queue_visible_loads)
 
     def set_empty_state(self, text: str, *, can_organize: bool = False) -> None:
+        if self._shutting_down:
+            return
         self.set_sections([])
         self.status_label.setText(text)
+        self.progress_bar.hide()
         self.organize_button.setEnabled(bool(can_organize))
 
     def set_read_only_mode(self, enabled: bool) -> None:
@@ -616,6 +652,8 @@ class SectionedGallery(QWidget):
         return indexes
 
     def _queue_visible_loads(self) -> None:
+        if self._shutting_down:
+            return
         preview_paths: list[str] = []
         viewport = self.table.viewport().rect()
         for row in range(self._model.rowCount()):
@@ -638,36 +676,123 @@ class SectionedGallery(QWidget):
         QTimer.singleShot(60, self._queue_visible_loads)
 
     def _queue_paths(self, paths: list[str] | tuple[str, ...]) -> None:
+        if self._shutting_down:
+            return
         generation = self._generation
         for path in dict.fromkeys(str(path) for path in paths if path):
             if path not in self._loading_paths and not self._model.has_image(path):
                 self._loading_paths.add(path)
-                runnable = _ThumbnailRunnable(path, self._tile_size, self._thumbnail_service, generation, self)
+                self._begin_viewport_task(generation, path, "thumbnail")
+                runnable = _ThumbnailRunnable(
+                    path, self._tile_size, self._thumbnail_service, generation, self._job_pool
+                )
                 runnable.loaded.connect(self._on_thumbnail_loaded)
                 runnable.failed.connect(self._on_thumbnail_failed)
-                QThreadPool.globalInstance().start(runnable)
+                self._job_pool.start(runnable)
             if path not in self._label_paths:
                 self._label_paths.add(path)
-                label_runnable = _LabelRunnable(path, generation, self)
+                self._begin_viewport_task(generation, path, "label")
+                label_runnable = _LabelRunnable(path, generation, self._job_pool)
                 label_runnable.loaded.connect(self._on_label_loaded)
-                QThreadPool.globalInstance().start(label_runnable)
+                self._job_pool.start(label_runnable)
 
     def _on_thumbnail_loaded(self, generation: int, path: str, image: QImage) -> None:
         self._loading_paths.discard(path)
-        if generation != self._generation or image.isNull():
+        self._complete_viewport_task(generation, path, "thumbnail")
+        if self._shutting_down or generation != self._generation or image.isNull():
             return
         self._model.set_image(path, image)
         self._refresh_hover_preview_for_path(path)
 
     def _on_thumbnail_failed(self, generation: int, path: str, error: str) -> None:
         self._loading_paths.discard(path)
-        if generation == self._generation:
+        self._complete_viewport_task(generation, path, "thumbnail")
+        if not self._shutting_down and generation == self._generation:
             self._model.set_failed(path, error)
             self._refresh_hover_preview_for_path(path)
 
     def _on_label_loaded(self, generation: int, path: str, label: str) -> None:
-        if generation == self._generation:
+        self._label_paths.discard(path)
+        self._complete_viewport_task(generation, path, "label")
+        if not self._shutting_down and generation == self._generation:
             self._model.set_label(path, label)
+
+    def _begin_viewport_task(self, generation: int, path: str, kind: str) -> None:
+        if generation != self._viewport_job_generation:
+            self._finish_viewport_job(status="cancelled")
+            self._viewport_job_generation = generation
+            self._viewport_tasks.clear()
+            self._viewport_completed_tasks.clear()
+        task = (str(path), str(kind))
+        if task in self._viewport_tasks:
+            return
+        self._viewport_tasks.add(task)
+        if self._viewport_job_id is None and self._job_manager is not None:
+            self._viewport_job_id = self._job_manager.register_job(
+                "Loading visible photos", origin="Photos", foreground=False
+            )
+        self._update_viewport_progress()
+
+    def _complete_viewport_task(self, generation: int, path: str, kind: str) -> None:
+        if generation != self._viewport_job_generation:
+            return
+        task = (str(path), str(kind))
+        if task not in self._viewport_tasks:
+            return
+        self._viewport_completed_tasks.add(task)
+        self._update_viewport_progress()
+        if self._viewport_tasks.issubset(self._viewport_completed_tasks):
+            self._finish_viewport_job(status="finished")
+
+    def _update_viewport_progress(self) -> None:
+        total = len(self._viewport_tasks)
+        completed = len(self._viewport_completed_tasks)
+        if total <= 0:
+            self.progress_bar.hide()
+            return
+        value = int((completed * 100) / total)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, min(100, value)))
+        self.progress_bar.show()
+        text = f"Loading visible photos: {completed}/{total}"
+        self.status_label.setText(text)
+        if self._job_manager is not None and self._viewport_job_id is not None:
+            self._job_manager.update(self._viewport_job_id, progress=value, text=text)
+
+    def _finish_viewport_job(self, *, status: str) -> None:
+        total = len(self._viewport_tasks)
+        completed = len(self._viewport_completed_tasks)
+        if self._job_manager is not None and self._viewport_job_id is not None:
+            self._job_manager.finish(self._viewport_job_id, status=status)
+        self._viewport_job_id = None
+        self._viewport_job_generation = -1
+        self._viewport_tasks.clear()
+        self._viewport_completed_tasks.clear()
+        self.progress_bar.hide()
+        if status == "finished" and total:
+            self.status_label.setText(f"Loaded {completed}/{total} visible photo tasks.")
+
+    def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
+        """Drain view-owned thumbnail work before Qt tears down this view."""
+        self._shutting_down = True
+        self._finish_viewport_job(status="cancelled")
+        self._generation += 1
+        self._loading_paths.clear()
+        self._label_paths.clear()
+        self._hide_hover_preview()
+        try:
+            self._job_pool.clear()
+            return bool(self._job_pool.waitForDone(max(0, int(timeout_ms))))
+        except RuntimeError:
+            return True
+        except Exception:
+            return False
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self.shutdown_jobs():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _toggle_checked_section(self, section_id: str) -> None:
         self._model.toggle_checked_section(section_id)
@@ -826,6 +951,8 @@ class SectionedGallery(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("Open", lambda: self._open_photo(index))
+        if self._active_face_service() is not None and not self._read_only:
+            menu.addAction("Edit Face Regions", lambda: self._open_photo(index))
         menu.addAction("Reveal folder", lambda: self._run_for_paths((path,), self._actions.slotOpenSelectedFolders))
         menu.addAction("Tag", lambda: self._run_for_paths((path,), self._actions.slotEditTags))
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -852,6 +979,10 @@ class SectionedGallery(QWidget):
             start_index=0,
             metadata_service=self._metadata_service,
             display_mode="basic",
+            face_service=self._active_face_service(),
+            allow_face_edit=bool(not self._read_only and self._active_face_service() is not None),
+            face_edit_saved_callback=self.face_edit_saved_callback,
+            job_manager=self._job_manager,
             parent=self,
         )
         dialog.exec()
@@ -867,9 +998,21 @@ class SectionedGallery(QWidget):
             start_index=paths.index(path),
             metadata_service=self._metadata_service,
             display_mode="basic",
+            face_service=self._active_face_service(),
+            allow_face_edit=bool(not self._read_only and self._active_face_service() is not None),
+            face_edit_saved_callback=self.face_edit_saved_callback,
+            job_manager=self._job_manager,
             parent=self,
         )
         dialog.exec()
+
+    def _active_face_service(self):
+        if not callable(self.face_service_provider):
+            return None
+        try:
+            return self.face_service_provider()
+        except Exception:
+            return None
 
     def _section_for_path(self, path: str) -> GallerySection | None:
         return next((section for section in self._model.sections() if path in section.paths), None)
@@ -892,13 +1035,20 @@ class _RunnableSignals(QObject):
 
 
 class _ThumbnailRunnable(QRunnable):
-    def __init__(self, path: str, size: int, service: ThumbnailService, generation: int, parent=None) -> None:
+    def __init__(
+        self,
+        path: str,
+        size: int,
+        service: ThumbnailService,
+        generation: int,
+        signal_parent: QObject,
+    ) -> None:
         super().__init__()
         self.path = str(path)
         self.size = int(size)
         self.service = service
         self.generation = int(generation)
-        self.signals = _RunnableSignals(parent)
+        self.signals = _RunnableSignals(signal_parent)
 
     @property
     def loaded(self):
@@ -919,11 +1069,11 @@ class _ThumbnailRunnable(QRunnable):
 
 
 class _LabelRunnable(QRunnable):
-    def __init__(self, path: str, generation: int, parent=None) -> None:
+    def __init__(self, path: str, generation: int, signal_parent: QObject) -> None:
         super().__init__()
         self.path = str(path)
         self.generation = int(generation)
-        self.signals = _RunnableSignals(parent)
+        self.signals = _RunnableSignals(signal_parent)
 
     @property
     def loaded(self):
@@ -944,4 +1094,3 @@ class _LabelRunnable(QRunnable):
         except Exception:
             label = ""
         self.signals.loaded.emit(self.generation, self.path, label)
-

@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -102,6 +103,7 @@ from app.services.cluster_explanations import ClusterExplanation
 from app.services.gallery_actions import GalleryActionService
 from app.services.saved_searches import SavedSearch, SavedSearchService
 from app.services.similarity_search import DuplicateReviewGroup, SearchResult, SimilaritySearchRequest, SimilaritySearchService
+from infra.cancel import raise_if_cancelled
 from infra.logging_config import get_logger
 from infra.qt_diagnostics import append_qt_diagnostic
 from infra.settings import get_settings
@@ -1040,7 +1042,7 @@ FACE_HELP = {
         "Use the current folder filter when enabled."
     ),
     "face_cluster_count": "Requested number of face clusters to generate.",
-    "face_cluster_backend": "Choose how unknown faces are grouped. HDBSCAN is the default review-first option.",
+    "face_cluster_backend": "Choose how unknown faces are grouped. CUDA-capable pipelines default to cosine K-means; CPU pipelines default to HDBSCAN.",
     "pending_face_review": (
         "Review proposed face-name assignments here before they become permanent labels.\n"
         "Accept writes face labels. Reject discards the proposal."
@@ -1096,6 +1098,10 @@ class _LazyServiceProxy:
 
     def __getattr__(self, name: str):
         return getattr(self._get(), name)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._instance = None
 
 
 class SearchPane(QWidget):
@@ -1231,7 +1237,15 @@ class SearchPane(QWidget):
         self._active_thread = None
         self._active_job = None
         self._active_job_id: int | None = None
+        self._active_completion_callback = False
         self._thread_jobs: dict[object, object | None] = {}
+        self._is_shutting_down = False
+        self._face_db_usage_job = None
+        self._face_db_usage_thread = None
+        self._face_db_usage_request_id = 0
+        self._face_action_audit_job = None
+        self._face_action_audit_thread = None
+        self._face_action_audit_request_id = 0
         self._action_buttons: list[QPushButton] = []
         self._mode_required_buttons: list[QPushButton] = []
         self._temp_query_files: dict[int, str] = {}
@@ -1271,7 +1285,11 @@ class SearchPane(QWidget):
         self._face_profiles_by_name: dict[str, PersonProfile] = {}
         self._face_identity_duplicates: dict[str, tuple[tuple[str, float], ...]] = {}
         self._face_identity_prototypes_by_name: dict[str, list[PersonPrototypeFace]] = {}
+        self._face_identity_cover_ages_by_name: dict[str, int | None] = {}
         self._face_identity_selected_name = ""
+        self._face_identity_prototype_request_id = 0
+        self._face_identity_prototype_loading_name = ""
+        self._face_identity_auxiliary_data_loaded = False
         self._face_review_drafts_by_path: dict[str, list[EditableFaceDraft]] = {}
         self._face_review_draft_dirty_paths: set[str] = set()
         self._face_review_context_by_path: dict[str, dict[str, object]] = {}
@@ -1296,6 +1314,10 @@ class SearchPane(QWidget):
         self._face_result_active_group_kind = "raw"
         self._face_result_source_summary = ""
         self._face_result_source_kind = ""
+        # A background All Faces publish must never replace a newer explicit
+        # search or clustering result.  Each source change advances this
+        # generation; publishers apply only the snapshot they started from.
+        self._face_result_generation = 0
         self._face_result_source_context_by_path: dict[str, dict[str, object]] = {}
         self._face_result_source_overlay_by_path: dict[str, str] = {}
         self._face_result_source_photo_paths: list[str] = []
@@ -1415,6 +1437,11 @@ class SearchPane(QWidget):
         self.gallery_layout.setSpacing(8)
         self._build_global_controls()
         self.tabs = CurrentPageTabWidget()
+        # Individual Faces pages have larger natural size hints (for example,
+        # wide field labels).  Inside the scrollable task pane they must wrap
+        # instead of widening the splitter past the available viewport.
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.tabs.setMinimumWidth(0)
         self.results_gallery = GalleryPane(self)
         self.results_gallery.set_empty_state(
             "No face results yet",
@@ -1844,6 +1871,10 @@ class SearchPane(QWidget):
         face_results_layout.addWidget(self.face_results_membership_table)
         self.results_list = QListWidget()
         self.status_label = QLabel("Search index idle.")
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setAccessibleName("Faces workspace operation progress")
+        self.progress_bar.hide()
         if self._tab_enabled("image search"):
             self._build_image_tab()
         if self._tab_enabled("text search"):
@@ -1914,6 +1945,7 @@ class SearchPane(QWidget):
         self.task_panel_toggle.toggled.connect(self._set_task_panel_visible)
         self.gallery_layout.addWidget(self.task_panel_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
         self.gallery_layout.addWidget(self.status_label)
+        self.gallery_layout.addWidget(self.progress_bar)
         self.results_toolbar = self._build_results_toolbar()
         self.gallery_layout.addWidget(self.results_toolbar)
         self.face_results_context_bar = QWidget(self.gallery_panel)
@@ -1965,7 +1997,6 @@ class SearchPane(QWidget):
         self.workspace_splitter.setSizes(list(self._face_splitter_default_sizes))
         self.workspace_splitter.splitterMoved.connect(self._on_face_workspace_splitter_moved)
         self.main_layout.addWidget(self.workspace_splitter, stretch=1)
-        self._start_face_tile_loader_threads()
         self.set_external_results_mode(self._external_results)
         self.set_ui_mode(self._face_ui_mode)
         self._refresh_face_grid_layouts(force=True)
@@ -1995,6 +2026,13 @@ class SearchPane(QWidget):
         except Exception:
             selected = "global"
         return self.search_service_session if "session" in selected else self.search_service_global
+
+    def reset_similarity_execution_services(self) -> None:
+        """Recreate owned lazy search stacks after the runtime policy changes."""
+        for service in (self.search_service_global, self.search_service_session):
+            reset = getattr(service, "reset", None)
+            if callable(reset):
+                reset()
 
     def _tab_enabled(self, *labels: str) -> bool:
         if not self._enabled_tabs:
@@ -3237,8 +3275,6 @@ class SearchPane(QWidget):
         except Exception:
             service = None
         policy = getattr(service, "execution_policy", None)
-        effective_mode = str(getattr(policy, "effective_mode", "") or "").strip().lower()
-        runtime_text = "GPU (CUDA)" if effective_mode == "cuda" else ("CPU" if effective_mode == "cpu" else "Runtime pending")
         torch_device = str(getattr(policy, "torch_device", "") or "unknown")
         onnx_provider = str(getattr(policy, "onnx_provider", "") or "unknown")
 
@@ -3247,34 +3283,60 @@ class SearchPane(QWidget):
         embedder_id = str(applied_prefs.get("embedder_id") or self.current_face_embedder_id())
         detector_name = detector_id
         embedder_name = embedder_id
+        detector_bundle = None
+        embedder_bundle = None
         try:
-            detector_name = resolve_face_detector_bundle(
+            detector_bundle = resolve_face_detector_bundle(
                 self.face_model_root,
                 self.current_face_mode(),
                 detector_id,
-            ).display_name or detector_id
+            )
+            detector_name = detector_bundle.display_name or detector_id
         except Exception:
             pass
         try:
-            embedder_name = resolve_face_embedder_bundle(
+            embedder_bundle = resolve_face_embedder_bundle(
                 self.face_model_root,
                 self.current_face_mode(),
                 embedder_id,
-            ).display_name or embedder_id
+            )
+            embedder_name = embedder_bundle.display_name or embedder_id
         except Exception:
             pass
+
+        torch_gpu = torch_device == "cuda"
+        onnx_gpu = onnx_provider == "CUDAExecutionProvider"
+        detector_source = str(getattr(detector_bundle, "source_kind", "") or "").strip().lower()
+        detector_backend = str(getattr(detector_bundle, "backend_family", "") or "").strip().lower()
+        embedder_source = str(getattr(embedder_bundle, "source_kind", "") or "").strip().lower()
+        detector_gpu = torch_gpu if detector_source in {"", "builtin"} else onnx_gpu
+        if detector_backend == "yunet":
+            detector_gpu = False
+        embedder_gpu = torch_gpu if embedder_source in {"", "builtin"} else onnx_gpu
+        if detector_gpu and embedder_gpu:
+            face_runtime = "GPU"
+            runtime_text = "GPU (CUDA)"
+        elif detector_gpu or embedder_gpu:
+            face_runtime = "Mixed GPU/CPU"
+            runtime_text = "Mixed GPU/CPU"
+        else:
+            face_runtime = "CPU"
+            runtime_text = "CPU"
+        detector_device = "GPU (CUDA)" if detector_gpu else "CPU"
+        embedder_device = "GPU (CUDA)" if embedder_gpu else "CPU"
+
         def _compact_name(value: str) -> str:
             text = str(value or "").replace(" (built-in)", "").strip()
             text = text.replace("VGGFace2 FaceNet", "VGGFace2")
             text = text.replace(" Glint360K", "")
             return text
 
-        label.setText(f"{_compact_name(detector_name)} — {_compact_name(embedder_name)} — {'GPU' if effective_mode == 'cuda' else 'CPU'}")
+        label.setText(f"{_compact_name(detector_name)} — {_compact_name(embedder_name)} — {face_runtime}")
         folder_detail = f"\nFolder: {folder}" if folder else ""
         label.setToolTip(
             f"Scope: {scope_text}{folder_detail}\nRuntime: {runtime_text}\nTorch device: {torch_device}\n"
-            f"ONNX provider: {onnx_provider}\nDetector: {detector_name} ({detector_id})\n"
-            f"Embedder: {embedder_name} ({embedder_id})"
+            f"ONNX provider: {onnx_provider}\nDetector: {detector_name} ({detector_id}) — {detector_device}\n"
+            f"Embedder: {embedder_name} ({embedder_id}) — {embedder_device}"
         )
 
     def _populate_component_combo(self, combo: QComboBox, choices: list[tuple[str, str]], target_id: str) -> None:
@@ -4134,6 +4196,13 @@ class SearchPane(QWidget):
             self.ensure_face_album_loaded()
         elif self._is_face_folder_tab_label(label) and hasattr(self, "face_scanned_list"):
             self.ensure_face_library_loaded()
+        elif label == "identities" and not self._face_identity_auxiliary_data_loaded:
+            # Storage and audit reads are passive maintenance work.  Defer
+            # them until their tab is actually opened so creating a Faces
+            # pane never competes with its first interactive task.
+            self._face_identity_auxiliary_data_loaded = True
+            QTimer.singleShot(0, self._refresh_face_db_usage_label)
+            QTimer.singleShot(0, self._refresh_face_action_audit)
         if label == "face search":
             self._update_face_selected_context_label()
         self._update_search_scope_control_visibility(label)
@@ -4250,14 +4319,32 @@ class SearchPane(QWidget):
             self._update_face_result_actions()
         if status:
             self.status_label.setText(status)
+        if busy:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.show()
+        else:
+            self.progress_bar.hide()
 
-    def _start_job(self, label: str, fn, on_completed) -> None:
+    def _on_job_progress(self, value: int, text: str) -> None:
+        if int(value) < 0:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(max(0, min(100, int(value))))
+        self.progress_bar.show()
+        if text:
+            self.status_label.setText(str(text))
+
+    def _start_job(self, label: str, fn, on_completed) -> AsyncJob | None:
         # QThread objects are deleted via deleteLater() in the helper; keep our reference safe.
         if self._active_thread is not None:
             try:
                 if self._active_thread.isRunning():
+                    if self._active_completion_callback:
+                        self._start_job_after_active(label, fn, on_completed)
+                        return None
                     errorBox("Busy", "Another operation is already running in SearchPane.")
-                    return
+                    return None
             except RuntimeError:
                 self._active_thread = None
                 self._active_job = None
@@ -4266,7 +4353,7 @@ class SearchPane(QWidget):
 
         job_id: int | None = None
         if self.job_manager is not None:
-            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel)
+            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin="Faces")
             self._active_job_id = job_id
             job.progress.connect(
                 lambda value, text, job_id=job_id: self.job_manager.update(
@@ -4275,8 +4362,7 @@ class SearchPane(QWidget):
                     text=text,
                 )
             )
-        # Always reflect progress text in the pane status for better UX.
-        job.progress.connect(lambda _value, text: self.status_label.setText(str(text)))
+        job.progress.connect(self._on_job_progress)
 
         def _on_failed(message: str) -> None:
             self._set_busy(False, "Search index idle.")
@@ -4284,7 +4370,7 @@ class SearchPane(QWidget):
                 self.job_manager.finish(job_id, status="failed", error=message)
             if self._active_job_id == job_id:
                 self._active_job_id = None
-            errorBox(f"{label} failed", message)
+            errorBox(f"{label} failed", message, parent=self)
 
         def _on_cancelled() -> None:
             self._set_busy(False, "Cancelled.")
@@ -4299,7 +4385,11 @@ class SearchPane(QWidget):
                 self.job_manager.finish(job_id, status="finished")
             if self._active_job_id == job_id:
                 self._active_job_id = None
-            on_completed(result)
+            self._active_completion_callback = True
+            try:
+                on_completed(result)
+            finally:
+                self._active_completion_callback = False
 
         job.failed.connect(_on_failed)
         job.cancelled.connect(_on_cancelled)
@@ -4315,6 +4405,27 @@ class SearchPane(QWidget):
         self._set_busy(True, f"{label} running...")
         if self.job_manager is not None and self._active_job_id is not None:
             self.job_manager.update(self._active_job_id, progress=None, text="Running")
+        return job
+
+    def _start_job_after_active(self, label: str, fn, on_completed) -> None:
+        """Queue a deliberate continuation until the current worker exits."""
+
+        def _launch() -> None:
+            if not self._is_shutting_down:
+                self._start_job(label, fn, on_completed)
+
+        thread = self._active_thread
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.finished.connect(
+                        lambda: QTimer.singleShot(0, _launch),
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+                    return
+            except RuntimeError:
+                pass
+        QTimer.singleShot(0, _launch)
 
     def _release_finished_thread(self, thread) -> None:
         if thread is None:
@@ -4324,11 +4435,20 @@ class SearchPane(QWidget):
             self._active_thread = None
             if self._active_job is job:
                 self._active_job = None
+        if self._face_db_usage_thread is thread:
+            self._face_db_usage_thread = None
+            if self._face_db_usage_job is job:
+                self._face_db_usage_job = None
+        if self._face_action_audit_thread is thread:
+            self._face_action_audit_thread = None
+            if self._face_action_audit_job is job:
+                self._face_action_audit_job = None
 
     def _on_async_thread_finished(self, thread=None) -> None:
         self._release_finished_thread(thread)
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
+        self._is_shutting_down = True
         ready_to_close = True
         deadline_s = perf_counter() + (max(0, int(timeout_ms)) / 1000.0)
         self._results_gallery_publish_token += 1
@@ -4397,6 +4517,8 @@ class SearchPane(QWidget):
             self._face_refresh_request_id += 1
             ready_to_close = _cancel_and_wait([
                 (getattr(self, "_face_refresh_job", None), getattr(self, "_face_refresh_thread", None)),
+                (self._face_db_usage_job, self._face_db_usage_thread),
+                (self._face_action_audit_job, self._face_action_audit_thread),
                 *list(getattr(self, "_retained_face_refresh_refs", []) or []),
             ], detach_on_timeout=True) and ready_to_close
         except Exception:
@@ -4434,6 +4556,10 @@ class SearchPane(QWidget):
             self._active_job = None
             self._active_thread = None
             self._thread_jobs = {}
+            self._face_db_usage_job = None
+            self._face_db_usage_thread = None
+            self._face_action_audit_job = None
+            self._face_action_audit_thread = None
             self._face_refresh_job = None
             self._face_refresh_thread = None
             self._retained_face_refresh_refs = []
@@ -4999,6 +5125,9 @@ class SearchPane(QWidget):
             bbox=tuple(int(value) for value in item.bbox),
             requested_size=(max(24, int(requested_size.width())), max(24, int(requested_size.height()))),
         )
+        # Tile workers are demand-driven.  Creating an empty Faces pane must
+        # not keep decoder threads alive before there is an image to load.
+        self._start_face_tile_loader_threads()
         if self._face_tile_request_queue.enqueue(request, priority=int(priority)):
             self._face_tile_pending_keys.add(key)
             return True
@@ -5915,27 +6044,26 @@ class SearchPane(QWidget):
             return
         threshold = float(getattr(self, "face_library_label_threshold", self.face_label_threshold).value())
         cluster_count = len(raw_groups)
-        photo_paths = list(dict.fromkeys(str(image_path) for image_path, _face_index in refs if str(image_path or "").strip()))
-        action_service = getattr(self.results_gallery, "action_service", None) or GalleryActionService()
 
         def _run(progress, cancel_check):
-            progress(-1, "Naming clusters and writing EXIF..." if cluster_count > 1 else "Naming cluster and writing EXIF...")
-            person = self._active_face_service().label_indexed_faces_immediately(
-                person_name,
-                refs,
-                similarity_threshold=threshold,
-            )
-            exif_result = action_service.write_exif_metadata_pairs(
-                photo_paths,
-                FACE_EXIF_PERSON_KEY,
-                str(person.person_name),
-                progress_callback=progress,
-                cancel_check=cancel_check,
-            )
-            return person, exif_result
+            progress(-1, "Naming face regions in selected clusters..." if cluster_count > 1 else "Naming face regions in cluster...")
+            service = self._active_face_service()
+            label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
+            if callable(label_with_metadata):
+                return label_with_metadata(
+                    person_name,
+                    refs,
+                    similarity_threshold=threshold,
+                    source="manual_cluster_name",
+                )
+            return service.label_indexed_faces_immediately(person_name, refs, similarity_threshold=threshold)
 
         def _done(result) -> None:
-            person, exif_result = result
+            person = getattr(result, "person", result)
+            if person is None:
+                failures = "; ".join(getattr(result, "failures", ()) or ())
+                self.status_label.setText(f"Could not write selected face regions{': ' + failures if failures else '.'}")
+                return
             self._set_face_identity_name_fields(str(person.person_name))
             tags = [tag.strip() for tag in self.face_profile_tags.text().split(",") if tag.strip()] if hasattr(self, "face_profile_tags") else []
             cover_ref = refs[0] if refs else None
@@ -5945,17 +6073,18 @@ class SearchPane(QWidget):
                 tags=tags,
                 cover_face_ref=cover_ref,
             )
-            affected = len(getattr(exif_result, "affected_paths", []) or [])
-            failures = len(getattr(exif_result, "failures", []) or [])
-            failure_suffix = f" ({failures} EXIF failure(s))" if failures else ""
+            affected_refs = list(getattr(result, "affected_refs", refs) or refs)
+            affected = len({str(image_path) for image_path, _face_index in affected_refs})
+            failures = len(getattr(result, "failures", ()) or ())
+            failure_suffix = f" ({failures} metadata failure(s))" if failures else ""
             if cluster_count == 1:
                 status_text = (
-                    f"Named cluster '{person.person_name}' on {len(refs)} face(s) and wrote EXIF to {affected} photo(s){failure_suffix}."
+                    f"Named cluster '{person.person_name}' on {len(affected_refs)} face region(s) in {affected} photo(s){failure_suffix}."
                 )
             else:
                 status_text = (
-                    f"Named {cluster_count} clusters as '{person.person_name}' on {len(refs)} face(s) "
-                    f"and wrote EXIF to {affected} photo(s){failure_suffix}."
+                    f"Named {cluster_count} clusters as '{person.person_name}' on {len(affected_refs)} face region(s) "
+                    f"in {affected} photo(s){failure_suffix}."
                 )
             self.status_label.setText(status_text)
             self._refresh_pending_face_labels()
@@ -6716,7 +6845,10 @@ class SearchPane(QWidget):
             return
         service = self._active_face_service()
         if force_reload:
+            self._face_identity_prototype_request_id += 1
+            self._face_identity_prototype_loading_name = ""
             self._face_identity_prototypes_by_name = {}
+            self._face_identity_cover_ages_by_name = {}
         if profiles is None or force_reload:
             try:
                 profiles = service.load_person_profiles(limit=max(1, int(self.face_browser_limit.value() or 1)))
@@ -6759,7 +6891,10 @@ class SearchPane(QWidget):
         self._refresh_selected_face_identity()
 
     def _request_face_identity_refresh(self) -> None:
+        self._face_identity_prototype_request_id += 1
+        self._face_identity_prototype_loading_name = ""
         self._face_identity_prototypes_by_name = {}
+        self._face_identity_cover_ages_by_name = {}
         service = self._active_face_service()
         limit = max(1, int(self.face_browser_limit.value() or 1))
 
@@ -6819,11 +6954,55 @@ class SearchPane(QWidget):
         if person_name in self._face_identity_prototypes_by_name:
             faces = list(self._face_identity_prototypes_by_name.get(person_name, []))
         else:
-            try:
-                faces = list(self._active_face_service().load_person_prototype_faces(person_name, limit=200, include_tiny_faces=True))
-            except Exception:
-                faces = []
-            self._face_identity_prototypes_by_name[person_name] = list(faces)
+            self.face_identity_summary.setText(f"Loading prototype face regions for {person_name}…")
+            self.face_identity_prototype_model.set_items([])
+            if self._face_identity_prototype_loading_name == person_name:
+                return
+            service = self._active_face_service()
+            self._face_identity_prototype_request_id += 1
+            request_id = int(self._face_identity_prototype_request_id)
+            self._face_identity_prototype_loading_name = person_name
+
+            def _run(progress, cancel_check):
+                progress(-1, "Loading identity prototype examples…")
+                raise_if_cancelled(cancel_check)
+                loaded_faces = list(
+                    service.load_person_prototype_faces(
+                        person_name, limit=200, include_tiny_faces=True
+                    )
+                )
+                raise_if_cancelled(cancel_check)
+                age = None
+                cover_path = str(getattr(profile, "cover_image_path", "") or "")
+                age_fn = getattr(service, "age_at_photo", None)
+                if cover_path and callable(age_fn):
+                    age = age_fn(person_name, cover_path)
+                return loaded_faces, age
+
+            def _done(result) -> None:
+                if (
+                    request_id != self._face_identity_prototype_request_id
+                    or person_name != str(self._face_identity_selected_name or "")
+                ):
+                    return
+                try:
+                    loaded_faces, age = result
+                except (TypeError, ValueError):
+                    loaded_faces, age = [], None
+                self._face_identity_prototypes_by_name[person_name] = list(loaded_faces or [])
+                self._face_identity_cover_ages_by_name[person_name] = None if age is None else int(age)
+                self._face_identity_prototype_loading_name = ""
+                self._refresh_selected_face_identity()
+
+            job = self._start_job("Loading identity prototype examples", _run, _done)
+            if job is not None:
+                def _clear_loading_state() -> None:
+                    if request_id == self._face_identity_prototype_request_id:
+                        self._face_identity_prototype_loading_name = ""
+
+                job.failed.connect(lambda _message: _clear_loading_state())
+                job.cancelled.connect(_clear_loading_state)
+            return
         duplicate_entries = self._face_identity_duplicates.get(person_name, ())
         duplicate_text = ", ".join(f"{other} ({score:.2f})" for other, score in duplicate_entries[:3])
         self.face_identity_duplicate_warning.setVisible(bool(duplicate_text))
@@ -6835,15 +7014,9 @@ class SearchPane(QWidget):
             profile_bits.append("favorite")
         if str(getattr(profile, "birth_date", "") or "").strip():
             profile_bits.append(f"DOB {getattr(profile, 'birth_date', '')}")
-            cover_path = str(getattr(profile, "cover_image_path", "") or "")
-            age_fn = getattr(self._active_face_service(), "age_at_photo", None)
-            if cover_path and callable(age_fn):
-                try:
-                    age = age_fn(person_name, cover_path)
-                except Exception:
-                    age = None
-                if age is not None:
-                    profile_bits.append(f"age at cover {int(age)}")
+            age = self._face_identity_cover_ages_by_name.get(person_name)
+            if age is not None:
+                profile_bits.append(f"age at cover {int(age)}")
         profile_text = f" {'; '.join(profile_bits)}." if profile_bits else ""
         self.face_identity_summary.setText(
             f"{person_name}: {len(faces)} prototype face(s), labeled={int(getattr(profile, 'labeled_count', 0) or 0)}, visible={int(getattr(profile, 'visible_face_count', 0) or 0)}.{profile_text}"
@@ -7045,17 +7218,23 @@ class SearchPane(QWidget):
     def current_face_cluster_backends(self) -> list[str]:
         override_checkbox = getattr(self, "face_cluster_backend_override_checkbox", None)
         if override_checkbox is None or not bool(override_checkbox.isChecked()):
-            return ["hdbscan"]
+            return [self._default_face_cluster_backend()]
         combo = getattr(self, "face_cluster_backend", None)
         if combo is not None:
             try:
-                return [str(combo.currentData() or "hdbscan")]
+                return [str(combo.currentData() or self._default_face_cluster_backend())]
             except Exception:
                 pass
-        return ["hdbscan"]
+        return [self._default_face_cluster_backend()]
+
+    def _default_face_cluster_backend(self) -> str:
+        service = getattr(self, "face_service", None)
+        policy = getattr(service, "execution_policy", None)
+        return "cosine-kmeans" if bool(getattr(policy, "uses_cuda", False)) else "hdbscan"
 
     def current_face_cluster_backend(self) -> str:
-        return str((self.current_face_cluster_backends() or ["hdbscan"])[0] or "hdbscan").strip().lower()
+        default_backend = self._default_face_cluster_backend()
+        return str((self.current_face_cluster_backends() or [default_backend])[0] or default_backend).strip().lower()
 
     def current_face_cluster_outlier_policy(self) -> str:
         combo = getattr(self, "face_cluster_outlier_policy_combo", None)
@@ -7071,7 +7250,14 @@ class SearchPane(QWidget):
         self._refresh_face_cluster_backend_controls()
 
     def current_face_cluster_backend_options(self) -> dict[str, object]:
-        if self.current_face_cluster_backend() != "hdbscan":
+        backend = self.current_face_cluster_backend()
+        if backend == "cosine-kmeans":
+            return {
+                "n_init": max(1, int(self.face_kmeans_n_init_spin.value())),
+                "max_iter": max(1, int(self.face_kmeans_max_iter_spin.value())),
+                "seed": max(0, int(self.face_kmeans_seed_spin.value())),
+            }
+        if backend != "hdbscan":
             return {}
         min_cluster_size = max(
             2,
@@ -7117,6 +7303,9 @@ class SearchPane(QWidget):
         widget = getattr(self, "face_hdbscan_options_widget", None)
         if widget is not None:
             widget.setVisible(hdbscan_only)
+        kmeans_widget = getattr(self, "face_kmeans_options_widget", None)
+        if kmeans_widget is not None:
+            kmeans_widget.setVisible(backend == "cosine-kmeans")
 
     def _save_face_refs_name(
         self,
@@ -7137,16 +7326,30 @@ class SearchPane(QWidget):
         threshold = float(getattr(self, "face_library_label_threshold", self.face_label_threshold).value())
 
         def _run(progress, cancel_check):
-            progress(-1, "Saving selected face label...")
+            progress(-1, "Saving selected face-region label...")
             _ = cancel_check
-            return self._active_face_service().label_indexed_faces_immediately(
+            service = self._active_face_service()
+            label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
+            if callable(label_with_metadata):
+                return label_with_metadata(
+                    person_name,
+                    refs,
+                    similarity_threshold=threshold,
+                    source="manual_selected_faces",
+                )
+            return service.label_indexed_faces_immediately(
                 person_name,
                 refs,
                 similarity_threshold=threshold,
                 source="manual_selected_faces",
             )
 
-        def _done(person) -> None:
+        def _done(result) -> None:
+            person = getattr(result, "person", result)
+            if person is None:
+                failures = "; ".join(getattr(result, "failures", ()) or ())
+                self.status_label.setText(f"Could not save the selected face region{': ' + failures if failures else '.'}")
+                return
             for widget_name in ("face_find_name_query", "face_name_query", "face_label_name", "person_name"):
                 widget = getattr(self, widget_name, None)
                 if widget is not None:
@@ -7163,7 +7366,7 @@ class SearchPane(QWidget):
                 cover_face_ref=cover_ref,
             )
             self.status_label.setText(
-                f"Saved '{person.person_name}' on {len(refs)} face(s) from {source_label}."
+                f"Saved '{person.person_name}' on {len(getattr(result, 'affected_refs', refs) or refs)} face region(s) from {source_label}."
             )
             self._refresh_pending_face_labels()
             self.refresh_face_library(reason="face refs named")
@@ -7190,6 +7393,7 @@ class SearchPane(QWidget):
         context_by_path: dict[str, dict[str, object]],
         kind: str,
     ) -> None:
+        self._face_result_generation += 1
         self._face_result_source_groups = list(groups)
         self._face_result_source_summary = str(summary or "")
         self._face_result_source_kind = str(kind or "")
@@ -8254,6 +8458,15 @@ class SearchPane(QWidget):
             context_by_path=context_by_path,
             kind="face_clusters",
         )
+        fallback_reasons = list(
+            dict.fromkeys(
+                str(metrics.get("compute_fallback_reason") or "").strip()
+                for metrics in metrics_by_key.values()
+                if str(metrics.get("compute_fallback_reason") or "").strip()
+            )
+        )
+        if fallback_reasons:
+            self.status_label.setText(f"{summary} CPU fallback: {'; '.join(fallback_reasons)}")
 
     def _search_face_ref(self, image_path: str, face_index: int, *, source_label: str) -> None:
         folder = self.face_name_folder_filter.text().strip() if hasattr(self, "face_name_folder_filter") else ""
@@ -8302,7 +8515,7 @@ class SearchPane(QWidget):
         num_clusters = min(self.face_cluster_count.value(), len(refs))
         min_score = self.face_min_score.value()
         backends = list(self.current_face_cluster_backends())
-        backend = str(backends[0] if backends else "hdbscan")
+        backend = str(backends[0] if backends else self._default_face_cluster_backend())
         backend_options = self.current_face_cluster_backend_options()
         outlier_policy = self.current_face_cluster_outlier_policy()
 
@@ -8314,7 +8527,7 @@ class SearchPane(QWidget):
                 min_face_score=min_score,
                 backends=backends,
                 outlier_policy=outlier_policy,
-                backend_options_by_backend={str(item): dict(backend_options) for item in backends if str(item) == "hdbscan"},
+                backend_options_by_backend={str(item): dict(backend_options) for item in backends if backend_options},
                 face_refs=refs,
                 include_tiny_faces=self._show_tiny_detections_enabled(),
                 cancel_check=cancel_check,
@@ -8396,24 +8609,25 @@ class SearchPane(QWidget):
         if not resolved_name:
             errorBox("Missing name", "Only merged groups with a resolved name can be written to EXIF.")
             return
-        image_paths = list(dict.fromkeys(str(item.image_path) for item in list(group.items) if str(item.image_path or "").strip()))
-        if not image_paths:
-            errorBox("No photos selected", "The current merged group does not include any photos.")
+        refs = self._face_result_group_refs(group, prefer_selection=False)
+        if not refs:
+            errorBox("No faces selected", "The current merged group does not include saved face regions.")
             return
-        action_service = getattr(self.results_gallery, "action_service", None) or GalleryActionService()
 
         def _run(progress, cancel_check):
-            return action_service.write_exif_metadata_pairs(
-                image_paths,
-                FACE_EXIF_PERSON_KEY,
-                resolved_name,
-                progress_callback=progress,
-                cancel_check=cancel_check,
-            )
+            _ = (progress, cancel_check)
+            service = self._active_face_service()
+            label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
+            if callable(label_with_metadata):
+                return label_with_metadata(resolved_name, refs, source="metadata_region_sync")
+            return service.label_indexed_faces_immediately(resolved_name, refs, source="metadata_region_sync")
 
         def _done(result) -> None:
-            affected = len(getattr(result, "affected_paths", []) or [])
-            self.status_label.setText(f"Wrote EXIF name '{resolved_name}' to {affected} photo(s).")
+            affected_refs = list(getattr(result, "affected_refs", refs) or refs)
+            self.status_label.setText(
+                f"Wrote face-region name '{resolved_name}' to {len(affected_refs)} face(s) in "
+                f"{len({path for path, _index in affected_refs})} photo(s)."
+            )
             self._apply_face_result_filters()
 
         self._start_job("Writing EXIF names", _run, _done)
@@ -8575,11 +8789,19 @@ class SearchPane(QWidget):
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Result Paths", "", "Text Files (*.txt)")
         if not out_path:
             return
-        try:
+
+        def _run(progress, cancel_check):
+            progress(-1, "Writing result paths…")
+            raise_if_cancelled(cancel_check)
             Path(out_path).write_text("\n".join(paths), encoding="utf-8")
-            infoBox("Export complete", f"Wrote {len(paths)} paths.")
-        except Exception as exc:
-            errorBox("Export failed", str(exc))
+            progress(100, "Result paths exported")
+            return len(paths)
+
+        self._start_job(
+            "Exporting result paths",
+            _run,
+            lambda count: infoBox("Export complete", f"Wrote {int(count)} paths."),
+        )
 
     def _export_face_cluster_results(self) -> None:
         groups = [group for group in list(self._face_result_source_groups or []) if str(group.comparison_key or "").strip() or int(group.cluster_id) >= 0]
@@ -8610,85 +8832,128 @@ class SearchPane(QWidget):
                 for group in groups
             ],
         }
-        try:
+        def _run(progress, cancel_check):
+            progress(-1, "Writing face cluster results…")
+            raise_if_cancelled(cancel_check)
             Path(out_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            progress(100, "Face cluster results exported")
+            return len(groups)
+
+        def _done(count: int) -> None:
             self.status_label.setText(f"Exported {len(groups)} face cluster group(s) to {out_path}.")
-        except Exception as exc:
-            errorBox("Export failed", str(exc))
+
+        self._start_job("Exporting face cluster results", _run, _done)
 
     def _export_face_identities(self) -> None:
         service = self._active_face_service()
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Face Identities", "", "JSON Files (*.json)")
         if not out_path:
             return
-        export_fn = getattr(service, "export_identity_data", None)
-        if callable(export_fn):
-            try:
+
+        def _run(progress, cancel_check):
+            progress(-1, "Collecting saved identities…")
+            raise_if_cancelled(cancel_check)
+            export_fn = getattr(service, "export_identity_data", None)
+            if callable(export_fn):
                 payload = dict(export_fn())
+                raise_if_cancelled(cancel_check)
                 Path(out_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-                self.status_label.setText(f"Exported {len(payload.get('identities', []) or [])} identity record(s) to {out_path}.")
-                return
-            except Exception as exc:
-                errorBox("Export failed", str(exc))
-                return
-        try:
+                return len(payload.get("identities", []) or [])
             profiles = list(service.load_person_profiles(limit=max(1, int(getattr(self, "face_browser_limit", self.face_name_top_k).value()))))
-        except Exception:
-            profiles = []
-        payload = {
-            "identities": [
-                {
-                    "person_name": str(profile.person_name),
-                    "similarity_threshold": float(profile.similarity_threshold),
-                    "example_count": int(profile.example_count),
-                    "labeled_count": int(profile.labeled_count),
-                    "visible_face_count": int(profile.visible_face_count),
-                    "notes": str(profile.notes or ""),
-                    "tags": list(profile.tags or ()),
-                    "favorite": bool(getattr(profile, "favorite", False)),
-                    "birth_date": str(getattr(profile, "birth_date", "") or ""),
-                    "hidden": bool(getattr(profile, "hidden", False)),
-                    "prototype_refs": [
-                        {
-                            "image_path": str(face.image_path),
-                            "face_index": int(face.face_index),
-                            "pinned": bool(face.pinned),
-                        }
-                        for face in list(getattr(service, "load_person_prototype_faces", lambda *_args, **_kwargs: [])(str(profile.person_name), limit=200, include_tiny_faces=True) or [])
-                    ],
-                }
-                for profile in profiles
-            ]
-        }
-        try:
+            identities = []
+            prototype_loader = getattr(service, "load_person_prototype_faces", lambda *_args, **_kwargs: [])
+            for profile in profiles:
+                raise_if_cancelled(cancel_check)
+                identities.append(
+                    {
+                        "person_name": str(profile.person_name),
+                        "similarity_threshold": float(profile.similarity_threshold),
+                        "example_count": int(profile.example_count),
+                        "labeled_count": int(profile.labeled_count),
+                        "visible_face_count": int(profile.visible_face_count),
+                        "notes": str(profile.notes or ""),
+                        "tags": list(profile.tags or ()),
+                        "favorite": bool(getattr(profile, "favorite", False)),
+                        "birth_date": str(getattr(profile, "birth_date", "") or ""),
+                        "hidden": bool(getattr(profile, "hidden", False)),
+                        "prototype_refs": [
+                            {
+                                "image_path": str(face.image_path),
+                                "face_index": int(face.face_index),
+                                "pinned": bool(face.pinned),
+                            }
+                            for face in list(
+                                prototype_loader(
+                                    str(profile.person_name), limit=200, include_tiny_faces=True
+                                )
+                                or []
+                            )
+                        ],
+                    }
+                )
+            payload = {"identities": identities}
+            raise_if_cancelled(cancel_check)
             Path(out_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            self.status_label.setText(f"Exported {len(payload['identities'])} identity record(s) to {out_path}.")
-        except Exception as exc:
-            errorBox("Export failed", str(exc))
+            progress(100, "Face identities exported")
+            return len(identities)
+
+        def _done(count: int) -> None:
+            self.status_label.setText(f"Exported {int(count)} identity record(s) to {out_path}.")
+
+        self._start_job("Exporting face identities", _run, _done)
 
     def _import_face_identities(self) -> None:
         service = self._active_face_service()
         in_path, _ = QFileDialog.getOpenFileName(self, "Import Face Identities", "", "JSON Files (*.json)")
         if not in_path:
             return
-        try:
+
+        def _read_preview(progress, cancel_check):
+            progress(-1, "Reading identity import file…")
+            raise_if_cancelled(cancel_check)
             payload = json.loads(Path(in_path).read_text(encoding="utf-8"))
+            raise_if_cancelled(cancel_check)
             preview = self._preview_identity_import(service, payload)
+            raise_if_cancelled(cancel_check)
+            return payload, preview
+
+        def _preview_done(result) -> None:
+            try:
+                payload, preview = result
+            except (TypeError, ValueError):
+                errorBox("Import failed", "The identity import preview returned invalid data.", parent=self)
+                return
             mode = self._choose_identity_import_mode(preview)
             if not mode:
                 self.status_label.setText("Identity import cancelled. No face database changes were made.")
                 return
-            import_fn = getattr(service, "import_identity_data", None)
-            if not callable(import_fn):
-                raise RuntimeError("The active face service does not support identity import.")
-            import_fn(payload, mode=mode)
-            self._refresh_face_identities(force_reload=True)
-            self._request_face_library_refresh(refresh_people=True, reason="identities imported", force_refresh=True)
-            self._maybe_refresh_global_face_album(reason="identities imported")
-            self.status_label.setText(f"Imported face identities from {in_path} using {mode} mode.")
-            infoBox("Import complete", "Face identities were imported into the active face database.")
-        except Exception as exc:
-            errorBox("Import failed", str(exc))
+
+            def _write(progress, cancel_check):
+                progress(-1, "Importing face identities…")
+                raise_if_cancelled(cancel_check)
+                import_fn = getattr(service, "import_identity_data", None)
+                if not callable(import_fn):
+                    raise RuntimeError("The active face service does not support identity import.")
+                import_fn(payload, mode=mode)
+                progress(100, "Face identities imported")
+                return None
+
+            def _import_done(_result) -> None:
+                self._refresh_face_identities(force_reload=True)
+                self._request_face_library_refresh(
+                    refresh_people=True,
+                    reason="identities imported",
+                    force_refresh=True,
+                )
+                self._maybe_refresh_global_face_album(reason="identities imported")
+                self.status_label.setText(f"Imported face identities from {in_path} using {mode} mode.")
+                infoBox("Import complete", "Face identities were imported into the active face database.")
+
+            # The generic job runner queues continuations until the preview
+            # worker has actually exited, rather than reporting a false Busy.
+            self._start_job("Importing face identities", _write, _import_done)
+
+        self._start_job("Previewing identity import", _read_preview, _preview_done)
 
     def _preview_identity_import(self, service, payload: dict[str, object]) -> dict[str, object]:
         preview_fn = getattr(service, "preview_identity_import", None)
@@ -9138,7 +9403,9 @@ class SearchPane(QWidget):
         job = AsyncJob(_run)
         album_job_id: int | None = None
         if self.job_manager is not None:
-            album_job_id = self.job_manager.register_job("All Faces refresh", cancel_fn=job.cancel)
+            album_job_id = self.job_manager.register_job(
+                "All Faces refresh", cancel_fn=job.cancel, origin="Faces", foreground=False
+            )
             self._face_album_refresh_job_id = album_job_id
             job.progress.connect(
                 lambda value, text, job_id=album_job_id: self.job_manager.update(
@@ -9279,7 +9546,12 @@ class SearchPane(QWidget):
             self._request_face_album_publish(summary)
 
     def _show_face_album_results(self, summary_text: str | None = None) -> None:
-        self._request_face_album_publish(str(summary_text or self._face_album_summary_text or "All Faces album"))
+        # Reopening All Faces is an explicit request to replace any current
+        # result view.  A background refresh, by contrast, remains passive.
+        self._request_face_album_publish(
+            str(summary_text or self._face_album_summary_text or "All Faces album"),
+            force=True,
+        )
 
     def _update_face_album_paging_actions(self) -> None:
         load_groups = getattr(self, "face_album_load_more_groups_button", None)
@@ -9298,7 +9570,9 @@ class SearchPane(QWidget):
         job = AsyncJob(run)
         album_job_id: int | None = None
         if self.job_manager is not None:
-            album_job_id = self.job_manager.register_job(label, cancel_fn=job.cancel)
+            album_job_id = self.job_manager.register_job(
+                label, cancel_fn=job.cancel, origin="Faces", foreground=False
+            )
             self._face_album_refresh_job_id = album_job_id
             job.progress.connect(
                 lambda value, text, job_id=album_job_id: self.job_manager.update(
@@ -9464,10 +9738,14 @@ class SearchPane(QWidget):
             self._face_album_publish_thread = None
             self._face_album_publish_job = None
 
-    def _request_face_album_publish(self, summary_text: str) -> None:
+    def _request_face_album_publish(self, summary_text: str, *, force: bool = False) -> None:
         groups = list(self._face_album_groups or [])
         records = list(self._face_album_records or [])
         if not groups and not records:
+            return
+        source_generation = int(self._face_result_generation)
+        source_kind = str(self._face_result_source_kind or "")
+        if not force and source_kind and source_kind != "face_album":
             return
         self._cancel_face_album_publish_job()
         request_id = int(self._face_album_request_id)
@@ -9495,6 +9773,10 @@ class SearchPane(QWidget):
             if not isinstance(result, FaceAlbumPublishSnapshot):
                 return
             if int(result.request_id) != int(self._face_album_request_id):
+                return
+            if int(self._face_result_generation) != source_generation:
+                return
+            if not force and str(self._face_result_source_kind or "") not in {"", "face_album"}:
                 return
             self._apply_face_album_publish_snapshot(result)
 
@@ -9707,7 +9989,9 @@ class SearchPane(QWidget):
         job = AsyncJob(_run)
         refresh_job_id: int | None = None
         if self.job_manager is not None:
-            refresh_job_id = self.job_manager.register_job("Face review refresh", cancel_fn=job.cancel)
+            refresh_job_id = self.job_manager.register_job(
+                "Face review refresh", cancel_fn=job.cancel, origin="Faces", foreground=False
+            )
             self._face_refresh_job_id = refresh_job_id
             job.progress.connect(
                 lambda value, text, job_id=refresh_job_id: self.job_manager.update(
@@ -13766,21 +14050,68 @@ class SearchPane(QWidget):
             return
         service = self._active_face_service()
         db_path = Path(str(getattr(service, "db_path", "") or ""))
-        total_bytes = 0
-        existing_paths: list[Path] = []
-        for candidate in [db_path, Path(f"{db_path}.faiss"), Path(f"{db_path}.faiss.json")]:
-            if candidate.exists():
-                existing_paths.append(candidate)
+        self._face_db_usage_request_id += 1
+        request_id = int(self._face_db_usage_request_id)
+        if self._face_db_usage_job is not None:
+            try:
+                self._face_db_usage_job.cancel()
+            except Exception:
+                pass
+        self.face_db_usage_label.setText("Face data usage: scanning saved face-library files…")
+        targets = [db_path, Path(f"{db_path}.faiss"), Path(f"{db_path}.faiss.json")]
+
+        def _run(progress, cancel_check):
+            progress(-1, "Scanning face-library storage…")
+            total_bytes = 0
+            existing_paths: list[str] = []
+            for candidate in targets:
+                raise_if_cancelled(cancel_check)
                 try:
-                    total_bytes += int(candidate.stat().st_size)
-                except Exception:
-                    pass
-        if not existing_paths:
-            self.face_db_usage_label.setText("Face data usage: no saved data has been created for this library yet.")
-            return
-        self.face_db_usage_label.setText(
-            f"Face data usage: {self._human_size(total_bytes)} across {len(existing_paths)} file(s).\n{db_path}"
+                    if candidate.exists():
+                        existing_paths.append(str(candidate))
+                        total_bytes += int(candidate.stat().st_size)
+                except OSError:
+                    continue
+            return total_bytes, existing_paths
+
+        job = AsyncJob(_run)
+        if self.job_manager is not None:
+            self.job_manager.bind_async_job(
+                job,
+                "Scanning face-library storage",
+                origin="Faces",
+                foreground=False,
+            )
+
+        def _completed(result) -> None:
+            if request_id != self._face_db_usage_request_id:
+                return
+            try:
+                total_bytes, paths = result
+            except (TypeError, ValueError):
+                return
+            existing_paths = [str(path) for path in list(paths or [])]
+            if not existing_paths:
+                self.face_db_usage_label.setText("Face data usage: no saved data has been created for this library yet.")
+                return
+            self.face_db_usage_label.setText(
+                f"Face data usage: {self._human_size(int(total_bytes or 0))} across {len(existing_paths)} file(s).\n{db_path}"
+            )
+
+        def _failed(message: str) -> None:
+            if request_id == self._face_db_usage_request_id:
+                self.face_db_usage_label.setText(f"Face data usage: unavailable ({message}).")
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        self._face_db_usage_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
         )
+        self._face_db_usage_thread = thread
 
     @staticmethod
     def _human_size(size_bytes: int) -> str:
@@ -13898,15 +14229,60 @@ class SearchPane(QWidget):
     def _refresh_face_action_audit(self) -> None:
         if not hasattr(self, "face_action_audit_list"):
             return
-        self.face_action_audit_list.clear()
-        events: list[object] = []
-        load_fn = getattr(self._active_face_service(), "load_face_action_audit", None)
-        if callable(load_fn):
+        self._face_action_audit_request_id += 1
+        request_id = int(self._face_action_audit_request_id)
+        if self._face_action_audit_job is not None:
             try:
+                self._face_action_audit_job.cancel()
+            except Exception:
+                pass
+        self.face_action_audit_list.clear()
+        self.face_action_audit_list.addItem("Loading recent face actions…")
+        service = self._active_face_service()
+
+        def _run(progress, cancel_check):
+            progress(-1, "Loading face action audit…")
+            events: list[object] = []
+            load_fn = getattr(service, "load_face_action_audit", None)
+            if callable(load_fn):
                 events.extend(list(load_fn(limit=30) or []))
-            except Exception as exc:
-                self.face_action_audit_list.addItem(f"Action audit failed: {exc}")
-        events.extend(self._load_face_ui_action_audit(limit=30))
+            raise_if_cancelled(cancel_check)
+            events.extend(self._load_face_ui_action_audit(limit=30))
+            return events
+
+        job = AsyncJob(_run)
+        if self.job_manager is not None:
+            self.job_manager.bind_async_job(
+                job,
+                "Loading face action audit",
+                origin="Faces",
+                foreground=False,
+            )
+
+        def _completed(events: object) -> None:
+            if request_id == self._face_action_audit_request_id:
+                self._apply_face_action_audit_events(list(events or []))
+
+        def _failed(message: str) -> None:
+            if request_id == self._face_action_audit_request_id:
+                self.face_action_audit_list.clear()
+                self.face_action_audit_list.addItem(f"Action audit failed: {message}")
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        self._face_action_audit_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._face_action_audit_thread = thread
+
+    def _apply_face_action_audit_events(self, events: list[object]) -> None:
+        if not hasattr(self, "face_action_audit_list"):
+            return
+        self.face_action_audit_list.clear()
         if not events:
             self.face_action_audit_list.addItem("No recent face action audit events.")
             return
@@ -13951,11 +14327,14 @@ class SearchPane(QWidget):
         self.face_cluster_backend = QComboBox()
         for backend_id, label in face_cluster_backend_choices():
             self.face_cluster_backend.addItem(label, backend_id)
-        self.face_cluster_backend.setCurrentIndex(max(0, self.face_cluster_backend.findData("hdbscan")))
+        self.face_cluster_backend.setCurrentIndex(
+            max(0, self.face_cluster_backend.findData(self._default_face_cluster_backend()))
+        )
         self.face_cluster_backend.currentIndexChanged.connect(lambda _index: self._refresh_face_cluster_backend_controls())
         self.face_cluster_backend_override_checkbox = QCheckBox("Advanced backend override")
         self.face_cluster_backend_override_checkbox.setToolTip(
-            "Standard Faces clustering always uses HDBSCAN. Enable this to run a different backend for manual review."
+            "Standard Faces clustering uses CUDA cosine K-means when available and CPU HDBSCAN otherwise. "
+            "Enable this to choose an advanced backend manually."
         )
         self.face_cluster_backend_override_checkbox.toggled.connect(lambda _checked: self._refresh_face_cluster_backend_controls())
         self.face_hdbscan_min_cluster_size_spin = QSpinBox()
@@ -13985,6 +14364,28 @@ class SearchPane(QWidget):
             )
         )
         face_hdbscan_layout.addWidget(build_help_inline(self.face_hdbscan_allow_single_cluster_checkbox, FACE_HELP["face_cluster_backend"], help_key="face_cluster_backend"))
+        self.face_kmeans_n_init_spin = QSpinBox()
+        self.face_kmeans_n_init_spin.setRange(1, 50)
+        self.face_kmeans_n_init_spin.setValue(3)
+        self.face_kmeans_max_iter_spin = QSpinBox()
+        self.face_kmeans_max_iter_spin.setRange(1, 1_000)
+        self.face_kmeans_max_iter_spin.setValue(100)
+        self.face_kmeans_seed_spin = QSpinBox()
+        self.face_kmeans_seed_spin.setRange(0, 2_147_483_647)
+        self.face_kmeans_seed_spin.setValue(42)
+        self.face_kmeans_options_widget = QWidget()
+        face_kmeans_layout = QVBoxLayout(self.face_kmeans_options_widget)
+        face_kmeans_layout.setContentsMargins(0, 0, 0, 0)
+        face_kmeans_layout.setSpacing(8)
+        face_kmeans_layout.addWidget(
+            self._field_widget("K-means restarts", self.face_kmeans_n_init_spin, tooltip="Try several deterministic initializations and keep the best result.")
+        )
+        face_kmeans_layout.addWidget(
+            self._field_widget("K-means maximum iterations", self.face_kmeans_max_iter_spin, tooltip="Stop each K-means initialization after this many refinement steps.")
+        )
+        face_kmeans_layout.addWidget(
+            self._field_widget("K-means seed", self.face_kmeans_seed_spin, tooltip="Use the same seed to reproduce face-cluster memberships.")
+        )
         self.face_cluster_outlier_policy_combo = QComboBox()
         for item_id, label in face_cluster_outlier_policy_choices():
             self.face_cluster_outlier_policy_combo.addItem(label, item_id)
@@ -14043,7 +14444,8 @@ class SearchPane(QWidget):
         self.face_cluster_count.setToolTip(FACE_HELP["face_cluster_count"])
         self.face_cluster_backend.setToolTip(FACE_HELP["face_cluster_backend"])
         self.face_cluster_backend_override_checkbox.setToolTip(
-            "Standard Faces clustering uses HDBSCAN by default. Enable this only when you want to override the backend."
+            "Standard Faces clustering uses CUDA cosine K-means when available and CPU HDBSCAN otherwise. "
+            "Enable this only when you want to override the backend."
         )
         self.face_hdbscan_options_widget.setToolTip(FACE_HELP["face_cluster_backend"])
         self.merge_source_person.setToolTip(FACE_HELP["merge_source"])
@@ -14362,6 +14764,7 @@ class SearchPane(QWidget):
         self.face_cluster_backend_field = self._field_widget("Cluster backend", self.face_cluster_backend, tooltip=FACE_HELP["face_cluster_backend"])
         manage_options_layout.addWidget(self.face_cluster_backend_field)
         manage_options_layout.addWidget(self._field_widget("Outlier policy", self.face_cluster_outlier_policy_combo, tooltip=FACE_HELP["face_cluster_backend"]))
+        manage_options_layout.addWidget(self.face_kmeans_options_widget)
         manage_options_layout.addWidget(self.face_hdbscan_options_widget)
         self.face_manage_options_toggle.toggled.connect(
             lambda checked: self._set_expander_state(self.face_manage_options_toggle, self.face_manage_options_panel, checked)
@@ -14728,8 +15131,6 @@ class SearchPane(QWidget):
             ]
         )
         self._refresh_selected_face_identity()
-        self._refresh_face_db_usage_label()
-        self._refresh_face_action_audit()
         self.tabs.addTab(tab_body, "Identities")
 
     def _folder_row(self, line_edit: QLineEdit) -> QWidget:
@@ -14954,6 +15355,9 @@ class SearchPane(QWidget):
             "face_hdbscan_min_samples": int(self.face_hdbscan_min_samples_spin.value()) if hasattr(self, "face_hdbscan_min_samples_spin") else 0,
             "face_hdbscan_cluster_selection_epsilon": float(self.face_hdbscan_cluster_selection_epsilon_spin.value()) if hasattr(self, "face_hdbscan_cluster_selection_epsilon_spin") else 0.0,
             "face_hdbscan_allow_single_cluster": bool(self.face_hdbscan_allow_single_cluster_checkbox.isChecked()) if hasattr(self, "face_hdbscan_allow_single_cluster_checkbox") else False,
+            "face_kmeans_n_init": int(self.face_kmeans_n_init_spin.value()) if hasattr(self, "face_kmeans_n_init_spin") else 3,
+            "face_kmeans_max_iter": int(self.face_kmeans_max_iter_spin.value()) if hasattr(self, "face_kmeans_max_iter_spin") else 100,
+            "face_kmeans_seed": int(self.face_kmeans_seed_spin.value()) if hasattr(self, "face_kmeans_seed_spin") else 42,
             "search_only_current_folder": bool(self.search_only_current_folder.isChecked()),
             "show_tiny_detections": bool(self._show_tiny_detections_enabled()),
             "image_model": _combo_id(getattr(self, "image_model", None)),
@@ -15076,6 +15480,13 @@ class SearchPane(QWidget):
             self.face_hdbscan_cluster_selection_epsilon_spin.setValue(max(0.0, float(state.get("face_hdbscan_cluster_selection_epsilon", 0.0) or 0.0)))
         if hasattr(self, "face_hdbscan_allow_single_cluster_checkbox"):
             self.face_hdbscan_allow_single_cluster_checkbox.setChecked(bool(state.get("face_hdbscan_allow_single_cluster", False)))
+        if hasattr(self, "face_kmeans_n_init_spin"):
+            self.face_kmeans_n_init_spin.setValue(max(1, int(state.get("face_kmeans_n_init", 3) or 3)))
+        if hasattr(self, "face_kmeans_max_iter_spin"):
+            self.face_kmeans_max_iter_spin.setValue(max(1, int(state.get("face_kmeans_max_iter", 100) or 100)))
+        if hasattr(self, "face_kmeans_seed_spin"):
+            seed_value = state.get("face_kmeans_seed", 42)
+            self.face_kmeans_seed_spin.setValue(max(0, int(42 if seed_value is None else seed_value)))
         self._refresh_face_cluster_backend_controls()
         self._set_combo_to_id(getattr(self, "face_cluster_outlier_policy_combo", None), state.get("face_cluster_outlier_policy", "isolate"))
         self.search_only_current_folder.setChecked(bool(state.get("search_only_current_folder", True)))
@@ -15586,7 +15997,7 @@ class SearchPane(QWidget):
         num_clusters = self.face_cluster_count.value()
         min_score = self.face_min_score.value()
         backends = list(self.current_face_cluster_backends())
-        backend = str(backends[0] if backends else "hdbscan")
+        backend = str(backends[0] if backends else self._default_face_cluster_backend())
         backend_options = self.current_face_cluster_backend_options()
         outlier_policy = self.current_face_cluster_outlier_policy()
         scope_paths = None if force_global else self._current_scope_paths()
@@ -15600,7 +16011,7 @@ class SearchPane(QWidget):
                 min_face_score=min_score,
                 backends=backends,
                 outlier_policy=outlier_policy,
-                backend_options_by_backend={str(item): dict(backend_options) for item in backends if str(item) == "hdbscan"},
+                backend_options_by_backend={str(item): dict(backend_options) for item in backends if backend_options},
                 folder_prefix=folder,
                 candidate_paths=scope_paths,
                 include_tiny_faces=self._show_tiny_detections_enabled(),

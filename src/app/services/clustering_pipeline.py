@@ -49,7 +49,35 @@ def _prepared_info_metrics(prepared_info: PreparedMatrixInfo) -> dict[str, objec
         "input_dimension": prepared_info.input_dimension,
         "prepared_dimension": prepared_info.prepared_dimension,
         "pca_components": prepared_info.pca_components or 0,
+        "preparation_compute_device": prepared_info.compute_device,
+        "preparation_compute_implementation": prepared_info.compute_implementation,
+        "preparation_compute_fallback_reason": prepared_info.compute_fallback_reason,
     }
+
+
+def _compute_signature(
+    clustering_service: ClusteringService,
+    backend: str,
+    similarity_mode: str,
+    performance_profile: str,
+    backend_options: dict[str, object] | None = None,
+) -> str:
+    signature_fn = getattr(clustering_service, "result_cache_signature", None)
+    if not callable(signature_fn):
+        return ""
+    try:
+        return str(
+            signature_fn(
+                backend,
+                similarity_mode,
+                performance_profile,
+                backend_options=backend_options,
+            )
+            or ""
+        )
+    except TypeError:
+        # Retain compatibility with lightweight test/dummy clustering services.
+        return str(signature_fn(backend, similarity_mode, performance_profile) or "")
 
 
 @dataclass
@@ -72,9 +100,13 @@ class ClusteringRequest:
     generate_cluster_meanings: bool = False
     generate_cluster_explanations: bool = True
     cluster_meaning_model: str = "auto"
+    backend_options_by_backend: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def normalized_similarity_modes(self) -> list[str]:
         return normalize_similarity_modes(self.similarity_modes, self.similarity_mode)
+
+    def backend_options(self, backend: str) -> dict[str, object]:
+        return dict(self.backend_options_by_backend.get(str(backend), {}) or {})
 
 
 @dataclass
@@ -99,7 +131,9 @@ class ClusteringPipelineService:
     ) -> None:
         self.discovery_service = discovery_service or ImageDiscoveryService()
         self.embedding_service = embedding_service or EmbeddingService()
-        self.clustering_service = clustering_service or ClusteringService()
+        model_manager = getattr(self.embedding_service, "model_manager", None)
+        execution_policy = getattr(model_manager, "execution_policy", None)
+        self.clustering_service = clustering_service or ClusteringService(execution_policy=execution_policy)
         self.embedding_index_service = embedding_index_service or EmbeddingIndexService()
         self.result_cache_service = result_cache_service or ResultCacheService()
         self.cluster_meaning_service = cluster_meaning_service or ClusterMeaningService()
@@ -298,6 +332,7 @@ class ClusteringPipelineService:
                 cached_by_backend: dict[str, tuple[dict[int, list[str]], dict[str, object]]] = {}
                 backends_to_compute: list[str] = []
                 for backend in backends:
+                    backend_options = request.backend_options(backend)
                     result_key = self.result_cache_service.build_result_key(
                         snapshot_key=snapshot_key,
                         embedding_model=model_name,
@@ -308,6 +343,14 @@ class ClusteringPipelineService:
                         use_onnx=request.use_onnx,
                         embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
+                        compute_signature=_compute_signature(
+                            self.clustering_service,
+                            backend,
+                            similarity_mode,
+                            request.performance_profile,
+                            backend_options,
+                        ),
+                        backend_options=backend_options,
                     )
                     if request.reuse_result_cache:
                         cached = self.result_cache_service.load(result_key)
@@ -354,6 +397,7 @@ class ClusteringPipelineService:
                 prepared_info: PreparedMatrixInfo,
             ):
                 key = self._comparison_key(model_name, similarity_mode, backend)
+                backend_options = request.backend_options(backend)
                 cached_by_backend = cache_plan[similarity_mode]
                 if backend in cached_by_backend:
                     clustered_images, cached_metrics = cached_by_backend[backend]
@@ -363,6 +407,7 @@ class ClusteringPipelineService:
                     backend_metrics["embedding_model"] = model_name
                     backend_metrics["similarity_mode"] = similarity_mode
                     backend_metrics["backend"] = backend
+                    backend_metrics.setdefault("backend_options", backend_options)
                     backend_metrics.update(_prepared_info_metrics(prepared_info))
                     backend_metrics["result_cache_hit"] = True
                     backend_metrics["backend_wall_time_s"] = 0.0
@@ -378,12 +423,14 @@ class ClusteringPipelineService:
                     backend=backend,
                     outlier_policy=request.outlier_policy,
                     performance_profile=request.performance_profile,
+                    backend_options=backend_options,
                 )
                 backend_metrics = dict(cluster_metrics)
                 backend_metrics["clustering_time_s"] = round(time.perf_counter() - cluster_start, 3)
                 backend_metrics["embedding_model"] = model_name
                 backend_metrics["similarity_mode"] = similarity_mode
                 backend_metrics["backend"] = backend
+                backend_metrics.setdefault("backend_options", backend_options)
                 backend_metrics.update(_prepared_info_metrics(prepared_info))
                 backend_metrics["result_cache_hit"] = False
 
@@ -391,7 +438,9 @@ class ClusteringPipelineService:
                     cluster_id: [paths_by_index[index] for index in indices]
                     for cluster_id, indices in clusters.items()
                 }
-                if request.reuse_result_cache:
+                if request.reuse_result_cache and not str(
+                    backend_metrics.get("compute_fallback_reason", "") or ""
+                ).strip():
                     result_key = self.result_cache_service.build_result_key(
                         snapshot_key=snapshot_key,
                         embedding_model=model_name,
@@ -402,6 +451,14 @@ class ClusteringPipelineService:
                         use_onnx=request.use_onnx,
                         embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
+                        compute_signature=_compute_signature(
+                            self.clustering_service,
+                            backend,
+                            similarity_mode,
+                            request.performance_profile,
+                            backend_options,
+                        ),
+                        backend_options=backend_options,
                     )
                     self.result_cache_service.save(result_key, clustered_images, backend_metrics)
                 backend_wall_time_s = round(time.perf_counter() - backend_start, 3)
@@ -592,6 +649,7 @@ class ClusteringPipelineService:
             embedding_signature = self._embedding_signature(model_name, request.use_onnx)
             for similarity_mode in similarity_modes:
                 for backend in backends:
+                    backend_options = request.backend_options(backend)
                     result_key = self.result_cache_service.build_result_key(
                         snapshot_key=snapshot_key,
                         embedding_model=model_name,
@@ -602,6 +660,14 @@ class ClusteringPipelineService:
                         use_onnx=request.use_onnx,
                         embedding_signature=embedding_signature,
                         similarity_space_version=SIMILARITY_SPACE_VERSION,
+                        compute_signature=_compute_signature(
+                            self.clustering_service,
+                            backend,
+                            similarity_mode,
+                            request.performance_profile,
+                            backend_options,
+                        ),
+                        backend_options=backend_options,
                     )
                     cached = self.result_cache_service.load(result_key)
                     if cached is None:
@@ -630,6 +696,7 @@ class ClusteringPipelineService:
             backend_metrics["embedding_model"] = model_name
             backend_metrics["similarity_mode"] = similarity_mode
             backend_metrics["backend"] = backend
+            backend_metrics.setdefault("backend_options", request.backend_options(backend))
             result.clusters_by_key[key] = clustered_images
             result.metrics_by_key[key] = backend_metrics
             backend_hit_flags[key] = True

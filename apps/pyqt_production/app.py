@@ -52,6 +52,7 @@ from ui.gallery_pane import GalleryPane  # noqa: E402
 from ui.sectioned_gallery import GallerySection, SectionedGallery  # noqa: E402
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
 from ui.job_manager import JobManager  # noqa: E402
+from ui.job_presentation import JobPresentationController  # noqa: E402
 from ui.job_widgets import JobIndicatorWidget  # noqa: E402
 from ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
 from ui.recent_folders import RecentFolderHistory  # noqa: E402
@@ -145,9 +146,6 @@ class ProductionClusterApp(QMainWindow):
         self.saved_search_service = SavedSearchService()
         self.cache_maintenance_service = CacheMaintenanceService(self.settings)
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
-        self._run_runtime_migrations()
-        self._cleanup_runtime_temp_on_startup()
-        self._recover_downloaded_model_storage()
         self.session_controller = ClusteringSessionController(runtime_layout, self)
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
         self.model_download_controller = ModelDownloadController(runtime_layout, self)
@@ -164,12 +162,16 @@ class ProductionClusterApp(QMainWindow):
         self.current_tag_filter: tuple[str, ...] = ()
         self.current_tag_match = "Any"
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
+        self._startup_maintenance_job = None
+        self._startup_maintenance_thread = None
+        self._startup_maintenance_complete = False
         self._preflight_job = None
         self._preflight_thread = None
         self._preflight_generation = 0
         self._preflight_job_id: int | None = None
         self._tag_context_job = None
         self._tag_context_thread = None
+        self._tag_context_job_id: int | None = None
         self._tag_context_generation = 0
         self._storage_usage_job = None
         self._storage_usage_thread = None
@@ -237,7 +239,7 @@ class ProductionClusterApp(QMainWindow):
         self._apply_safety_state()
         self.set_faces_mode(self._preferred_faces_ui_mode())
         self.set_active_workspace(self._preferred_workspace())
-        self._refresh_footer_storage_usage()
+        QTimer.singleShot(0, self._start_startup_maintenance)
         self._startup_check_timer.start(0)
 
     def _cleanup_runtime_temp_on_startup(self) -> None:
@@ -297,6 +299,75 @@ class ProductionClusterApp(QMainWindow):
         if result.failures:
             LOGGER.warning("Runtime migration completed with failures: %s", "; ".join(result.failures))
 
+    def _start_startup_maintenance(self) -> None:
+        """Recover local runtime state after the window can show its progress."""
+        if self._is_shutting_down or self._startup_maintenance_complete:
+            return
+        if self._thread_is_running(self._startup_maintenance_thread):
+            return
+
+        def _run(progress, cancel_check):
+            progress(-1, "Migrating local workspace…")
+            raise_if_cancelled(cancel_check)
+            self._run_runtime_migrations()
+            progress(-1, "Cleaning local temporary files…")
+            raise_if_cancelled(cancel_check)
+            self._cleanup_runtime_temp_on_startup()
+            progress(-1, "Recovering downloaded model storage…")
+            raise_if_cancelled(cancel_check)
+            self._recover_downloaded_model_storage()
+            progress(100, "Local workspace ready")
+            return None
+
+        job = AsyncJob(_run)
+        self._startup_maintenance_job = job
+        job_id = self.job_manager.register_job(
+            "Preparing local workspace",
+            cancel_fn=job.cancel,
+            origin="Startup",
+        )
+        job.progress.connect(
+            lambda value, text, job_id=job_id: self.job_manager.update(job_id, progress=value, text=text)
+        )
+
+        def _cleanup() -> None:
+            if self._startup_maintenance_job is job:
+                self._startup_maintenance_job = None
+            if self._startup_maintenance_thread is thread:
+                self._startup_maintenance_thread = None
+            self._release_async_refs(job, thread)
+
+        def _completed(_result) -> None:
+            self._startup_maintenance_complete = True
+            self.job_manager.finish(job_id, status="finished")
+            _cleanup()
+            self._refresh_footer_storage_usage()
+            if self._active_workspace == "names" and self.names_pane is None:
+                self._start_names_workspace_load()
+            elif self._active_workspace == "faces" and self.faces_pane is None:
+                self._start_faces_workspace_load()
+
+        def _failed(message: str) -> None:
+            # Individual recovery helpers log their own recoverable failures;
+            # an unexpected one must still leave the main app usable.
+            self._startup_maintenance_complete = True
+            self.job_manager.finish(job_id, status="failed", error=str(message))
+            _cleanup()
+            self._refresh_footer_storage_usage()
+            if self._can_update_widget(getattr(self, "footer_bar", None)):
+                self.footer_bar.set_status(f"Startup maintenance needs attention: {message}")
+
+        def _cancelled() -> None:
+            self.job_manager.finish(job_id, status="cancelled")
+            _cleanup()
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        thread = start_job_in_thread(job)
+        self._startup_maintenance_thread = thread
+        self._retain_async_refs(job, thread)
+
     def _build_ui(self) -> None:
         self.setWindowTitle(PRODUCTION_DISPLAY_NAME)
         self.resize(1920, 1080)
@@ -339,6 +410,8 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.set_read_only_mode(self._read_only_mode())
         self.gallery_pane.set_action_target_provider(self.cluster_pane.current_selection_target)
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
+        self.gallery_pane.face_edit_service_provider = lambda: self.face_service_global
+        self.gallery_pane.face_edit_saved_callback = self._on_main_gallery_face_labels_changed
         self.gallery_pane.set_empty_state(
             "Start clustering your photos",
             "Choose a folder, then run clustering to organize its photos into visual groups.",
@@ -370,9 +443,11 @@ class ProductionClusterApp(QMainWindow):
         photo_gallery_layout.setContentsMargins(0, 0, 0, 0)
         photo_gallery_layout.setSpacing(6)
         self.photo_gallery = SectionedGallery(self.photo_gallery_workspace)
-        self.photo_gallery._actions.job_manager = self.job_manager
+        self.photo_gallery.set_job_manager(self.job_manager)
         self.photo_gallery._actions.metadata_service = self.photo_metadata_service
         self.photo_gallery._actions.image_tag_service = self.image_tag_service
+        self.photo_gallery.face_service_provider = lambda: self.face_service_global
+        self.photo_gallery.face_edit_saved_callback = self._on_main_gallery_face_labels_changed
         self.photo_gallery.set_read_only_mode(self._read_only_mode())
         photo_gallery_layout.addWidget(self.photo_gallery, stretch=1)
 
@@ -391,6 +466,7 @@ class ProductionClusterApp(QMainWindow):
         self.main_splitter.setStretchFactor(1, 11)
 
         self.footer_bar = WorkspaceFooter(self)
+        self.job_presentation = JobPresentationController(self.job_manager, self.footer_bar, self)
         layout.addWidget(self.footer_bar)
         self.statusBar().hide()
         self.set_clustering_mode("basic")
@@ -484,6 +560,11 @@ class ProductionClusterApp(QMainWindow):
         self._names_init_scheduled = False
         if self._is_shutting_down:
             return
+        if not self._startup_maintenance_complete:
+            if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
+                self.names_placeholder_detail.setText("Preparing local workspace before opening saved names…")
+            self._start_startup_maintenance()
+            return
         if self.names_pane is not None and self.face_service_global is not None:
             return
         if self._thread_is_running(self._names_init_thread):
@@ -543,7 +624,9 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._names_init_job = job
-        self._names_init_job_id = self.job_manager.register_job("Opening Names", cancel_fn=job.cancel)
+        self._names_init_job_id = self.job_manager.register_job(
+            "Opening Names", cancel_fn=job.cancel, origin="Names"
+        )
         job.progress.connect(
             lambda value, text: self.job_manager.update(
                 self._names_init_job_id or -1,
@@ -608,6 +691,11 @@ class ProductionClusterApp(QMainWindow):
     def _start_faces_workspace_load(self) -> None:
         self._faces_init_scheduled = False
         if self.faces_pane is not None or self._is_shutting_down:
+            return
+        if not self._startup_maintenance_complete:
+            if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
+                self.faces_placeholder_detail.setText("Preparing local workspace before opening Faces…")
+            self._start_startup_maintenance()
             return
         if self._thread_is_running(self._faces_init_thread):
             return
@@ -692,7 +780,9 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._faces_init_job = job
-        self._faces_init_job_id = self.job_manager.register_job("Opening Faces", cancel_fn=job.cancel)
+        self._faces_init_job_id = self.job_manager.register_job(
+            "Opening Faces", cancel_fn=job.cancel, origin="Faces"
+        )
         job.progress.connect(
             lambda value, text: self.job_manager.update(
                 self._faces_init_job_id or -1,
@@ -818,7 +908,11 @@ class ProductionClusterApp(QMainWindow):
 
         from ui.names_pane import NamesPane
 
-        pane = NamesPane(lambda: self.face_service_global, self.workspace_stack)
+        pane = NamesPane(
+            lambda: self.face_service_global,
+            self.workspace_stack,
+            job_manager=self.job_manager,
+        )
         pane.gallery.job_manager = self.job_manager
         pane.gallery.metadata_service = self.photo_metadata_service
         pane.gallery.image_tag_service = self.image_tag_service
@@ -850,6 +944,13 @@ class ProductionClusterApp(QMainWindow):
             return
         self.faces_pane.refresh_face_library(reason="labels changed in Names")
         self.faces_pane.refresh_face_album(reason="labels changed in Names", force_refresh=True)
+
+    def _on_main_gallery_face_labels_changed(self, _image_path: str) -> None:
+        """Refresh durable-name views after a Photos inspector face edit."""
+
+        if self.names_pane is not None:
+            self.names_pane.refresh_names()
+        self._on_names_face_labels_changed()
 
     def _connect_faces_signals(self, pane) -> None:
         pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
@@ -1596,6 +1697,7 @@ class ProductionClusterApp(QMainWindow):
             generate_cluster_meanings=self._clustering_mode == "advanced",
             generate_cluster_explanations=True,
             cluster_meaning_model="auto",
+            backend_options_by_backend=self.clustering_pane.backend_options_by_backend(),
         )
 
     def _confirm_large_folder_if_needed(self, request: ProductionClusterRequest) -> bool:
@@ -1769,7 +1871,6 @@ class ProductionClusterApp(QMainWindow):
         # a separate killable process. The clustering worker itself is offline.
         self._pending_model_download_run = (replace(request, allow_model_downloads=False), str(run_origin))
         self._set_running_state(True)
-        self.footer_bar.set_progress(-1, "Preparing model download...")
         if self.model_download_controller.start(items):
             return True
         self._pending_model_download_run = None
@@ -1782,7 +1883,6 @@ class ProductionClusterApp(QMainWindow):
         self.runtime_badge.update_runtime(self.runtime_service.detect(), policy)
         if policy.cuda_required_unavailable:
             message = policy.error or policy.reason or "CUDA was requested, but no compatible CUDA runtime is available."
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status(message)
             self._set_activity("CUDA unavailable")
             errorBox("CUDA unavailable", message)
@@ -1814,7 +1914,6 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.update_gallery([])
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
         self.footer_bar.set_metrics("")
-        self.footer_bar.set_progress(0, "Preparing clustering run...")
         self.footer_bar.set_status("Preparing clustering run...")
         self._set_activity("Preparing clustering run...")
         return self.session_controller.start(request)
@@ -1852,11 +1951,12 @@ class ProductionClusterApp(QMainWindow):
         self._preflight_generation += 1
         generation = self._preflight_generation
         self._set_running_state(True)
-        self.footer_bar.set_progress(-1, "Scanning selected folder...")
         self.footer_bar.set_status("Scanning selected folder...")
         self._set_activity("Preparing clustering run...")
         self._update_footer_storage_state()
-        job_id = self.job_manager.register_job("Preparing clustering run", cancel_fn=self.cancel_clustering)
+        job_id = self.job_manager.register_job(
+            "Preparing clustering run", cancel_fn=self.cancel_clustering, origin="Clustering"
+        )
         self._preflight_job_id = job_id
         request_copy = replace(request)
 
@@ -1973,7 +2073,6 @@ class ProductionClusterApp(QMainWindow):
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="finished")
             if not self._confirm_large_folder_if_needed(payload.request):
-                self.footer_bar.set_progress(None)
                 self.footer_bar.set_status("Clustering cancelled before inference.")
                 self._set_activity("Cancelled")
                 self._set_running_state(False)
@@ -1981,7 +2080,6 @@ class ProductionClusterApp(QMainWindow):
                 return
             prepared_request = self._prepare_request_model_downloads(payload.request)
             if prepared_request is None:
-                self.footer_bar.set_progress(None)
                 self._set_running_state(False)
                 _cleanup()
                 return
@@ -1996,7 +2094,6 @@ class ProductionClusterApp(QMainWindow):
             self._set_activity("Starting worker...")
             started = self._start_request_with_assets(prepared_request, run_origin=payload.run_origin)
             if not started:
-                self.footer_bar.set_progress(None)
                 self.footer_bar.set_status("Clustering could not start because another run is active.")
                 self._set_activity("Idle")
                 self._set_running_state(False)
@@ -2010,7 +2107,6 @@ class ProductionClusterApp(QMainWindow):
             self._preflight_job_id = None
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="failed", error=message)
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status(f"Clustering could not start: {message}")
             self._set_activity("Preflight failed")
             self._set_running_state(False)
@@ -2025,13 +2121,11 @@ class ProductionClusterApp(QMainWindow):
             self._preflight_job_id = None
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="cancelled")
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Clustering preparation cancelled.")
             self._set_activity("Cancelled")
             self._set_running_state(False)
             _cleanup()
 
-        job.progress.connect(self.footer_bar.set_progress)
         job.progress.connect(lambda value, status: self._on_preflight_progress(job_id, value, status))
         job.completed.connect(_done)
         job.failed.connect(_failed)
@@ -2097,7 +2191,7 @@ class ProductionClusterApp(QMainWindow):
         if not directory or not Path(directory).is_dir():
             self.photo_gallery.set_empty_state("Choose a folder to show its photos.")
             return
-        self.photo_gallery.set_empty_state("Finding photos in this folder...", can_organize=False)
+        self.photo_gallery.set_loading_state("Finding photos in this folder…")
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
@@ -2198,18 +2292,18 @@ class ProductionClusterApp(QMainWindow):
 
     def _on_model_download_started(self, item_keys: tuple) -> None:
         label = "Downloading model assets"
-        job_id = self.job_manager.register_job(label, cancel_fn=self.model_download_controller.cancel)
+        job_id = self.job_manager.register_job(
+            label, cancel_fn=self.model_download_controller.cancel, origin="Models"
+        )
         self._model_download_job_id = job_id
         item_text = ", ".join(str(item).split(":text=", 1)[0] for item in item_keys)
         status = f"Downloading model assets: {item_text}" if item_text else "Downloading model assets"
         self.job_manager.update(job_id, progress=-1, text="Cache lookup and download starting")
         self.footer_bar.set_status(status)
-        self.footer_bar.set_progress(-1, status)
         self._set_activity("Downloading model assets...")
         self._update_footer_storage_state()
 
     def _on_model_download_progress(self, value: int, status: str) -> None:
-        self.footer_bar.set_progress(value, status)
         self.footer_bar.set_status(status)
         self._set_activity(status)
         if self._model_download_job_id is not None:
@@ -2240,7 +2334,6 @@ class ProductionClusterApp(QMainWindow):
             cache_parts.append(f"reused {len(reused)} cached")
         cache_text = "Cache ready" + (f" ({', '.join(cache_parts)})" if cache_parts else "")
         self._finish_model_download_job("finished", cache_text=cache_text)
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status(f"{cache_text}.")
         self._set_activity("Model cache ready")
 
@@ -2283,7 +2376,6 @@ class ProductionClusterApp(QMainWindow):
         self._pending_model_download_run = None
         self._active_post_install_model_name = None
         self._finish_model_download_job("failed", error=message)
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status(f"Model download failed: {message}")
         self._set_activity("Model download failed")
         if pending_run is not None:
@@ -2297,7 +2389,6 @@ class ProductionClusterApp(QMainWindow):
         self._pending_model_download_run = None
         self._active_post_install_model_name = None
         self._finish_model_download_job("cancelled", cache_text="Cancelled; completed and partial cache files are retained")
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status("Model download cancelled. Cached files will be reused on retry.")
         self._set_activity("Model download cancelled")
         if pending_run is not None:
@@ -2305,22 +2396,21 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_footer_storage_usage()
 
     def _on_clustering_started(self) -> None:
-        job_id = self.job_manager.register_job("Production clustering", cancel_fn=self.session_controller.cancel)
+        job_id = self.job_manager.register_job(
+            "Production clustering", cancel_fn=self.session_controller.cancel, origin="Clustering"
+        )
         self._active_job_id = job_id
         self.footer_bar.set_status("Clustering started.")
-        self.footer_bar.set_progress(-1, "Clustering started...")
         self._set_activity("Clustering started...")
         self._update_footer_storage_state()
 
     def _on_clustering_progress(self, value: int, status: str) -> None:
-        self.footer_bar.set_progress(value, status)
         self._set_activity(status)
         job_id = getattr(self, "_active_job_id", None)
         if job_id is not None:
             self.job_manager.update(job_id, progress=value, text=status)
 
     def _on_clustering_completed(self, payload: dict) -> None:
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status("Clustering finished.")
         job_id = getattr(self, "_active_job_id", None)
         if job_id is not None:
@@ -2329,11 +2419,21 @@ class ProductionClusterApp(QMainWindow):
         self.cluster_data = _restore_cluster_dict(payload.get("clusters_by_key") or {})
         self.membership_by_image = _restore_membership(payload.get("membership_by_image") or {})
         self.metrics_by_backend = {str(key): dict(value) for key, value in dict(payload.get("metrics_by_key") or {}).items()}
+        fallback_reasons = list(
+            dict.fromkeys(
+                str(metrics.get("compute_fallback_reason") or "").strip()
+                for metrics in self.metrics_by_backend.values()
+                if str(metrics.get("compute_fallback_reason") or "").strip()
+            )
+        )
+        fallback_notice = f" CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else ""
         self.cluster_explanations = _restore_cluster_explanations(payload.get("cluster_explanations_by_key") or {})
         self.cluster_meanings = _restore_cluster_meanings(payload.get("cluster_meanings_by_key") or {})
         self.last_run_metrics = dict(payload.get("metrics") or {})
         self.last_run_metrics["run_origin"] = self.current_run_origin
         self.last_run_metrics["tag_match"] = self.current_tag_match
+        if fallback_reasons:
+            self.last_run_metrics["compute_fallback_reason"] = "; ".join(fallback_reasons)
         if self.current_tag_filter:
             self.last_run_metrics["tag_filter"] = ", ".join(self.current_tag_filter)
         self.cluster_tag_summaries = _restore_cluster_summaries(payload.get("cluster_summaries") or {})
@@ -2358,17 +2458,16 @@ class ProductionClusterApp(QMainWindow):
         if default_selection is not None:
             comparison_key, cluster_id = default_selection
             warm_note = " Worker kept warm for the next run." if self.session_controller.is_worker_warm() else ""
-            self.footer_bar.set_status(f"Clustering finished. Showing {comparison_key} / cluster {cluster_id}.{warm_note}")
+            self.footer_bar.set_status(f"Clustering finished. Showing {comparison_key} / cluster {cluster_id}.{fallback_notice}{warm_note}")
             self.update_gallery(comparison_key, cluster_id)
         else:
             warm_note = " Worker kept warm for the next run." if self.session_controller.is_worker_warm() else ""
-            self.footer_bar.set_status(f"Clustering finished with no clusters to preview.{warm_note}")
+            self.footer_bar.set_status(f"Clustering finished with no clusters to preview.{fallback_notice}{warm_note}")
         self._set_activity("Refreshing tag summaries...")
         self._start_cluster_tag_context_refresh()
         self._refresh_footer_storage_usage()
 
     def _on_clustering_failed(self, message: str) -> None:
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status(f"Clustering failed: {message}")
         self._set_activity("Failed")
         job_id = getattr(self, "_active_job_id", None)
@@ -2379,7 +2478,6 @@ class ProductionClusterApp(QMainWindow):
         errorBox("Clustering failed", message)
 
     def _on_clustering_cancelled(self) -> None:
-        self.footer_bar.set_progress(None)
         self.footer_bar.set_status("Clustering cancelled.")
         job_id = getattr(self, "_active_job_id", None)
         if job_id is not None:
@@ -2698,6 +2796,8 @@ class ProductionClusterApp(QMainWindow):
         capabilities = self.runtime_service.detect()
         self.execution_policy = self.runtime_service.select_policy(self._preferred_execution_mode())
         self.runtime_badge.update_runtime(capabilities, self.execution_policy)
+        if self.faces_pane is not None:
+            self.faces_pane.reset_similarity_execution_services()
         self._refresh_health_badge()
 
     def open_tag_manager(self) -> None:
@@ -2761,7 +2861,6 @@ class ProductionClusterApp(QMainWindow):
         def _done(result) -> None:
             failures = list(getattr(result, "failures", []))
             affected_paths = list(getattr(result, "affected_paths", []))
-            self.footer_bar.set_progress(None)
             self._set_activity("Ready")
             if affected_paths:
                 self._on_gallery_metadata_changed(affected_paths)
@@ -2771,15 +2870,15 @@ class ProductionClusterApp(QMainWindow):
             infoBox("Suggested tags applied", f"Added {', '.join(tags)} to {len(affected_paths)} image(s).")
 
         job = AsyncJob(_run)
-        suggested_tags_job_id = self.job_manager.register_job("Applying suggested tags", cancel_fn=job.cancel)
+        suggested_tags_job_id = self.job_manager.register_job(
+            "Applying suggested tags", cancel_fn=job.cancel, origin="Clustering"
+        )
         thread_holder: dict[str, object] = {}
 
         def _cleanup() -> None:
             thread = thread_holder.get("thread")
             self._release_async_refs(job, thread)
-            self.footer_bar.set_progress(None)
 
-        job.progress.connect(self.footer_bar.set_progress)
         job.progress.connect(
             lambda value, status: self.job_manager.update(
                 suggested_tags_job_id,
@@ -3156,7 +3255,6 @@ class ProductionClusterApp(QMainWindow):
         ):
             return
         self.gallery_pane.clear_memory_caches(reload_visible=False)
-        self.footer_bar.set_progress(-1, "Clearing caches and generated runtime data...")
         self.footer_bar.set_status("Clearing caches and generated runtime data...")
         self._set_activity("Clearing caches...")
         self._update_footer_storage_state()
@@ -3190,7 +3288,9 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._storage_clear_job = job
-        storage_clear_job_id = self.job_manager.register_job("Clearing runtime caches", cancel_fn=job.cancel)
+        storage_clear_job_id = self.job_manager.register_job(
+            "Clearing runtime caches", cancel_fn=job.cancel, origin="Storage"
+        )
         thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
@@ -3205,7 +3305,6 @@ class ProductionClusterApp(QMainWindow):
             self._refresh_footer_storage_usage()
 
         def _done(result: object) -> None:
-            self.footer_bar.set_progress(None)
             if isinstance(result, CacheClearResult):
                 if result.failures:
                     self.job_manager.finish(
@@ -3231,7 +3330,6 @@ class ProductionClusterApp(QMainWindow):
 
         def _failed(message: str) -> None:
             self.job_manager.finish(storage_clear_job_id, status="failed", error=message)
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status(f"Cache clear failed: {message}")
             self._set_activity("Cache clear failed")
             errorBox("Cache clear failed", message)
@@ -3239,12 +3337,10 @@ class ProductionClusterApp(QMainWindow):
 
         def _cancelled() -> None:
             self.job_manager.finish(storage_clear_job_id, status="cancelled")
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Cache clear cancelled. Already removed rebuildable files remain removed.")
             self._set_activity("Cache clear cancelled")
             _cleanup()
 
-        job.progress.connect(self.footer_bar.set_progress)
         job.progress.connect(
             lambda value, status: self.job_manager.update(
                 storage_clear_job_id,
@@ -3447,9 +3543,13 @@ class ProductionClusterApp(QMainWindow):
     def _cancel_cluster_tag_context_refresh(self) -> None:
         job = self._tag_context_job
         thread = self._tag_context_thread
+        job_id = self._tag_context_job_id
         self._retain_async_refs(job, thread)
         self._tag_context_job = None
         self._tag_context_thread = None
+        self._tag_context_job_id = None
+        if job_id is not None:
+            self.job_manager.finish(job_id, status="cancelled")
         if job is None:
             return
         self._tag_context_generation += 1
@@ -3471,7 +3571,6 @@ class ProductionClusterApp(QMainWindow):
             self.image_tags_by_path = {}
             self.cluster_tag_summaries = {}
             self.gallery_extra_context_by_path = {}
-            self.footer_bar.set_progress(None)
             self._set_activity("Ready")
             self._update_footer_storage_state()
             return
@@ -3535,14 +3634,31 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._tag_context_job = job
-        self.footer_bar.set_progress(-1, "Refreshing cluster tag context...")
+        job_id = self.job_manager.register_job(
+            "Refreshing cluster tag context",
+            cancel_fn=job.cancel,
+            origin="Clustering",
+            foreground=False,
+        )
+        self._tag_context_job_id = job_id
+        job.progress.connect(
+            lambda value, text, job_id=job_id: self.job_manager.update(
+                job_id, progress=value, text=str(text)
+            )
+        )
         self._set_activity("Refreshing cluster tag context...")
         thread_holder: dict[str, object | None] = {"thread": None}
 
         def _current_generation() -> bool:
             return generation == self._tag_context_generation
 
+        def _finish_job(status: str, error: str = "") -> None:
+            self.job_manager.finish(job_id, status=status, error=error)
+            if self._tag_context_job_id == job_id:
+                self._tag_context_job_id = None
+
         def _done(payload: object) -> None:
+            _finish_job("finished")
             if not _current_generation() or not isinstance(payload, ClusterTagContextPayload):
                 return
             self.image_tags_by_path = dict(payload.image_tags_by_path)
@@ -3563,23 +3679,22 @@ class ProductionClusterApp(QMainWindow):
                 self.cluster_meanings,
                 preserve_selection=True,
             )
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Cluster context ready.")
             self._set_activity("Ready")
             self._refresh_footer_storage_usage()
 
         def _failed(message: str) -> None:
+            _finish_job("failed", message)
             if not _current_generation():
                 return
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status(f"Cluster context refresh failed: {message}")
             self._set_activity("Cluster context refresh failed")
             LOGGER.warning("Production tag-context refresh failed: %s", message)
 
         def _cancelled() -> None:
+            _finish_job("cancelled")
             if not _current_generation():
                 return
-            self.footer_bar.set_progress(None)
             self.footer_bar.set_status("Cluster context refresh cancelled.")
             self._set_activity("Ready")
 
@@ -3593,7 +3708,6 @@ class ProductionClusterApp(QMainWindow):
                 self._tag_context_job = None
             self._update_footer_storage_state()
 
-        job.progress.connect(self.footer_bar.set_progress)
         job.progress.connect(lambda _value, status: self._set_activity(status))
         job.completed.connect(_done)
         job.completed.connect(lambda _payload: _cleanup())
@@ -3619,6 +3733,7 @@ class ProductionClusterApp(QMainWindow):
         self._cancel_request_preflight()
         self._cancel_cluster_tag_context_refresh()
         runtime_jobs = (
+            (self._startup_maintenance_job, self._startup_maintenance_thread),
             (self._storage_usage_job, self._storage_usage_thread),
             (self._storage_clear_job, self._storage_clear_thread),
             (self._post_install_model_job, self._post_install_model_thread),
@@ -3635,6 +3750,8 @@ class ProductionClusterApp(QMainWindow):
                 pass
         self._storage_usage_job = None
         self._storage_usage_thread = None
+        self._startup_maintenance_job = None
+        self._startup_maintenance_thread = None
         self._storage_clear_job = None
         self._storage_clear_thread = None
         self._post_install_model_job = None

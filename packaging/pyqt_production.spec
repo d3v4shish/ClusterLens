@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 
 REPO_ROOT = Path(SPEC).resolve().parents[1]
@@ -82,14 +82,28 @@ cpu_excludes = [
     "torch.distributed.elastic",
 ]
 excludes = list(common_excludes)
+gpu_binaries = []
+gpu_hiddenimports = []
 if BUILD_VARIANT == "cpu":
     excludes.extend(cpu_excludes)
+else:
+    for package_name in (
+        "libcudf",
+        "libcuml",
+        "libkvikio",
+        "libraft",
+        "librmm",
+        "libucx",
+        "libucxx",
+    ):
+        gpu_binaries.extend(collect_dynamic_libs(package_name))
+    gpu_hiddenimports.extend(("cuml.cluster", "cuml.cluster.hdbscan", "cupy"))
 
 
 a = Analysis(
     [str(ENTRYPOINT)],
     pathex=[str(REPO_ROOT), str(SRC_DIR)],
-    binaries=[],
+    binaries=gpu_binaries,
     datas=[
         (str(ASSETS_DIR / "app_icon.png"), "apps/pyqt_production/assets"),
         (str(REPO_ROOT / "docs" / "USER_FLOWS.md"), "docs"),
@@ -99,8 +113,10 @@ a = Analysis(
     ],
     hiddenimports=[
         "apps.pyqt_production.worker",
+        "app.services.face_region_metadata",
         "sentencepiece",
         "torch.distributed.rpc",
+        *gpu_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},

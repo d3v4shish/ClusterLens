@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from unittest.mock import patch
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
@@ -116,5 +117,37 @@ def test_group_header_hover_opens_a_photo_first_preview() -> None:
     assert gallery._hover_section_id == "group"
     assert gallery._hover_popup.title.text() == "Photo group · 3 photos"
     gallery._hide_hover_preview()
+    gallery.close()
+    app.processEvents()
+
+
+def test_photos_gallery_opens_inspector_with_face_region_editing_when_index_is_ready() -> None:
+    app = QApplication.instance() or QApplication([])
+    from ui.sectioned_gallery import SectionedGallery
+
+    gallery = SectionedGallery()
+    face_service = object()
+    callback_paths: list[str] = []
+    gallery.face_service_provider = lambda: face_service
+    gallery.face_edit_saved_callback = callback_paths.append
+    gallery._model.set_sections([GallerySection("group", ("/a.jpg", "/b.jpg"))])
+    captured: dict[str, object] = {}
+
+    class _Dialog:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def exec(self) -> int:
+            return 0
+
+    with patch("ui.sectioned_gallery.PhotoInspectorDialog", _Dialog):
+        gallery._open_photo(gallery._model.index(1, 1))
+
+    assert captured["image_paths"] == ["/a.jpg", "/b.jpg"]
+    assert captured["start_index"] == 1
+    assert captured["face_service"] is face_service
+    assert captured["allow_face_edit"] is True
+    captured["face_edit_saved_callback"]("/a.jpg")
+    assert callback_paths == ["/a.jpg"]
     gallery.close()
     app.processEvents()

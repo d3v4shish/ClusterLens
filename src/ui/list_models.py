@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSize, Qt
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter
@@ -65,6 +65,15 @@ class ListEntryModel(QAbstractListModel):
         if 0 <= int(row) < len(self._items):
             return self._items[int(row)]
         return None
+
+    def set_item_icon(self, row: int, icon: QIcon | None) -> None:
+        """Update a late-loading icon without resetting selection or scroll."""
+        row = int(row)
+        if not (0 <= row < len(self._items)):
+            return
+        self._items[row] = replace(self._items[row], icon=icon)
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
 
     def clear(self) -> None:
         self.set_items([])

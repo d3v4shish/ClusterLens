@@ -7,14 +7,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QEvent, QItemSelectionModel, QSize, Qt, pyqtSlot
-from PyQt6.QtGui import QIcon, QImageReader, QKeyEvent, QKeySequence, QPixmap, QShortcut
-from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QLabel, QListView, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, pyqtSlot
+from PyQt6.QtGui import QIcon, QImage, QImageReader, QKeyEvent, QKeySequence, QPainter, QPixmap, QShortcut
+from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
 
 from app.services.face_types import EditableFaceInput
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from ui.error_mbox import confirmBox, errorBox
+from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel
 from ui.zoomable_image import ZoomableImageView
 from PIL import Image, ImageOps
@@ -50,6 +51,7 @@ class PhotoInspectorDialog(QDialog):
         face_draft_updated_callback: Callable[[str, list[EditableFaceDraft], bool], None] | None = None,
         face_edit_saved_callback: Callable[[str], None] | None = None,
         face_auto_clean_callback: Callable[[str, list[EditableFaceDraft]], tuple[list[EditableFaceDraft], dict[str, int]]] | None = None,
+        job_manager: JobManager | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -59,15 +61,26 @@ class PhotoInspectorDialog(QDialog):
         self.face_draft_updated_callback = face_draft_updated_callback
         self.face_edit_saved_callback = face_edit_saved_callback
         self.face_auto_clean_callback = face_auto_clean_callback
+        self.job_manager = job_manager
         self._allow_face_edit = bool(allow_face_edit and face_service is not None)
         self._active_thread = None
         self._active_job = None
         self._preview_thread = None
         self._preview_job = None
+        self._face_draft_thread = None
+        self._face_draft_job = None
+        self._face_thumbnail_thread = None
+        self._face_thumbnail_job = None
+        self._face_thumbnail_request_signature: tuple[object, ...] | None = None
+        self._face_thumbnail_cache: dict[tuple[str, tuple[int, int, int, int]], QIcon] = {}
+        self._prefetch_thread = None
+        self._prefetch_job = None
         self._face_edit_thread = None
         self._face_edit_job = None
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
         self._thread_jobs: dict[object, object | None] = {}
+        self._progress_jobs: dict[int, dict[str, object]] = {}
+        self._progress_sequence = 0
         self._request_id = 0
         self._full_res_loaded = False
         self._context_provider = context_provider
@@ -159,12 +172,18 @@ class PhotoInspectorDialog(QDialog):
         self.state_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         details_layout.addWidget(self.state_label)
 
+        self.operation_progress_bar = QProgressBar(self.details_panel)
+        self.operation_progress_bar.setTextVisible(False)
+        self.operation_progress_bar.setAccessibleName("Photo inspector operation progress")
+        self.operation_progress_bar.hide()
+        details_layout.addWidget(self.operation_progress_bar)
+
         self.face_editor_panel = QWidget(self.details_panel)
         face_editor_layout = QVBoxLayout(self.face_editor_panel)
         face_editor_layout.setContentsMargins(0, 0, 0, 0)
         face_editor_layout.setSpacing(6)
 
-        self.face_editor_summary_label = QLabel("Face editing is only available for Face Library review images.")
+        self.face_editor_summary_label = QLabel("Face regions are available when face indexing is ready for this photo.")
         self.face_editor_summary_label.setWordWrap(True)
         face_editor_layout.addWidget(self.face_editor_summary_label)
 
@@ -183,6 +202,11 @@ class PhotoInspectorDialog(QDialog):
         self.face_auto_clean_button = QPushButton("Auto-Clean This Image")
         self.face_reset_button = QPushButton("Reset")
         self.face_save_button = QPushButton("Save Face Edits")
+        self.face_name_input = QLineEdit()
+        self.face_name_input.setPlaceholderText("Identity name")
+        self.face_name_selected_button = QPushButton("Name Selected Face(s)")
+        self.face_rename_selected_button = QPushButton("Rename Selected")
+        self.face_unlabel_selected_button = QPushButton("Unlabel Selected")
         face_action_buttons = [
             self.face_rescan_button,
             self.face_draw_button,
@@ -200,6 +224,14 @@ class PhotoInspectorDialog(QDialog):
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             face_action_grid.addWidget(button, button_index // 2, button_index % 2)
         face_editor_layout.addLayout(face_action_grid)
+
+        face_name_row = QHBoxLayout()
+        face_name_row.setContentsMargins(0, 0, 0, 0)
+        face_name_row.addWidget(self.face_name_input, stretch=1)
+        face_name_row.addWidget(self.face_name_selected_button)
+        face_name_row.addWidget(self.face_rename_selected_button)
+        face_name_row.addWidget(self.face_unlabel_selected_button)
+        face_editor_layout.addLayout(face_name_row)
 
         self.face_editor_helper_label = QLabel(
             "Use Auto-Scan for this image only, or draw a box directly on the photo when a face was missed. "
@@ -277,6 +309,9 @@ class PhotoInspectorDialog(QDialog):
         self.face_auto_clean_button.clicked.connect(self._auto_clean_faces)
         self.face_reset_button.clicked.connect(self._reset_face_drafts)
         self.face_save_button.clicked.connect(self._save_face_edits)
+        self.face_name_selected_button.clicked.connect(self._name_selected_faces)
+        self.face_rename_selected_button.clicked.connect(self._rename_selected_faces)
+        self.face_unlabel_selected_button.clicked.connect(self._unlabel_selected_faces)
         selection_model = self.image_faces_list.selectionModel()
         if selection_model is not None:
             selection_model.selectionChanged.connect(lambda *_args: self._on_face_draft_selection_changed())
@@ -309,6 +344,22 @@ class PhotoInspectorDialog(QDialog):
             self._preview_job.cancel()
             self._preview_job = None
             self._preview_thread = None
+        if self._face_draft_job is not None:
+            self._retain_async_refs(self._face_draft_job, self._face_draft_thread)
+            self._face_draft_job.cancel()
+            self._face_draft_job = None
+            self._face_draft_thread = None
+        if self._face_thumbnail_job is not None:
+            self._retain_async_refs(self._face_thumbnail_job, self._face_thumbnail_thread)
+            self._face_thumbnail_job.cancel()
+            self._face_thumbnail_job = None
+            self._face_thumbnail_thread = None
+        self._face_thumbnail_request_signature = None
+        if self._prefetch_job is not None:
+            self._retain_async_refs(self._prefetch_job, self._prefetch_thread)
+            self._prefetch_job.cancel()
+            self._prefetch_job = None
+            self._prefetch_thread = None
 
         if self._context_provider is not None:
             try:
@@ -344,6 +395,7 @@ class PhotoInspectorDialog(QDialog):
             return metadata
 
         job = AsyncJob(_run)
+        self._track_operation_job(job, "Loading photo metadata", foreground=False)
 
         def _on_completed(metadata: PhotoMetadata) -> None:
             if request_id != self._request_id:
@@ -407,6 +459,11 @@ class PhotoInspectorDialog(QDialog):
             return image
 
         job = AsyncJob(_run)
+        self._track_operation_job(
+            job,
+            "Loading full-resolution preview" if full_res else "Loading photo preview",
+            foreground=False,
+        )
 
         def _on_completed(image) -> None:
             if request_id != self._request_id:
@@ -463,6 +520,18 @@ class PhotoInspectorDialog(QDialog):
             self._preview_thread = None
             if self._preview_job is job:
                 self._preview_job = None
+        if self._face_draft_thread is thread:
+            self._face_draft_thread = None
+            if self._face_draft_job is job:
+                self._face_draft_job = None
+        if self._face_thumbnail_thread is thread:
+            self._face_thumbnail_thread = None
+            if self._face_thumbnail_job is job:
+                self._face_thumbnail_job = None
+        if self._prefetch_thread is thread:
+            self._prefetch_thread = None
+            if self._prefetch_job is job:
+                self._prefetch_job = None
         if self._face_edit_thread is thread:
             self._face_edit_thread = None
             if self._face_edit_job is job:
@@ -482,7 +551,8 @@ class PhotoInspectorDialog(QDialog):
         return str(self._current_image_path or "")
 
     def _face_edit_enabled_for_context(self, context: dict[str, object] | None) -> bool:
-        return bool(self._allow_face_edit and isinstance((context or {}).get("face_review"), dict))
+        _ = context
+        return bool(self._allow_face_edit)
 
     def _load_face_editor_state(self, image_path: str, context: dict[str, object]) -> None:
         enabled = self._face_edit_enabled_for_context(context)
@@ -504,20 +574,88 @@ class PhotoInspectorDialog(QDialog):
             if isinstance(shared_state, tuple) and len(shared_state) == 2:
                 shared_drafts, shared_dirty = shared_state
                 drafts = list(shared_drafts or [])
-                if shared_dirty:
-                    self._face_original_drafts_by_path[path] = list(self._load_indexed_face_drafts(path, context))
-                else:
-                    self._face_original_drafts_by_path[path] = list(drafts)
+                self._face_original_drafts_by_path[path] = list(drafts)
                 self._face_drafts_by_path[path] = list(drafts)
                 if shared_dirty:
                     self._face_editor_dirty_paths.add(path)
                 else:
                     self._face_editor_dirty_paths.discard(path)
             else:
-                drafts = self._load_indexed_face_drafts(path, context)
+                drafts = self._drafts_from_context(context)
                 self._face_original_drafts_by_path[path] = list(drafts)
                 self._face_drafts_by_path[path] = list(drafts)
         self._refresh_face_editor_ui(path)
+        self.face_editor_summary_label.setText(f"Loading saved face regions for {Path(path).name}…")
+        self._load_indexed_face_drafts_async(path, context, request_id=self._request_id)
+
+    @staticmethod
+    def _drafts_from_context(context: dict[str, object]) -> list[EditableFaceDraft]:
+        indexed = context.get("indexed_faces")
+        if not isinstance(indexed, dict) or not isinstance(indexed.get("faces"), list):
+            return []
+        drafts: list[EditableFaceDraft] = []
+        for index, face in enumerate(indexed.get("faces", [])):
+            if not isinstance(face, dict):
+                continue
+            bbox = face.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                drafts.append(
+                    EditableFaceDraft(
+                        bbox=tuple(int(value) for value in bbox),
+                        confidence=float(face.get("confidence", 1.0) or 1.0),
+                        source="indexed",
+                        person_name=str(face.get("person_name") or ""),
+                        face_index=int(face.get("face_index", index)),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return drafts
+
+    def _load_indexed_face_drafts_async(self, image_path: str, context: dict[str, object], *, request_id: int) -> None:
+        """Read the database and XMP face regions away from the Qt UI thread."""
+        if self.face_service is None:
+            return
+
+        def _run(progress, cancel_check):
+            progress(-1, "Reading saved face regions…")
+            raise_if_cancelled(cancel_check)
+            drafts = self._load_indexed_face_drafts(image_path, context)
+            raise_if_cancelled(cancel_check)
+            return drafts
+
+        job = AsyncJob(_run)
+        self._track_operation_job(job, "Reading saved face regions", foreground=False)
+
+        def _completed(drafts: object) -> None:
+            if request_id != self._request_id or image_path != self._current_editable_path():
+                return
+            # A user may have edited the context drafts while the database/XMP
+            # read was in flight.  Never replace that edit or its selection
+            # with a late passive refresh.
+            if image_path in self._face_editor_dirty_paths:
+                return
+            loaded = list(drafts or []) or self._drafts_from_context(context)
+            self._face_original_drafts_by_path[image_path] = list(loaded)
+            self._face_drafts_by_path[image_path] = list(loaded)
+            self._refresh_face_editor_ui(image_path)
+
+        def _failed(_message: str) -> None:
+            if request_id == self._request_id and image_path == self._current_editable_path():
+                self._refresh_face_editor_ui(image_path)
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        self._face_draft_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._face_draft_thread = thread
 
     def _load_indexed_face_drafts(self, image_path: str, context: dict[str, object]) -> list[EditableFaceDraft]:
         records: list[IndexedFaceRecord] = []
@@ -527,17 +665,47 @@ class PhotoInspectorDialog(QDialog):
             except Exception:
                 records = []
         drafts: list[EditableFaceDraft] = []
+        metadata_regions = []
+        try:
+            from app.services.face_region_metadata import FaceRegionMetadataService
+
+            with Image.open(image_path) as image:
+                image_size = image.size
+            region_service = FaceRegionMetadataService()
+            metadata_regions = list(region_service.read(image_path).regions)
+        except Exception:
+            region_service = None
+            image_size = (1, 1)
         if records:
             for record in records:
+                metadata_name = ""
+                if region_service is not None:
+                    candidate = region_service.normalized_region_for_bbox(record.face_bbox, image_size)
+                    matched = region_service.best_matching_region(metadata_regions, candidate)
+                    if matched is not None:
+                        metadata_name = str(matched.name or "").strip()
                 drafts.append(
                     EditableFaceDraft(
                         bbox=tuple(int(value) for value in record.face_bbox),
                         confidence=float(record.face_confidence or 1.0),
                         source="indexed",
-                        person_name=str(record.person_name or ""),
+                        person_name=str(record.person_name or metadata_name or ""),
                         face_index=int(record.face_index),
                     )
                 )
+            if region_service is not None:
+                indexed_regions = [region_service.normalized_region_for_bbox(record.face_bbox, image_size) for record in records]
+                for region in metadata_regions:
+                    if region_service.best_matching_region(indexed_regions, region) is None:
+                        drafts.append(
+                            EditableFaceDraft(
+                                bbox=region_service.bbox_for_region(region, image_size),
+                                confidence=1.0,
+                                source="xmp",
+                                person_name=str(region.name or ""),
+                                face_index=-1,
+                            )
+                        )
             return drafts
         if not drafts:
             indexed = context.get("indexed_faces")
@@ -557,6 +725,17 @@ class PhotoInspectorDialog(QDialog):
                             face_index=int(face.get("face_index", index)),
                         )
                     )
+        if not drafts and region_service is not None:
+            for region in metadata_regions:
+                drafts.append(
+                    EditableFaceDraft(
+                        bbox=region_service.bbox_for_region(region, image_size),
+                        confidence=1.0,
+                        source="xmp",
+                        person_name=str(region.name or ""),
+                        face_index=-1,
+                    )
+                )
         return drafts
 
     def _refresh_face_editor_ui(self, image_path: str) -> None:
@@ -577,7 +756,7 @@ class PhotoInspectorDialog(QDialog):
                 ListEntry(
                     title=f"{title}\nFace #{index + 1}",
                     payload=int(index),
-                    icon=self._make_face_thumbnail_icon(image_path, draft.bbox),
+                    icon=self._face_thumbnail_cache.get((image_path, tuple(draft.bbox))),
                     tooltip=(
                         f"{Path(image_path).name}\nface #{index + 1}\nsource={source}\n"
                         f"bbox={tuple(draft.bbox)}\nconf={float(draft.confidence):.3f}"
@@ -602,6 +781,10 @@ class PhotoInspectorDialog(QDialog):
         self.face_remove_button.setEnabled(selected_count > 0)
         self.face_duplicate_button.setEnabled(selected_count == 1)
         self.face_split_button.setEnabled(selected_count == 1)
+        selected_saved = [draft for index, draft in enumerate(drafts) if index in selected_indexes and int(draft.face_index) >= 0]
+        self.face_name_selected_button.setEnabled(bool(selected_saved))
+        self.face_rename_selected_button.setEnabled(bool(selected_saved and any(str(draft.person_name or "").strip() for draft in selected_saved)))
+        self.face_unlabel_selected_button.setEnabled(bool(selected_saved and any(str(draft.person_name or "").strip() for draft in selected_saved)))
         if drafts:
             dirty = image_path in self._face_editor_dirty_paths
             dirty_text = " Unsaved edits pending." if dirty else ""
@@ -616,6 +799,7 @@ class PhotoInspectorDialog(QDialog):
             self.face_editor_summary_label.setText(
                 f"No saved faces for {Path(image_path).name}. Use Auto-Scan This Image or Draw Face Box to add one.{suffix}"
             )
+        self._load_face_thumbnail_icons_async(image_path, drafts, request_id=self._request_id)
         self._update_selected_face_details(image_path)
 
     @staticmethod
@@ -730,13 +914,27 @@ class PhotoInspectorDialog(QDialog):
         selected = self._selected_face_draft_indexes()
         drafts = list(self._face_drafts_by_path.get(image_path, []))
         if not selected:
+            self.face_name_selected_button.setEnabled(False)
+            self.face_rename_selected_button.setEnabled(False)
+            self.face_unlabel_selected_button.setEnabled(False)
             self.face_selected_details_label.setText("Selected face: none")
             return
         first_index = int(selected[0])
         if first_index < 0 or first_index >= len(drafts):
+            self.face_name_selected_button.setEnabled(False)
+            self.face_rename_selected_button.setEnabled(False)
+            self.face_unlabel_selected_button.setEnabled(False)
             self.face_selected_details_label.setText("Selected face: none")
             return
         draft = drafts[first_index]
+        selected_drafts = [drafts[index] for index in selected if 0 <= index < len(drafts)]
+        saved_drafts = [item for item in selected_drafts if int(item.face_index) >= 0]
+        named_drafts = [item for item in saved_drafts if str(item.person_name or "").strip()]
+        self.face_name_selected_button.setEnabled(bool(saved_drafts))
+        self.face_rename_selected_button.setEnabled(bool(named_drafts))
+        self.face_unlabel_selected_button.setEnabled(bool(named_drafts))
+        if len(selected_drafts) == 1 and str(draft.person_name or "").strip():
+            self.face_name_input.setText(str(draft.person_name))
         source = str(draft.source or "manual").replace("_", " ")
         label = draft.person_name or "Unlabeled"
         self.face_selected_details_label.setText(
@@ -754,6 +952,7 @@ class PhotoInspectorDialog(QDialog):
             self._select_face_row(int(index))
             selection_model.blockSignals(False)
         self.preview_view.set_selected_face_indexes([int(index)])
+        self._update_selected_face_details(self._current_editable_path())
 
     def _update_draw_button_text(self) -> None:
         if self.preview_view.draw_mode_enabled():
@@ -1000,28 +1199,88 @@ class PhotoInspectorDialog(QDialog):
             f"{int(metrics.get('review', 0))} face(s) still need manual review."
         )
 
-    def _make_face_thumbnail_icon(self, image_path: str, bbox: tuple[int, int, int, int]) -> QIcon:
-        thumb_size = 72
-        try:
-            with Image.open(image_path) as image:
-                rgb = ImageOps.exif_transpose(image).convert("RGB")
+    def _load_face_thumbnail_icons_async(
+        self,
+        image_path: str,
+        drafts: list[EditableFaceDraft],
+        *,
+        request_id: int,
+    ) -> None:
+        """Decode face crops in a worker so face-list refresh never blocks paint."""
+        missing = [
+            tuple(draft.bbox)
+            for draft in drafts
+            if (image_path, tuple(draft.bbox)) not in self._face_thumbnail_cache
+        ]
+        if not missing:
+            return
+        signature = (int(request_id), str(image_path), tuple(missing))
+        if signature == self._face_thumbnail_request_signature:
+            return
+        if self._face_thumbnail_job is not None:
+            self._retain_async_refs(self._face_thumbnail_job, self._face_thumbnail_thread)
+            self._face_thumbnail_job.cancel()
+        self._face_thumbnail_request_signature = signature
+
+        def _run(progress, cancel_check):
+            progress(-1, "Loading face-region previews…")
+            reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if image.isNull():
+                raise ValueError(reader.errorString() or "Could not decode face-region previews")
+            thumb_size = 72
+            results: list[tuple[tuple[int, int, int, int], QImage]] = []
+            for index, bbox in enumerate(missing, start=1):
+                raise_if_cancelled(cancel_check)
                 x1, y1, x2, y2 = [int(value) for value in bbox]
                 pad_x = max(8, (x2 - x1) // 6)
                 pad_y = max(8, (y2 - y1) // 6)
-                crop = rgb.crop(
-                    (
-                        max(0, x1 - pad_x),
-                        max(0, y1 - pad_y),
-                        min(rgb.width, x2 + pad_x),
-                        min(rgb.height, y2 + pad_y),
-                    )
+                left = max(0, x1 - pad_x)
+                top = max(0, y1 - pad_y)
+                right = min(image.width(), x2 + pad_x)
+                bottom = min(image.height(), y2 + pad_y)
+                if right <= left or bottom <= top:
+                    continue
+                crop = image.copy(QRect(left, top, right - left, bottom - top))
+                scaled = crop.scaled(
+                    thumb_size,
+                    thumb_size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
-                crop.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
-                canvas = Image.new("RGB", (thumb_size, thumb_size), (18, 18, 18))
-                canvas.paste(crop, ((thumb_size - crop.width) // 2, (thumb_size - crop.height) // 2))
-                return QIcon(QPixmap.fromImage(ImageQt(canvas)))
-        except Exception:
-            return QIcon()
+                canvas = QImage(thumb_size, thumb_size, QImage.Format.Format_ARGB32_Premultiplied)
+                canvas.fill(Qt.GlobalColor.black)
+                painter = QPainter(canvas)
+                painter.drawImage((thumb_size - scaled.width()) // 2, (thumb_size - scaled.height()) // 2, scaled)
+                painter.end()
+                results.append((bbox, canvas))
+                progress(int(index * 100 / max(1, len(missing))), f"Loading face-region previews {index}/{len(missing)}")
+            return results
+
+        job = AsyncJob(_run)
+        self._track_operation_job(job, "Loading face-region previews", foreground=False)
+
+        def _completed(payload: object) -> None:
+            if request_id != self._request_id or image_path != self._current_editable_path():
+                return
+            for bbox, image in list(payload or []):
+                if isinstance(image, QImage) and not image.isNull():
+                    self._face_thumbnail_cache[(image_path, tuple(bbox))] = QIcon(QPixmap.fromImage(image))
+            for row, draft in enumerate(list(self._face_drafts_by_path.get(image_path, []))):
+                icon = self._face_thumbnail_cache.get((image_path, tuple(draft.bbox)))
+                if icon is not None:
+                    self.image_faces_model.set_item_icon(row, icon)
+
+        job.completed.connect(_completed)
+        self._face_thumbnail_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._face_thumbnail_thread = thread
 
     def _set_face_edit_busy(self, busy: bool, message: str = "") -> None:
         for button in [
@@ -1051,6 +1310,7 @@ class PhotoInspectorDialog(QDialog):
                 self._face_edit_thread = None
                 self._face_edit_job = None
         job = AsyncJob(fn)
+        self._track_operation_job(job, label, foreground=True)
 
         def _on_completed(result) -> None:
             self._set_face_edit_busy(False)
@@ -1113,6 +1373,143 @@ class PhotoInspectorDialog(QDialog):
 
         self._start_face_edit_job("Auto-scan current image", _run, _done)
 
+    def _selected_saved_face_refs(self, *, person_name: str = "") -> list[tuple[str, int]]:
+        image_path = self._current_editable_path()
+        drafts = list(self._face_drafts_by_path.get(image_path, []))
+        source = str(person_name or "").strip()
+        refs: list[tuple[str, int]] = []
+        for index in self._selected_face_draft_indexes():
+            if not (0 <= index < len(drafts)):
+                continue
+            draft = drafts[index]
+            if int(draft.face_index) < 0:
+                continue
+            if source and str(draft.person_name or "").strip() != source:
+                continue
+            refs.append((image_path, int(draft.face_index)))
+        return list(dict.fromkeys(refs))
+
+    def _refresh_saved_face_drafts(self, image_path: str) -> None:
+        """Refresh persisted regions without performing database I/O in Qt's event loop."""
+        self._face_editor_dirty_paths.discard(image_path)
+        self._load_indexed_face_drafts_async(
+            str(image_path),
+            dict(self._current_context),
+            request_id=self._request_id,
+        )
+
+    def _name_selected_faces(self) -> None:
+        refs = self._selected_saved_face_refs()
+        if not refs or self.face_service is None:
+            errorBox("No saved face region", "Save a detected or drawn face box, then select it to name it.")
+            return
+        name = self.face_name_input.text().strip()
+        if not name:
+            name, accepted = QInputDialog.getText(self, "Name selected face regions", "Identity name")
+            name = str(name or "").strip()
+            if not accepted or not name:
+                return
+        image_path = self._current_editable_path()
+
+        def _run(progress, cancel_check):
+            _ = cancel_check
+            progress(-1, "Writing selected face-region names...")
+            label_with_metadata = getattr(self.face_service, "label_indexed_faces_with_metadata", None)
+            if callable(label_with_metadata):
+                return label_with_metadata(name, refs, source="photo_inspector")
+            return self.face_service.label_indexed_faces_immediately(name, refs, source="photo_inspector")
+
+        def _done(result) -> None:
+            person = getattr(result, "person", result)
+            if person is None:
+                self.face_editor_summary_label.setText("Could not write the selected face-region name.")
+                return
+            self.face_name_input.setText(str(person.person_name))
+            self._refresh_saved_face_drafts(image_path)
+            self.face_editor_summary_label.setText(f"Saved '{person.person_name}' on {len(getattr(result, 'affected_refs', refs) or refs)} face region(s).")
+            if callable(self.face_edit_saved_callback):
+                self.face_edit_saved_callback(image_path)
+
+        self._start_face_edit_job("Name selected face regions", _run, _done)
+
+    def _choose_selected_source_name(self, *, title: str) -> str:
+        image_path = self._current_editable_path()
+        drafts = list(self._face_drafts_by_path.get(image_path, []))
+        names = sorted(
+            {
+                str(drafts[index].person_name or "").strip()
+                for index in self._selected_face_draft_indexes()
+                if 0 <= index < len(drafts) and str(drafts[index].person_name or "").strip()
+            },
+            key=str.casefold,
+        )
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        name, accepted = QInputDialog.getItem(self, title, "Current face-region name", names, 0, False)
+        return str(name or "").strip() if accepted else ""
+
+    def _rename_selected_faces(self) -> None:
+        if not self._selected_saved_face_refs() or self.face_service is None:
+            return
+        source = self._choose_selected_source_name(title="Rename selected face regions")
+        if not source:
+            return
+        refs = self._selected_saved_face_refs(person_name=source)
+        if not refs:
+            return
+        target, accepted = QInputDialog.getText(self, "Rename selected face regions", f"New name for {source}")
+        target = str(target or "").strip()
+        if not accepted or not target or target == source:
+            return
+        image_path = self._current_editable_path()
+
+        def _run(progress, cancel_check):
+            _ = cancel_check
+            progress(-1, "Renaming selected face regions...")
+            label_with_metadata = getattr(self.face_service, "label_indexed_faces_with_metadata", None)
+            if callable(label_with_metadata):
+                return label_with_metadata(target, refs, source="photo_inspector_rename")
+            return self.face_service.label_indexed_faces_immediately(target, refs, source="photo_inspector_rename")
+
+        def _done(_result) -> None:
+            self.face_name_input.setText(target)
+            self._refresh_saved_face_drafts(image_path)
+            self.face_editor_summary_label.setText(f"Renamed selected '{source}' face region(s) to '{target}'.")
+            if callable(self.face_edit_saved_callback):
+                self.face_edit_saved_callback(image_path)
+
+        self._start_face_edit_job("Rename selected face regions", _run, _done)
+
+    def _unlabel_selected_faces(self) -> None:
+        if not self._selected_saved_face_refs() or self.face_service is None:
+            return
+        source = self._choose_selected_source_name(title="Unlabel selected face regions")
+        if not source:
+            return
+        refs = self._selected_saved_face_refs(person_name=source)
+        if not refs:
+            return
+        if not confirmBox("Unlabel selected face regions", f"Remove '{source}' only from the selected face region(s)?", parent=self):
+            return
+        image_path = self._current_editable_path()
+
+        def _run(progress, cancel_check):
+            _ = cancel_check
+            progress(-1, "Unlabeling selected face regions...")
+            unlabel = getattr(self.face_service, "unlabel_indexed_faces_with_metadata", None)
+            return unlabel(refs, source="photo_inspector_unlabel") if callable(unlabel) else self.face_service.unlabel_labeled_faces_in_images(source, [image_path])
+
+        def _done(_result) -> None:
+            self.face_name_input.clear()
+            self._refresh_saved_face_drafts(image_path)
+            self.face_editor_summary_label.setText(f"Unlabeled selected '{source}' face region(s).")
+            if callable(self.face_edit_saved_callback):
+                self.face_edit_saved_callback(image_path)
+
+        self._start_face_edit_job("Unlabel selected face regions", _run, _done)
+
     def _save_face_edits(self) -> None:
         image_path = self._current_editable_path()
         if not image_path or self.face_service is None:
@@ -1171,6 +1568,9 @@ class PhotoInspectorDialog(QDialog):
         active_pairs = [
             (self._active_job, self._active_thread),
             (self._preview_job, self._preview_thread),
+            (self._face_draft_job, self._face_draft_thread),
+            (self._face_thumbnail_job, self._face_thumbnail_thread),
+            (self._prefetch_job, self._prefetch_thread),
             (self._face_edit_job, self._face_edit_thread),
             *self._retained_async_refs,
         ]
@@ -1191,6 +1591,13 @@ class PhotoInspectorDialog(QDialog):
         self._active_thread = None
         self._preview_job = None
         self._preview_thread = None
+        self._face_draft_job = None
+        self._face_draft_thread = None
+        self._face_thumbnail_job = None
+        self._face_thumbnail_thread = None
+        self._face_thumbnail_request_signature = None
+        self._prefetch_job = None
+        self._prefetch_thread = None
         self._face_edit_job = None
         self._face_edit_thread = None
         if ready_to_close:
@@ -1204,17 +1611,35 @@ class PhotoInspectorDialog(QDialog):
         self._load_preview(self._image_paths[self._index], request_id=self._request_id, full_res=True)
 
     def _prefetch_neighbors(self) -> None:
-        # Keep this lightweight: touching the filesystem cache through QImageReader is enough.
         if not self._image_paths:
             return
-        neighbor_indexes = [idx for idx in {self._index - 1, self._index + 1} if 0 <= idx < len(self._image_paths)]
-        for neighbor_index in neighbor_indexes:
-            try:
-                reader = QImageReader(self._image_paths[neighbor_index])
+        paths = [
+            self._image_paths[index]
+            for index in {self._index - 1, self._index + 1}
+            if 0 <= index < len(self._image_paths)
+        ]
+        if not paths:
+            return
+
+        def _run(progress, cancel_check):
+            progress(-1, "Prefetching adjacent photos…")
+            for path in paths:
+                raise_if_cancelled(cancel_check)
+                reader = QImageReader(path)
                 reader.setAutoTransform(True)
                 _ = reader.size()
-            except Exception:
-                pass
+            return None
+
+        job = AsyncJob(_run)
+        self._track_operation_job(job, "Prefetching adjacent photos", foreground=False)
+        self._prefetch_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._prefetch_thread = thread
 
     def closeEvent(self, event) -> None:
         if not self.shutdown_jobs():
@@ -1266,6 +1691,62 @@ class PhotoInspectorDialog(QDialog):
 
     def _set_state_text(self, message: str) -> None:
         self.state_label.setText(message)
+
+    def _track_operation_job(self, job: AsyncJob, label: str, *, foreground: bool) -> None:
+        """Expose every inspector worker locally and in the shared Jobs panel."""
+        if self.job_manager is not None:
+            self.job_manager.bind_async_job(
+                job,
+                label,
+                origin="Photo Inspector",
+                foreground=foreground,
+            )
+        self._progress_sequence += 1
+        key = id(job)
+        self._progress_jobs[key] = {
+            "label": str(label),
+            "foreground": bool(foreground),
+            "progress": None,
+            "text": f"{label}…",
+            "sequence": self._progress_sequence,
+        }
+        job.progress.connect(lambda value, text, key=key: self._update_operation_progress(key, value, text))
+        job.completed.connect(lambda _result, key=key: self._finish_operation_progress(key))
+        job.failed.connect(lambda _message, key=key: self._finish_operation_progress(key))
+        job.cancelled.connect(lambda key=key: self._finish_operation_progress(key))
+        self._refresh_operation_progress()
+
+    def _update_operation_progress(self, key: int, value: int, text: str) -> None:
+        state = self._progress_jobs.get(int(key))
+        if state is None:
+            return
+        state["progress"] = None if int(value) < 0 else max(0, min(100, int(value)))
+        if text:
+            state["text"] = str(text)
+        self._refresh_operation_progress()
+
+    def _finish_operation_progress(self, key: int) -> None:
+        self._progress_jobs.pop(int(key), None)
+        self._refresh_operation_progress()
+
+    def _refresh_operation_progress(self) -> None:
+        if not self._progress_jobs:
+            self.operation_progress_bar.hide()
+            return
+        state = max(
+            self._progress_jobs.values(),
+            key=lambda item: (bool(item["foreground"]), int(item["sequence"])),
+        )
+        progress = state.get("progress")
+        if progress is None:
+            self.operation_progress_bar.setRange(0, 0)
+        else:
+            self.operation_progress_bar.setRange(0, 100)
+            self.operation_progress_bar.setValue(int(progress))
+        self.operation_progress_bar.show()
+        text = str(state.get("text") or "")
+        if text:
+            self._set_state_text(text)
 
     def _set_loading_state(self, *, face_message: str = "") -> None:
         if self._display_mode == "basic":

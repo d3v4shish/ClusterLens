@@ -7,6 +7,7 @@ from PyQt6.QtGui import QFileSystemModel
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -341,7 +342,7 @@ class ClusteringOptionsPane(QWidget):
         self.preset_combo.addItem("High Quality", "high_quality")
         self.preset_combo.addItem("Custom", "custom")
         self.preset_combo.setCurrentIndex(self.preset_combo.findData("balanced"))
-        self.preset_summary = QLabel("SigLIP with HDBSCAN for natural photo groups and outliers.")
+        self.preset_summary = QLabel("SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.")
         self.preset_summary.setWordWrap(True)
         preset_layout.addRow("Preset", self.preset_combo)
         preset_layout.addRow(self.preset_summary)
@@ -386,6 +387,40 @@ class ClusteringOptionsPane(QWidget):
             self.backend_checkboxes[backend] = checkbox
             backend_layout.addWidget(checkbox, index // 2, index % 2)
         technical_layout.addWidget(backend_group)
+
+        self.hdbscan_options_group = QGroupBox("HDBSCAN tuning")
+        self.hdbscan_options_group.setToolTip(
+            "Tune density clustering. These values are used by CUDA cuML when available and by native CPU HDBSCAN otherwise."
+        )
+        hdbscan_layout = QFormLayout(self.hdbscan_options_group)
+        self.hdbscan_min_cluster_size_spin = QSpinBox()
+        self.hdbscan_min_cluster_size_spin.setRange(2, 10_000)
+        self.hdbscan_min_cluster_size_spin.setValue(2)
+        self.hdbscan_min_cluster_size_spin.setToolTip("Smallest dense group that HDBSCAN may keep as a cluster.")
+        hdbscan_layout.addRow("Minimum cluster size", self.hdbscan_min_cluster_size_spin)
+
+        self.hdbscan_min_samples_spin = QSpinBox()
+        self.hdbscan_min_samples_spin.setRange(0, 10_000)
+        self.hdbscan_min_samples_spin.setSpecialValueText("Auto")
+        self.hdbscan_min_samples_spin.setValue(0)
+        self.hdbscan_min_samples_spin.setToolTip("Use Auto to let HDBSCAN derive the density threshold from minimum cluster size.")
+        hdbscan_layout.addRow("Minimum samples", self.hdbscan_min_samples_spin)
+
+        self.hdbscan_cluster_selection_epsilon_spin = QDoubleSpinBox()
+        self.hdbscan_cluster_selection_epsilon_spin.setRange(0.0, 2.0)
+        self.hdbscan_cluster_selection_epsilon_spin.setDecimals(3)
+        self.hdbscan_cluster_selection_epsilon_spin.setSingleStep(0.01)
+        self.hdbscan_cluster_selection_epsilon_spin.setValue(0.0)
+        self.hdbscan_cluster_selection_epsilon_spin.setToolTip("Merge clusters separated by less than this distance; zero disables extra merging.")
+        hdbscan_layout.addRow("Merge epsilon", self.hdbscan_cluster_selection_epsilon_spin)
+
+        self.hdbscan_allow_single_cluster_checkbox = QCheckBox("Allow one cluster")
+        self.hdbscan_allow_single_cluster_checkbox.setToolTip("Permit HDBSCAN to return one overall cluster when the density structure supports it.")
+        hdbscan_layout.addRow(self.hdbscan_allow_single_cluster_checkbox)
+        technical_layout.addWidget(self.hdbscan_options_group)
+        hdbscan_checkbox = self.backend_checkboxes.get("hdbscan")
+        if hdbscan_checkbox is not None:
+            hdbscan_checkbox.toggled.connect(self._refresh_hdbscan_controls)
 
         options_group = QGroupBox("Options")
         options_layout = QFormLayout(options_group)
@@ -493,6 +528,10 @@ class ClusteringOptionsPane(QWidget):
             self.embedding_cache_lookup_checkbox,
             self.tag_filter_field,
             self.tag_match_combobox,
+            self.hdbscan_min_cluster_size_spin,
+            self.hdbscan_min_samples_spin,
+            self.hdbscan_cluster_selection_epsilon_spin,
+            self.hdbscan_allow_single_cluster_checkbox,
         ):
             signal = getattr(widget, "textChanged", None) or getattr(widget, "valueChanged", None) or getattr(widget, "toggled", None) or getattr(widget, "currentIndexChanged", None)
             if signal is not None:
@@ -501,6 +540,7 @@ class ClusteringOptionsPane(QWidget):
             self._apply_preset("balanced")
         else:
             self.technical_panel.show()
+        self._refresh_hdbscan_controls()
 
     def _on_preset_changed(self, _index: int) -> None:
         preset = str(self.preset_combo.currentData() or "custom")
@@ -518,11 +558,15 @@ class ClusteringOptionsPane(QWidget):
         self.technical_panel.show()
         self.preset_summary.setText("Custom settings. Review model, grouping, cache, and runtime tradeoffs below.")
 
+    def _refresh_hdbscan_controls(self, *_args) -> None:
+        checkbox = self.backend_checkboxes.get("hdbscan")
+        self.hdbscan_options_group.setVisible(bool(checkbox and checkbox.isChecked()))
+
     def _apply_preset(self, preset: str) -> None:
         preset = str(preset or "custom")
         summaries = {
             "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "SigLIP with HDBSCAN for natural photo groups and outliers.",
+            "balanced": "SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.",
             "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
             "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
         }
@@ -540,11 +584,11 @@ class ClusteringOptionsPane(QWidget):
                 "outlier": "assign", "clusters": 8, "onnx": True,
             },
             "balanced": {
-                "models": {"siglip"}, "backends": {"hdbscan"}, "modes": {"semantic"},
+                "models": {"siglip"}, "backends": {"cosine-kmeans"}, "modes": {"semantic"},
                 "outlier": "isolate", "clusters": 12, "onnx": False,
             },
             "high_quality": {
-                "models": {"dinov2_base", "clip"}, "backends": {"hdbscan", "graph"}, "modes": {"semantic", "cosine"},
+                "models": {"dinov2_base", "clip"}, "backends": {"cosine-kmeans", "graph"}, "modes": {"semantic", "cosine"},
                 "outlier": "isolate", "clusters": 16, "onnx": False,
             },
         }
@@ -564,8 +608,13 @@ class ClusteringOptionsPane(QWidget):
             self.onnx_checkbox.setChecked(bool(config["onnx"]))
             self.result_cache_checkbox.setChecked(True)
             self.embedding_cache_lookup_checkbox.setChecked(True)
+            self.hdbscan_min_cluster_size_spin.setValue(2)
+            self.hdbscan_min_samples_spin.setValue(0)
+            self.hdbscan_cluster_selection_epsilon_spin.setValue(0.0)
+            self.hdbscan_allow_single_cluster_checkbox.setChecked(False)
         finally:
             self._applying_preset = False
+        self._refresh_hdbscan_controls()
 
     def set_running(self, running: bool) -> None:
         self.cluster_button.setEnabled(not running)
@@ -578,6 +627,19 @@ class ClusteringOptionsPane(QWidget):
     def selected_clustering_backends(self) -> list[str]:
         selected = [backend for backend, checkbox in self.backend_checkboxes.items() if checkbox.isChecked()]
         return normalize_clustering_backends(selected, scope=self.option_scope)
+
+    def backend_options_by_backend(self) -> dict[str, dict[str, object]]:
+        hdbscan_checkbox = self.backend_checkboxes.get("hdbscan")
+        if hdbscan_checkbox is None or not hdbscan_checkbox.isChecked():
+            return {}
+        return {
+            "hdbscan": {
+                "min_cluster_size": int(self.hdbscan_min_cluster_size_spin.value()),
+                "min_samples": int(self.hdbscan_min_samples_spin.value()),
+                "cluster_selection_epsilon": float(self.hdbscan_cluster_selection_epsilon_spin.value()),
+                "allow_single_cluster": bool(self.hdbscan_allow_single_cluster_checkbox.isChecked()),
+            }
+        }
 
     def selected_embedding_models(self) -> list[str]:
         selected = [name for name, checkbox in self.embedding_checkboxes.items() if checkbox.isChecked()]
@@ -622,6 +684,7 @@ class ClusteringOptionsPane(QWidget):
             "use_embedding_cache_lookup": bool(self.embedding_cache_lookup_checkbox.isChecked()),
             "tag_filter": self.tag_filter_field.text().strip(),
             "tag_match": self.selected_tag_match_mode(),
+            "backend_options_by_backend": self.backend_options_by_backend(),
         }
 
     def apply_state(self, state: dict[str, object] | None) -> None:
@@ -651,6 +714,16 @@ class ClusteringOptionsPane(QWidget):
         )
         for name, checkbox in self.backend_checkboxes.items():
             checkbox.setChecked(name in clustering_backends)
+        raw_backend_options = state.get("backend_options_by_backend", {})
+        backend_options = dict(raw_backend_options) if isinstance(raw_backend_options, dict) else {}
+        raw_hdbscan_options = backend_options.get("hdbscan", {})
+        hdbscan_options = dict(raw_hdbscan_options) if isinstance(raw_hdbscan_options, dict) else {}
+        self.hdbscan_min_cluster_size_spin.setValue(max(2, int(hdbscan_options.get("min_cluster_size", 2) or 2)))
+        self.hdbscan_min_samples_spin.setValue(max(0, int(hdbscan_options.get("min_samples", 0) or 0)))
+        self.hdbscan_cluster_selection_epsilon_spin.setValue(
+            max(0.0, float(hdbscan_options.get("cluster_selection_epsilon", 0.0) or 0.0))
+        )
+        self.hdbscan_allow_single_cluster_checkbox.setChecked(bool(hdbscan_options.get("allow_single_cluster", False)))
         modes = normalize_similarity_modes(
             state.get("similarity_modes") if isinstance(state.get("similarity_modes"), list) else None,
             str(state.get("similarity_mode") or "") if state.get("similarity_mode") else None,
@@ -672,10 +745,11 @@ class ClusteringOptionsPane(QWidget):
         self.tag_filter_field.setText(str(state.get("tag_filter") or ""))
         self.tag_match_combobox.setCurrentText(str(state.get("tag_match") or "Any"))
         self._applying_preset = False
-        self.technical_panel.setVisible(preset == "custom" or self.option_scope != "production")
+        self.technical_panel.setVisible(True)
+        self._refresh_hdbscan_controls()
         self.preset_summary.setText({
             "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "SigLIP with HDBSCAN for natural photo groups and outliers.",
+            "balanced": "SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.",
             "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
             "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
         }.get(preset, "Custom settings."))
@@ -715,6 +789,7 @@ class ClusteringOptionsPane(QWidget):
             "embedding_backend",
             "amp_enabled",
             "clustering_backends",
+            "compute_fallback_reason",
             "backend_cache_hits",
             "cluster_quality_score",
             "outlier_count",

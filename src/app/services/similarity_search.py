@@ -12,6 +12,7 @@ from infra.cancel import raise_if_cancelled
 from infra.atomic_io import atomic_write_text
 from infra.settings import get_settings
 from ml.embeddings import EmbeddingService
+from ml.vector_compute import VectorComputeService
 
 from .discovery import ImageDiscoveryService
 from .perceptual_hash import PerceptualHashIndexService
@@ -277,6 +278,10 @@ class SimilaritySearchService:
         self.embedding_service = embedding_service or EmbeddingService()
         self.phash_service = phash_service or PerceptualHashIndexService()
         self.index_service = index_service or GlobalImageIndexService()
+        model_manager = getattr(self.embedding_service, "model_manager", None)
+        self.vector_compute = VectorComputeService(getattr(model_manager, "execution_policy", None))
+        self.last_search_metrics: dict[str, object] = {}
+        self._ann_compute_metrics: dict[str, object] = {}
 
     def index_directory(
         self,
@@ -380,6 +385,8 @@ class SimilaritySearchService:
         }
 
     def search(self, request: SimilaritySearchRequest, *, cancel_check=None) -> list[SearchResult]:
+        self.last_search_metrics = {}
+        self._ann_compute_metrics = {}
         records = self.index_service.load_records(request.embedding_model, filters=request.filters)
         if request.candidate_paths:
             allowed_paths = {str(Path(path)) for path in request.candidate_paths if path}
@@ -419,12 +426,26 @@ class SimilaritySearchService:
             )
         records = kept
         records = self._ann_filter_records(records, query_embedding, request)
+        if not records:
+            return []
         query_orb = self._orb_features(request.query_image_path) if request.orb_rerank and request.query_image_path else None
+        score_matrix = np.ascontiguousarray(
+            np.stack([record.embedding for record in records], axis=0),
+            dtype=np.float32,
+        )
+        dense_scores, compute_info = self.vector_compute.cosine_scores(score_matrix, query_embedding)
+        self.last_search_metrics = {
+            "candidate_count": len(records),
+            "compute_device": compute_info.device,
+            "compute_implementation": compute_info.implementation,
+            "compute_fallback_reason": compute_info.fallback_reason,
+            **self._ann_compute_metrics,
+        }
 
         scored_results = []
-        for record in records:
+        for record, dense_score in zip(records, dense_scores):
             raise_if_cancelled(cancel_check)
-            score = float(np.dot(query_embedding, record.embedding))
+            score = float(dense_score)
             orb_score = 0.0
             if query_orb is not None:
                 orb_score = self._orb_match_score(query_orb, self._orb_features(record.image_path))
@@ -553,6 +574,16 @@ class SimilaritySearchService:
         matrix = np.asarray([record.embedding for record in records], dtype=np.float32)
         dim = matrix.shape[1]
         query = np.asarray(query_embedding, dtype=np.float32).reshape(1, -1)
+        if self.vector_compute.cuda_enabled:
+            scores, compute_info = self.vector_compute.cosine_scores(matrix, query[0])
+            limit = min(len(records), max(request.top_k * 4, request.top_k))
+            order = np.argsort(-scores, kind="stable")[:limit]
+            self._ann_compute_metrics = {
+                "ann_compute_device": compute_info.device,
+                "ann_compute_implementation": f"{compute_info.device}-exact-topk",
+                "ann_compute_fallback_reason": compute_info.fallback_reason,
+            }
+            return [records[int(index)] for index in order]
         if request.ann_backend == "hnsw":
             index = faiss.IndexHNSWFlat(dim, 32)
             index.hnsw.efConstruction = 64

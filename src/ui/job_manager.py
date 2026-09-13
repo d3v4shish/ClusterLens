@@ -19,6 +19,9 @@ class JobState:
     error: str = ""
     cache_status: str = ""
     cancel_fn: Callable[[], None] | None = None
+    origin: str = "Workspace"
+    foreground: bool = True
+    updated_at_s: float = 0.0
 
     @property
     def cancellable(self) -> bool:
@@ -41,10 +44,27 @@ class JobManager(QObject):
         self._history: list[int] = []
         self._max_history = max(10, int(max_history))
 
-    def register_job(self, label: str, cancel_fn: Callable[[], None] | None = None) -> int:
+    def register_job(
+        self,
+        label: str,
+        cancel_fn: Callable[[], None] | None = None,
+        *,
+        origin: str = "Workspace",
+        foreground: bool = True,
+    ) -> int:
+        """Register visible background work without blocking the Qt event loop."""
         job_id = self._next_id
         self._next_id += 1
-        self._jobs[job_id] = JobState(job_id=job_id, label=str(label), cancel_fn=cancel_fn, started_at_s=time())
+        now = time()
+        self._jobs[job_id] = JobState(
+            job_id=job_id,
+            label=str(label),
+            cancel_fn=cancel_fn,
+            origin=str(origin or "Workspace"),
+            foreground=bool(foreground),
+            started_at_s=now,
+            updated_at_s=now,
+        )
         self._history.append(job_id)
         self._prune_history()
         self.job_added.emit(job_id)
@@ -66,6 +86,7 @@ class JobManager(QObject):
             job.text = str(text)
         if cache_status is not None:
             job.cache_status = str(cache_status)
+        job.updated_at_s = time()
         self.job_updated.emit(job.job_id)
 
     def finish(self, job_id: int, status: str = "finished", error: str = "", cache_status: str = "") -> None:
@@ -80,6 +101,7 @@ class JobManager(QObject):
         if cache_status:
             job.cache_status = str(cache_status)
         job.finished_at_s = time()
+        job.updated_at_s = job.finished_at_s
         job.cancel_fn = None
         self.job_finished.emit(job.job_id)
         self._prune_history()
@@ -110,12 +132,56 @@ class JobManager(QObject):
                 out.append(job)
         return out
 
-    def most_recent_active(self) -> JobState | None:
-        for job_id in reversed(self._history):
-            job = self._jobs.get(job_id)
-            if job is not None and job.status in {"running", "cancelling"}:
-                return job
-        return None
+    def most_recent_active(self, *, foreground_only: bool = False) -> JobState | None:
+        active = [
+            job
+            for job in self._jobs.values()
+            if job.status in {"running", "cancelling"} and (not foreground_only or job.foreground)
+        ]
+        return max(active, key=lambda job: (job.updated_at_s, job.job_id), default=None)
+
+    def active_count(self, *, foreground_only: bool = False) -> int:
+        return len(
+            [
+                job
+                for job in self._jobs.values()
+                if job.status in {"running", "cancelling"} and (not foreground_only or job.foreground)
+            ]
+        )
+
+    def bind_async_job(
+        self,
+        job: object,
+        label: str,
+        *,
+        origin: str,
+        foreground: bool = True,
+    ) -> int:
+        """Bind an AsyncJob-like object to the job registry lifecycle."""
+        cancel_fn = getattr(job, "cancel", None)
+        job_id = self.register_job(
+            label,
+            cancel_fn=cancel_fn if callable(cancel_fn) else None,
+            origin=origin,
+            foreground=foreground,
+        )
+        progress_signal = getattr(job, "progress", None)
+        completed_signal = getattr(job, "completed", None)
+        failed_signal = getattr(job, "failed", None)
+        cancelled_signal = getattr(job, "cancelled", None)
+        if progress_signal is not None:
+            progress_signal.connect(
+                lambda value, text, job_id=job_id: self.update(job_id, progress=value, text=str(text))
+            )
+        if completed_signal is not None:
+            completed_signal.connect(lambda _result, job_id=job_id: self.finish(job_id, status="finished"))
+        if failed_signal is not None:
+            failed_signal.connect(
+                lambda message, job_id=job_id: self.finish(job_id, status="failed", error=str(message))
+            )
+        if cancelled_signal is not None:
+            cancelled_signal.connect(lambda job_id=job_id: self.finish(job_id, status="cancelled"))
+        return job_id
 
     def _prune_history(self) -> None:
         if len(self._history) <= self._max_history:

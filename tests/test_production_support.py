@@ -28,7 +28,7 @@ from apps.shared.runtime_migrations import RuntimeMigrationService
 from apps.shared.runtime_support import activate_runtime_root
 from apps.shared.support_bundle import export_support_bundle
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest
-from app.services.model_assets import sha256_file
+from app.services.model_assets import ModelDownloadPlan, sha256_file
 from infra.runtime import RuntimeCapabilities, RuntimeCapabilityService
 import infra.settings as settings_mod
 from ml.clustering import ClusteringService
@@ -123,6 +123,15 @@ class _FakeResultCacheService:
 
 class ProductionSupportTests(unittest.TestCase):
     def setUp(self):
+        self._runtime_environment_snapshot = {
+            key: os.environ.get(key)
+            for key in ("CLUSTERLENS_RUNTIME_ROOT", "IMAGE_CLUSTERING_APP_DIR")
+        }
+        # ``activate_runtime_root`` deliberately sets both process variables.
+        # Start each test clean so one temporary runtime cannot leak into the
+        # next test's fixture or into a developer's local cache.
+        os.environ.pop("CLUSTERLENS_RUNTIME_ROOT", None)
+        os.environ.pop("IMAGE_CLUSTERING_APP_DIR", None)
         store = QSettings(PRODUCTION_QSETTINGS_ORG, PRODUCTION_QSETTINGS_APP)
         self._production_settings_snapshot = {
             key: store.value(key)
@@ -150,7 +159,11 @@ class ProductionSupportTests(unittest.TestCase):
     @classmethod
     def _wait_for_storage_idle(cls, window) -> None:
         cls._wait_for(
-            lambda: window._storage_usage_thread is None and window._storage_clear_thread is None,
+            lambda: (
+                window._storage_usage_thread is None
+                and window._storage_clear_thread is None
+                and bool(getattr(window, "_startup_maintenance_complete", True))
+            ),
             timeout_s=5.0,
         )
 
@@ -170,6 +183,11 @@ class ProductionSupportTests(unittest.TestCase):
 
     def tearDown(self):
         settings_mod._RUNTIME_BASE_DIR = None
+        for key, value in self._runtime_environment_snapshot.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         store = QSettings(PRODUCTION_QSETTINGS_ORG, PRODUCTION_QSETTINGS_APP)
         store.clear()
         for key, value in self._production_settings_snapshot.items():
@@ -320,7 +338,11 @@ class ProductionSupportTests(unittest.TestCase):
         from app.services.face_model_installer import FaceModelInstaller
 
         with TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"CLUSTERLENS_RUNTIME_ROOT": tmp, "IMAGE_CLUSTERING_APP_DIR": tmp},
+                clear=False,
+            ):
                 settings_mod._RUNTIME_BASE_DIR = None
                 layout = activate_runtime_root("ProductionFaceRecoveryTest")
                 installer = FaceModelInstaller()
@@ -655,6 +677,9 @@ class ProductionSupportTests(unittest.TestCase):
             batch_size_gpu=37,
             preprocess_workers=6,
             vram_headroom_mb=1536,
+            backend_options_by_backend={
+                "hdbscan": {"min_cluster_size": 8, "min_samples": 3}
+            },
         )
         self.assertEqual(["semantic", "cosine"], request.similarity_modes)
         self.assertTrue(request.generate_cluster_meanings)
@@ -665,6 +690,10 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertEqual(37, request.as_dict()["batch_size_gpu"])
         self.assertEqual(6, request.as_dict()["preprocess_workers"])
         self.assertEqual(1536, request.as_dict()["vram_headroom_mb"])
+        self.assertEqual(
+            {"hdbscan": {"min_cluster_size": 8, "min_samples": 3}},
+            request.as_dict()["backend_options_by_backend"],
+        )
 
     def test_session_controller_releases_completed_worker_payload(self):
         with TemporaryDirectory() as tmp:
@@ -760,7 +789,23 @@ class ProductionSupportTests(unittest.TestCase):
                     cluster_meaning_model="auto",
                 )
 
-                with patch("apps.pyqt_production.app.confirmBox", return_value=False):
+                missing_dino_plan = ModelDownloadPlan(
+                    requested_models=("dino",),
+                    runnable_without_download=(),
+                    models_requiring_download=("dino",),
+                    meaning_model="auto",
+                    meaning_requires_download=True,
+                    bundled_fallback_model="fast_preview",
+                    bundled_models=("fast_preview",),
+                )
+                with (
+                    patch("apps.pyqt_production.app.confirmBox", return_value=False),
+                    patch.object(
+                        window.model_asset_service,
+                        "build_download_plan",
+                        return_value=missing_dino_plan,
+                    ),
+                ):
                     resolved = window._prepare_request_model_downloads(request)
 
                 self.assertIsNotNone(resolved)
@@ -797,7 +842,23 @@ class ProductionSupportTests(unittest.TestCase):
                     cluster_meaning_model="auto",
                 )
 
-                with patch("apps.pyqt_production.app.confirmBox", return_value=True):
+                missing_dino_plan = ModelDownloadPlan(
+                    requested_models=("dino",),
+                    runnable_without_download=(),
+                    models_requiring_download=("dino",),
+                    meaning_model=None,
+                    meaning_requires_download=False,
+                    bundled_fallback_model="fast_preview",
+                    bundled_models=("fast_preview",),
+                )
+                with (
+                    patch("apps.pyqt_production.app.confirmBox", return_value=True),
+                    patch.object(
+                        window.model_asset_service,
+                        "build_download_plan",
+                        return_value=missing_dino_plan,
+                    ),
+                ):
                     resolved = window._prepare_request_model_downloads(request)
 
                 self.assertIsNotNone(resolved)
@@ -838,7 +899,14 @@ class ProductionSupportTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             runtime_root = Path(tmp) / "runtime"
-            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": str(runtime_root)}, clear=False):
+            with patch.dict(
+                os.environ,
+                {
+                    "CLUSTERLENS_RUNTIME_ROOT": str(runtime_root),
+                    "IMAGE_CLUSTERING_APP_DIR": str(runtime_root),
+                },
+                clear=False,
+            ):
                 settings_mod._RUNTIME_BASE_DIR = None
                 layout = activate_runtime_root("ProductionOfflineModelTest")
                 asset_dir = layout.model_assets_dir / "fast_preview"
@@ -902,6 +970,14 @@ class ProductionSupportTests(unittest.TestCase):
             "infra.runtime._package_version", side_effect=lambda name: versions.get(name, "")
         ), patch("infra.runtime._module_available", return_value=False), patch(
             "infra.runtime._flash_sdp_enabled", return_value=False
+        ), patch(
+            "infra.runtime._cpu_runtime_details",
+            return_value={
+                "numpy_simd": ("AVX2",),
+                "blas": "openblas",
+                "blas_threads": 8,
+                "libjpeg_turbo": True,
+            },
         ):
             details = service.diagnostics("cuda")
 
@@ -909,6 +985,9 @@ class ProductionSupportTests(unittest.TestCase):
         remediation = "\n".join(details.get("remediation") or [])
         self.assertFalse(optional_details.get("hf_xet_installed"))
         self.assertFalse(optional_details.get("flash_sdp_enabled"))
+        self.assertEqual(("AVX2",), details["cpu_details"]["numpy_simd"])
+        self.assertEqual("openblas", details["cpu_details"]["blas"])
+        self.assertTrue(details["cpu_details"]["libjpeg_turbo"])
         self.assertIn("hf_xet", remediation)
         self.assertIn("packaged exe", remediation)
         self.assertIn("Flash SDP", remediation)
@@ -1041,6 +1120,42 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertFalse(request.generate_cluster_meanings)
         window.close()
 
+    def test_production_file_hdbscan_options_persist_and_enter_request(self):
+        from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
+        from ui.mode_panes import ClusteringOptionsPane
+
+        window = ProductionClusterApp(RUNTIME_LAYOUT)
+        pane = window.clustering_pane
+        pane.preset_combo.setCurrentIndex(pane.preset_combo.findData("custom"))
+        for checkbox in pane.backend_checkboxes.values():
+            checkbox.setChecked(False)
+        pane.backend_checkboxes["hdbscan"].setChecked(True)
+        pane.hdbscan_min_cluster_size_spin.setValue(9)
+        pane.hdbscan_min_samples_spin.setValue(4)
+        pane.hdbscan_cluster_selection_epsilon_spin.setValue(0.175)
+        pane.hdbscan_allow_single_cluster_checkbox.setChecked(True)
+        APP.processEvents()
+
+        expected = {
+            "hdbscan": {
+                "min_cluster_size": 9,
+                "min_samples": 4,
+                "cluster_selection_epsilon": 0.175,
+                "allow_single_cluster": True,
+            }
+        }
+        self.assertFalse(pane.hdbscan_options_group.isHidden())
+        self.assertEqual(expected, window._build_request().backend_options_by_backend)
+        state = pane.export_state()
+        restored = ClusteringOptionsPane(option_scope="production")
+        restored.show()
+        restored.apply_state(state)
+        APP.processEvents()
+        self.assertEqual(expected, restored.backend_options_by_backend())
+        self.assertTrue(restored.hdbscan_options_group.isVisible())
+        restored.close()
+        window.close()
+
     def test_production_shell_uses_shared_authoritative_ui_modules(self):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
@@ -1079,8 +1194,38 @@ class ProductionSupportTests(unittest.TestCase):
             ]
         ).lower()
         self.assertEqual("apps.pyqt_production.settings_dialog", ProductionSettingsDialog.__module__)
+        self.assertEqual("Rescan Available Resources", dialog.refresh_runtime_button.text())
+        self.assertIn("ONNX face indexing:", dialog.runtime_text.toPlainText())
+        self.assertIn("Cosine K-means:", dialog.runtime_text.toPlainText())
+        self.assertIn("CPU SIMD dispatch:", dialog.runtime_text.toPlainText())
+        self.assertIn("CPU BLAS:", dialog.runtime_text.toPlainText())
         self.assertNotIn("face/search", combined_text)
         self.assertNotIn("convnext", combined_text)
+        dialog.close()
+
+    def test_production_settings_resource_rescan_forces_background_runtime_refresh(self):
+        from apps.pyqt_production.app import RUNTIME_LAYOUT
+        from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
+
+        store = QSettings("ClusterLensTests", "ProductionRuntimeRescan")
+        service = RuntimeCapabilityService()
+        dialog = ProductionSettingsDialog(
+            store,
+            service,
+            runtime_layout=RUNTIME_LAYOUT,
+            support_metadata_provider=lambda: {},
+        )
+        preferred_mode = str(dialog.execution_mode.currentData() or "auto")
+        with patch.object(service, "diagnostics", wraps=service.diagnostics) as diagnostics:
+            dialog.refresh_runtime_button.click()
+            self.assertFalse(dialog.refresh_runtime_button.isEnabled())
+            self.assertFalse(dialog.verify_runtime_button.isEnabled())
+            self._wait_for(lambda: dialog._verify_thread is None, timeout_s=5.0)
+
+        diagnostics.assert_called_once_with(preferred_mode, refresh=True)
+        self.assertTrue(dialog.refresh_runtime_button.isEnabled())
+        self.assertTrue(dialog.verify_runtime_button.isEnabled())
+        self.assertIn("face indexing:", dialog.runtime_text.toPlainText().lower())
         dialog.close()
 
     def test_production_pane_hide_buttons_and_toolbar_toggles_work(self):
