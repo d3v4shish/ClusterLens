@@ -1,5 +1,19 @@
 # Benchmarks
 
+## 2026-09-14 Faces similarity-arrangement publication baseline
+
+Method: `CLUSTERLENS_BENCHMARK_PYTHON="$PWD/.venv/bin/python" bash scripts/benchmark.sh --faces-arrangement-only --faces 4096 --columns 6 --repeats 5` constructs one deterministic in-memory group of 4,096 `FaceTileItem` values, then measures the transient `SectionedFaceTileModel` publication and six-column layout. It starts an offscreen Qt application but creates no photos, thumbnails, databases, models, GPU work, or mutable application state.
+
+The samples were 24.043, 21.888, 24.562, 86.257, and 21.597 ms, with a 24.043 ms median for 684 model rows (one heading plus 683 face-grid rows). The high sample is retained rather than discarded. This is a presentation-model baseline, not a clustering or end-to-end UI-throughput claim; face embeddings/clustering remain background work and crop decoding remains demand-driven.
+
+## 2026-09-13 Gallery routing and cuML-provider validation
+
+Method: `bash scripts/benchmark.sh` after the Gallery-route, non-blocking completion, and cuML-provider changes. The command uses only its generated seeded fixtures and a temporary runtime; it does not read user photos, durable labels, or application caches. This is a reproducibility check, not a before/after throughput claim.
+
+On the current source runtime, the 20,000 × 128 cosine K-means fixture measured 585.865 ms median for CPU and 117.610 ms for the selected CUDA path. The 10,000 × 32 HDBSCAN fixture measured 394.895 ms with explicit CPU; the selected CUDA policy recorded `cuML HDBSCAN is unavailable: No module named 'cuml'`, used native CPU HDBSCAN, and measured 379.063 ms. The exact fallback is now shown in metrics, the footer, and Jobs; an explicitly selected CUDA HDBSCAN operation instead fails with remediation. The generated eight-region 1600 × 1200 JPEG XMP merge/readback measured 10.702 ms median. The remaining generated fixtures measured 42.322 ms for four thumbnail-index service opens, 34.633 ms for a global Tags inventory page, and 0.099 ms for a global tagged-photo follow-up page. Timings are host- and cache-state-specific and are not compared with earlier runs.
+
+The same checkout passed `bash scripts/build.sh` and the complete `bash scripts/test.sh` suite (517 passed, 4 environment/provider warnings) after this measurement.
+
 ## 2026-09-13 operational-safety validation
 
 This pass changed storage/release behavior, not an algorithmic hot path, so it makes no throughput claim. The release fixture is seeded synthetic PNG data with a checksum manifest; category-clear, manifest-tamper, trash collision/restart/restore, and packaged-report validation run in temporary directories only. The offscreen source smoke wrote its expected non-frozen report and exited 0.702 seconds after the window-show log; this validates smoke teardown only, not packaged startup performance. A real frozen executable and native-display/clean-VM evidence remain required for release qualification.
@@ -64,6 +78,10 @@ The expanded `scripts/verify_gpu_runtime.py` check passed with no failures. It s
 
 The dedicated CUDA 12.1 source runtime was checked on the existing Ubuntu host with an NVIDIA GeForce RTX 4090 (24,328 MiB reported), Torch 2.2.2+cu121, and ONNX Runtime GPU 1.18.0. `scripts/verify_gpu_runtime.py` passed both smoke tests: Torch CUDA matrix multiplication took 28.64 ms and ONNX selected `CUDAExecutionProvider` in 808.43 ms. A separate temporary-database check opened the installed SCRFD 10G detector and ArcFace R100 embedder; both sessions reported `CUDAExecutionProvider` first. No user photos or face-database rows were read or changed.
 
+## 2026-09-14 launcher and resource-check validation
+
+No clustering algorithm or performance setting changed in this pass. The canonical launcher now selects an already-installed dedicated CUDA source runtime without setup/download work, while the UI continues to perform its provider checks on a background worker. On the same RTX 4090 host, `scripts/verify_gpu_runtime.py` reported Torch CUDA 3.11 ms, CUDA ONNX 396.94 ms, cuML 25.10, and no failures. The verifier selected CUDA for semantic PCA, cosine K-means, sampled silhouette, graph neighbors, dense scores, and HDBSCAN. This is a local capability/smoke result, not a new end-to-end performance claim.
+
 Before the UI change, five direct capability-refresh samples took 1316.577, 0.015, 0.008, 0.006, and 0.006 ms; that path did not verify an ONNX provider. After the change, three complete `diagnostics("auto", refresh=True)` rescans took 705.585, 4.597, and 6.299 ms (6.299 ms median), and every sample selected `CUDAExecutionProvider`. The different workloads are recorded as validation evidence, not as a performance-improvement claim. The first probe includes lazy CUDA initialization; the UI therefore runs it on an `AsyncJob` worker.
 
 ## 2026-09-10 Names workspace assessment
@@ -94,3 +112,9 @@ For a release benchmark, use a fixed local photo fixture and record the fixture 
 ```
 
 Run the same fixture at least twice for cold and warm-cache measurements. Never compare results from different fixtures or unseeded/randomized workloads.
+
+## 2026-09-14 deep saved-name expansion baseline
+
+Method: `CLUSTERLENS_BENCHMARK_PYTHON="$PWD/.venv/bin/python" bash scripts/benchmark.sh --deep-face-search-only --samples 512 --dimensions 64 --repeats 2` built 512 deterministic, normalized float32 indexed-face records from NumPy seed 42. All rows were unlabelled, so the fixture exercised a complete first frontier plus its fixed-point confirmation round. It uses a temporary face database, reads no photos, models, user labels, or persistent caches.
+
+The explicit CPU control used contiguous NumPy/BLAS matrices and measured 3.541 and 3.708 ms (3.625 ms median), returning all 512 regions in two rounds. The selected source runtime used CUDA Torch matrix multiplication and measured 2.430 and 48.822 ms (25.626 ms median); the second sample includes CUDA worker/runtime variation, so this two-sample result is validation evidence rather than a throughput claim. The benchmark is now part of `scripts/benchmark.sh`; larger comparisons must use the same fixture, repeat count, and warm/cold policy.

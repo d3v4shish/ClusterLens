@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
 from app.services.clustering_options import clustering_model_names, model_label
 from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
-from app.services.face_model_installer import FaceModelInstaller
+from app.services.face_model_installer import FaceModelInstaller, face_model_runtime_root_dir
 from app.services.model_assets import TEXT_MODEL_ORDER, ModelAssetService
 from app.services.model_downloads import ModelDownloadItem
 from apps.pyqt_production.model_download_controller import ModelDownloadController
@@ -672,7 +672,10 @@ class ProductionSettingsDialog(QDialog):
         form.addRow("Support bundles", QLabel(str(self.runtime_layout.support_dir)))
         layout.addLayout(form)
 
-        note = QLabel("Runtime details, verification output, logs, and paths are provided here for troubleshooting and support.")
+        note = QLabel(
+            "Runtime details, verification output, logs, and paths are provided here for troubleshooting and support. "
+            "Resource checks only inspect installed local providers; they never download, move, or open model files."
+        )
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -682,9 +685,10 @@ class ProductionSettingsDialog(QDialog):
         open_journal = QPushButton("Open operation journal")
         export_bundle = QPushButton("Export Support Bundle")
         view_crash = QPushButton("View Last Crash")
-        self.refresh_runtime_button = QPushButton("Rescan Available Resources")
+        self.refresh_runtime_button = QPushButton("Rescan GPU Resources")
         self.refresh_runtime_button.setToolTip(
-            "Re-probe CPU, CUDA, and ONNX providers. This does not install packages or change the saved compute preference."
+            "In a background worker, check NVIDIA/Torch CUDA, CUDA ONNX for SCRFD and ArcFace, and cuML HDBSCAN. "
+            "This does not install packages, download models, or change the saved compute preference."
         )
         self.verify_runtime_button = QPushButton("Verify Runtime")
         buttons.addWidget(open_logs)
@@ -698,7 +702,7 @@ class ProductionSettingsDialog(QDialog):
 
         self.runtime_text = QTextEdit(self)
         self.runtime_text.setReadOnly(True)
-        self.runtime_text.setMaximumHeight(220)
+        self.runtime_text.setMaximumHeight(280)
         self.runtime_text.setPlaceholderText("Runtime diagnostics")
         layout.addWidget(self.runtime_text)
 
@@ -1544,15 +1548,56 @@ class ProductionSettingsDialog(QDialog):
         capabilities = details["capabilities"]
         policy = details["policy"]
         packages = details.get("packages") or {}
+        hdbscan_status = details.get("cuml_hdbscan") or {}
         optional_details = details.get("optional_details") or {}
         cpu_details = details.get("cpu_details") or {}
+        gpu_probe_policy = details.get("gpu_probe_policy")
         remediation = list(details.get("remediation") or [])
         profile = select_performance_profile(str(self.performance_profile.currentData() or "balanced"), self.system_resources)
         vector_device = "GPU (Torch CUDA)" if policy.torch_device == "cuda" else "CPU (NumPy/BLAS)"
-        hdbscan_device = "GPU (cuML)" if policy.torch_device == "cuda" and packages.get("cuml") else "CPU (native HDBSCAN)"
+        hdbscan_available = bool(hdbscan_status.get("available"))
+        hdbscan_detail = str(hdbscan_status.get("detail") or "cuML HDBSCAN was not verified.")
+        hdbscan_device = "GPU (cuML)" if policy.torch_device == "cuda" and hdbscan_available else "CPU (native HDBSCAN)"
         simd_features = ", ".join(cpu_details.get("numpy_simd") or ()) or "runtime dispatch unavailable"
+        preferred_cpu = policy.preferred_mode == "cpu"
+        torch_status = (
+            f"READY — {capabilities.cuda_device_name or 'CUDA device'} ({capabilities.cuda_total_memory_mb} MB)"
+            if capabilities.torch_cuda_available
+            else "UNAVAILABLE — this process cannot use a CUDA Torch device"
+        )
+        checked_onnx_provider = str(getattr(gpu_probe_policy, "onnx_provider", policy.onnx_provider))
+        if checked_onnx_provider == "CUDAExecutionProvider" and preferred_cpu:
+            onnx_status = "AVAILABLE — CUDAExecutionProvider was verified; CPU mode is currently active"
+        elif checked_onnx_provider == "CUDAExecutionProvider":
+            onnx_status = "READY — SCRFD and ArcFace ONNX inference will use CUDAExecutionProvider"
+        elif preferred_cpu and gpu_probe_policy is None:
+            onnx_status = "NOT CHECKED — CPU mode was selected; use Rescan GPU Resources to check it explicitly"
+        elif capabilities.has_onnx_cuda:
+            onnx_status = "UNAVAILABLE — CUDA ONNX is listed but failed provider verification"
+        else:
+            onnx_status = "UNAVAILABLE — this process has no verified CUDAExecutionProvider"
+        if capabilities.torch_cuda_available and hdbscan_available and preferred_cpu:
+            hdbscan_status_text = "AVAILABLE — cuML HDBSCAN is installed; CPU mode is currently active"
+        elif capabilities.torch_cuda_available and hdbscan_available:
+            hdbscan_status_text = "READY — cuML HDBSCAN is installed and importable"
+        elif not capabilities.torch_cuda_available:
+            hdbscan_status_text = "UNAVAILABLE — no usable CUDA Torch device"
+        else:
+            hdbscan_status_text = f"UNAVAILABLE — {hdbscan_detail}"
 
         text = [
+            "GPU acceleration checklist (local inspection; no model downloads):",
+            f"1. NVIDIA / Torch CUDA: {torch_status}",
+            f"2. CUDA ONNX for SCRFD / ArcFace: {onnx_status}",
+            f"3. cuML HDBSCAN: {hdbscan_status_text}",
+            "",
+            "Current process and model artifacts:",
+            f"- Python: {sys.executable}",
+            f"- Managed face-model directory: {face_model_runtime_root_dir(self.app_settings)}",
+            f"- Clustering-model cache: {self.app_settings.cache_dir}",
+            "- SCRFD and ArcFace ONNX files are provider-neutral: CUDA uses the existing files through ONNX Runtime, not a separate GPU download.",
+            "- This rescan only probes installed packages/providers. It never downloads, moves, or opens model files or user photos.",
+            "",
             f"Preferred mode: {policy.preferred_mode}",
             f"Effective mode: {policy.effective_mode}",
             f"Precision: {self.precision_mode.currentData() or 'auto'}",
@@ -1580,6 +1625,7 @@ class ProductionSettingsDialog(QDialog):
             f"Semantic PCA: {vector_device}",
             f"Cosine K-means: {vector_device}",
             f"HDBSCAN: {hdbscan_device}",
+            f"HDBSCAN provider: {hdbscan_detail}",
             f"Cluster quality scoring: {vector_device}",
             f"Graph neighbor search: {vector_device}",
             f"Dense similarity scoring: {vector_device}",
@@ -1650,11 +1696,19 @@ class ProductionSettingsDialog(QDialog):
             return
 
         preferred_mode = str(self.execution_mode.currentData() or "auto")
+        probe_mode = "cuda" if preferred_mode == "cpu" else preferred_mode
 
         def _run(progress, cancel_check):
             raise_if_cancelled(cancel_check)
-            progress(-1, "Rescanning CPU, CUDA, and ONNX resources...")
-            result = self.runtime_service.diagnostics(preferred_mode, refresh=True)
+            progress(-1, "Checking the current process and NVIDIA / Torch CUDA (no models or photos are opened)...")
+            self.runtime_service.detect(refresh=True)
+            raise_if_cancelled(cancel_check)
+            progress(-1, "Checking CUDA ONNX provider for SCRFD and ArcFace (no model download)...")
+            gpu_probe_policy = self.runtime_service.select_policy(preferred_mode=probe_mode, refresh=True)
+            raise_if_cancelled(cancel_check)
+            progress(-1, "Checking installed cuML HDBSCAN and CPU fallback resources...")
+            result = self.runtime_service.diagnostics(preferred_mode, refresh=False)
+            result["gpu_probe_policy"] = gpu_probe_policy
             raise_if_cancelled(cancel_check)
             return result
 

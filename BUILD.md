@@ -22,21 +22,21 @@ uv run python scripts/build_pyqt_binary.py --variant cpu --recreate-venv
 uv run python scripts/build_pyqt_binary.py --variant gpu-cu121 --recreate-venv
 ```
 
-`run_app.sh` launches with the normal per-user application-data directory. On Linux, managed face models are retained in `~/.local/share/ClusterLens/cache/face_model_assets`; reusable face-model download archives are retained in `~/.local/share/ClusterLens/cache/face_model_downloads`.
+`run_app.sh` launches with the normal per-user application-data directory. On Linux, managed face models are retained in `~/.local/share/ClusterLens/cache/face_model_assets`; reusable face-model download archives are retained in `~/.local/share/ClusterLens/cache/face_model_downloads`. `run.sh` is the canonical developer launcher: it selects the already-installed CUDA source runtime when present and otherwise reports its CPU-compatible fallback. It never runs GPU setup or downloads model files.
 
 For the dedicated CUDA 12.1 source runtime on Linux x86-64 with Python 3.12:
 
 ```bash
 bash scripts/setup_gpu_runtime.sh
 .venv-gpu-cu121/bin/python scripts/verify_gpu_runtime.py
-bash scripts/run_app_gpu.sh
+bash scripts/run.sh
 ```
 
 The GPU setup is deliberately separate from `uv sync --frozen`, so CPU source environments and non-Linux platforms retain their existing dependency set. It pins RAPIDS cuML 25.10 and scikit-learn 1.7.2 while preserving Torch 2.2.2's CUDA 12.1 libraries. `uv` uses best-match resolution only across the explicitly declared PyPI, PyTorch, and NVIDIA indexes because RAPIDS' `cuda-python` wrapper is not present on the first index. The verifier must report `CUDAExecutionProvider` and successful Torch, ONNX, semantic-PCA, cosine-K-means, cuML-HDBSCAN, silhouette, graph-neighbor, and dense-similarity smoke tests before GPU indexing or clustering is used.
 
-The CPU and CUDA packages are separate artifacts. The CUDA variant requires a compatible NVIDIA driver and CUDA-enabled Torch/ONNX Runtime packages. Use the Settings runtime diagnostics to verify the effective device after installation.
+The CPU and CUDA packages are separate artifacts. The CUDA variant requires a compatible NVIDIA driver and CUDA-enabled Torch/ONNX Runtime packages. In Settings → Support, **Rescan GPU Resources** is a visible background-only checklist for Torch CUDA, CUDA ONNX, and cuML HDBSCAN. It does not install packages or download/move model files; use it to inspect the active process after hardware changes.
 
-`scripts/benchmark.sh` runs four generated, isolated fixtures: the fixed vector workload, an eight-region 1600×1200 JPEG XMP merge/readback workload, a four-service thumbnail-index recovery workload, and a 75,000-row SQLite tag-workspace query workload. They are comparable only within their own fixtures. Run only the deterministic thumbnail recovery fixture with `bash scripts/benchmark.sh --thumbnail-index-only`, or only the SQLite tag fixture with `bash scripts/benchmark.sh --tag-workspace-only`. End-to-end photo-pipeline claims still require the fixed photo fixture described in `BENCHMARKS.md`.
+`scripts/benchmark.sh` runs six generated, isolated fixtures: the fixed vector workload, an eight-region 1600×1200 JPEG XMP merge/readback workload, a four-service thumbnail-index recovery workload, a 75,000-row SQLite tag-workspace query workload, a seeded full-scope deep face-search workload, and a 4,096-face transient Faces-tab arrangement model. They are comparable only within their own fixtures. Run only the deterministic thumbnail recovery fixture with `bash scripts/benchmark.sh --thumbnail-index-only`, the SQLite tag fixture with `bash scripts/benchmark.sh --tag-workspace-only`, deep face search with `bash scripts/benchmark.sh --deep-face-search-only`, or the Faces arrangement model with `bash scripts/benchmark.sh --faces-arrangement-only`. End-to-end photo-pipeline claims still require the fixed photo fixture described in `BENCHMARKS.md`.
 
 ## Release evidence
 

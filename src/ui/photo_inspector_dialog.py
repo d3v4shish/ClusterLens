@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, pyqtSlot
 from PyQt6.QtGui import QIcon, QImage, QImageReader, QKeyEvent, QKeySequence, QPainter, QPixmap, QShortcut
-from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
 
 from app.services.face_types import EditableFaceInput
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
@@ -202,11 +202,6 @@ class PhotoInspectorDialog(QDialog):
         self.face_auto_clean_button = QPushButton("Auto-Clean This Image")
         self.face_reset_button = QPushButton("Reset")
         self.face_save_button = QPushButton("Save Face Edits")
-        self.face_name_input = QLineEdit()
-        self.face_name_input.setPlaceholderText("Identity name")
-        self.face_name_selected_button = QPushButton("Name Selected Face(s)")
-        self.face_rename_selected_button = QPushButton("Rename Selected")
-        self.face_unlabel_selected_button = QPushButton("Unlabel Selected")
         face_action_buttons = [
             self.face_rescan_button,
             self.face_draw_button,
@@ -218,20 +213,63 @@ class PhotoInspectorDialog(QDialog):
             self.face_remove_all_button,
             self.face_auto_clean_button,
             self.face_reset_button,
-            self.face_save_button,
         ]
         for button_index, button in enumerate(face_action_buttons):
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             face_action_grid.addWidget(button, button_index // 2, button_index % 2)
+        face_action_grid.setColumnStretch(0, 1)
+        face_action_grid.setColumnStretch(1, 1)
+        self.face_save_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        face_action_grid.addWidget(self.face_save_button, len(face_action_buttons) // 2, 0, 1, 2)
         face_editor_layout.addLayout(face_action_grid)
 
+        self.face_name_group = QGroupBox("Selected face regions", self.face_editor_panel)
+        self.face_name_group.setToolTip(
+            "Name, rename, or unlabel only the selected saved face regions. "
+            "Other face regions in the photo are unchanged."
+        )
+        face_name_layout = QVBoxLayout(self.face_name_group)
+        face_name_layout.setContentsMargins(8, 6, 8, 8)
+        face_name_layout.setSpacing(6)
         face_name_row = QHBoxLayout()
         face_name_row.setContentsMargins(0, 0, 0, 0)
+        face_name_label = QLabel("&Name", self.face_name_group)
+        face_name_label.setMinimumWidth(42)
+        self.face_name_input = QLineEdit(self.face_name_group)
+        self.face_name_input.setPlaceholderText("Name for the selected face region(s)")
+        self.face_name_input.setClearButtonEnabled(True)
+        self.face_name_input.setMinimumHeight(32)
+        self.face_name_input.setToolTip(
+            "Enter the name to apply to the selected saved face regions. "
+            "An explicit name is saved even when automatic matching quality is low."
+        )
+        face_name_label.setBuddy(self.face_name_input)
+        face_name_row.addWidget(face_name_label)
         face_name_row.addWidget(self.face_name_input, stretch=1)
-        face_name_row.addWidget(self.face_name_selected_button)
-        face_name_row.addWidget(self.face_rename_selected_button)
-        face_name_row.addWidget(self.face_unlabel_selected_button)
-        face_editor_layout.addLayout(face_name_row)
+        face_name_layout.addLayout(face_name_row)
+
+        self.face_name_selected_button = QPushButton("Apply Name", self.face_name_group)
+        self.face_rename_selected_button = QPushButton("Rename", self.face_name_group)
+        self.face_unlabel_selected_button = QPushButton("Unlabel", self.face_name_group)
+        self.face_name_selected_button.setAccessibleName("Name selected face regions")
+        self.face_rename_selected_button.setAccessibleName("Rename selected face regions")
+        self.face_unlabel_selected_button.setAccessibleName("Unlabel selected face regions")
+        self.face_name_selected_button.setToolTip("Write the entered name to every selected saved face region and its XMP/EXIF metadata.")
+        self.face_rename_selected_button.setToolTip("Choose a current name from the selected regions, then rename only those regions.")
+        self.face_unlabel_selected_button.setToolTip("Choose a current name from the selected regions, then remove it only from those regions.")
+        face_name_actions = QGridLayout()
+        face_name_actions.setContentsMargins(0, 0, 0, 0)
+        face_name_actions.setHorizontalSpacing(6)
+        for column in range(3):
+            face_name_actions.setColumnStretch(column, 1)
+        for column, button in enumerate(
+            (self.face_name_selected_button, self.face_rename_selected_button, self.face_unlabel_selected_button)
+        ):
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setMinimumHeight(32)
+            face_name_actions.addWidget(button, 0, column)
+        face_name_layout.addLayout(face_name_actions)
+        face_editor_layout.addWidget(self.face_name_group)
 
         self.face_editor_helper_label = QLabel(
             "Use Auto-Scan for this image only, or draw a box directly on the photo when a face was missed. "
@@ -1283,7 +1321,7 @@ class PhotoInspectorDialog(QDialog):
         self._face_thumbnail_thread = thread
 
     def _set_face_edit_busy(self, busy: bool, message: str = "") -> None:
-        for button in [
+        for control in [
             self.face_rescan_button,
             self.face_draw_button,
             self.face_remove_button,
@@ -1295,8 +1333,14 @@ class PhotoInspectorDialog(QDialog):
             self.face_auto_clean_button,
             self.face_reset_button,
             self.face_save_button,
+            self.face_name_input,
+            self.face_name_selected_button,
+            self.face_rename_selected_button,
+            self.face_unlabel_selected_button,
         ]:
-            button.setEnabled(not busy)
+            control.setEnabled(not busy)
+        if not busy:
+            self._refresh_face_editor_ui(self._current_editable_path())
         if message:
             self.face_editor_summary_label.setText(message)
 

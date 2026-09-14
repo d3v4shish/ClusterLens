@@ -730,7 +730,7 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(captured["c_contiguous"])
 
     def test_clustering_hdbscan_reports_cuda_failure_and_uses_native_cpu(self):
-        policy = ExecutionPolicy(preferred_mode="cuda", effective_mode="cuda", torch_device="cuda")
+        policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
         service = ClusteringService(execution_policy=policy)
         fallback = VectorComputeInfo(
             "cpu",
@@ -763,6 +763,20 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("cpu", metrics["compute_device"])
         self.assertEqual("hdbscan-native", metrics["compute_implementation"])
         self.assertIn("fixture failure", metrics["compute_fallback_reason"])
+
+    def test_clustering_hdbscan_blocks_unavailable_provider_when_cuda_is_explicit(self):
+        policy = ExecutionPolicy(preferred_mode="cuda", effective_mode="cuda", torch_device="cuda")
+        service = ClusteringService(execution_policy=policy)
+        fallback = VectorComputeInfo("cpu", "hdbscan-native", "cuML HDBSCAN is unavailable: fixture failure")
+
+        with patch.object(service.vector_compute, "hdbscan_labels", return_value=(None, fallback)):
+            with self.assertRaisesRegex(RuntimeError, "choose Auto/CPU"):
+                service.cluster_prepared(
+                    np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]], dtype=np.float32),
+                    2,
+                    backend="hdbscan",
+                    outlier_policy="keep",
+                )
 
     def test_clustering_service_reports_operation_level_cuda_fallback(self):
         policy = ExecutionPolicy(preferred_mode="auto", effective_mode="cuda", torch_device="cuda")
@@ -4040,6 +4054,53 @@ class ServiceTests(unittest.TestCase):
             del service
             gc.collect()
 
+    def test_deep_name_search_expands_only_through_unlabeled_faces(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed_path = root / "seed.jpg"
+            first_path = root / "first.jpg"
+            second_path = root / "second.jpg"
+            other_path = root / "other.jpg"
+            for image_path in (seed_path, first_path, second_path, other_path):
+                Image.new("RGB", (48, 48), (20, 30, 40)).save(image_path)
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+            vectors = {
+                seed_path: np.asarray([1.0, 0.0], dtype=np.float32),
+                first_path: np.asarray([0.8, 0.6], dtype=np.float32),
+                second_path: np.asarray([0.28, 0.96], dtype=np.float32),
+                other_path: np.asarray([0.0, 1.0], dtype=np.float32),
+            }
+            for image_path, embedding in vectors.items():
+                service.save_face_records(
+                    [
+                        FaceIndexRecord(
+                            image_path=str(image_path),
+                            face_index=0,
+                            face_bbox=(2, 2, 38, 38),
+                            face_confidence=0.99,
+                            embedding=embedding,
+                        )
+                    ],
+                    mtime_ns=image_path.stat().st_mtime_ns,
+                    file_size=image_path.stat().st_size,
+                    assess_quality=False,
+                )
+            service.label_indexed_faces_immediately("Alice", [(str(seed_path), 0)], similarity_threshold=0.75)
+            service.label_indexed_faces_immediately("Bob", [(str(other_path), 0)], similarity_threshold=0.75)
+
+            expansion = service.deep_search_by_person_name("Alice", min_score=0.75)
+
+            self.assertEqual({(str(seed_path), 0), (str(first_path), 0), (str(second_path), 0), (str(other_path), 0)}, {
+                (match.result.image_path, match.result.face_index) for match in expansion.matches
+            })
+            self.assertEqual({(str(first_path), 0), (str(second_path), 0)}, set(expansion.unlabeled_refs))
+            self.assertGreaterEqual(expansion.round_count, 2)
+            self.assertEqual("deep_face_identity_search", service.last_vector_compute_metrics["operation"])
+
     def test_load_person_profiles_uses_scoped_counts_without_loading_examples(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4112,6 +4173,28 @@ class ServiceTests(unittest.TestCase):
         self.assertGreaterEqual(detect.call_count, 2)
         self.assertTrue(all(call.kwargs.get("refresh") is True for call in detect.call_args_list))
         provider_probe.assert_called_once_with("CUDAExecutionProvider", refresh=True)
+
+    def test_runtime_caches_failed_cuml_hdbscan_probe_until_explicit_rescan(self):
+        import infra.runtime as runtime_module
+
+        previous = runtime_module._CUML_HDBSCAN_PROBE_CACHE
+        runtime_module._CUML_HDBSCAN_PROBE_CACHE = None
+        try:
+            with patch.object(runtime_module, "_module_available", return_value=True), patch.object(
+                runtime_module.importlib,
+                "import_module",
+                side_effect=RuntimeError("fixture cuML import failure"),
+            ) as import_module:
+                first = runtime_module.cuml_hdbscan_status()
+                second = runtime_module.cuml_hdbscan_status()
+                refreshed = runtime_module.cuml_hdbscan_status(refresh=True)
+
+            self.assertFalse(first["available"])
+            self.assertEqual(first, second)
+            self.assertIn("fixture cuML import failure", str(refreshed["detail"]))
+            self.assertEqual(2, import_module.call_count)
+        finally:
+            runtime_module._CUML_HDBSCAN_PROBE_CACHE = previous
 
     def test_runtime_policy_cpu_request_does_not_probe_cuda_provider(self):
         service = RuntimeCapabilityService()

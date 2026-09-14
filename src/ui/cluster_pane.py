@@ -834,6 +834,7 @@ class ClusterCellDelegate(QStyledItemDelegate):
 class ClusterPane(QWidget):
     cluster_selected = pyqtSignal(str, int)
     recluster_requested = pyqtSignal()
+    open_in_gallery_requested = pyqtSignal(object)
     selection_target_changed = pyqtSignal(object)
     hide_requested = pyqtSignal()
 
@@ -892,12 +893,18 @@ class ClusterPane(QWidget):
         self.recluster_button = QPushButton("Recluster")
         self.recluster_button.setEnabled(False)
         self.recluster_button.clicked.connect(self.recluster_requested.emit)
+        self.open_gallery_button = QPushButton("Open in Gallery")
+        self.open_gallery_button.setToolTip("Open the selected cluster's photo set in the top-level Gallery.")
+        self.open_gallery_button.setAccessibleName("Open selected cluster in Gallery")
+        self.open_gallery_button.setEnabled(False)
+        self.open_gallery_button.clicked.connect(self._open_selected_cluster_in_gallery)
         self.hide_button = QPushButton("Hide")
         self.hide_button.setProperty("paneToggle", True)
         self.hide_button.setFixedHeight(24)
         self.hide_button.clicked.connect(self.hide_requested.emit)
         header_row.addWidget(title_label, stretch=1)
         header_row.addWidget(build_help_inline(self.recluster_button, CLUSTER_PANE_HELP["recluster"], help_key="recluster"))
+        header_row.addWidget(self.open_gallery_button)
         header_row.addWidget(self.hide_button)
         layout.addLayout(header_row)
 
@@ -1085,12 +1092,14 @@ class ClusterPane(QWidget):
         self.shape_widget.clear()
         self.basis_label.setText(CLUSTER_BASIS_EMPTY_TEXT)
         self.recluster_button.setEnabled(False)
+        self.open_gallery_button.setEnabled(False)
         self.prev_selection = None
         if selection is not None and self._clusters_by_backend.get(selection[0], {}).get(selection[1]):
             self.prev_selection = selection
             self._grid_model.set_selected(selection)
             self._update_preview(selection[0], selection[1])
             self.recluster_button.setEnabled(True)
+            self.open_gallery_button.setEnabled(True)
             self.selection_target_changed.emit(self.current_selection_target())
             return
         self.selection_target_changed.emit(None)
@@ -1106,6 +1115,7 @@ class ClusterPane(QWidget):
             self._grid_model.set_selected(selection)
             self._update_preview(selection[0], selection[1])
             self.recluster_button.setEnabled(True)
+            self.open_gallery_button.setEnabled(True)
             self.selection_target_changed.emit(self.current_selection_target())
             return selection
         self.selection_target_changed.emit(None)
@@ -1119,6 +1129,7 @@ class ClusterPane(QWidget):
         self._grid_model.set_selected(selection)
         self._update_preview(selection[0], selection[1])
         self.recluster_button.setEnabled(True)
+        self.open_gallery_button.setEnabled(True)
         if self.prev_selection == selection:
             return
         self.prev_selection = selection
@@ -1204,6 +1215,11 @@ class ClusterPane(QWidget):
                 "cluster_tag_summary": summary.as_context() if summary is not None else {},
             },
         )
+
+    def _open_selected_cluster_in_gallery(self) -> None:
+        target = self.current_selection_target()
+        if target is not None:
+            self.open_in_gallery_requested.emit(target)
 
     def _update_hover_popup_for_index(self, index: QModelIndex) -> None:
         cell = self._grid_model.cell_at(index)

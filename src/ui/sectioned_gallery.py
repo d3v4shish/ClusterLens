@@ -457,6 +457,10 @@ class _GroupHoverPreviewPopup(QFrame):
 
 class SectionedGallery(QWidget):
     organize_requested = pyqtSignal()
+    analyze_requested = pyqtSignal(list)
+    review_faces_requested = pyqtSignal(list)
+    return_to_folder_requested = pyqtSignal()
+    return_to_source_requested = pyqtSignal(str)
     paths_removed = pyqtSignal(list)
     metadata_changed = pyqtSignal(list)
 
@@ -480,6 +484,9 @@ class SectionedGallery(QWidget):
         self._generation = 0
         self._read_only = False
         self.face_service_provider = None
+        # A routed gallery can retain the exact source context that opened a
+        # photo without requiring the source workspace to stay visible.
+        self.inspector_context_provider = None
         # Optional production-shell hook: (image_path, on_ready, on_failed).
         self.face_edit_request_handler = None
         self.face_edit_saved_callback = None
@@ -500,6 +507,10 @@ class SectionedGallery(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         toolbar = QHBoxLayout()
+        self.route_label = QLabel("")
+        self.route_label.setProperty("role", "section")
+        self.route_label.setAccessibleName("Current photo set")
+        self.route_label.hide()
         self.status_label = QLabel("Choose a folder to show its photos.")
         self.status_label.setWordWrap(True)
         self.progress_bar = QProgressBar(self)
@@ -509,14 +520,35 @@ class SectionedGallery(QWidget):
         self.organize_button = QPushButton("Organize")
         self.organize_button.setToolTip("Arrange this folder using the current Clustering settings.")
         self.organize_button.clicked.connect(self.organize_requested.emit)
+        self.analyze_button = QPushButton("Analyze in Clustering")
+        self.analyze_button.setToolTip("Use this explicit photo set as the input to Clustering.")
+        self.analyze_button.setAccessibleName("Analyze current photo set in Clustering")
+        self.analyze_button.clicked.connect(lambda: self.analyze_requested.emit(self.selected_or_all_paths()))
+        self.review_faces_button = QPushButton("Review Faces")
+        self.review_faces_button.setToolTip("Open this explicit photo set in Faces. Detection starts only after you choose Detect Faces.")
+        self.review_faces_button.setAccessibleName("Review current photo set in Faces")
+        self.review_faces_button.clicked.connect(lambda: self.review_faces_requested.emit(self.selected_or_all_paths()))
+        self.back_to_folder_button = QPushButton("Back to Folder Photos")
+        self.back_to_folder_button.setToolTip("Return to all photos in the selected folder.")
+        self.back_to_folder_button.setAccessibleName("Return to folder photos")
+        self.back_to_folder_button.clicked.connect(self.return_to_folder_requested.emit)
+        self.return_to_source_button = QPushButton("Return to Source")
+        self.return_to_source_button.setToolTip("Return to the workspace that opened this photo set.")
+        self.return_to_source_button.setAccessibleName("Return to source workspace")
+        self.return_to_source_button.clicked.connect(self._emit_return_to_source)
         self.expand_all_button = QPushButton("Expand all")
         self.expand_all_button.setToolTip("Show every photo group.")
         self.collapse_all_button = QPushButton("Collapse all")
         self.collapse_all_button.setToolTip("Hide the photos in every group.")
         self.expand_all_button.clicked.connect(self.expand_all_sections)
         self.collapse_all_button.clicked.connect(self.collapse_all_sections)
+        toolbar.addWidget(self.route_label)
         toolbar.addWidget(self.status_label, stretch=1)
         toolbar.addWidget(self.progress_bar)
+        toolbar.addWidget(self.analyze_button)
+        toolbar.addWidget(self.review_faces_button)
+        toolbar.addWidget(self.back_to_folder_button)
+        toolbar.addWidget(self.return_to_source_button)
         toolbar.addWidget(self.expand_all_button)
         toolbar.addWidget(self.collapse_all_button)
         toolbar.addWidget(self.organize_button)
@@ -543,6 +575,8 @@ class SectionedGallery(QWidget):
         self.group_actions.setMenu(menu)
         self.group_bar.hide()
         layout.addWidget(self.group_bar)
+
+        self.set_photo_set_route()
 
         self.table = _SectionedTable(self)
         self.table.setModel(self._model)
@@ -574,6 +608,40 @@ class SectionedGallery(QWidget):
         """Route visible gallery work to the shared Jobs surface."""
         self._job_manager = job_manager
         self._actions.job_manager = job_manager
+
+    def set_photo_set_route(
+        self,
+        *,
+        title: str = "",
+        source: str = "",
+        can_return: bool = False,
+        can_review_faces: bool = False,
+        can_analyze: bool = False,
+    ) -> None:
+        """Render the session-only route that owns the visible photo set."""
+
+        normalized_title = str(title or "").strip()
+        self.route_label.setText(normalized_title)
+        self.route_label.setToolTip(str(source or normalized_title))
+        self.route_label.setVisible(bool(normalized_title))
+        self.back_to_folder_button.setVisible(bool(normalized_title))
+        self.return_to_source_button.setVisible(bool(normalized_title) and bool(can_return))
+        self.return_to_source_button.setProperty("route_source", str(source or ""))
+        self.review_faces_button.setVisible(bool(can_review_faces))
+        self.analyze_button.setVisible(bool(can_analyze))
+
+    def selected_or_all_paths(self) -> list[str]:
+        """Use an explicit selection when present, otherwise the visible route."""
+
+        target = self._current_action_target()
+        if target is not None and target.paths:
+            return list(target.paths)
+        return self._model.all_paths()
+
+    def _emit_return_to_source(self) -> None:
+        source = str(self.return_to_source_button.property("route_source") or "")
+        if source:
+            self.return_to_source_requested.emit(source)
 
     def set_loading_state(self, text: str) -> None:
         """Show folder discovery before thumbnail tasks can begin."""
@@ -979,6 +1047,7 @@ class SectionedGallery(QWidget):
         dialog = PhotoInspectorDialog(
             image_paths=list(paths),
             start_index=0,
+            context_provider=self._inspector_context_for_path,
             metadata_service=self._metadata_service,
             display_mode="basic",
             face_service=self._active_face_service(),
@@ -998,6 +1067,7 @@ class SectionedGallery(QWidget):
         dialog = PhotoInspectorDialog(
             image_paths=paths,
             start_index=paths.index(path),
+            context_provider=self._inspector_context_for_path,
             metadata_service=self._metadata_service,
             display_mode="basic",
             face_service=self._active_face_service(),
@@ -1052,6 +1122,15 @@ class SectionedGallery(QWidget):
             return self.face_service_provider()
         except Exception:
             return None
+
+    def _inspector_context_for_path(self, path: str) -> dict[str, object]:
+        if not callable(self.inspector_context_provider):
+            return {}
+        try:
+            context = self.inspector_context_provider(str(path))
+        except Exception:
+            return {}
+        return dict(context) if isinstance(context, dict) else {}
 
     def _section_for_path(self, path: str) -> GallerySection | None:
         return next((section for section in self._model.sections() if path in section.paths), None)

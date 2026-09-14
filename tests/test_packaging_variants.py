@@ -132,6 +132,17 @@ def test_cuda_requirements_force_cuda_wheels_and_provider() -> None:
     assert "onnxruntime-gpu" in requirements
 
 
+def test_canonical_source_runner_prefers_existing_gpu_runtime_without_setup_work() -> None:
+    runner = (REPO_ROOT / "scripts" / "run.sh").read_text(encoding="utf-8")
+    gpu_runner = (REPO_ROOT / "scripts" / "run_app_gpu.sh").read_text(encoding="utf-8")
+
+    assert '.venv-gpu-cu121/bin/python' in runner
+    assert 'exec bash "$script_dir/run_app_gpu.sh" "$@"' in runner
+    assert "setup_gpu_runtime.sh" not in runner
+    assert "does not download models" in runner
+    assert "normal per-user model cache" in gpu_runner
+
+
 def test_update_manifest_lists_separate_cpu_and_gpu_artifacts() -> None:
     manifest = json.loads((REPO_ROOT / "packaging" / "update_manifest.example.json").read_text(encoding="utf-8"))
     variants = {str(item["variant"]) for item in manifest["artifacts"]}

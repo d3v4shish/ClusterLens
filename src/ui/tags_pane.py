@@ -31,6 +31,7 @@ class TagsPane(QWidget):
     generate_suggestions_requested = pyqtSignal()
     apply_suggestions_requested = pyqtSignal()
     metadata_changed = pyqtSignal(list)
+    open_in_gallery_requested = pyqtSignal(list, str)
 
     INVENTORY_PAGE_SIZE = 100
     PHOTO_PAGE_SIZE = 200
@@ -134,7 +135,15 @@ class TagsPane(QWidget):
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(8)
         self.photo_heading = QLabel("Choose a tag")
-        body_layout.addWidget(self.photo_heading)
+        photo_heading_row = QHBoxLayout()
+        photo_heading_row.addWidget(self.photo_heading, stretch=1)
+        self.open_in_gallery_button = QPushButton("Open in Gallery")
+        self.open_in_gallery_button.setToolTip("Open the selected tag's currently loaded photos in the top-level Gallery.")
+        self.open_in_gallery_button.setAccessibleName("Open tagged photos in Gallery")
+        self.open_in_gallery_button.setEnabled(False)
+        self.open_in_gallery_button.clicked.connect(self._open_tagged_photos_in_gallery)
+        photo_heading_row.addWidget(self.open_in_gallery_button)
+        body_layout.addLayout(photo_heading_row)
         self.gallery = GalleryPane(body)
         self.gallery.job_manager = self.job_manager
         self.gallery.image_tag_service = self.tag_service
@@ -210,6 +219,7 @@ class TagsPane(QWidget):
         self.inventory_model.set_items([])
         self.inventory_count_label.setText("0 tags")
         self.gallery.update_gallery([])
+        self.open_in_gallery_button.setEnabled(False)
         self.photo_heading.setText("Choose a tag")
         if self._inventory_loading:
             self._inventory_refresh_pending = True
@@ -358,6 +368,7 @@ class TagsPane(QWidget):
                 self._photo_total = int(page.total_count)
             self._photo_offset = offset + len(page.paths)
             self.photo_heading.setText(f"Photos tagged {tag} · {self._photo_total} photo(s)")
+            self.open_in_gallery_button.setEnabled(bool(self.gallery.images))
             self._update_controls()
 
         job = self._start_job("Loading tagged photos", _run, _done)
@@ -465,6 +476,11 @@ class TagsPane(QWidget):
     def _on_gallery_metadata_changed(self, paths: list[str]) -> None:
         self.metadata_changed.emit(list(paths))
         self.refresh()
+
+    def _open_tagged_photos_in_gallery(self) -> None:
+        paths = list(self.gallery.images)
+        if paths and self._selected_tag:
+            self.open_in_gallery_requested.emit(paths, self._selected_tag)
 
     def _start_job(self, title: str, run, done) -> AsyncJob:
         job = AsyncJob(run)

@@ -1,5 +1,62 @@
 # Current implementation plan
 
+## Faces inline unlabelled-similarity arrangement
+
+- [x] Keep similar unlabelled face regions together directly in the folder-review Faces tab without replacing the existing Face Groups workflow.
+  Contract: **Arrange Unlabelled by Similarity** explicitly submits only durable, unlabelled indexed refs from the current loaded folder review to the configured face-clustering backend in a cancellable foreground Job. The result is a session-only virtual grid with inline headings: a folder-ordered Labelled faces section when All is shown, stable Similar groups, and Other / not grouped for outliers, drafts, and excluded faces. It never writes labels; resetting, filter/review/tab changes, successful naming, cancellation, or stale completion restores/retains raw folder order.
+  Validation: focused deterministic offscreen coverage verifies named-ref exclusion, inline grouping/outlier presentation, filter invalidation, reset behavior, raw streamed review compatibility, and shared face-tile queue compatibility. Build/whitespace checks and the generated vector baseline are recorded with this pass.
+
+## All Faces labelled/unlabelled view
+
+- [x] Put an explicit labelled/unlabelled selector in the All Faces task and apply it before face-album pagination.
+  Contract: All Faces visibly offers All, Labelled, and Unlabelled views; the selected view is backed by the global face-album group query, loads only the matching category's first group page, keeps pending proposals with unlabelled faces because they have no durable name, and publishes no stale result after a rapid switch.
+  Validation: `test_face_album_pages_are_bounded_scoped_and_embedding_free` and `test_all_faces_visible_label_filter_reloads_labelled_and_unlabelled_faces` passed in the focused deterministic service/offscreen suite; compilation, whitespace, and `bash scripts/build.sh` also passed.
+
+## Inspector face naming recovery and layout
+
+- [x] Treat an explicit user name for an already indexed face region as an override of the automatic prototype-quality gate.
+  Contract: Photos, Faces, and Names can persist a user-selected face-region name and its XMP/EXIF metadata even when that region is excluded from automatic-quality workflows; automatic example selection, search, and clustering keep their configured quality filters.
+  Validation: `test_explicit_face_region_name_overrides_automatic_quality_gate` and the strict `test_prototype_quality_gate_and_auto_label_threshold_apply` passed in the focused deterministic suite.
+- [x] Reflow the Photo Inspector face-name controls into a labeled, keyboard-accessible section.
+  Contract: the name input and Name, Rename, and Unlabel actions remain fully legible in the supported right-hand inspector width; face-edit jobs disable all mutating name controls until their background work completes.
+  Validation: `test_photo_inspector_face_name_controls_are_spacious_and_busy_safe` passed offscreen at the supported 1200×800 layout.
+
+## Names similarity results
+
+- [x] Expose Find by Name + Similar inside Names as a bounded face-tile result view.
+  Contract: selecting a durable name enables an explicit background search using that name's saved prototype; the result displays face crops, score, identity state, and the exact source-face details without replacing the normal durable named-photo view.
+  Validation: deterministic offscreen coverage verifies selected-name gating, the `search_by_person_name` request, face-tile publication, stale-result suppression, and worker shutdown.
+
+## Folder-tree visibility and GPU runtime readiness
+
+- [x] Keep the Folder pane anchored at its browse root while revealing the selected directory inside the complete on-demand tree.
+  Contract: choosing a nested folder must not hide its parents or sibling folders; changing the browse root remains an explicit action and no folder is recursively enumerated on the Qt thread.
+  Validation: focused offscreen UI coverage preserves the browse-root index, selects the nested target, and expands its ancestor path.
+- [x] Make the canonical source launcher prefer the installed dedicated CUDA runtime and make its CPU fallback explicit.
+  Contract: launching does not install packages, move model files, or trigger model downloads; the CUDA and CPU launchers share the normal per-user runtime-data location.
+  Validation: shell syntax checks passed; the physical RTX 4090 verifier selected CUDA for Torch, ONNX, cuML HDBSCAN, and every vector-compute smoke operation with no failures.
+- [x] Make Support rescan progress and diagnostics explain each acceleration dependency and model-cache behavior.
+  Contract: the background-only resource check visibly distinguishes Torch CUDA, CUDA ONNX for SCRFD/ArcFace, and cuML HDBSCAN; it never opens user photos or downloads models.
+  Validation: focused dialog/runtime/UI tests pass for the checklist, staged background refresh, remediation, and complete folder tree.
+- [x] Prevent late startup and footer-progress callbacks from touching deleted Qt widgets during close.
+  Contract: shutdown cancels visible startup work, stops the footer presentation timer, and makes queued completions no-ops once the window is closing.
+  Validation: the deterministic footer shutdown test passed; a forced 15-second offscreen GPU-launcher close completed without deleted-widget tracebacks.
+
+## Gallery-first cross-workspace routing and lifecycle completion
+
+- [x] Make the top-level Gallery the explicit, session-only viewer for face, name, tag, and cluster photo sets.
+  Contract: routes retain their source and return workspace, never trigger face detection implicitly, and preserve exact per-photo face context while active; metadata and tag mutations invalidate affected views safely.
+  Validation: production route coverage verifies Faces routes into the top Gallery with preserved context; the complete 517-test suite covers the shared Gallery, Names, Tags, cluster, and Faces UI contracts.
+- [x] Bind folder discovery and Gallery-owned background work to the shared Jobs lifecycle and close it without UI-thread waits.
+  Contract: folder discovery is visible/cancellable; obsolete worker results cannot publish; application shutdown cancels and drains all Gallery work without freezing the Qt event loop.
+  Validation: Gallery discovery is bound to `JobManager`; close-pending cancellation/drain behavior and Gallery worker ownership pass in the complete deterministic suite.
+- [x] Make CUDA HDBSCAN readiness explicit and preserve an actionable CPU fallback policy.
+  Contract: Auto reports cached cuML unavailability and uses vectorized CPU HDBSCAN; explicit CUDA blocks unavailable HDBSCAN instead of silently changing policy.
+  Validation: runtime/provider cache, explicit-policy, and Jobs fallback tests pass; the benchmark recorded `No module named 'cuml'` as an exact Auto-mode fallback.
+- [x] Resolve the order-sensitive full-suite Qt teardown failure.
+  Contract: test teardown leaves no active QThreads, queued late publications, mutable runtime overrides, or service singletons for later tests.
+  Validation: `bash scripts/test.sh` completed normally with 517 passed and 4 provider/dependency warnings; no tests were skipped.
+
 ## Clean-native operational safety and release evidence
 
 - [x] Expose generated-storage categories in the production Settings dialog without importing the legacy folder cache or catalog.
@@ -74,9 +131,9 @@
 - [x] Benchmark and document metadata operations.
   Contract: the benchmark uses generated local fixtures only and makes no hardware-independent timing claim.
   Validation: `bash scripts/benchmark.sh` measured the generated eight-region JPEG fixture; `bash scripts/build.sh`, focused service/UI tests, compilation, and whitespace checks passed.
-- [ ] Resolve the existing order-sensitive full-suite fixture failure before claiming a green full run.
+- [x] Resolve the existing order-sensitive full-suite fixture failure before claiming a green full run.
   Contract: `bash scripts/test.sh` must complete without sharing mutable model-asset state between production-support tests.
-  Validation: the 2026-09-13 isolated rerun reached 67% after all production-support, service, startup-readiness, and early UI-smoke checks, then ended without a pytest summary while UI smoke was still running. Focused production (46), service plus UX-acceptance (188), build, compilation, and whitespace checks pass. This remains visible rather than being presented as a green full run.
+  Validation: fixture teardown now drains queued Qt deletion work; asynchronous Faces completions are non-modal; model-availability tests explicitly provide ready fixtures. `bash scripts/test.sh` completed with 517 passed and 4 warnings.
 
 ## GPU HDBSCAN and clustering tuning
 
@@ -300,6 +357,15 @@
 - [x] Remove the stale model-inventory update for the deleted Settings license panel.
   Contract: model inventory updates the Clustering Models table without accessing removed widgets.
   Validation: clean application startup and production Settings acceptance test.
+## Faces-tab labels and Deep Name + Similar
+
+- [x] Put the labelled/unlabelled control in the folder-review Faces tab and keep publication responsive.
+  Contract: All, Labelled, and Unlabelled filter only the visible face tiles in the active review; changing it restarts the existing bounded publisher without rescanning or embedding photos.
+  Validation: deterministic offscreen `test_faces_tab_label_filter_changes_only_detected_face_tiles` passed.
+- [x] Add full-scope, reviewed deep saved-name expansion in Names and Faces.
+  Contract: all eligible indexed faces in the initiating scope are compared in GPU/CPU vector batches; newly found durable-unlabelled faces expand the temporary corpus until stable, existing names never expand or overwrite, and no mutation occurs before explicit confirmation.
+  Validation: deterministic service chain test and seeded benchmark fixture passed; selected metadata writes report saved, skipped, failed, and cancellation-after-completed-files outcomes.
+
 ## Measured performance pass
 
 - [x] Establish a deterministic baseline and profile the current hot path.

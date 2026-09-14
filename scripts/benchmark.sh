@@ -25,7 +25,19 @@ if [[ "${1:-}" == "--tag-workspace-only" ]]; then
     "$benchmark_python" scripts/benchmark_tag_workspace.py "$@"
     exit 0
 fi
+if [[ "${1:-}" == "--deep-face-search-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_deep_face_search.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--faces-arrangement-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_face_tile_arrangement.py "$@"
+    exit 0
+fi
 "$benchmark_python" scripts/benchmark_acceleration.py "$@"
 "$benchmark_python" scripts/benchmark_face_region_metadata.py
 "$benchmark_python" scripts/benchmark_thumbnail_index.py
 "$benchmark_python" scripts/benchmark_tag_workspace.py
+"$benchmark_python" scripts/benchmark_deep_face_search.py
+"$benchmark_python" scripts/benchmark_face_tile_arrangement.py

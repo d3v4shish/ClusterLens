@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
 
 _ONNX_CUDA_LIBS_PRELOADED = False
 _ONNX_PROVIDER_PROBE_CACHE: dict[str, bool] = {}
+_CUML_HDBSCAN_PROBE_CACHE: dict[str, object] | None = None
 _MODULE_UNSET = object()
 _TORCH_MODULE: object = _MODULE_UNSET
 _ONNX_RUNTIME_MODULE: object = _MODULE_UNSET
@@ -69,6 +70,46 @@ def _module_available(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except Exception:
         return False
+
+
+def cuml_hdbscan_status(*, refresh: bool = False) -> dict[str, object]:
+    """Return a cached import-level cuML HDBSCAN capability result.
+
+    Package metadata alone is not sufficient: a mismatched CUDA/cuML install
+    can be present yet fail on import.  This probe is called only from runtime
+    diagnostics/rescan workers and is cached until an explicit rescan.
+    """
+
+    global _CUML_HDBSCAN_PROBE_CACHE
+    if _CUML_HDBSCAN_PROBE_CACHE is not None and not refresh:
+        return dict(_CUML_HDBSCAN_PROBE_CACHE)
+    if not _module_available("cuml"):
+        result = {
+            "available": False,
+            "implementation": "cpu-hdbscan",
+            "detail": "cuML is not installed in this runtime.",
+            "version": _first_package_version("cuml-cu12", "cuml"),
+        }
+    else:
+        try:
+            module = importlib.import_module("cuml.cluster")
+            if not callable(getattr(module, "HDBSCAN", None)):
+                raise RuntimeError("cuml.cluster.HDBSCAN is unavailable")
+            result = {
+                "available": True,
+                "implementation": "cuml-hdbscan",
+                "detail": "cuML HDBSCAN is available.",
+                "version": _first_package_version("cuml-cu12", "cuml"),
+            }
+        except Exception as exc:
+            result = {
+                "available": False,
+                "implementation": "cpu-hdbscan",
+                "detail": f"cuML HDBSCAN could not load: {exc}",
+                "version": _first_package_version("cuml-cu12", "cuml"),
+            }
+    _CUML_HDBSCAN_PROBE_CACHE = dict(result)
+    return dict(result)
 
 
 def preload_onnx_cuda_runtime_libraries() -> bool:
@@ -192,6 +233,7 @@ def _build_remediation(
     capabilities: "RuntimeCapabilities",
     packages: dict[str, str],
     optional_details: dict[str, object],
+    hdbscan_status: dict[str, object] | None = None,
 ) -> list[str]:
     remediation: list[str] = []
     if not capabilities.torch_cuda_available:
@@ -203,8 +245,12 @@ def _build_remediation(
         remediation.append("Install onnx (python package) to export models for ONNX Runtime CUDA/CPU inference.")
     if not capabilities.has_onnx_cuda:
         remediation.append("Install an ONNX Runtime GPU build (onnxruntime-gpu) for CUDA ONNX inference.")
-    if capabilities.torch_cuda_available and not packages.get("cuml"):
-        remediation.append("Install the pinned RAPIDS cuML CUDA runtime to accelerate HDBSCAN; native HDBSCAN remains the CPU fallback.")
+    if capabilities.torch_cuda_available and not bool((hdbscan_status or {}).get("available")):
+        detail = str((hdbscan_status or {}).get("detail") or "cuML HDBSCAN is unavailable.")
+        remediation.append(
+            "Install or repair the pinned RAPIDS cuML CUDA runtime to accelerate HDBSCAN; "
+            f"native HDBSCAN remains the CPU fallback. Current check: {detail}"
+        )
     if not bool(optional_details.get("hf_xet_installed")):
         remediation.append(
             "Install hf_xet (or huggingface_hub[hf_xet]) for faster Hugging Face downloads, and include it in the packaged exe if you ship one."
@@ -450,10 +496,12 @@ class RuntimeCapabilityService:
         }
         optional_details = _optional_runtime_details()
         cpu_details = _cpu_runtime_details()
+        hdbscan_status = cuml_hdbscan_status(refresh=refresh)
         remediation = _build_remediation(
             capabilities=capabilities,
             packages=packages,
             optional_details=optional_details,
+            hdbscan_status=hdbscan_status,
         )
 
         return {
@@ -462,6 +510,7 @@ class RuntimeCapabilityService:
             "packages": packages,
             "optional_details": optional_details,
             "cpu_details": cpu_details,
+            "cuml_hdbscan": hdbscan_status,
             "remediation": remediation,
         }
 
@@ -481,6 +530,7 @@ class RuntimeCapabilityService:
         }
         optional_details = _optional_runtime_details()
         cpu_details = _cpu_runtime_details()
+        hdbscan_status = cuml_hdbscan_status(refresh=True)
 
         torch = _torch_module()
         ort = _onnx_runtime_module()
@@ -547,6 +597,7 @@ class RuntimeCapabilityService:
             capabilities=capabilities,
             packages=packages,
             optional_details=optional_details,
+            hdbscan_status=hdbscan_status,
         )
         if isinstance(flash_attention_smoke, dict) and not flash_attention_smoke.get("ok"):
             remediation.append(
@@ -559,6 +610,7 @@ class RuntimeCapabilityService:
             "packages": packages,
             "optional_details": optional_details,
             "cpu_details": cpu_details,
+            "cuml_hdbscan": hdbscan_status,
             "torch_smoke": torch_smoke,
             "onnx_smoke": onnx_smoke,
             "flash_attention_smoke": flash_attention_smoke,

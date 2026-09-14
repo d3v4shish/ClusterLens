@@ -5,8 +5,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QVBoxLayout, QWidget
+from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 
 from app.services.thumbnails import ThumbnailService
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
@@ -15,10 +15,11 @@ from ui.error_mbox import confirmBox
 from ui.gallery_pane import GalleryPane
 from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
+from ui.search_pane import FaceTileItem, FaceTileItemDelegate, FaceTileListModel
 from ui.theme import COLORS
 
 if TYPE_CHECKING:
-    from app.services.face_search import FaceIndexService, NamedPhotoSummary
+    from app.services.face_search import FaceIndexService, FaceSearchResult, NamedPhotoSummary
 
 
 NAMES_HELP = (
@@ -26,7 +27,7 @@ NAMES_HELP = (
     "Select a name to see every unique photo containing a face saved with that name. "
     "Every photo in this view already has the active saved name. Right-click one or more selected photos "
     "to rename or unlabel only those matching face rows. "
-    "Similarity-only matches remain in Faces > Find by Name."
+    "Use Find Similar Faces to search the selected saved identity's prototype and review face crops without leaving Names."
 )
 
 SELECTED_IMAGES_HELP = (
@@ -37,6 +38,8 @@ SELECTED_IMAGES_HELP = (
 NAME_HOVER_PREVIEW_IMAGE_SIZE = QSize(216, 216)
 NAME_HOVER_PREVIEW_MAX_ITEMS = 9
 NAME_HOVER_PREVIEW_CACHE_SIZE = 24
+NAME_SIMILAR_FACE_TILE_SIZE = QSize(112, 112)
+NAME_SIMILAR_FACE_LIMIT = 60
 
 
 class NameHoverPreviewPopup(QFrame):
@@ -109,6 +112,8 @@ class NamesPane(QWidget):
     """Global browser and bounded editor for durable saved face labels."""
 
     face_labels_changed = pyqtSignal()
+    open_in_gallery_requested = pyqtSignal(list, str)
+    open_similar_faces_in_gallery_requested = pyqtSignal(list, str, dict)
 
     def __init__(
         self,
@@ -128,6 +133,14 @@ class NamesPane(QWidget):
         self._refresh_thread = None
         self._photos_job = None
         self._photos_thread = None
+        self._similar_job = None
+        self._similar_thread = None
+        self._deep_similar_job = None
+        self._deep_similar_thread = None
+        self._similar_token = 0
+        self._similar_face_images: dict[tuple[str, int, tuple[int, int, int, int]], QImage] = {}
+        self._similar_face_items: list[FaceTileItem] = []
+        self._deep_similar_review: dict[str, object] = {}
         self._mutation_job = None
         self._mutation_thread = None
         self._read_only_mode = False
@@ -160,9 +173,32 @@ class NamesPane(QWidget):
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setToolTip("Reload durable saved names and their photo counts from the global face database.")
         self.refresh_button.clicked.connect(self.refresh_names)
+        self.open_in_gallery_button = QPushButton("Open in Gallery")
+        self.open_in_gallery_button.setToolTip(
+            "Open the active name's exact labeled photos in the top-level Gallery. This does not search similar faces."
+        )
+        self.open_in_gallery_button.setAccessibleName("Open named photos in Gallery")
+        self.open_in_gallery_button.clicked.connect(self._open_named_photos_in_gallery)
+        self.open_in_gallery_button.setEnabled(False)
+        self.find_similar_button = QPushButton("Find Similar Faces")
+        self.find_similar_button.setToolTip(
+            "Search the selected saved name's identity prototype and show up to 60 matching face crops, including unlabeled similar faces."
+        )
+        self.find_similar_button.setAccessibleName("Find faces similar to selected name")
+        self.find_similar_button.clicked.connect(self._find_similar_faces)
+        self.find_similar_button.setEnabled(False)
+        self.deep_find_similar_button = QPushButton("Deep Name + Similar")
+        self.deep_find_similar_button.setToolTip(
+            "Search the complete saved face index through newly found unlabeled faces, then review the combined result before saving names."
+        )
+        self.deep_find_similar_button.clicked.connect(self._deep_find_similar_faces)
+        self.deep_find_similar_button.setEnabled(False)
         title_row.addWidget(title)
         title_row.addWidget(self.help_button)
         title_row.addStretch(1)
+        title_row.addWidget(self.open_in_gallery_button)
+        title_row.addWidget(self.find_similar_button)
+        title_row.addWidget(self.deep_find_similar_button)
         title_row.addWidget(self.refresh_button)
         layout.addLayout(title_row)
 
@@ -221,7 +257,8 @@ class NamesPane(QWidget):
         sidebar_layout.addWidget(self.names_list, stretch=1)
         splitter.addWidget(sidebar)
 
-        self.gallery = GalleryPane(splitter)
+        self.results_stack = QStackedWidget(splitter)
+        self.gallery = GalleryPane(self.results_stack)
         self.gallery.setObjectName("namesWorkspaceGallery")
         self.gallery.set_action_bar_visible(False)
         self.gallery.set_empty_state(
@@ -231,7 +268,73 @@ class NamesPane(QWidget):
             show_run=False,
         )
         self.gallery.set_context_menu_action_provider(self._names_context_menu_actions)
-        splitter.addWidget(self.gallery)
+        self.results_stack.addWidget(self.gallery)
+
+        self.similar_faces_panel = QWidget(self.results_stack)
+        self.similar_faces_panel.setObjectName("namesSimilarFacesPanel")
+        similar_layout = QVBoxLayout(self.similar_faces_panel)
+        similar_layout.setContentsMargins(0, 0, 0, 0)
+        similar_layout.setSpacing(8)
+        self.similar_faces_summary = QLabel("Select a saved name, then use Find Similar Faces.")
+        self.similar_faces_summary.setWordWrap(True)
+        self.similar_faces_summary.setToolTip(
+            "Every tile is an individual matching face region. Scores compare the selected saved identity prototype to the indexed face."
+        )
+        similar_layout.addWidget(self.similar_faces_summary)
+        similar_actions = QHBoxLayout()
+        similar_actions.setContentsMargins(0, 0, 0, 0)
+        self.show_named_photos_button = QPushButton("Show Named Photos")
+        self.show_named_photos_button.setToolTip("Return to the selected name's exact durable labeled-photo list.")
+        self.show_named_photos_button.clicked.connect(self._show_named_photos)
+        self.open_selected_similar_face_button = QPushButton("Open Selected Photo")
+        self.open_selected_similar_face_button.setToolTip("Open the selected matching face's photo in Gallery with its face-region context.")
+        self.open_selected_similar_face_button.setEnabled(False)
+        self.open_selected_similar_face_button.clicked.connect(self._open_selected_similar_face_in_gallery)
+        self.open_similar_faces_button = QPushButton("Open Match Photos")
+        self.open_similar_faces_button.setToolTip("Open every photo with a matching face in the top-level Gallery.")
+        self.open_similar_faces_button.setEnabled(False)
+        self.open_similar_faces_button.clicked.connect(self._open_similar_faces_in_gallery)
+        self.select_all_deep_faces_button = QPushButton("Select All Unlabelled")
+        self.select_all_deep_faces_button.setToolTip("Select every still-unlabelled face in the current deep-search review.")
+        self.select_all_deep_faces_button.clicked.connect(self._select_all_deep_similar_faces)
+        self.select_all_deep_faces_button.setEnabled(False)
+        self.apply_deep_faces_button = QPushButton("Apply Selected Names")
+        self.apply_deep_faces_button.setProperty("kind", "primary")
+        self.apply_deep_faces_button.setToolTip("Write the selected deep-search face regions to XMP/EXIF and save their durable name.")
+        self.apply_deep_faces_button.clicked.connect(self._apply_selected_deep_similar_faces)
+        self.apply_deep_faces_button.setEnabled(False)
+        similar_actions.addWidget(self.show_named_photos_button)
+        similar_actions.addWidget(self.open_selected_similar_face_button)
+        similar_actions.addWidget(self.open_similar_faces_button)
+        similar_actions.addWidget(self.select_all_deep_faces_button)
+        similar_actions.addWidget(self.apply_deep_faces_button)
+        similar_actions.addStretch(1)
+        similar_layout.addLayout(similar_actions)
+        self.similar_faces_model = FaceTileListModel(
+            self._similar_face_image_for_item,
+            self._similar_face_cache_key_for_item,
+            NAME_SIMILAR_FACE_TILE_SIZE,
+            self,
+        )
+        self.similar_faces_list = QListView(self.similar_faces_panel)
+        self.similar_faces_list.setObjectName("namesSimilarFacesList")
+        self.similar_faces_list.setViewMode(QListView.ViewMode.IconMode)
+        self.similar_faces_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.similar_faces_list.setMovement(QListView.Movement.Static)
+        self.similar_faces_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.similar_faces_list.setUniformItemSizes(True)
+        self.similar_faces_list.setIconSize(NAME_SIMILAR_FACE_TILE_SIZE)
+        self.similar_faces_list.setGridSize(QSize(150, 170))
+        self.similar_faces_list.setSpacing(8)
+        self.similar_faces_list.setModel(self.similar_faces_model)
+        self.similar_faces_list.setItemDelegate(FaceTileItemDelegate(self.similar_faces_list))
+        self.similar_faces_list.doubleClicked.connect(lambda _index: self._open_selected_similar_face_in_gallery())
+        selection_model = self.similar_faces_list.selectionModel()
+        if selection_model is not None:
+            selection_model.selectionChanged.connect(lambda *_args: self._update_similar_face_actions())
+        similar_layout.addWidget(self.similar_faces_list, stretch=1)
+        self.results_stack.addWidget(self.similar_faces_panel)
+        splitter.addWidget(self.results_stack)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 9)
         splitter.setSizes([280, 1060])
@@ -343,6 +446,9 @@ class NamesPane(QWidget):
             row = 0
         if row < 0:
             self._selected_name = ""
+            self.find_similar_button.setEnabled(False)
+            self._clear_similar_face_results()
+            self.results_stack.setCurrentWidget(self.gallery)
             self.gallery.update_gallery_with_options(images=[], clear_pixmaps=False, reset_scroll=True)
             self.gallery.set_empty_state(
                 "No saved names",
@@ -542,8 +648,22 @@ class NamesPane(QWidget):
         if not name or name == self._selected_name and self._photos_thread is not None:
             return
         self._selected_name = name
+        self._similar_token += 1
+        for job in (self._similar_job, self._deep_similar_job):
+            if job is None:
+                continue
+            try:
+                job.cancel()
+            except Exception:
+                pass
+        self._clear_similar_face_results()
+        self._show_named_photos()
         self._photos_token += 1
         token = self._photos_token
+        self.open_in_gallery_button.setEnabled(False)
+        self.find_similar_button.setEnabled(bool(name))
+        self.deep_find_similar_button.setEnabled(bool(name))
+        self._deep_similar_review = {}
         service = self._face_service_provider()
         self.status_label.setText(f"Loading photos for {name}...")
 
@@ -565,8 +685,439 @@ class NamesPane(QWidget):
                 show_run=False,
             )
             self.status_label.setText(f"{name} · {len(paths)} unique photo(s)")
+            self.open_in_gallery_button.setEnabled(bool(paths))
 
         self._start_job("photos", _run, _done, lambda _message: self.status_label.setText(f"Could not load photos for {name}."))
+
+    def _open_named_photos_in_gallery(self) -> None:
+        paths = list(self.gallery.images)
+        name = self._current_name() or self._selected_name
+        if paths and name:
+            self.open_in_gallery_requested.emit(paths, name)
+
+    @staticmethod
+    def _similar_face_key(item: FaceTileItem) -> tuple[str, int, tuple[int, int, int, int]]:
+        return (
+            str(item.image_path),
+            int(item.face_index),
+            tuple(int(value) for value in item.bbox),
+        )
+
+    def _similar_face_cache_key_for_item(
+        self,
+        item: FaceTileItem,
+        requested_size: QSize,
+    ) -> tuple[object, ...]:
+        return (
+            str(item.image_path),
+            int(self._similar_token),
+            0,
+            tuple(int(value) for value in item.bbox),
+            int(requested_size.width()),
+            int(requested_size.height()),
+            "names_similar_faces_v1",
+        )
+
+    def _similar_face_image_for_item(self, item: FaceTileItem, _requested_size: QSize) -> QImage:
+        return self._similar_face_images.get(self._similar_face_key(item), QImage())
+
+    @staticmethod
+    def _load_similar_face_thumbnail(
+        image_path: str,
+        bbox: tuple[int, int, int, int],
+    ) -> QImage:
+        """Decode one bounded face crop in the search worker, never on Qt's UI thread."""
+
+        reader = QImageReader(str(image_path))
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            return QImage()
+        try:
+            x1, y1, x2, y2 = (int(value) for value in bbox)
+        except (TypeError, ValueError):
+            return QImage()
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        width = max(2, right - left)
+        height = max(2, bottom - top)
+        pad_x = max(8, width // 6)
+        pad_y = max(8, height // 6)
+        crop_left = max(0, left - pad_x)
+        crop_top = max(0, top - pad_y)
+        crop_right = min(image.width(), right + pad_x)
+        crop_bottom = min(image.height(), bottom + pad_y)
+        if crop_right <= crop_left or crop_bottom <= crop_top:
+            return QImage()
+        crop = image.copy(crop_left, crop_top, crop_right - crop_left, crop_bottom - crop_top)
+        scaled = crop.scaled(
+            NAME_SIMILAR_FACE_TILE_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = QImage(NAME_SIMILAR_FACE_TILE_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(QColor(18, 18, 18))
+        painter = QPainter(canvas)
+        painter.drawImage(
+            max(0, (canvas.width() - scaled.width()) // 2),
+            max(0, (canvas.height() - scaled.height()) // 2),
+            scaled,
+        )
+        painter.end()
+        return canvas
+
+    @staticmethod
+    def _saved_name_for_similar_result(service, result) -> str:
+        """Prefer the durable row over the query's fallback display name."""
+
+        load_record = getattr(service, "load_face_record", None)
+        if not callable(load_record):
+            return ""
+        try:
+            record = load_record(str(result.image_path), int(result.face_index))
+        except Exception:
+            return ""
+        return str(getattr(record, "person_name", "") or "").strip()
+
+    def _find_similar_faces(self) -> None:
+        name = self._current_name() or self._selected_name
+        if not name:
+            return
+        self._similar_token += 1
+        self._deep_similar_review = {}
+        token = self._similar_token
+        self.find_similar_button.setEnabled(False)
+        self.status_label.setText(f"Finding faces similar to {name}...")
+        service = self._face_service_provider()
+
+        def _run(progress, cancel_check):
+            progress(-1, f"Searching faces similar to {name}...")
+            results = list(
+                service.search_by_person_name(
+                    name,
+                    top_k=NAME_SIMILAR_FACE_LIMIT,
+                    include_tiny_faces=True,
+                )
+                or []
+            )
+            thumbnails: list[tuple[object, str, QImage]] = []
+            for index, result in enumerate(results, start=1):
+                if cancel_check():
+                    return None
+                saved_name = self._saved_name_for_similar_result(service, result)
+                thumbnail = self._load_similar_face_thumbnail(
+                    str(result.image_path),
+                    tuple(int(value) for value in result.face_bbox),
+                )
+                thumbnails.append((result, saved_name, thumbnail))
+                progress(
+                    int(index * 100 / max(1, len(results))),
+                    f"Loading similar face crops {index}/{len(results)}",
+                )
+            return thumbnails
+
+        def _done(matches) -> None:
+            if token != self._similar_token or name != (self._current_name() or self._selected_name) or matches is None:
+                return
+            self._publish_similar_face_results(name, list(matches or []))
+            self.find_similar_button.setEnabled(True)
+
+        def _failed(_message: str) -> None:
+            if token == self._similar_token:
+                self.status_label.setText(f"Could not find faces similar to {name}.")
+                self.find_similar_button.setEnabled(bool(self._current_name() or self._selected_name))
+
+        self._start_job("similar", _run, _done, _failed)
+
+    def _deep_find_similar_faces(self) -> None:
+        name = self._current_name() or self._selected_name
+        if not name:
+            return
+        self._similar_token += 1
+        token = self._similar_token
+        self.deep_find_similar_button.setEnabled(False)
+        self.status_label.setText(f"Deep-searching faces for {name}...")
+        service = self._face_service_provider()
+
+        def _run(progress, cancel_check):
+            expansion = service.deep_search_by_person_name(
+                name,
+                include_tiny_faces=True,
+                progress=progress,
+                cancel_check=cancel_check,
+            )
+            matches: list[tuple[object, str, QImage, int]] = []
+            raw_matches = list(getattr(expansion, "matches", ()) or ())
+            for index, match in enumerate(raw_matches, start=1):
+                if cancel_check():
+                    return None
+                result = match.result
+                thumbnail = self._load_similar_face_thumbnail(
+                    str(result.image_path),
+                    tuple(int(value) for value in result.face_bbox),
+                )
+                matches.append((result, str(match.durable_person_name or ""), thumbnail, int(match.discovery_round)))
+                progress(int(index * 100 / max(1, len(raw_matches))), f"Loading deep-search face crops {index}/{len(raw_matches)}")
+            return expansion, matches
+
+        def _done(payload) -> None:
+            if token != self._similar_token or name != (self._current_name() or self._selected_name) or payload is None:
+                return
+            expansion, matches = payload
+            self._publish_deep_similar_face_results(name, expansion, list(matches or []))
+            self.deep_find_similar_button.setEnabled(True)
+
+        def _failed(_message: str) -> None:
+            if token == self._similar_token:
+                self.status_label.setText(f"Could not complete the deep search for {name}.")
+                self.deep_find_similar_button.setEnabled(bool(self._current_name() or self._selected_name))
+
+        self._start_job("deep_similar", _run, _done, _failed)
+
+    def _publish_deep_similar_face_results(self, name: str, expansion, matches: list[tuple[object, str, QImage, int]]) -> None:
+        self._publish_similar_face_results(name, [(result, saved_name, thumbnail) for result, saved_name, thumbnail, _round in matches])
+        refs = set(getattr(expansion, "unlabeled_refs", ()) or ())
+        rounds_by_ref = {
+            (str(result.image_path), int(result.face_index)): int(round_number)
+            for result, _saved_name, _thumbnail, round_number in matches
+        }
+        self._deep_similar_review = {
+            "name": name,
+            "refs": refs,
+            "threshold": float(getattr(expansion, "threshold", 0.72) or 0.72),
+        }
+        self.similar_faces_summary.setText(
+            f"{name} · {len(matches)} combined match(es) from {int(getattr(expansion, 'round_count', 0) or 0)} deep-search round(s). "
+            f"{len(refs)} unlabeled face region(s) are preselected; deselect any you do not want to name."
+        )
+        for row, item in enumerate(self._similar_face_items):
+            ref = self._face_ref_from_similar_item(item)
+            round_number = rounds_by_ref.get(ref, 0)
+            if round_number:
+                item_payload = dict(item.payload) if isinstance(item.payload, dict) else {}
+                item_payload["deep_round"] = round_number
+                self._similar_face_items[row] = FaceTileItem(
+                    image_path=item.image_path,
+                    face_index=item.face_index,
+                    bbox=item.bbox,
+                    title=f"{item.title}\nRound {round_number}",
+                    tooltip=f"{item.tooltip}\ndeep-search round={round_number}",
+                    status=item.status,
+                    draft_slot=item.draft_slot,
+                    saved_face_index=item.saved_face_index,
+                    payload=item_payload,
+                )
+        self.similar_faces_model.set_items(self._similar_face_items)
+        self._select_all_deep_similar_faces()
+
+    @staticmethod
+    def _face_ref_from_similar_item(item: FaceTileItem | None) -> tuple[str, int] | None:
+        if item is None or not str(item.image_path or "").strip():
+            return None
+        return (str(item.image_path), int(item.saved_face_index if item.saved_face_index >= 0 else item.face_index))
+
+    def _select_all_deep_similar_faces(self) -> None:
+        refs = set(self._deep_similar_review.get("refs", set()) or set())
+        selection = self.similar_faces_list.selectionModel()
+        if selection is None:
+            return
+        selection.clearSelection()
+        for row, item in enumerate(self._similar_face_items):
+            if self._face_ref_from_similar_item(item) not in refs:
+                continue
+            index = self.similar_faces_model.index(row, 0)
+            selection.select(index, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self._update_similar_face_actions()
+
+    def _apply_selected_deep_similar_faces(self) -> None:
+        if self._read_only_mode:
+            return
+        name = str(self._deep_similar_review.get("name", "") or "").strip()
+        eligible = set(self._deep_similar_review.get("refs", set()) or set())
+        refs = [
+            ref
+            for ref in (
+                self._face_ref_from_similar_item(self.similar_faces_model.item_at(index.row()))
+                for index in self.similar_faces_list.selectionModel().selectedIndexes()
+            )
+            if ref is not None and ref in eligible
+        ]
+        refs = list(dict.fromkeys(refs))
+        if not name or not refs:
+            return
+        if not confirmBox(
+            "Apply deep face names",
+            f"Save '{name}' on {len(refs)} selected face region(s) in {len({path for path, _index in refs})} photo(s)? "
+            "Successful regions are written to XMP/EXIF before their durable labels are saved.",
+            parent=self,
+        ):
+            return
+        service = self._face_service_provider()
+        threshold = float(self._deep_similar_review.get("threshold", 0.72) or 0.72)
+
+        def _run(progress, cancel_check):
+            return service.label_unlabeled_indexed_faces_with_metadata(
+                name,
+                refs,
+                similarity_threshold=threshold,
+                source="deep_name_similar",
+                progress=progress,
+                cancel_check=cancel_check,
+            )
+
+        def _done(result) -> None:
+            affected_refs = set(getattr(result, "affected_refs", ()) or ())
+            saved = len(affected_refs)
+            skipped = len(getattr(result, "skipped_refs", ()) or ())
+            failed = len(getattr(result, "failures", ()) or ())
+            suffix = f"; skipped {skipped}" if skipped else ""
+            suffix += f"; {failed} metadata failure(s)" if failed else ""
+            suffix += "; cancelled after completed files" if bool(getattr(result, "cancelled", False)) else ""
+            self.status_label.setText(f"Deep naming saved {saved} face region(s){suffix}. Refreshing saved names...")
+            self._deep_similar_review["refs"] = eligible - affected_refs
+            refreshed_items: list[FaceTileItem] = []
+            for item in self._similar_face_items:
+                if self._face_ref_from_similar_item(item) not in affected_refs:
+                    refreshed_items.append(item)
+                    continue
+                refreshed_items.append(
+                    FaceTileItem(
+                        image_path=item.image_path,
+                        face_index=item.face_index,
+                        bbox=item.bbox,
+                        title=item.title.replace("Unlabeled", name, 1),
+                        tooltip=f"{item.tooltip}\nsaved deep name={name}",
+                        status=item.status,
+                        draft_slot=item.draft_slot,
+                        saved_face_index=item.saved_face_index,
+                        payload=item.payload,
+                    )
+                )
+            self._similar_face_items = refreshed_items
+            self.similar_faces_model.set_items(refreshed_items)
+            self._update_similar_face_actions()
+            self.face_labels_changed.emit()
+            self.refresh_names(preserve_name=name)
+
+        self._start_job(
+            "mutation",
+            _run,
+            _done,
+            lambda _message: self.status_label.setText("Could not save the selected deep face labels."),
+        )
+
+    def _publish_similar_face_results(self, name: str, matches: list[tuple[object, str, QImage]]) -> None:
+        items: list[FaceTileItem] = []
+        images: dict[tuple[str, int, tuple[int, int, int, int]], QImage] = {}
+        for result, saved_name, thumbnail in matches:
+            image_path = str(getattr(result, "image_path", "") or "")
+            face_index = int(getattr(result, "face_index", -1) or -1)
+            bbox = tuple(int(value) for value in getattr(result, "face_bbox", ()))
+            if not image_path or len(bbox) != 4:
+                continue
+            state = str(saved_name or "").strip() or "Unlabeled"
+            score = float(getattr(result, "score", 0.0) or 0.0)
+            quality = str(getattr(result, "quality_status", "") or "saved")
+            item = FaceTileItem(
+                image_path=image_path,
+                face_index=face_index,
+                bbox=bbox,
+                title=f"{state}\n{score:.3f} · Face #{face_index + 1}",
+                tooltip=(
+                    f"{image_path}\nface #{face_index + 1}\n"
+                    f"saved name={state}\nscore={score:.4f}\n"
+                    f"bbox={bbox}\nquality={quality}"
+                ),
+                status=quality,
+                saved_face_index=face_index,
+                payload={"result": result, "saved_name": str(saved_name or "")},
+            )
+            items.append(item)
+            if isinstance(thumbnail, QImage) and not thumbnail.isNull():
+                images[self._similar_face_key(item)] = thumbnail
+        self._similar_face_items = items
+        self._similar_face_images = images
+        self.similar_faces_model.set_items(items)
+        self.results_stack.setCurrentWidget(self.similar_faces_panel)
+        self.open_similar_faces_button.setEnabled(bool(items))
+        self._update_similar_face_actions()
+        self.similar_faces_summary.setText(
+            f"{name} · {len(items)} matching face region(s). "
+            "Each tile is a face crop; double-click a tile to open its source photo."
+        )
+        self.status_label.setText(f"Found {len(items)} face region(s) similar to {name}.")
+
+    def _clear_similar_face_results(self) -> None:
+        self._similar_face_items = []
+        self._similar_face_images = {}
+        self._deep_similar_review = {}
+        if hasattr(self, "similar_faces_model"):
+            self.similar_faces_model.set_items([])
+        if hasattr(self, "similar_faces_summary"):
+            self.similar_faces_summary.setText("Select a saved name, then use Find Similar Faces.")
+        if hasattr(self, "open_similar_faces_button"):
+            self.open_similar_faces_button.setEnabled(False)
+        if hasattr(self, "open_selected_similar_face_button"):
+            self.open_selected_similar_face_button.setEnabled(False)
+        if hasattr(self, "select_all_deep_faces_button"):
+            self.select_all_deep_faces_button.setEnabled(False)
+        if hasattr(self, "apply_deep_faces_button"):
+            self.apply_deep_faces_button.setEnabled(False)
+
+    def _show_named_photos(self) -> None:
+        self.results_stack.setCurrentWidget(self.gallery)
+
+    def _selected_similar_face_item(self) -> FaceTileItem | None:
+        index = self.similar_faces_list.currentIndex()
+        return self.similar_faces_model.item_at(index.row()) if index.isValid() else None
+
+    def _update_similar_face_actions(self) -> None:
+        self.open_selected_similar_face_button.setEnabled(self._selected_similar_face_item() is not None)
+        deep_refs = set(self._deep_similar_review.get("refs", set()) or set())
+        selected_refs = {
+            self._face_ref_from_similar_item(self.similar_faces_model.item_at(index.row()))
+            for index in self.similar_faces_list.selectionModel().selectedIndexes()
+        }
+        self.select_all_deep_faces_button.setEnabled(bool(deep_refs) and not self._read_only_mode)
+        self.apply_deep_faces_button.setEnabled(bool(deep_refs & selected_refs) and not self._read_only_mode)
+
+    @staticmethod
+    def _similar_face_context(item: FaceTileItem) -> dict[str, object]:
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        result = payload.get("result") if isinstance(payload, dict) else None
+        return {
+            "face_search": {
+                "face_index": int(item.face_index),
+                "bbox": tuple(int(value) for value in item.bbox),
+                "score": float(getattr(result, "score", 0.0) or 0.0),
+                "confidence": float(getattr(result, "face_confidence", 0.0) or 0.0),
+                "person_name": str(payload.get("saved_name", "") or ""),
+            }
+        }
+
+    def _open_selected_similar_face_in_gallery(self) -> None:
+        item = self._selected_similar_face_item()
+        name = self._current_name() or self._selected_name
+        if item is None or not name:
+            return
+        self.open_similar_faces_in_gallery_requested.emit(
+            [str(item.image_path)],
+            name,
+            {str(item.image_path): self._similar_face_context(item)},
+        )
+
+    def _open_similar_faces_in_gallery(self) -> None:
+        name = self._current_name() or self._selected_name
+        if not name or not self._similar_face_items:
+            return
+        paths: list[str] = []
+        context_by_path: dict[str, dict[str, object]] = {}
+        for item in self._similar_face_items:
+            path = str(item.image_path)
+            if path not in context_by_path:
+                paths.append(path)
+                context_by_path[path] = self._similar_face_context(item)
+        self.open_similar_faces_in_gallery_requested.emit(paths, name, context_by_path)
 
     def _selected_image_paths(self) -> list[str]:
         selected = self.gallery._selected_gallery_paths()
@@ -750,13 +1301,15 @@ class NamesPane(QWidget):
             label = {
                 "refresh": "Loading saved names",
                 "photos": "Loading named photos",
+                "similar": "Finding similar faces",
+                "deep_similar": "Deep name and similar search",
                 "mutation": "Saving face-region names",
             }.get(str(slot), "Names workspace work")
             job_id = self.job_manager.register_job(
                 label,
                 cancel_fn=job.cancel,
                 origin="Names",
-                foreground=str(slot) in {"refresh", "mutation"},
+                foreground=str(slot) in {"refresh", "similar", "deep_similar", "mutation"},
             )
             self._operation_job_ids[str(slot)] = job_id
             job.progress.connect(
@@ -818,7 +1371,7 @@ class NamesPane(QWidget):
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready = True
         self._hide_name_hover_preview(cancel_preview=True)
-        for slot in ("refresh", "photos", "mutation"):
+        for slot in ("refresh", "photos", "similar", "deep_similar", "mutation"):
             job = getattr(self, f"_{slot}_job", None)
             thread = getattr(self, f"_{slot}_thread", None)
             if job is not None:
@@ -832,6 +1385,10 @@ class NamesPane(QWidget):
         self._refresh_thread = None
         self._photos_job = None
         self._photos_thread = None
+        self._similar_job = None
+        self._similar_thread = None
+        self._deep_similar_job = None
+        self._deep_similar_thread = None
         self._mutation_job = None
         self._mutation_thread = None
         for _job, thread in list(self._retained_hover_preview_refs):

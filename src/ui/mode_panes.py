@@ -133,7 +133,7 @@ class SourcePane(QWidget):
         # from reporting both `/home` and "No folder selected".
         self.selected_directory = ""
         self._recent_directories: list[str] = []
-        self._browse_root = "C:/" if os.name == "nt" else "/home"
+        self._browse_root = "C:/" if os.name == "nt" else "/"
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -164,6 +164,9 @@ class SourcePane(QWidget):
         layout.addLayout(header)
 
         self.directory_combobox = QComboBox()
+        self.directory_combobox.setToolTip(
+            "Choose the root shown by the complete folder tree. Selecting a folder in the tree does not hide its parents or siblings."
+        )
         self.populate_drives()
         self.directory_combobox.currentIndexChanged.connect(self.on_directory_changed)
         layout.addWidget(self.directory_combobox)
@@ -171,7 +174,9 @@ class SourcePane(QWidget):
         self.selected_folder_label = QLabel("No folder selected", self)
         self.selected_folder_label.setObjectName("selectedFolderRoot")
         self.selected_folder_label.setWordWrap(False)
-        self.selected_folder_label.setToolTip("Choose a folder to show its subfolders.")
+        self.selected_folder_label.setToolTip(
+            "Choose a folder to use for clustering. The complete tree remains visible under the chosen browse root."
+        )
         layout.addWidget(self.selected_folder_label)
 
         self.file_model = QFileSystemModel()
@@ -251,7 +256,7 @@ class SourcePane(QWidget):
             self._browse_root = drives[0] if drives else "C:/"
         else:
             drives = ["/", "/home"]
-            self._browse_root = "/home"
+            self._browse_root = "/"
         self.directory_combobox.addItems(drives)
 
     def on_directory_selected(self, index) -> None:
@@ -261,7 +266,60 @@ class SourcePane(QWidget):
         root_directory = self.directory_combobox.currentText()
         self._browse_root = root_directory
         self.file_model.setRootPath(root_directory)
+        self.file_tree.setRootIndex(self.file_model.index(root_directory))
         self.set_selected_directory(root_directory, emit_state=True)
+
+    @staticmethod
+    def _path_is_within(directory: str, root: str) -> bool:
+        try:
+            normalized_directory = os.path.normcase(os.path.abspath(directory))
+            normalized_root = os.path.normcase(os.path.abspath(root))
+            return os.path.commonpath((normalized_directory, normalized_root)) == normalized_root
+        except (TypeError, ValueError):
+            return False
+
+    def _ensure_browse_root_contains(self, directory: str) -> None:
+        if self._path_is_within(directory, self._browse_root):
+            return
+        candidates = [self.directory_combobox.itemText(index) for index in range(self.directory_combobox.count())]
+        matching_roots = [root for root in candidates if self._path_is_within(directory, root)]
+        if matching_roots:
+            browse_root = max(matching_roots, key=len)
+        else:
+            drive, _ = os.path.splitdrive(directory)
+            browse_root = f"{drive}{os.path.sep}" if drive else os.path.abspath(os.path.sep)
+        self._browse_root = browse_root
+        combo_index = self.directory_combobox.findText(browse_root)
+        if combo_index >= 0:
+            self.directory_combobox.blockSignals(True)
+            self.directory_combobox.setCurrentIndex(combo_index)
+            self.directory_combobox.blockSignals(False)
+        self.file_model.setRootPath(browse_root)
+        self.file_tree.setRootIndex(self.file_model.index(browse_root))
+
+    def _reveal_selected_directory(self, directory: str) -> None:
+        selected_index = self.file_model.index(directory)
+        if not selected_index.isValid():
+            return
+        root_index = self.file_model.index(self._browse_root)
+        if root_index.isValid():
+            self.file_tree.setRootIndex(root_index)
+
+        ancestors = []
+        ancestor = selected_index.parent()
+        while ancestor.isValid():
+            ancestor_path = self.file_model.filePath(ancestor)
+            if not self._path_is_within(ancestor_path, self._browse_root):
+                break
+            ancestors.append(ancestor)
+            if os.path.normcase(os.path.abspath(ancestor_path)) == os.path.normcase(os.path.abspath(self._browse_root)):
+                break
+            ancestor = ancestor.parent()
+        for index in reversed(ancestors):
+            self.file_tree.expand(index)
+        self.file_tree.expand(selected_index)
+        self.file_tree.setCurrentIndex(selected_index)
+        self.file_tree.scrollTo(selected_index)
 
     def set_selected_directory(self, directory: str, *, emit_state: bool = False) -> None:
         directory = str(directory or "").strip()
@@ -276,9 +334,9 @@ class SourcePane(QWidget):
                 self.directory_combobox.setCurrentIndex(idx)
                 self.directory_combobox.blockSignals(False)
         self.selected_directory = directory
-        self.file_model.setRootPath(self._browse_root)
-        self.file_tree.setRootIndex(self.file_model.index(directory))
-        self.selected_folder_label.setText(f"Root: {directory}")
+        self._ensure_browse_root_contains(directory)
+        self._reveal_selected_directory(directory)
+        self.selected_folder_label.setText(f"Selected: {directory}")
         self.selected_folder_label.setToolTip(directory)
         self.directory_changed.emit(self.selected_directory)
         if emit_state:

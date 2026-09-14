@@ -481,7 +481,7 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertFalse(staging.exists())
                 window.close()
 
-    def test_production_face_results_open_in_main_gallery(self):
+    def test_production_face_results_open_in_top_level_gallery_route(self):
         from apps.pyqt_production.app import ProductionClusterApp
 
         with TemporaryDirectory() as tmp:
@@ -497,11 +497,45 @@ class ProductionSupportTests(unittest.TestCase):
                 window.faces_pane.context_for_path = lambda path: {"origin": "faces", "path": path}
 
                 window._open_face_results_in_main_gallery([image_a, image_b])
-                self._wait_for(lambda: list(window.gallery_pane.images) == [image_a, image_b], timeout_s=2.0)
+                self._wait_for(lambda: window._photo_set_route is not None, timeout_s=2.0)
 
-                self.assertEqual("clustering", window._active_workspace)
-                self.assertEqual([image_a, image_b], list(window.gallery_pane.images))
-                self.assertEqual("faces", window.gallery_pane.inspector_context_provider(image_a)["origin"])
+                self.assertEqual("gallery", window._active_workspace)
+                self.assertEqual([image_a, image_b], list(window.photo_gallery._model.all_paths()))
+                self.assertEqual("faces", window._photo_gallery_context_for_path(image_a)["origin"])
+                self.assertEqual("faces", window._photo_set_route.return_workspace)
+                self.assertFalse(window.photo_gallery.review_faces_button.isHidden())
+                self.assertFalse(window.photo_gallery.back_to_folder_button.isHidden())
+                window.close()
+
+    def test_production_clustering_job_records_exact_cpu_fallback_reason(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionClusteringFallbackJobTest")
+                window = ProductionClusterApp(layout)
+                self._wait_for_storage_idle(window)
+                window._start_cluster_tag_context_refresh = lambda: None
+
+                window._on_clustering_started()
+                job_id = window._active_job_id
+                window._on_clustering_completed(
+                    {
+                        "clusters_by_key": {},
+                        "membership_by_image": {},
+                        "metrics_by_key": {
+                            "dino::hdbscan": {
+                                "compute_fallback_reason": "cuML HDBSCAN provider unavailable",
+                            }
+                        },
+                    }
+                )
+
+                job = window.job_manager.get(job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual("finished", job.status)
+                self.assertEqual("CPU fallback: cuML HDBSCAN provider unavailable", job.cache_status)
                 window.close()
 
     def test_benchmark_schema_writes_json_and_markdown(self):
@@ -1111,6 +1145,7 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertIn("hf_xet", remediation)
         self.assertIn("packaged exe", remediation)
         self.assertIn("Flash SDP", remediation)
+        self.assertIn("cuML", remediation)
 
     def test_production_gallery_uses_one_overflow_without_legacy_buttons(self):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
@@ -1337,7 +1372,9 @@ class ProductionSupportTests(unittest.TestCase):
             ]
         ).lower()
         self.assertEqual("apps.pyqt_production.settings_dialog", ProductionSettingsDialog.__module__)
-        self.assertEqual("Rescan Available Resources", dialog.refresh_runtime_button.text())
+        self.assertEqual("Rescan GPU Resources", dialog.refresh_runtime_button.text())
+        self.assertIn("GPU acceleration checklist", dialog.runtime_text.toPlainText())
+        self.assertIn("no model downloads", dialog.runtime_text.toPlainText().lower())
         self.assertIn("ONNX face indexing:", dialog.runtime_text.toPlainText())
         self.assertIn("Cosine K-means:", dialog.runtime_text.toPlainText())
         self.assertIn("CPU SIMD dispatch:", dialog.runtime_text.toPlainText())
@@ -1373,11 +1410,38 @@ class ProductionSupportTests(unittest.TestCase):
             self.assertFalse(dialog.verify_runtime_button.isEnabled())
             self._wait_for(lambda: dialog._verify_thread is None, timeout_s=5.0)
 
-        diagnostics.assert_called_once_with(preferred_mode, refresh=True)
+        diagnostics.assert_called_once_with(preferred_mode, refresh=False)
         self.assertTrue(dialog.refresh_runtime_button.isEnabled())
         self.assertTrue(dialog.verify_runtime_button.isEnabled())
         self.assertIn("face indexing:", dialog.runtime_text.toPlainText().lower())
+        self.assertIn("gpu acceleration checklist", dialog.runtime_text.toPlainText().lower())
         self.assertEqual([True], rescanned)
+        dialog.close()
+
+    def test_production_settings_rescan_checks_cuda_even_when_cpu_mode_is_active(self):
+        from apps.pyqt_production.app import RUNTIME_LAYOUT
+        from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
+
+        store = QSettings("ClusterLensTests", "ProductionRuntimeRescanCpuMode")
+        service = RuntimeCapabilityService()
+        dialog = ProductionSettingsDialog(
+            store,
+            service,
+            runtime_layout=RUNTIME_LAYOUT,
+            support_metadata_provider=lambda: {},
+        )
+        dialog._set_combo_data(dialog.execution_mode, "cpu")
+        with patch.object(service, "select_policy", wraps=service.select_policy) as select_policy:
+            dialog.refresh_runtime_button.click()
+            self._wait_for(lambda: dialog._verify_thread is None, timeout_s=5.0)
+
+        self.assertTrue(
+            any(
+                call.kwargs == {"preferred_mode": "cuda", "refresh": True}
+                for call in select_policy.call_args_list
+            )
+        )
+        self.assertIn("cuda onnx", dialog.runtime_text.toPlainText().lower())
         dialog.close()
 
     def test_production_pane_hide_buttons_and_toolbar_toggles_work(self):

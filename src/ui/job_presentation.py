@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QObject, QTimer
+from PyQt6 import sip
 
 from .footer_bar import WorkspaceFooter
 from .job_manager import JobManager, JobState
@@ -28,8 +29,24 @@ class JobPresentationController(QObject):
         self.refresh()
 
     def _schedule_refresh(self, *_args) -> None:
+        if not self._footer_is_alive():
+            return
         if not self._refresh_timer.isActive():
             self._refresh_timer.start(50)
+
+    def _footer_is_alive(self) -> bool:
+        if self._footer is None:
+            return False
+        try:
+            return not bool(sip.isdeleted(self._footer))
+        except Exception:
+            return True
+
+    def shutdown(self) -> None:
+        """Stop queued footer updates before its parent window is deleted."""
+
+        self._refresh_timer.stop()
+        self._footer = None
 
     @staticmethod
     def _text_for(job: JobState, active_count: int) -> str:
@@ -43,6 +60,8 @@ class JobPresentationController(QObject):
         return text
 
     def refresh(self) -> None:
+        if not self._footer_is_alive():
+            return
         job = self._job_manager.most_recent_active(foreground_only=True)
         if job is None:
             if self._last_job_id is not None:

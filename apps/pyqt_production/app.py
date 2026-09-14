@@ -71,6 +71,9 @@ COMPACT_LAYOUT_WIDTH = 1440
 PACKAGED_LAUNCH_SMOKE_ENV = "CLUSTERLENS_PACKAGED_LAUNCH_SMOKE"
 PACKAGED_LAUNCH_REPORT_ENV = "CLUSTERLENS_PACKAGED_LAUNCH_REPORT"
 PACKAGED_LAUNCH_SMOKE_SCENARIO = "settings-storage"
+# A top-level Qt widget has no QObject parent.  Retain a close-pending window
+# while its event-loop-driven cancellation drain owns live worker signals.
+_CLOSE_PENDING_WINDOWS: list["ProductionClusterApp"] = []
 
 if TYPE_CHECKING:
     from app.services.face_search import FaceIndexService
@@ -118,11 +121,27 @@ class NamesWorkspacePayload:
     service_key: tuple[str, str, str, str]
 
 
+@dataclass(frozen=True)
+class PhotoSetRoute:
+    """A transient Gallery set opened by another workspace.
+
+    Routes deliberately live only in memory.  Persisting result paths would
+    make a restored session point at files the user may have moved or removed.
+    """
+
+    source: str
+    title: str
+    paths: tuple[str, ...]
+    return_workspace: str
+    context_by_path: dict[str, dict[str, object]]
+
+
 class ProductionClusterApp(QMainWindow):
     def __init__(self, runtime_layout: RuntimeLayout):
         super().__init__()
         self._is_shutting_down = False
         self._close_pending = False
+        self._close_retry_scheduled = False
         self._packaged_launch_smoke = bool(str(os.environ.get(PACKAGED_LAUNCH_SMOKE_ENV) or "").strip())
         self._unsupported_resolution_active = False
         self._screen_available_width = MIN_SUPPORTED_SCREEN_WIDTH
@@ -210,6 +229,8 @@ class ProductionClusterApp(QMainWindow):
         self._gallery_discovery_job = None
         self._gallery_discovery_thread = None
         self._gallery_primary_comparison_key = ""
+        self._photo_set_route: PhotoSetRoute | None = None
+        self._pending_face_review_paths: tuple[str, ...] = ()
         self._active_cluster_directory = ""
         self._pane_visibility = {"source": True, "controls": True, "details": True}
         self._advanced_pane_visibility = {"source": True, "controls": True, "details": True}
@@ -361,6 +382,14 @@ class ProductionClusterApp(QMainWindow):
             self._release_async_refs(job, thread)
 
         def _completed(_result) -> None:
+            if (
+                self._is_shutting_down
+                or self._close_pending
+                or not self._can_update_widget(getattr(self, "clustering_pane", None))
+            ):
+                self.job_manager.finish(job_id, status="cancelled")
+                _cleanup()
+                return
             self._startup_maintenance_complete = True
             self.job_manager.finish(job_id, status="finished")
             _cleanup()
@@ -374,6 +403,14 @@ class ProductionClusterApp(QMainWindow):
         def _failed(message: str) -> None:
             # Individual recovery helpers log their own recoverable failures;
             # an unexpected one must still leave the main app usable.
+            if (
+                self._is_shutting_down
+                or self._close_pending
+                or not self._can_update_widget(getattr(self, "clustering_pane", None))
+            ):
+                self.job_manager.finish(job_id, status="cancelled")
+                _cleanup()
+                return
             self._startup_maintenance_complete = True
             self.job_manager.finish(job_id, status="failed", error=str(message))
             _cleanup()
@@ -388,6 +425,8 @@ class ProductionClusterApp(QMainWindow):
         def _cancelled() -> None:
             self.job_manager.finish(job_id, status="cancelled")
             _cleanup()
+            if self._is_shutting_down or self._close_pending:
+                return
             self._finish_pending_photo_face_tool_requests(
                 error="Local workspace preparation was cancelled."
             )
@@ -479,6 +518,7 @@ class ProductionClusterApp(QMainWindow):
         self.photo_gallery._actions.metadata_service = self.photo_metadata_service
         self.photo_gallery._actions.image_tag_service = self.image_tag_service
         self.photo_gallery.face_service_provider = lambda: self.face_service_global
+        self.photo_gallery.inspector_context_provider = self._photo_gallery_context_for_path
         self.photo_gallery.face_edit_request_handler = self._request_photo_face_tools
         self.photo_gallery.face_edit_saved_callback = self._on_main_gallery_face_labels_changed
         self.photo_gallery.set_read_only_mode(self._read_only_mode())
@@ -1080,6 +1120,8 @@ class ProductionClusterApp(QMainWindow):
         pane.setMinimumWidth(self._layout_widths()["faces"])
         self.names_pane = pane
         pane.face_labels_changed.connect(self._on_names_face_labels_changed)
+        pane.open_in_gallery_requested.connect(self._open_named_photos_in_gallery)
+        pane.open_similar_faces_in_gallery_requested.connect(self._open_names_similar_faces_in_gallery)
         if self.faces_pane is not None:
             self.faces_pane.face_labels_changed.connect(pane.refresh_names)
         self._apply_workspace_preferences()
@@ -1117,6 +1159,21 @@ class ProductionClusterApp(QMainWindow):
             self.names_pane.refresh_names()
         self._on_names_face_labels_changed()
 
+    def _photo_gallery_context_for_path(self, path: str) -> dict[str, object]:
+        """Combine normal photo context with the active route's face context."""
+
+        context = self._gallery_context_for_path(str(path))
+        route = self._photo_set_route
+        if route is not None:
+            route_context = route.context_by_path.get(str(path))
+            if isinstance(route_context, dict):
+                context.update(route_context)
+            context["photo_set_route"] = {
+                "source": route.source,
+                "title": route.title,
+            }
+        return context
+
     def _connect_faces_signals(self, pane) -> None:
         pane.open_in_gallery_requested.connect(self._open_face_results_in_main_gallery)
         pane.append_to_gallery_requested.connect(self._append_face_results_to_main_gallery)
@@ -1131,6 +1188,7 @@ class ProductionClusterApp(QMainWindow):
         pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         pane.set_recent_directories(self.recent_folder_history.paths())
+        self._apply_pending_photo_face_review(pane)
 
     def _show_face_pipeline_controls(self) -> None:
         self.set_active_workspace("faces")
@@ -1310,6 +1368,7 @@ class ProductionClusterApp(QMainWindow):
         self.clustering_pane.hide_requested.connect(lambda: self._set_pane_visible("controls", False))
         self.cluster_pane.cluster_selected.connect(self.update_gallery)
         self.cluster_pane.recluster_requested.connect(self.recluster_selected_cluster)
+        self.cluster_pane.open_in_gallery_requested.connect(self._open_selected_cluster_in_gallery)
         self.cluster_pane.hide_requested.connect(lambda: self._set_pane_visible("details", False))
         self.cluster_pane.selection_target_changed.connect(self._on_cluster_selection_target_changed)
         self.gallery_pane.first_paint_ready.connect(self._on_gallery_first_paint)
@@ -1320,12 +1379,17 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.paths_removed.connect(self._on_gallery_paths_removed)
         self.gallery_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.photo_gallery.organize_requested.connect(self.run_gallery_organize)
+        self.photo_gallery.analyze_requested.connect(self._analyze_photo_set_in_clustering)
+        self.photo_gallery.review_faces_requested.connect(self._review_photo_set_in_faces)
+        self.photo_gallery.return_to_folder_requested.connect(self._return_to_folder_photo_gallery)
+        self.photo_gallery.return_to_source_requested.connect(self._return_to_photo_set_source)
         self.photo_gallery.paths_removed.connect(self._on_gallery_paths_removed)
         self.photo_gallery.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.tags_pane.run_tag_filter_requested.connect(self._run_tag_filter_from_tags_workspace)
         self.tags_pane.generate_suggestions_requested.connect(self.generate_cluster_tag_suggestions)
         self.tags_pane.apply_suggestions_requested.connect(self.apply_cluster_tag_suggestions)
         self.tags_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
+        self.tags_pane.open_in_gallery_requested.connect(self._open_tagged_photos_in_gallery)
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
         self.session_controller.progress.connect(self._on_clustering_progress)
@@ -1346,6 +1410,9 @@ class ProductionClusterApp(QMainWindow):
             ("Ctrl+1", lambda: self.set_active_workspace("gallery")),
             ("Ctrl+2", lambda: self.set_active_workspace("clustering")),
             ("Ctrl+3", lambda: self.set_active_workspace("faces")),
+            ("Ctrl+4", lambda: self.set_active_workspace("names")),
+            ("Ctrl+5", lambda: self.set_active_workspace("tags")),
+            ("Ctrl+J", self._open_jobs_dialog),
             ("Ctrl+,", self.open_settings_dialog),
             ("Ctrl+O", self._focus_folder_picker),
             ("Ctrl+F", self._focus_workspace_search),
@@ -1377,10 +1444,17 @@ class ProductionClusterApp(QMainWindow):
         if target is not None:
             target.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
+    def _open_jobs_dialog(self) -> None:
+        """Keep the Jobs surface reachable without relying on footer focus."""
+
+        opener = getattr(self.jobs_widget, "_open_jobs_dialog", None)
+        if callable(opener):
+            opener()
+
     def _show_keyboard_help(self) -> None:
         infoBox(
             "Keyboard shortcuts",
-            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
+            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+4 Names\nCtrl+5 Tags\nCtrl+J Jobs\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
         )
 
     def _open_runtime_status_details(self) -> None:
@@ -2562,6 +2636,8 @@ class ProductionClusterApp(QMainWindow):
                 self.faces_pane.face_folder_path.setText(directory)
                 self.faces_pane.face_folder_path.blockSignals(False)
                 self.faces_pane._update_face_scope_summary()
+        self._photo_set_route = None
+        self.photo_gallery.set_photo_set_route()
         self._load_gallery_folder(directory)
         self._apply_startup_workflow_gate()
 
@@ -2594,6 +2670,7 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._gallery_discovery_job = job
+        self.job_manager.bind_async_job(job, "Finding folder photos", origin="Gallery")
 
         def _finished(result) -> None:
             if generation != self._gallery_discovery_generation or self._is_shutting_down:
@@ -2620,6 +2697,120 @@ class ProductionClusterApp(QMainWindow):
         self._gallery_discovery_thread = thread
         self._retain_async_refs(job, thread)
         thread.finished.connect(lambda: self._release_async_refs(job, thread), Qt.ConnectionType.QueuedConnection)
+
+    @staticmethod
+    def _unique_photo_paths(paths: list[str] | tuple[str, ...]) -> list[str]:
+        return list(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
+
+    def _open_photo_set_route(
+        self,
+        paths: list[str] | tuple[str, ...],
+        *,
+        source: str,
+        title: str,
+        return_workspace: str,
+        context_by_path: dict[str, dict[str, object]] | None = None,
+        append: bool = False,
+    ) -> None:
+        """Publish a bounded, transient Gallery route from another workspace."""
+
+        route_paths = self._unique_photo_paths(paths)
+        if append and self._photo_set_route is not None:
+            route_paths = self._unique_photo_paths([*self._photo_set_route.paths, *route_paths])
+        if not route_paths:
+            return
+        route_context = {
+            str(path): dict(context)
+            for path, context in dict(context_by_path or {}).items()
+            if str(path or "").strip() and isinstance(context, dict)
+        }
+        if append and self._photo_set_route is not None:
+            route_context = {**self._photo_set_route.context_by_path, **route_context}
+        route = PhotoSetRoute(
+            source=str(source or "Gallery"),
+            title=str(title or "Photo set"),
+            paths=tuple(route_paths),
+            return_workspace=str(return_workspace or "gallery"),
+            context_by_path=route_context,
+        )
+        self._photo_set_route = route
+        self.photo_gallery.inspector_context_provider = self._photo_gallery_context_for_path
+        self.photo_gallery.set_photo_set_route(
+            title=f"{route.title} · {len(route.paths)} photos",
+            source=route.return_workspace,
+            can_return=route.return_workspace != "gallery",
+            can_review_faces=True,
+            can_analyze=True,
+        )
+        self.photo_gallery.set_sections(
+            [GallerySection("route", route.paths, kind="photos", title=route.title)],
+            status=f"Showing {len(route.paths)} photo(s) from {route.source}. Select photos, then use the visible route actions.",
+        )
+        self.set_active_workspace("gallery")
+        self.footer_bar.set_status(f"Opened {len(route.paths)} photo(s) from {route.source} in Gallery.")
+        self._set_activity(f"Gallery route: {route.source}")
+
+    def _return_to_folder_photo_gallery(self) -> None:
+        """Drop only session routing; the selected-folder gallery remains durable."""
+
+        self._photo_set_route = None
+        self.photo_gallery.set_photo_set_route()
+        if not self._gallery_paths:
+            self.photo_gallery.set_empty_state("Choose a folder to show its photos.")
+        else:
+            self.photo_gallery.set_sections(
+                [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
+                status=f"Showing {len(self._gallery_paths)} folder photo(s). Organize when you are ready.",
+            )
+        self.footer_bar.set_status("Returned to selected-folder photos.")
+
+    def _return_to_photo_set_source(self, workspace_id: str) -> None:
+        target = self._normalize_workspace_id(workspace_id)
+        if target == "gallery":
+            return
+        self.set_active_workspace(target)
+        self.footer_bar.set_status("Returned to the workspace that opened this photo set.")
+
+    def _analyze_photo_set_in_clustering(self, paths: list[str]) -> None:
+        selected_paths = self._unique_photo_paths(paths)
+        if len(selected_paths) < 2:
+            errorBox("More photos needed", "Select at least two photos before analyzing this photo set.")
+            return
+        if not self._clustering_ready_for_action() or self._run_request_active():
+            return
+        request = self._build_request()
+        request = replace(
+            request,
+            source_paths=selected_paths,
+            tag_filter=[],
+            generate_cluster_meanings=False,
+            generate_cluster_explanations=False,
+        )
+        self.set_active_workspace("clustering")
+        self.footer_bar.set_status(f"Preparing {len(selected_paths)} Gallery photo(s) for clustering…")
+        self._start_request_preflight(request)
+
+    def _review_photo_set_in_faces(self, paths: list[str]) -> None:
+        selected_paths = tuple(self._unique_photo_paths(paths))
+        if not selected_paths:
+            return
+        # This is only a review hand-off.  SearchPane displays the explicit
+        # scope and waits for its Detect Faces action before indexing anything.
+        self._pending_face_review_paths = selected_paths
+        self.set_active_workspace("faces")
+        if self.faces_pane is not None:
+            self._apply_pending_photo_face_review(self.faces_pane)
+        self.footer_bar.set_status(f"{len(selected_paths)} photo(s) are ready in Faces. Choose Detect Faces to start indexing.")
+
+    def _apply_pending_photo_face_review(self, pane) -> None:
+        paths = tuple(self._pending_face_review_paths)
+        if not paths or pane is None:
+            return
+        setter = getattr(pane, "set_explicit_review_scope_paths", None)
+        if not callable(setter):
+            return
+        setter(list(paths))
+        self._pending_face_review_paths = ()
 
     def run_gallery_organize(self) -> None:
         if not self._clustering_ready_for_action():
@@ -2806,9 +2997,6 @@ class ProductionClusterApp(QMainWindow):
     def _on_clustering_completed(self, payload: dict) -> None:
         self.footer_bar.set_status("Clustering finished.")
         job_id = getattr(self, "_active_job_id", None)
-        if job_id is not None:
-            self.job_manager.finish(job_id, status="finished")
-            self._active_job_id = None
         self.cluster_data = _restore_cluster_dict(payload.get("clusters_by_key") or {})
         self.membership_by_image = _restore_membership(payload.get("membership_by_image") or {})
         self.metrics_by_backend = {str(key): dict(value) for key, value in dict(payload.get("metrics_by_key") or {}).items()}
@@ -2820,6 +3008,13 @@ class ProductionClusterApp(QMainWindow):
             )
         )
         fallback_notice = f" CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else ""
+        if job_id is not None:
+            self.job_manager.finish(
+                job_id,
+                status="finished",
+                cache_status=f"CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else "",
+            )
+            self._active_job_id = None
         self.cluster_explanations = _restore_cluster_explanations(payload.get("cluster_explanations_by_key") or {})
         self.cluster_meanings = _restore_cluster_meanings(payload.get("cluster_meanings_by_key") or {})
         self.last_run_metrics = dict(payload.get("metrics") or {})
@@ -2915,6 +3110,22 @@ class ProductionClusterApp(QMainWindow):
         removed = {str(path) for path in paths if path}
         if not removed:
             return
+        self._gallery_paths = [path for path in self._gallery_paths if path not in removed]
+        route = self._photo_set_route
+        if route is not None:
+            remaining_route_paths = tuple(path for path in route.paths if path not in removed)
+            remaining_context = {
+                path: context
+                for path, context in route.context_by_path.items()
+                if path not in removed
+            }
+            self._photo_set_route = replace(
+                route,
+                paths=remaining_route_paths,
+                context_by_path=remaining_context,
+            ) if remaining_route_paths else None
+            if not remaining_route_paths:
+                self.photo_gallery.set_photo_set_route()
         self._main_gallery_context_overrides = {
             image_path: context
             for image_path, context in self._main_gallery_context_overrides.items()
@@ -2956,7 +3167,12 @@ class ProductionClusterApp(QMainWindow):
             )
 
     def _on_gallery_metadata_changed(self, paths: list[str]) -> None:
-        _ = paths
+        changed = {str(path) for path in paths if path}
+        route = self._photo_set_route
+        if route is not None and changed.intersection(route.paths):
+            self.photo_gallery.status_label.setText(
+                f"Metadata changed for {len(changed.intersection(route.paths))} routed photo(s). Source views are refreshing."
+            )
         self.footer_bar.set_status("Refreshing cluster context after metadata changes...")
         self._set_activity("Refreshing after metadata change...")
         self.cluster_pane.update_clusters(
@@ -4050,33 +4266,85 @@ class ProductionClusterApp(QMainWindow):
         ordered_paths = list(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
         if not ordered_paths:
             return
-        self._main_gallery_context_overrides = self._capture_face_context(ordered_paths)
-        self.gallery_pane.set_membership_context({}, {})
-        self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
-        self.set_active_workspace("clustering")
-        self.gallery_pane.update_gallery_with_options(
-            images=ordered_paths,
-            clear_pixmaps=True,
-            reset_scroll=True,
+        self._open_photo_set_route(
+            ordered_paths,
+            source="Faces results",
+            title="Face results",
+            return_workspace="faces",
+            context_by_path=self._capture_face_context(ordered_paths),
         )
-        self.footer_bar.set_status(f"Opened {len(ordered_paths)} face result(s) in main gallery.")
-        self._set_activity("Face results opened")
 
     def _append_face_results_to_main_gallery(self, paths: list[str]) -> None:
         ordered_paths = list(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
         if not ordered_paths:
             return
-        self._main_gallery_context_overrides.update(self._capture_face_context(ordered_paths))
-        combined = list(dict.fromkeys([*list(self.gallery_pane.images), *ordered_paths]))
-        self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
-        self.set_active_workspace("clustering")
-        self.gallery_pane.update_gallery_with_options(
-            images=combined,
-            clear_pixmaps=True,
-            reset_scroll=False,
+        self._open_photo_set_route(
+            ordered_paths,
+            source="Faces results",
+            title="Face results",
+            return_workspace="faces",
+            context_by_path=self._capture_face_context(ordered_paths),
+            append=True,
         )
-        self.footer_bar.set_status(f"Appended {len(ordered_paths)} face result(s) to main gallery.")
-        self._set_activity("Face results appended")
+
+    def _open_named_photos_in_gallery(self, paths: list[str], name: str) -> None:
+        person_name = str(name or "").strip()
+        self._open_photo_set_route(
+            paths,
+            source=f"Names · {person_name}",
+            title=f"Photos named {person_name}",
+            return_workspace="names",
+            context_by_path={
+                str(path): {"named_face": {"person_name": person_name}}
+                for path in self._unique_photo_paths(paths)
+            },
+        )
+
+    def _open_names_similar_faces_in_gallery(
+        self,
+        paths: list[str],
+        name: str,
+        context_by_path: dict[str, dict[str, object]],
+    ) -> None:
+        person_name = str(name or "").strip()
+        ordered_paths = self._unique_photo_paths(paths)
+        if not ordered_paths or not person_name:
+            return
+        self._open_photo_set_route(
+            ordered_paths,
+            source=f"Names · similar to {person_name}",
+            title=f"Faces similar to {person_name}",
+            return_workspace="names",
+            context_by_path={
+                str(path): dict(context_by_path.get(str(path), {}) or {})
+                for path in ordered_paths
+            },
+        )
+
+    def _open_tagged_photos_in_gallery(self, paths: list[str], tag: str) -> None:
+        tag_name = str(tag or "").strip()
+        self._open_photo_set_route(
+            paths,
+            source=f"Tags · {tag_name}",
+            title=f"Photos tagged {tag_name}",
+            return_workspace="tags",
+            context_by_path={
+                str(path): {"tag_route": {"tag": tag_name}}
+                for path in self._unique_photo_paths(paths)
+            },
+        )
+
+    def _open_selected_cluster_in_gallery(self, target: SelectionTarget | None) -> None:
+        if target is None:
+            return
+        context = dict(target.source_context or {})
+        self._open_photo_set_route(
+            list(target.paths),
+            source=f"Clustering · {target.label}",
+            title=target.label,
+            return_workspace="clustering",
+            context_by_path={str(path): {"cluster_route": context} for path in target.paths},
+        )
 
     def _main_gallery_context_for_path(self, path: str) -> dict[str, object]:
         context = self._gallery_context_for_path(path)
@@ -4363,6 +4631,7 @@ class ProductionClusterApp(QMainWindow):
         # guard before this window (and its footer) can be deleted.
         self._close_pending = True
         self._is_shutting_down = True
+        self.job_presentation.shutdown()
         self._startup_check_timer.stop()
         self._post_install_timer.stop()
         self._pending_post_install_model_name = None
@@ -4380,6 +4649,7 @@ class ProductionClusterApp(QMainWindow):
             (self._faces_init_job, self._faces_init_thread),
             (self._names_init_job, self._names_init_thread),
             (self._tag_suggestion_job, self._tag_suggestion_thread),
+            (self._gallery_discovery_job, self._gallery_discovery_thread),
         )
         for job, thread in runtime_jobs:
             if job is None:
@@ -4409,7 +4679,15 @@ class ProductionClusterApp(QMainWindow):
         self._tag_suggestion_job_id = None
         self._preflight_job = None
         self._preflight_thread = None
-        ready_to_close = self._wait_for_thread(self._tag_context_thread, 2500)
+        # Tests create a disposable runtime root per case.  Their teardown
+        # releases that root immediately after close(), so it must drain the
+        # same event-driven workers deterministically.  Interactive closes
+        # remain non-blocking and retry from the event loop below.
+        drain_timeout_ms = 2500 if bool(os.environ.get("PYTEST_CURRENT_TEST")) else 0
+        # Closing is a cancellation/drain state machine.  Never wait for a
+        # worker on Qt's event loop: a queued completion needs that same loop
+        # to run before the following close attempt can succeed.
+        ready_to_close = self._wait_for_thread(self._tag_context_thread, drain_timeout_ms)
         retained_jobs = list(self._retained_async_refs)
         for job, thread in retained_jobs:
             if job is not None:
@@ -4417,7 +4695,7 @@ class ProductionClusterApp(QMainWindow):
                     job.cancel()
                 except Exception:
                     pass
-            ready_to_close = self._wait_for_thread(thread, 2500) and ready_to_close
+            ready_to_close = self._wait_for_thread(thread, drain_timeout_ms) and ready_to_close
         if ready_to_close:
             for job, thread in (*runtime_jobs, *retained_jobs):
                 dispose = getattr(job, "dispose", None)
@@ -4432,38 +4710,57 @@ class ProductionClusterApp(QMainWindow):
                 except (AttributeError, RuntimeError):
                     pass
         self._retained_async_refs = []
-        ready_to_close = self.model_download_controller.shutdown(2500) and ready_to_close
-        ready_to_close = self.session_controller.shutdown(2500) and ready_to_close
+        ready_to_close = self.model_download_controller.shutdown(drain_timeout_ms) and ready_to_close
+        ready_to_close = self.session_controller.shutdown(drain_timeout_ms) and ready_to_close
         try:
-            ready_to_close = self.gallery_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+            ready_to_close = self.gallery_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
+        except Exception:
+            ready_to_close = False
+        try:
+            ready_to_close = self.photo_gallery.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
         except Exception:
             ready_to_close = False
         if self.faces_pane is not None:
             try:
-                ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+                ready_to_close = self.faces_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         if self.names_pane is not None:
             try:
-                ready_to_close = self.names_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+                ready_to_close = self.names_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         if self.tags_pane is not None:
             try:
-                ready_to_close = self.tags_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+                ready_to_close = self.tags_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         try:
-            ready_to_close = self.cluster_pane.shutdown_jobs(timeout_ms=2500) and ready_to_close
+            ready_to_close = self.cluster_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
         except Exception:
             ready_to_close = False
         if not ready_to_close:
-            self._is_shutting_down = False
             if self._can_update_widget(getattr(self, "footer_bar", None)):
                 self.footer_bar.set_status("Waiting for background work to stop before closing.")
             self._set_activity("Stopping background work...")
+            if not self._close_retry_scheduled:
+                self._close_retry_scheduled = True
+
+                def _retry_close() -> None:
+                    self._close_retry_scheduled = False
+                    if self._close_pending:
+                        self.close()
+
+                QTimer.singleShot(50, _retry_close)
+            if self not in _CLOSE_PENDING_WINDOWS:
+                _CLOSE_PENDING_WINDOWS.append(self)
+            self.hide()
             event.ignore()
             return
+        try:
+            _CLOSE_PENDING_WINDOWS.remove(self)
+        except ValueError:
+            pass
         self.settings_store.setValue("workspace/default_view", self._active_workspace)
         self.settings_store.setValue("workspace/faces_mode", self._faces_mode)
         self.settings_store.sync()
@@ -4506,6 +4803,7 @@ class ProductionClusterApp(QMainWindow):
             "_startup_readiness_job",
             "_faces_init_job",
             "_names_init_job",
+            "_gallery_discovery_job",
         ):
             job = getattr(self, job_name, None)
             if job is None:

@@ -406,6 +406,12 @@ class ClusteringService:
                 )
                 if labels is not None:
                     return labels, "hdbscan", compute_info
+                if self.vector_compute.execution_policy.preferred_mode == "cuda":
+                    detail = compute_info.fallback_reason or "cuML HDBSCAN is unavailable in this CUDA runtime."
+                    raise RuntimeError(
+                        f"CUDA HDBSCAN was explicitly requested but cannot run: {detail} "
+                        "Install the matching cuML runtime or choose Auto/CPU to allow native HDBSCAN fallback."
+                    )
             else:
                 compute_info = VectorComputeInfo("cpu", "hdbscan-native")
             if hdbscan is not None:

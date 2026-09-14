@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import importlib.util
 from dataclasses import dataclass
 from threading import RLock
 
@@ -44,6 +43,9 @@ class VectorComputeService:
 
     def __init__(self, execution_policy: ExecutionPolicy | None = None) -> None:
         self.execution_policy = execution_policy or ExecutionPolicy()
+        self._cuml_hdbscan_provider = None
+        self._cuml_hdbscan_probe_complete = False
+        self._cuml_hdbscan_error = ""
 
     @property
     def cuda_enabled(self) -> bool:
@@ -51,10 +53,20 @@ class VectorComputeService:
 
     @property
     def cuml_hdbscan_available(self) -> bool:
+        return self._load_cuml_hdbscan_provider() is not None
+
+    def _load_cuml_hdbscan_provider(self):
+        """Load cuML once per compute service and retain failed probes too."""
+
+        if self._cuml_hdbscan_probe_complete:
+            return self._cuml_hdbscan_provider
+        self._cuml_hdbscan_probe_complete = True
         try:
-            return importlib.util.find_spec("cuml") is not None
-        except Exception:
-            return False
+            self._cuml_hdbscan_provider = _load_cuml_hdbscan()
+        except Exception as exc:
+            self._cuml_hdbscan_provider = None
+            self._cuml_hdbscan_error = f"cuML HDBSCAN is unavailable: {exc}"
+        return self._cuml_hdbscan_provider
 
     def cosine_scores(
         self,
@@ -316,11 +328,18 @@ class VectorComputeService:
             return None, VectorComputeInfo("cpu", "hdbscan-native")
 
         contiguous = _contiguous_float32(matrix)
+        provider = self._load_cuml_hdbscan_provider()
+        if provider is None:
+            return None, VectorComputeInfo(
+                "cpu",
+                "hdbscan-native",
+                self._cuml_hdbscan_error or "cuML HDBSCAN is unavailable in this CUDA runtime.",
+            )
         try:
             with _CUDA_COMPUTE_LOCK:
                 self._verified_cuda_torch()
                 self._release_cuda_cache()
-                estimator = _load_cuml_hdbscan()(
+                estimator = provider(
                     min_cluster_size=int(min_cluster_size),
                     min_samples=min_samples,
                     metric="euclidean",

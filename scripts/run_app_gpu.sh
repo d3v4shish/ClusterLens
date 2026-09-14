@@ -11,6 +11,9 @@ if [[ ! -x "$runtime_python" ]]; then
     exit 2
 fi
 
+printf '%s\n' "ClusterLens: dedicated CUDA runtime selected; the app will verify Torch CUDA, CUDA ONNX, and cuML HDBSCAN in the background."
+printf '%s\n' "ClusterLens: this runtime reuses the normal per-user model cache and does not download duplicate GPU model files."
+
 for variable in CLUSTERLENS_RUNTIME_ROOT IMAGE_CLUSTERING_APP_DIR; do
     value="${!variable:-}"
     if [[ "$value" == /tmp/* ]]; then

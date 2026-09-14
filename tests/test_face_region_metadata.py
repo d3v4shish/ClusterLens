@@ -210,6 +210,40 @@ def test_indexed_face_mutations_are_region_scoped_and_persisted(tmp_path: Path) 
     assert service.load_face_record(str(image_path), 1).person_name == "Bob"
 
 
+def test_explicit_face_region_name_overrides_automatic_quality_gate(tmp_path: Path) -> None:
+    image_path = tmp_path / "low-quality-but-confirmed.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    service = _face_index(tmp_path)
+    service.save_face_records(
+        [
+            FaceIndexRecord(
+                image_path=str(image_path),
+                face_index=0,
+                face_bbox=(0, 0, 40, 50),
+                face_confidence=0.99,
+                embedding=np.array([1.0, 0.0], dtype=np.float32),
+                quality_status="reject",
+                quality_score=0.10,
+            )
+        ],
+        mtime_ns=image_path.stat().st_mtime_ns,
+        file_size=image_path.stat().st_size,
+        assess_quality=False,
+    )
+
+    named = service.label_indexed_faces_with_metadata("Lilly", [(str(image_path), 0)], similarity_threshold=0.5)
+
+    assert named.affected_refs == ((str(image_path), 0),)
+    assert _service(tmp_path).read(image_path).names == ("Lilly",)
+    assert service.load_face_record(str(image_path), 0).person_name == "Lilly"
+
+    unlabelled = service.unlabel_indexed_faces_with_metadata([(str(image_path), 0)])
+
+    assert unlabelled.affected_refs == ((str(image_path), 0),)
+    assert _service(tmp_path).read(image_path).names == ()
+    assert service.load_face_record(str(image_path), 0).person_name == ""
+
+
 def test_reindex_keeps_database_name_when_xmp_conflicts(tmp_path: Path) -> None:
     image_path = tmp_path / "conflict.jpg"
     Image.new("RGB", (100, 100), "white").save(image_path)

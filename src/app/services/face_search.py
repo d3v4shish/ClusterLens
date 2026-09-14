@@ -74,6 +74,7 @@ DEFAULT_BUNDLED_FACE_PROFILE = DEFAULT_HUMAN_FACE_PROFILE_ID
 MAX_FACE_INDEX_PROGRESS_UPDATES = 32
 FACE_INDEX_PROGRESS_MIN_INTERVAL_S = 0.15
 FACE_SCAN_ROW_PREFETCH_CHUNK = 500
+DEEP_FACE_SEARCH_SCORE_BATCH_ROWS = 4096
 
 FACE_MODEL_PROFILE_LABELS: dict[str, str] = {
     "accuracy": "Accuracy",
@@ -1374,6 +1375,41 @@ class FaceSearchResult:
 
 
 @dataclass(frozen=True)
+class DeepFaceSearchMatch:
+    """One face discovered while transitively expanding a saved identity."""
+
+    result: FaceSearchResult
+    discovery_round: int
+    durable_person_name: str = ""
+
+    @property
+    def face_ref(self) -> tuple[str, int]:
+        return (str(self.result.image_path), int(self.result.face_index))
+
+    @property
+    def is_unlabeled(self) -> bool:
+        return not bool(str(self.durable_person_name or "").strip())
+
+
+@dataclass(frozen=True)
+class DeepFaceSearchResult:
+    """A complete, non-mutating transitive saved-name search."""
+
+    person_name: str
+    threshold: float
+    matches: tuple[DeepFaceSearchMatch, ...]
+    candidate_count: int
+    round_count: int
+    compute_device: str = "cpu"
+    compute_implementation: str = "numpy-blas-matmul"
+    compute_fallback_reason: str = ""
+
+    @property
+    def unlabeled_refs(self) -> tuple[tuple[str, int], ...]:
+        return tuple(match.face_ref for match in self.matches if match.is_unlabeled)
+
+
+@dataclass(frozen=True)
 class FaceClusterMember:
     image_path: str
     face_index: int
@@ -1517,6 +1553,8 @@ class FaceRegionLabelMutationResult:
     affected_refs: tuple[tuple[str, int], ...] = ()
     failed_paths: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
+    skipped_refs: tuple[tuple[str, int], ...] = ()
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -4944,11 +4982,19 @@ class FaceIndexService:
         folder_prefix: str = "",
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
+        group_kinds: tuple[str, ...] | list[str] | None = None,
         cancel_check=None,
     ) -> FaceAlbumGroupPage:
         raise_if_cancelled(cancel_check)
         page_offset = max(0, int(offset))
         page_limit = max(1, min(500, int(limit)))
+        allowed_group_kinds = {"named", "unlabeled", "pending", "hidden"}
+        selected_group_kinds = tuple(
+            dict.fromkeys(str(value or "").strip().lower() for value in list(group_kinds or []))
+        )
+        invalid_group_kinds = sorted(set(selected_group_kinds) - allowed_group_kinds)
+        if invalid_group_kinds:
+            raise ValueError(f"Unsupported face album group kind(s): {', '.join(invalid_group_kinds)}")
         with self._connect() as connection:
             candidate_scope = self._prepare_face_album_scope_table(connection, candidate_paths)
             base_scope, base_args = self._face_album_scope_sql(
@@ -5016,13 +5062,19 @@ class FaceIndexService:
                 FROM ({member_rows_sql}) album_members
                 GROUP BY group_id, group_kind, person_name
             """
-            params = [*base_args, *pending_args]
+            group_kind_clause = ""
+            group_kind_args: list[object] = []
+            if selected_group_kinds:
+                group_kind_clause = " WHERE group_kind IN (" + ", ".join("?" for _ in selected_group_kinds) + ")"
+                group_kind_args = list(selected_group_kinds)
+            filtered_grouped_sql = f"SELECT * FROM ({grouped_sql}) grouped{group_kind_clause}"
+            params = [*base_args, *pending_args, *group_kind_args]
             total_count = int(
-                connection.execute(f"SELECT COUNT(*) FROM ({grouped_sql}) grouped", params).fetchone()[0] or 0
+                connection.execute(f"SELECT COUNT(*) FROM ({filtered_grouped_sql}) filtered_groups", params).fetchone()[0] or 0
             )
             rows = connection.execute(
                 f"""
-                {grouped_sql}
+                {filtered_grouped_sql}
                 ORDER BY
                     CASE group_kind WHEN 'named' THEN 0 WHEN 'unlabeled' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END,
                     CASE WHEN group_kind='named' THEN favorite ELSE 0 END DESC,
@@ -6636,7 +6688,17 @@ class FaceIndexService:
         *,
         similarity_threshold: float = 0.72,
         source: str = "manual_cluster_name",
+        allow_low_quality: bool = True,
     ) -> PersonPrototype:
+        """Persist an explicit user-selected name without a proposal/review step.
+
+        Automatic matching must obey the configured prototype-quality gate, but
+        a person explicitly choosing a saved region is authoritative. This is
+        particularly important for metadata round-trips: rejecting the record
+        after its XMP/EXIF write would leave the file and durable label store
+        inconsistent.
+        """
+
         person_name = str(person_name or "").strip()
         if not person_name:
             raise ValueError("Identity name is required.")
@@ -6653,10 +6715,12 @@ class FaceIndexService:
         records: list[IndexedFaceRecord] = []
         for image_path, face_index in normalized_refs:
             record = self.load_face_record(image_path, face_index)
-            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+            if record is not None and (
+                allow_low_quality or self._quality_allows(record.quality_status, self.prototype_quality_min)
+            ):
                 records.append(record)
         if not records:
-            raise ValueError("The selected indexed faces do not meet the current prototype quality gate.")
+            raise ValueError("The selected indexed face regions are no longer available.")
 
         embeddings = np.asarray([record.embedding for record in records], dtype=np.float32)
         person = self._save_person_prototype(
@@ -6697,6 +6761,12 @@ class FaceIndexService:
                     "face_count": len(records),
                     "source": str(source or "manual_cluster_name"),
                     "prototype_face_count": len(records),
+                    "quality_override_count": sum(
+                        not self._quality_allows(record.quality_status, self.prototype_quality_min)
+                        for record in records
+                    )
+                    if allow_low_quality
+                    else 0,
                 },
                 reversible=False,
                 connection=connection,
@@ -6710,6 +6780,8 @@ class FaceIndexService:
         *,
         similarity_threshold: float = 0.72,
         source: str = "manual_cluster_name",
+        progress=None,
+        cancel_check=None,
     ) -> FaceRegionLabelMutationResult:
         """Name exact indexed faces after their metadata regions are durable.
 
@@ -6725,7 +6797,7 @@ class FaceIndexService:
             raise ValueError("Identity name is required.")
         records = self._indexed_records_for_refs(face_refs)
         if not records:
-            raise ValueError("The selected indexed faces do not meet the current prototype quality gate.")
+            raise ValueError("The selected indexed face regions are no longer available.")
         metadata = FaceRegionMetadataService()
         records_by_path: dict[str, list[IndexedFaceRecord]] = defaultdict(list)
         for record in records:
@@ -6733,7 +6805,17 @@ class FaceIndexService:
         succeeded_refs: list[tuple[str, int]] = []
         failed_paths: list[str] = []
         failures: list[str] = []
-        for image_path, image_records in records_by_path.items():
+        cancelled = False
+        path_items = list(records_by_path.items())
+        for path_index, (image_path, image_records) in enumerate(path_items, start=1):
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
+            if progress is not None:
+                progress(
+                    int((path_index - 1) * 100 / max(1, len(path_items))),
+                    f"Writing face-region names {path_index}/{len(path_items)}...",
+                )
             width, height = self._image_dimensions(image_path)
             updates = [
                 FaceRegionUpdate(region.x, region.y, region.width, region.height, target)
@@ -6746,14 +6828,52 @@ class FaceIndexService:
                 failed_paths.append(image_path)
                 failures.append(f"{image_path}: {write_result.error}")
         if not succeeded_refs:
-            return FaceRegionLabelMutationResult(None, (), tuple(failed_paths), tuple(failures))
+            return FaceRegionLabelMutationResult(None, (), tuple(failed_paths), tuple(failures), cancelled=cancelled)
         person = self.label_indexed_faces_immediately(
             target,
             succeeded_refs,
             similarity_threshold=similarity_threshold,
             source=source,
         )
-        return FaceRegionLabelMutationResult(person, tuple(succeeded_refs), tuple(failed_paths), tuple(failures))
+        if progress is not None:
+            progress(100, "Saved face-region names.")
+        return FaceRegionLabelMutationResult(
+            person,
+            tuple(succeeded_refs),
+            tuple(failed_paths),
+            tuple(failures),
+            cancelled=cancelled,
+        )
+
+    def label_unlabeled_indexed_faces_with_metadata(
+        self,
+        person_name: str,
+        face_refs: list[tuple[str, int]],
+        *,
+        similarity_threshold: float = 0.72,
+        source: str = "deep_name_similar",
+        progress=None,
+        cancel_check=None,
+    ) -> FaceRegionLabelMutationResult:
+        """Name only still-unlabeled rows, preserving concurrent edits."""
+
+        records = self._indexed_records_for_refs(face_refs)
+        eligible = [record for record in records if not str(record.person_name or "").strip()]
+        eligible_refs = [(record.image_path, int(record.face_index)) for record in eligible]
+        found_refs = {(record.image_path, int(record.face_index)) for record in records}
+        requested_refs = list(dict.fromkeys((str(path), int(index)) for path, index in face_refs if str(path or "").strip()))
+        skipped = tuple(ref for ref in requested_refs if ref not in set(eligible_refs))
+        if not eligible_refs:
+            return FaceRegionLabelMutationResult(None, skipped_refs=skipped)
+        result = self.label_indexed_faces_with_metadata(
+            person_name,
+            eligible_refs,
+            similarity_threshold=similarity_threshold,
+            source=source,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+        return replace(result, skipped_refs=tuple(dict.fromkeys((*result.skipped_refs, *skipped))))
 
     def face_region_names_for_paths(self, image_paths: list[str]) -> dict[str, tuple[str, ...]]:
         """Return names physically stored in XMP/EXIF region metadata."""
@@ -6864,10 +6984,17 @@ class FaceIndexService:
         return self._mutate_face_regions_in_images(source_name, "", image_paths, action="unlabel_face_regions")
 
     def _indexed_records_for_refs(self, face_refs: list[tuple[str, int]]) -> list[IndexedFaceRecord]:
+        """Load exact saved face regions for an explicit metadata mutation.
+
+        This helper deliberately does not apply automatic-quality filtering:
+        the caller has already selected a concrete indexed region to name,
+        rename, or unlabel.
+        """
+
         records: list[IndexedFaceRecord] = []
         for image_path, face_index in list(dict.fromkeys((str(path), int(index)) for path, index in face_refs if str(path or "").strip())):
             record = self.load_face_record(image_path, face_index)
-            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+            if record is not None:
                 records.append(record)
         return records
 
@@ -7764,6 +7891,145 @@ class FaceIndexService:
             )
             for result in results
         ]
+
+    def deep_search_by_person_name(
+        self,
+        person_name: str,
+        *,
+        min_score: float | None = None,
+        folder_prefix: str = "",
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        progress=None,
+        cancel_check=None,
+    ) -> DeepFaceSearchResult:
+        """Expand a saved identity through every eligible face in a scope.
+
+        Unlike the ordinary Top-K search, this deliberately visits the whole
+        scoped index.  Only durable-unlabeled matches become new query vectors;
+        faces already carrying another person's name are visible in the final
+        review but can neither grow the corpus nor be overwritten later.
+        """
+
+        name = str(person_name or "").strip()
+        if not name:
+            raise ValueError("Identity name is required.")
+        prototypes = {item.person_name: item for item in self.load_person_prototypes()}
+        prototype = prototypes.get(name)
+        if prototype is None:
+            raise ValueError(f"No saved face prototype found for identity '{name}'.")
+        threshold = float(min_score) if min_score is not None else float(prototype.similarity_threshold)
+        threshold = max(threshold, float(self.recognition_min_score))
+        if progress is not None:
+            progress(0, "Preparing the full face-search scope...")
+        records = [
+            record
+            for record in self.load_all_records(
+                folder_prefix=folder_prefix,
+                candidate_paths=candidate_paths,
+                include_tiny_faces=include_tiny_faces,
+            )
+            if self._quality_allows(record.quality_status, self.search_quality_min)
+        ]
+        raise_if_cancelled(cancel_check)
+        if not records:
+            return DeepFaceSearchResult(name, threshold, (), 0, 0)
+
+        matrix = np.ascontiguousarray(np.stack([record.embedding for record in records]), dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        matrix = np.ascontiguousarray(matrix / np.clip(norms, 1e-12, None), dtype=np.float32)
+        seed = np.asarray(prototype.embedding, dtype=np.float32).reshape(1, -1)
+        if seed.shape[1] != matrix.shape[1]:
+            raise ValueError("The saved identity prototype is incompatible with the current face index.")
+        seed = np.ascontiguousarray(seed / np.clip(np.linalg.norm(seed, axis=1, keepdims=True), 1e-12, None), dtype=np.float32)
+
+        matches: dict[tuple[str, int], tuple[int, float, IndexedFaceRecord]] = {}
+        frontier = seed
+        round_count = 0
+        compute_info = None
+        while frontier.size:
+            raise_if_cancelled(cancel_check)
+            round_count += 1
+            if progress is not None:
+                progress(-1, f"Deep search round {round_count}: comparing {len(records)} indexed face(s)...")
+            best_scores = np.empty((len(records),), dtype=np.float32)
+            for start in range(0, len(records), DEEP_FACE_SEARCH_SCORE_BATCH_ROWS):
+                raise_if_cancelled(cancel_check)
+                stop = min(len(records), start + DEEP_FACE_SEARCH_SCORE_BATCH_ROWS)
+                row_scores = np.full((stop - start,), -np.inf, dtype=np.float32)
+                for frontier_start in range(0, len(frontier), DEEP_FACE_SEARCH_SCORE_BATCH_ROWS):
+                    raise_if_cancelled(cancel_check)
+                    frontier_stop = min(len(frontier), frontier_start + DEEP_FACE_SEARCH_SCORE_BATCH_ROWS)
+                    scores, compute_info = self.clustering_service.vector_compute.cosine_matrix(
+                        matrix[start:stop],
+                        frontier[frontier_start:frontier_stop],
+                        normalize=False,
+                    )
+                    row_scores = np.maximum(row_scores, np.max(np.asarray(scores, dtype=np.float32), axis=1))
+                best_scores[start:stop] = row_scores
+            new_frontier_rows: list[int] = []
+            for row, (record, raw_score) in enumerate(zip(records, best_scores)):
+                if row % 512 == 0:
+                    raise_if_cancelled(cancel_check)
+                score = float(raw_score)
+                if score < threshold:
+                    continue
+                ref = (str(record.image_path), int(record.face_index))
+                previous = matches.get(ref)
+                if previous is None or score > previous[1]:
+                    matches[ref] = (
+                        int(previous[0]) if previous is not None else round_count,
+                        score,
+                        record,
+                    )
+                if previous is None and not str(record.person_name or "").strip():
+                    new_frontier_rows.append(row)
+            if not new_frontier_rows:
+                break
+            frontier = np.ascontiguousarray(matrix[new_frontier_rows], dtype=np.float32)
+
+        ordered: list[DeepFaceSearchMatch] = []
+        for _ref, (discovery_round, score, record) in sorted(
+            matches.items(),
+            key=lambda item: (-float(item[1][1]), item[1][0], item[0][0], item[0][1]),
+        ):
+            result = FaceSearchResult(
+                image_path=str(record.image_path),
+                face_index=int(record.face_index),
+                score=round(float(score), 6),
+                phash_distance=-1,
+                face_bbox=tuple(int(value) for value in record.face_bbox),
+                face_confidence=round(float(record.face_confidence), 6),
+                model_name=self.model_name,
+                match_reason=f"deep identity expansion: {name}",
+                person_name=str(record.person_name or ""),
+                quality_status=str(record.quality_status or "clean"),
+                quality_reasons=tuple(record.quality_reasons or ()),
+                hidden=bool(record.hidden),
+                image_mtime=float(record.image_mtime or 0.0),
+            )
+            ordered.append(DeepFaceSearchMatch(result, int(discovery_round), str(record.person_name or "")))
+        if progress is not None:
+            progress(100, f"Deep search complete: {len(ordered)} matching face region(s) in {round_count} round(s).")
+        info = compute_info
+        self.last_vector_compute_metrics = {
+            "operation": "deep_face_identity_search",
+            "candidate_count": len(records),
+            "round_count": round_count,
+            "compute_device": str(getattr(info, "device", "cpu")),
+            "compute_implementation": str(getattr(info, "implementation", "numpy-blas-matmul")),
+            "compute_fallback_reason": str(getattr(info, "fallback_reason", "")),
+        }
+        return DeepFaceSearchResult(
+            name,
+            threshold,
+            tuple(ordered),
+            len(records),
+            round_count,
+            str(getattr(info, "device", "cpu")),
+            str(getattr(info, "implementation", "numpy-blas-matmul")),
+            str(getattr(info, "fallback_reason", "")),
+        )
 
     def find_face_records_by_people(
         self,
@@ -9091,7 +9357,7 @@ class FaceIndexService:
         records: list[IndexedFaceRecord] = []
         for image_path, face_index in normalized_refs:
             record = self.load_face_record(image_path, face_index)
-            if record is not None and self._quality_allows(record.quality_status, self.prototype_quality_min):
+            if record is not None:
                 records.append(record)
         if not records:
             return 0

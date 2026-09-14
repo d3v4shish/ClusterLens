@@ -75,6 +75,21 @@ def test_face_album_pages_are_bounded_scoped_and_embedding_free(tmp_path: Path) 
     assert len(second_page.items) == 2
     assert all("Outside" not in item.title for item in [*first_page.items, *second_page.items])
 
+    labelled_page = service.load_face_album_group_page(
+        folder_prefix=str(scope),
+        limit=10,
+        group_kinds=("named",),
+    )
+    unlabelled_page = service.load_face_album_group_page(
+        folder_prefix=str(scope),
+        limit=10,
+        group_kinds=("unlabeled", "pending"),
+    )
+    assert labelled_page.total_count == 2
+    assert [item.group_id for item in labelled_page.items] == ["person:Alice", "person:Bob"]
+    assert unlabelled_page.total_count == 2
+    assert [item.group_id for item in unlabelled_page.items] == ["unlabeled", "pending"]
+
     alice_first = service.load_face_album_member_page("person:Alice", folder_prefix=str(scope), limit=1)
     alice_second = service.load_face_album_member_page(
         "person:Alice",
