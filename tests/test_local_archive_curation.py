@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -164,6 +165,43 @@ class LocalArchiveCurationTests(unittest.TestCase):
 
             with self.assertRaises(Cancelled):
                 catalog.query_timeline(CatalogQuery(root_ids=(root.root_id,)), cancel_check=_cancel)
+
+    def test_timeline_can_derive_capture_time_from_unambiguous_filename_on_forced_refresh(self) -> None:
+        with TemporaryDirectory() as raw:
+            directory = Path(raw)
+            photos = directory / "photos"
+            photos.mkdir()
+            photo = photos / "IMG_20240506_123456.jpg"
+            self._photo(photo, (30, 80, 170))
+            # A known modification time makes the fallback assertion stable on
+            # every host and demonstrates that a catalog policy never edits
+            # the image itself.
+            modified_ns = 1_577_836_800_000_000_000  # 2020-01-01T00:00:00Z
+            os.utime(photo, ns=(modified_ns, modified_ns))
+            catalog = self._catalog(directory)
+            root = catalog.register_root(photos)
+
+            first = catalog.scan_root(root.root_id)
+            self.assertEqual(1, first["updated"])
+            asset = catalog.query_assets(CatalogQuery(root_ids=(root.root_id,))).items[0]
+            self.assertEqual("filename", asset.capture_source)
+            self.assertEqual("2024-05-06T12:34:56+00:00", asset.captured_at)
+
+            catalog.set_filename_date_policy("metadata_only")
+            unchanged = catalog.scan_root(root.root_id)
+            self.assertEqual(1, unchanged["unchanged"])
+            forced = catalog.scan_root(root.root_id, force=True)
+            self.assertEqual(1, forced["updated"])
+            refreshed = catalog.query_assets(CatalogQuery(root_ids=(root.root_id,))).items[0]
+            self.assertEqual("modified", refreshed.capture_source)
+            self.assertEqual("2020-01-01T00:00:00+00:00", refreshed.captured_at)
+
+    def test_filename_date_parser_rejects_ambiguous_or_invalid_values(self) -> None:
+        parser = LibraryCatalogService.filename_capture_datetime
+        self.assertEqual("2024-05-06T12:34:56+00:00", parser("IMG-2024-05-06-123456.jpg"))
+        self.assertEqual("2024-05-06T00:00:00+00:00", parser("scan_20240506.jpg"))
+        self.assertEqual("", parser("IMG-05-06-2024.jpg"))
+        self.assertEqual("", parser("IMG-2024-02-30.jpg"))
 
     def test_context_uses_catalog_capture_order_and_reuses_cache(self) -> None:
         with TemporaryDirectory() as raw:

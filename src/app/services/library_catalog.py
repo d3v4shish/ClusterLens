@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from infra.settings import get_settings
 LOGGER = get_logger(__name__)
 CATALOG_SCHEMA_VERSION = 2
 CATALOG_WRITE_BATCH_SIZE = 48
+FILENAME_DATE_POLICIES = ("metadata_only", "metadata_or_filename", "prefer_filename", "filename_only")
 
 
 @dataclass(frozen=True)
@@ -153,11 +155,25 @@ class LibraryCatalogService:
     XMP sidecars, tags, or face labels.
     """
 
-    def __init__(self, *, db_path: str | Path | None = None) -> None:
+    def __init__(self, *, db_path: str | Path | None = None, filename_date_policy: str = "metadata_or_filename") -> None:
         settings = get_settings()
         self.db_path = Path(db_path) if db_path is not None else settings.cache_dir / "library_catalog.sqlite3"
         self._fts_available = True
+        self._filename_date_policy = self.normalize_filename_date_policy(filename_date_policy)
         self._init_db()
+
+    @staticmethod
+    def normalize_filename_date_policy(value: str) -> str:
+        policy = str(value or "").strip().lower()
+        return policy if policy in FILENAME_DATE_POLICIES else "metadata_or_filename"
+
+    @property
+    def filename_date_policy(self) -> str:
+        return self._filename_date_policy
+
+    def set_filename_date_policy(self, value: str) -> None:
+        """Set the source-safe capture-time policy used on the next catalog scan."""
+        self._filename_date_policy = self.normalize_filename_date_policy(value)
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,6 +398,7 @@ class LibraryCatalogService:
         self,
         root_ids: Iterable[str] | None = None,
         *,
+        force: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, int]:
@@ -393,7 +410,12 @@ class LibraryCatalogService:
             if progress_callback:
                 progress_callback(int((index - 1) * 100 / max(1, len(roots))), f"Scanning library root {index}/{len(roots)}: {root.display_name}")
             try:
-                stats = self.scan_root(root.root_id, progress_callback=progress_callback, cancel_check=cancel_check)
+                stats = self.scan_root(
+                    root.root_id,
+                    force=force,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
                 for key in ("discovered", "updated", "unchanged", "removed"):
                     totals[key] += int(stats.get(key, 0))
             except Cancelled:
@@ -410,6 +432,7 @@ class LibraryCatalogService:
         self,
         root_id: str,
         *,
+        force: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, int]:
@@ -448,7 +471,7 @@ class LibraryCatalogService:
                 continue
             metadata_mtime_ns, metadata_size = self._metadata_sidecar_fingerprint(path)
             fingerprint = (int(stat.st_mtime_ns), int(stat.st_size), metadata_mtime_ns, metadata_size)
-            if known.get(canonical) == fingerprint:
+            if not force and known.get(canonical) == fingerprint:
                 unchanged += 1
                 continue
             asset = self._read_asset(
@@ -980,8 +1003,7 @@ class LibraryCatalogService:
         width = height = 0
         camera = ""
         exif: dict[str, str] = {}
-        captured_at = ""
-        capture_source = "modified"
+        exif_captured_at = ""
         embedded_xmp = ""
         try:
             with Image.open(path) as image:
@@ -993,15 +1015,16 @@ class LibraryCatalogService:
                         exif[label] = rendered
                 camera = " ".join(part for part in (exif.get("Make", ""), exif.get("Model", "")) if part).strip()
                 raw_date = exif.get("DateTimeOriginal") or exif.get("DateTimeDigitized") or exif.get("DateTime") or ""
-                captured_at = self._normalize_exif_datetime(raw_date)
-                if captured_at:
-                    capture_source = "exif"
+                exif_captured_at = self._normalize_exif_datetime(raw_date)
                 xmp_candidate = image.info.get("XML:com.adobe.xmp") or image.info.get("xmp") or ""
                 embedded_xmp = self._scalar_text(xmp_candidate, max_length=32768)
         except Exception as exc:
             LOGGER.debug("Catalog metadata read failed for %s: %s", image_path, exc)
-        if not captured_at:
-            captured_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
+        captured_at, capture_source = self._resolve_capture_time(
+            exif_captured_at=exif_captured_at,
+            filename_captured_at=self.filename_capture_datetime(path.name),
+            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        )
         xmp_text = self._read_xmp_text(path, embedded_xmp)
         return CatalogAsset(
             image_path=image_path,
@@ -1126,6 +1149,57 @@ class LibraryCatalogService:
             except ValueError:
                 pass
         return ""
+
+    @staticmethod
+    def filename_capture_datetime(file_name: str) -> str:
+        """Extract an unambiguous year-first date/time from a camera filename.
+
+        Ambiguous locale formats are deliberately ignored.  The result is
+        derived catalog data only; choosing it never changes EXIF/XMP.
+        """
+        match = re.search(
+            r"(?<!\d)(?P<year>19\d{2}|20\d{2})[-_.]?(?P<month>0[1-9]|1[0-2])[-_.]?(?P<day>0[1-9]|[12]\d|3[01])"
+            r"(?:[T _.-]?(?P<hour>[01]\d|2[0-3])[:._-]?(?P<minute>[0-5]\d)(?:[:._-]?(?P<second>[0-5]\d))?)?(?!\d)",
+            str(file_name or ""),
+        )
+        if match is None:
+            return ""
+        try:
+            captured = datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                int(match.group("hour") or 0),
+                int(match.group("minute") or 0),
+                int(match.group("second") or 0),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return ""
+        return captured.isoformat(timespec="seconds")
+
+    def _resolve_capture_time(
+        self,
+        *,
+        exif_captured_at: str,
+        filename_captured_at: str,
+        modified_at: str,
+    ) -> tuple[str, str]:
+        values = {
+            "exif": str(exif_captured_at or ""),
+            "filename": str(filename_captured_at or ""),
+            "modified": str(modified_at or ""),
+        }
+        priorities = {
+            "metadata_only": ("exif", "modified"),
+            "metadata_or_filename": ("exif", "filename", "modified"),
+            "prefer_filename": ("filename", "exif", "modified"),
+            "filename_only": ("filename", "modified"),
+        }[self._filename_date_policy]
+        for source in priorities:
+            if values[source]:
+                return values[source], source
+        return "", "modified"
 
     @staticmethod
     def _timeline_bucket(captured_at: str) -> tuple[int, int]:

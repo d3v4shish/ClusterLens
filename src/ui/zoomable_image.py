@@ -37,6 +37,8 @@ class ZoomableImageView(QScrollArea):
         self._resize_face_started = False
         self._zoom = 1.0
         self._user_zoomed = False
+        self._pan_origin: QPoint | None = None
+        self._pan_scroll_origin: tuple[int, int] | None = None
         # "Fit" should be a true fit-to-viewport operation (including scaling up),
         # otherwise small/preview pixmaps can look like thin strips.
         self._fit_scale_up = True
@@ -106,12 +108,40 @@ class ZoomableImageView(QScrollArea):
         delta = event.angleDelta().y()
         if delta == 0:
             return
+        position = event.position()
+        old_zoom = float(self._zoom)
+        old_width = max(1.0, float(self._pixmap.width() if self._pixmap is not None else 1) * old_zoom)
+        old_height = max(1.0, float(self._pixmap.height() if self._pixmap is not None else 1) * old_zoom)
+        anchor_x = (float(self.horizontalScrollBar().value()) + float(position.x())) / old_width
+        anchor_y = (float(self.verticalScrollBar().value()) + float(position.y())) / old_height
         factor = 1.15 if delta > 0 else 1 / 1.15
         self._user_zoomed = True
-        self._zoom = max(0.05, min(25.0, self._zoom * factor))
+        self._zoom = max(0.02, min(64.0, self._zoom * factor))
         self._apply_zoom()
+        if self._pixmap is not None and not self._pixmap.isNull():
+            self.horizontalScrollBar().setValue(
+                int(round(anchor_x * self._pixmap.width() * self._zoom - float(position.x())))
+            )
+            self.verticalScrollBar().setValue(
+                int(round(anchor_y * self._pixmap.height() * self._zoom - float(position.y())))
+            )
         self.zoom_changed.emit(float(self._zoom))
         event.accept()
+
+    def zoom_in(self) -> None:
+        self._set_zoom(self._zoom * 1.25)
+
+    def zoom_out(self) -> None:
+        self._set_zoom(self._zoom / 1.25)
+
+    def actual_size(self) -> None:
+        self._set_zoom(1.0)
+
+    def _set_zoom(self, zoom: float) -> None:
+        self._user_zoomed = True
+        self._zoom = max(0.02, min(64.0, float(zoom)))
+        self._apply_zoom()
+        self.zoom_changed.emit(float(self._zoom))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -135,11 +165,20 @@ class ZoomableImageView(QScrollArea):
         scale = min(scale_w, scale_h)
         if not self._fit_scale_up:
             scale = min(1.0, scale)
-        self._zoom = max(0.05, min(25.0, float(scale)))
+        self._zoom = max(0.02, min(64.0, float(scale)))
         self._apply_zoom()
         self.zoom_changed.emit(float(self._zoom))
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_origin = event.position().toPoint()
+            self._pan_scroll_origin = (
+                int(self.horizontalScrollBar().value()),
+                int(self.verticalScrollBar().value()),
+            )
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             point = self._viewport_point_to_image(event.position())
             if point is not None:
@@ -168,6 +207,12 @@ class ZoomableImageView(QScrollArea):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._pan_origin is not None and self._pan_scroll_origin is not None:
+            delta = event.position().toPoint() - self._pan_origin
+            self.horizontalScrollBar().setValue(int(self._pan_scroll_origin[0] - delta.x()))
+            self.verticalScrollBar().setValue(int(self._pan_scroll_origin[1] - delta.y()))
+            event.accept()
+            return
         if self._draw_mode and self._drag_origin is not None:
             point = self._viewport_point_to_image(event.position())
             if point is not None:
@@ -211,6 +256,12 @@ class ZoomableImageView(QScrollArea):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._pan_origin is not None and event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_origin = None
+            self._pan_scroll_origin = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
         if self._draw_mode and self._drag_origin is not None and event.button() == Qt.MouseButton.LeftButton:
             point = self._viewport_point_to_image(event.position()) or self._drag_origin
             x1 = min(self._drag_origin[0], point[0])

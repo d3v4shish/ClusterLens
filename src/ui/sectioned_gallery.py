@@ -541,6 +541,7 @@ class SectionedGallery(QWidget):
     return_to_folder_requested = pyqtSignal()
     return_to_source_requested = pyqtSignal(str)
     paths_removed = pyqtSignal(list)
+    paths_renamed = pyqtSignal(list)
     metadata_changed = pyqtSignal(list)
 
     def __init__(self, parent=None) -> None:
@@ -578,6 +579,7 @@ class SectionedGallery(QWidget):
         self._actions.hide()
         self._actions.set_action_target_provider(self._current_action_target)
         self._actions.paths_removed.connect(self._on_paths_removed)
+        self._actions.paths_renamed.connect(self._on_paths_renamed)
         self._actions.metadata_changed.connect(self.metadata_changed)
         self._build_ui()
 
@@ -1297,6 +1299,32 @@ class SectionedGallery(QWidget):
         sections = [section for section in (_remove(item) for item in self._model.root_sections()) if section is not None]
         self.set_sections(sections, status=f"Removed {len(removed)} photo(s) from the gallery.")
         self.paths_removed.emit(sorted(removed))
+
+    def _on_paths_renamed(self, changed_paths: list[tuple[str, str]]) -> None:
+        replacements = {
+            str(source): str(target)
+            for source, target in changed_paths
+            if str(source).strip() and str(target).strip() and str(source) != str(target)
+        }
+        if not replacements:
+            return
+
+        def _replace(section: GallerySection) -> GallerySection:
+            return GallerySection(
+                section.section_id,
+                tuple(replacements.get(path, path) for path in section.paths),
+                section.kind,
+                section.title,
+                replacements.get(section.anchor_path, section.anchor_path),
+                section.anchor_face_index,
+                tuple(_replace(child) for child in section.children),
+            )
+
+        self.set_sections(
+            [_replace(section) for section in self._model.root_sections()],
+            status=f"Renamed {len(replacements)} photo(s).",
+        )
+        self.paths_renamed.emit([(source, target) for source, target in replacements.items()])
 
 
 class _RunnableSignals(QObject):

@@ -1,5 +1,44 @@
 # Current implementation plan
 
+## Readable adaptive UX redesign (active branch: `feat/readable-adaptive-ux`)
+
+### Implemented foundation slices (the broader contracts below remain open)
+
+- [x] Expose shared Sources/Data Home inventory, wider readable typography, visible Jobs history, and a zoom/pan/full-resolution inspector foundation.
+  Acceptance: source roots remain separate from managed data; viewer controls and job history are keyboard-accessible; covered by focused offscreen smoke tests.
+- [x] Add reusable autocomplete inputs to face inspection, Names mutations, and Library People Cleanup.
+  Acceptance: a saved choice commits by click, Enter, or Tab; explicit creation remains distinct; focused picker/UI tests pass.
+- [x] Add derived filename-date timeline policy and a preview-first journalled batch file rename.
+  Acceptance: filename dates never rewrite metadata, an unsafe rename makes no file changes, completed renames restore through Recovery; deterministic catalog/recovery tests pass.
+
+- [ ] Establish deterministic UX and performance baselines before each redesign slice.
+  Contract: generated fixtures cover 500 and 10,000 assets, constrained CPU-only operation, and accelerated operation without user media or mutable runtime state.
+  Validation: `scripts/benchmark.sh` reports first-content p50/p95, UI publish delay, RSS, queue delay, cache behaviour, I/O, and CPU/GPU fallback evidence in `BENCHMARKS.md`.
+- [ ] Make Sources the single global multi-root scope and expose a relocatable Data Home inventory.
+  Contract: Photos, Faces, Organize, Timeline, search, and maintenance share the exact same selected roots; the user can inspect, back up, verify, rebuild, or relocate every managed-data category without touching source photos.
+  Validation: deterministic root-scope, unavailable-root, storage-inventory, move/recovery, and source-safety tests pass.
+- [ ] Ship the common visual system, accessible typography, contextual help, and Power-user mode.
+  Contract: controls, icons, spacing, focus, loading/error states, tooltips, help affordances, and advanced details are consistent; Power-user mode exposes complete diagnostics and advanced settings without removing safeguards.
+  Validation: offscreen UI tests cover keyboard focus, text scaling, tooltip/help text, icon labels, and mode visibility.
+- [ ] Replace ad-hoc name entry with reusable autocomplete entity pickers.
+  Contract: person assignments/renames always offer cancellable saved-name suggestions and consistently commit a highlighted result on click, Enter, or Tab; legal new values use an explicit create choice.
+  Validation: picker tests cover casing, stale requests, keyboard/mouse commit, empty values, and new-value creation.
+- [ ] Upgrade the photo inspector into the shared zoomable viewer and staged editor.
+  Contract: every photo can be inspected at fit/1:1/deep zoom with pan, metadata, face-region, tag, and history editing; source writes are explicit, atomic, cancellable between files, and recoverable.
+  Validation: viewport-bound preview/full-resolution tests, face edit tests, metadata write rollback tests, and cancellation tests pass.
+- [ ] Add timeline filename-date provenance, previewed safe batch rename, and exact/near/visual duplicate review.
+  Contract: no source filename or metadata changes without preview/confirmation; all completed mutation steps are journalled for Undo/Recovery.
+  Validation: seeded parser, collision, rename-undo, duplicate-classification, and cancellation fixtures pass.
+- [ ] Make every job visible, cancellable, dependency-aware, and resource-aware.
+  Contract: independent work runs concurrently; same-asset/data-home/GPU conflicts are explained, queued, and cancellable; the user can choose automatic, queue-for-GPU, CPU fallback, or ask-on-conflict behavior.
+  Validation: deterministic job lifecycle, priority, conflict, cancellation, GPU-policy, and recovery tests pass.
+- [ ] Add Recovery Center, checksummed backups, restore previews, and resumable derived-data migration.
+  Contract: interrupted moves, migrations, scans, renames, metadata edits, backups, restores, and cache maintenance leave data valid and provide a visible resume/rollback path.
+  Validation: fault-injection tests cover every durable checkpoint and preserve source-media hashes.
+- [ ] Profile and eliminate every measured avoidable hotspot in each migrated workflow.
+  Contract: no UI-thread I/O/compute, unbounded queue/cache, duplicate query/decode, or unnecessary serialization remains in completed workflows; irreducible costs are bounded and documented.
+  Validation: baseline/profile/change/rerun evidence is appended to `BENCHMARKS.md` and residual constraints to `HOTSPOTS.md` before a task is marked complete.
+
 ## Complete Clean-app performance pass
 
 - [x] Establish fresh deterministic baselines for every shipped benchmark path, including the progressive Faces review request path.

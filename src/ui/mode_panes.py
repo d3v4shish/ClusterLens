@@ -168,6 +168,7 @@ class SourcePane(QWidget):
     hide_requested = pyqtSignal()
     run_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
+    data_home_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -190,7 +191,7 @@ class SourcePane(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
 
-        title = QLabel("Folders")
+        title = QLabel("Sources")
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.hide_button = QPushButton("Hide")
         self.hide_button.setProperty("paneToggle", True)
@@ -224,7 +225,7 @@ class SourcePane(QWidget):
         )
         layout.addWidget(self.selected_folder_label)
 
-        active_heading = QLabel("Active roots (include subfolders)", self)
+        active_heading = QLabel("Sources (include subfolders)", self)
         active_heading.setProperty("role", "help")
         active_heading.setToolTip("These checked roots are shared by every workspace. Overlapping child roots are folded into their parent.")
         layout.addWidget(active_heading)
@@ -232,15 +233,15 @@ class SourcePane(QWidget):
         self.active_roots_list.setObjectName("activeRootsList")
         self.active_roots_list.setMinimumHeight(54)
         self.active_roots_list.setMaximumHeight(112)
-        self.active_roots_list.setToolTip("Active roots shared by Gallery, Clustering, Faces, Names, Tags, and Library.")
+        self.active_roots_list.setToolTip("These selected photo sources are shared by Gallery, Clustering, Faces, Names, Tags, and Library.")
         self.active_roots_list.itemSelectionChanged.connect(self._refresh_active_root_action_state)
         layout.addWidget(self.active_roots_list)
         active_actions = QHBoxLayout()
         active_actions.setContentsMargins(0, 0, 0, 0)
-        self.add_browsed_root_button = QPushButton("Add browsed")
+        self.add_browsed_root_button = QPushButton("Include folder")
         self.remove_active_root_button = QPushButton("Remove")
-        self.clear_active_roots_button = QPushButton("Clear")
-        self.add_browsed_root_button.setToolTip("Add the currently browsed folder to the shared active roots.")
+        self.clear_active_roots_button = QPushButton("Clear sources")
+        self.add_browsed_root_button.setToolTip("Include the currently browsed folder in every workspace source scope.")
         self.remove_active_root_button.setToolTip("Remove the selected active root without touching source files.")
         self.clear_active_roots_button.setToolTip("Clear the shared active scope. No workspace will scan or search folders until roots are selected again.")
         self.add_browsed_root_button.clicked.connect(lambda: self.add_active_root(self.selected_directory))
@@ -250,6 +251,24 @@ class SourcePane(QWidget):
         active_actions.addWidget(self.remove_active_root_button)
         active_actions.addWidget(self.clear_active_roots_button)
         layout.addLayout(active_actions)
+
+        data_home_heading = QLabel("ClusterLens Data Home", self)
+        data_home_heading.setProperty("role", "help")
+        data_home_heading.setToolTip(
+            "This separate location contains app-managed indexes, thumbnails, models, recovery journals, logs, and backups. "
+            "It never contains or deletes your source photos by default."
+        )
+        self.data_home_label = QLabel("Managed data location is available in Storage.", self)
+        self.data_home_label.setWordWrap(True)
+        self.data_home_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.data_home_button = QPushButton("Manage Data Home", self)
+        self.data_home_button.setToolTip(
+            "View all managed app data, backup or clear safe categories, and open Storage settings. Source photos are unaffected."
+        )
+        self.data_home_button.clicked.connect(self.data_home_requested.emit)
+        layout.addWidget(data_home_heading)
+        layout.addWidget(self.data_home_label)
+        layout.addWidget(self.data_home_button)
 
         self.file_model = ActiveRootFileSystemModel(self)
         self.file_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
@@ -440,6 +459,17 @@ class SourcePane(QWidget):
             self.scope_changed.emit(scope)
             if emit_state:
                 self.state_changed.emit()
+
+    def set_data_home_summary(self, path: str, *, detail: str = "") -> None:
+        """Present the current managed-data location without conflating it with photo sources."""
+        location = str(path or "").strip()
+        if not location:
+            self.data_home_label.setText("Managed data location is unavailable.")
+            self.data_home_label.setToolTip("")
+            return
+        suffix = f"\n{str(detail).strip()}" if str(detail).strip() else ""
+        self.data_home_label.setText(f"{location}{suffix}")
+        self.data_home_label.setToolTip(location)
 
     def add_active_root(self, directory: str) -> None:
         path = str(directory or "").strip()

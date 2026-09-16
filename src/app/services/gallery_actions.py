@@ -29,6 +29,19 @@ class GalleryActionResult:
     journal_path: str = ""
 
 
+@dataclass(frozen=True)
+class RenamePreviewItem:
+    """One source-safe in-place rename proposed by a user-visible preview."""
+
+    source_path: str
+    target_path: str = ""
+    reason: str = ""
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.source_path and self.target_path and not self.reason)
+
+
 class GalleryActionService:
     def __init__(
         self,
@@ -156,6 +169,130 @@ class GalleryActionService:
                 result.failures.append(failure)
                 self._update_journal_file(file_entry_id, result, status="failed", error=failure)
         self._write_audit(result, requested_paths=image_paths, destination=str(destination))
+        return result
+
+    @staticmethod
+    def preview_renames(
+        image_paths: list[str],
+        template: str,
+        *,
+        capture_times: dict[str, str] | None = None,
+    ) -> list[RenamePreviewItem]:
+        """Build a non-mutating, all-or-nothing in-place rename preview.
+
+        ``template`` produces a filename *stem* and may use ``{stem}``,
+        ``{index}``, ``{date}``, ``{year}``, ``{month}``, and ``{day}``.
+        The original extension is always retained. Capture dates are supplied
+        by the caller when known; otherwise the file's modification date is
+        used. Directory changes and collision auto-resolution are deliberately
+        excluded so users can review every intended source mutation.
+        """
+        normalized_template = str(template or "").strip()
+        if not normalized_template:
+            return [RenamePreviewItem(str(path), reason="A filename template is required.") for path in image_paths]
+        capture_times = {str(path): str(value) for path, value in (capture_times or {}).items()}
+        preview: list[RenamePreviewItem] = []
+        seen_sources: set[str] = set()
+        for index, raw_path in enumerate(image_paths, start=1):
+            source = Path(str(raw_path)).expanduser().resolve()
+            source_text = str(source)
+            if source_text in seen_sources:
+                continue
+            seen_sources.add(source_text)
+            if not source.is_file():
+                preview.append(RenamePreviewItem(source_text, reason="Source file does not exist."))
+                continue
+            captured = GalleryActionService._rename_capture_parts(capture_times.get(source_text, ""), source)
+            values: dict[str, object] = {
+                "stem": source.stem,
+                "index": index,
+                "date": f"{captured.year:04d}{captured.month:02d}{captured.day:02d}",
+                "year": f"{captured.year:04d}",
+                "month": f"{captured.month:02d}",
+                "day": f"{captured.day:02d}",
+            }
+            try:
+                target_stem = normalized_template.format_map(values).strip()
+            except (KeyError, ValueError, IndexError) as exc:
+                preview.append(RenamePreviewItem(source_text, reason=f"Invalid template: {exc}"))
+                continue
+            if not target_stem or target_stem in {".", ".."}:
+                preview.append(RenamePreviewItem(source_text, reason="Template produced an empty filename."))
+                continue
+            if any(separator in target_stem for separator in ("/", "\\", "\x00")):
+                preview.append(RenamePreviewItem(source_text, reason="Template may not contain folder separators."))
+                continue
+            target = source.with_name(f"{target_stem}{source.suffix}")
+            if target == source:
+                preview.append(RenamePreviewItem(source_text, str(target), "New filename is unchanged."))
+                continue
+            preview.append(RenamePreviewItem(source_text, str(target)))
+
+        source_paths = {item.source_path for item in preview}
+        target_counts: dict[str, int] = {}
+        for item in preview:
+            if item.target_path:
+                target_counts[item.target_path] = target_counts.get(item.target_path, 0) + 1
+        checked: list[RenamePreviewItem] = []
+        for item in preview:
+            if item.reason:
+                checked.append(item)
+                continue
+            target = Path(item.target_path)
+            if target_counts.get(item.target_path, 0) > 1:
+                checked.append(RenamePreviewItem(item.source_path, item.target_path, "Another planned rename has this target."))
+            elif item.target_path in source_paths:
+                checked.append(RenamePreviewItem(item.source_path, item.target_path, "Target is another source in this batch; split this rename into separate operations."))
+            elif target.exists():
+                checked.append(RenamePreviewItem(item.source_path, item.target_path, "Target file already exists."))
+            else:
+                checked.append(item)
+        return checked
+
+    def rename_files(
+        self,
+        preview: list[RenamePreviewItem],
+        progress_callback=None,
+        cancel_check=None,
+    ) -> GalleryActionResult:
+        """Apply only a fully-safe preview and make each rename recoverable."""
+        result = self._new_result("rename")
+        requested_paths = [item.source_path for item in preview]
+        invalid = [item for item in preview if not item.is_ready]
+        if invalid:
+            result.failures.extend(f"{item.source_path}: {item.reason or 'unsafe rename preview'}" for item in invalid)
+            return result
+        if not self._begin_journal_operation(result, requested_paths=requested_paths, destination="renamed in place"):
+            return result
+        total = len(preview)
+        for index, item in enumerate(preview, start=1):
+            if cancel_check and cancel_check():
+                result.cancelled = True
+                break
+            if progress_callback:
+                progress_callback(int((index / max(1, total)) * 100), f"Renaming {index}/{total}")
+            source = Path(item.source_path)
+            target = Path(item.target_path)
+            file_entry_id = self._record_journal_file(result, source_path=str(source), target_path=str(target))
+            if not source.is_file():
+                failure = f"{source}: source file does not exist"
+                result.failures.append(failure)
+                self._update_journal_file(file_entry_id, result, status="failed", error=failure)
+                continue
+            if target.exists():
+                failure = f"{target}: target file already exists"
+                result.failures.append(failure)
+                self._update_journal_file(file_entry_id, result, status="failed", error=failure)
+                continue
+            try:
+                self._atomic_move(source, target)
+                result.changed_paths.append((str(source), str(target)))
+                self._update_journal_file(file_entry_id, result, status="completed", target_path=str(target))
+            except Exception as exc:
+                failure = f"{source}: {exc}"
+                result.failures.append(failure)
+                self._update_journal_file(file_entry_id, result, status="failed", error=failure)
+        self._write_audit(result, requested_paths=requested_paths, destination="renamed in place")
         return result
 
     def write_exif_comment(self, image_path: str, comment: str) -> None:
@@ -760,6 +897,16 @@ class GalleryActionService:
             counter += 1
         return candidate
 
+    @staticmethod
+    def _rename_capture_parts(raw_capture: str, source: Path) -> datetime:
+        raw = str(raw_capture or "").strip()
+        if raw:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            except ValueError:
+                pass
+        return datetime.fromtimestamp(source.stat().st_mtime, timezone.utc)
+
 
 def _loads_json_list(raw: object) -> list[object]:
     try:
@@ -772,7 +919,7 @@ def _loads_json_list(raw: object) -> list[object]:
 
 
 def _file_recovery_status(operation: str, *, status: str) -> str:
-    if operation in {"move", "delete_to_trash", "restore"}:
+    if operation in {"move", "rename", "delete_to_trash", "restore"}:
         if status == "completed":
             return "restorable" if operation != "restore" else "restored"
         if status == "failed":
@@ -784,7 +931,7 @@ def _file_recovery_status(operation: str, *, status: str) -> str:
 def _operation_recovery_status(operation: str, *, completed: bool, changed_paths: list[tuple[str, str]]) -> str:
     if operation == "restore":
         return "restored" if changed_paths else "not_applicable"
-    if operation in {"move", "delete_to_trash"}:
+    if operation in {"move", "rename", "delete_to_trash"}:
         if not completed:
             return "pending"
         return "restorable" if changed_paths else "not_applicable"

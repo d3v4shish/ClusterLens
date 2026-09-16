@@ -61,6 +61,11 @@ if [[ "${1:-}" == "--multi-root-discovery-only" ]]; then
     "$benchmark_python" scripts/benchmark_library_catalog.py --multi-root-discovery-only "$@"
     exit 0
 fi
+if [[ "${1:-}" == "--entity-picker-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_entity_picker.py "$@"
+    exit 0
+fi
 "$benchmark_python" scripts/benchmark_acceleration.py "$@"
 "$benchmark_python" scripts/benchmark_face_region_metadata.py
 "$benchmark_python" scripts/benchmark_thumbnail_index.py
@@ -70,3 +75,4 @@ fi
 "$benchmark_python" scripts/benchmark_face_indexing.py
 "$benchmark_python" scripts/benchmark_face_review_paging.py
 "$benchmark_python" scripts/benchmark_library_catalog.py
+"$benchmark_python" scripts/benchmark_entity_picker.py

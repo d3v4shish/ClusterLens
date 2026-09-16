@@ -9,14 +9,14 @@ from tempfile import TemporaryDirectory
 from threading import Event
 from time import monotonic, sleep
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex, QPoint, QSize, Qt, QSettings, QThread
 from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QGridLayout, QMenu, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QDialog, QGridLayout, QMenu, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -2135,9 +2135,15 @@ class UiSmokeTests(unittest.TestCase):
             [action.text() for action in pane.metadata_menu.actions()],
         )
         self.assertEqual(
-            ["Copy current target (0)", "Move current target (0)", "Move current target to ClusterLens Trash (0)"],
+            [
+                "Copy current target (0)",
+                "Move current target (0)",
+                "Preview batch rename for current target (0)",
+                "Move current target to ClusterLens Trash (0)",
+            ],
             [action.text() for action in pane.file_ops_menu.actions()],
         )
+        self.assertTrue(pane.rename_selection_action.toolTip())
         self.assertEqual(
             ["Copy paths (0)", "Export paths (0)", "Retry failed thumbnails (0)"],
             [action.text() for action in pane.more_menu.actions()],
@@ -2669,10 +2675,10 @@ class UiSmokeTests(unittest.TestCase):
         service = _RegionNameService()
         pane = NamesPane(lambda: service)
         try:
-            with patch(
-                "ui.names_pane.QInputDialog.getItem",
-                return_value=("Bob — 3 region(s) in 2 photo(s)", True),
-            ) as choose_name:
+            dialog = MagicMock()
+            dialog.exec.return_value = QDialog.DialogCode.Accepted
+            dialog.selected_value.return_value = "Bob"
+            with patch("ui.names_pane.EntityPickerDialog", return_value=dialog) as choose_name:
                 selected = pane._choose_metadata_source_name(
                     ["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"],
                     preferred="Alice",
@@ -2680,10 +2686,35 @@ class UiSmokeTests(unittest.TestCase):
 
             self.assertEqual("Bob", selected)
             self.assertEqual(["/photos/mixed-a.jpg", "/photos/mixed-b.jpg"], service.paths)
-            self.assertIn("Bob — 3 region(s) in 2 photo(s)", choose_name.call_args.args[3])
+            self.assertEqual(["Alice", "Bob"], choose_name.call_args.kwargs["choices"])
         finally:
             pane.shutdown_jobs(timeout_ms=500)
             pane.close()
+
+    def test_library_people_name_picker_loads_saved_names_in_a_background_job(self):
+        from app.services.library_catalog import LibraryCatalogService
+        from ui.library_pane import LibraryPane
+
+        class _FaceService:
+            def list_known_person_names(self, *, cancel_check=None):
+                self.cancel_check = cancel_check
+                return ["Bob", "Alice", "alice"]
+
+        with TemporaryDirectory() as tmp:
+            service = _FaceService()
+            pane = LibraryPane(
+                lambda: "",
+                lambda: service,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            try:
+                pane._request_people_name_choices(service)
+                self.assertTrue(self._wait_until(lambda: pane._people_name_job is None))
+                self.assertEqual(("Alice", "Bob"), pane.people_name_field.choices)
+                self.assertTrue(callable(service.cancel_check))
+            finally:
+                pane.shutdown_jobs(timeout_ms=500)
+                pane.close()
 
     def test_runtime_warmup_is_deferred_outside_clustering_workspace(self):
         progress_calls: list[object] = []
@@ -3137,10 +3168,28 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(55, footer.progress_bar.value())
         self.assertIn("Faces: Writing EXIF", indicator.label.text())
         self.assertIn("2 jobs", indicator.label.text())
+        self.assertEqual("Jobs (2)", indicator.jobs_btn.text())
 
         manager.finish(foreground)
         self.assertTrue(self._wait_until(lambda: not footer.progress_bar.isVisible()))
         self.assertIn("background job", indicator.label.text())
+        self.assertEqual("Jobs (1)", indicator.jobs_btn.text())
+
+    def test_source_pane_keeps_managed_data_home_separate_from_photo_sources(self):
+        pane = SourcePane()
+        requested: list[bool] = []
+        pane.data_home_requested.connect(lambda: requested.append(True))
+        try:
+            pane.set_active_roots(["/photos/a", "/photos/b"])
+            before = pane.active_roots
+            pane.set_data_home_summary("/managed/clusterlens", detail="Indexes and recovery data")
+            self.assertEqual(before, pane.active_roots)
+            self.assertIn("/managed/clusterlens", pane.data_home_label.text())
+            self.assertIn("Indexes and recovery data", pane.data_home_label.text())
+            pane.data_home_button.click()
+            self.assertEqual([True], requested)
+        finally:
+            pane.close()
 
     def test_job_presentation_shutdown_ignores_late_job_updates_after_footer_close(self):
         manager = JobManager()
@@ -9884,8 +9933,8 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertTrue(dialog.face_name_selected_button.isEnabled())
                 self.assertTrue(dialog.face_rename_selected_button.isEnabled())
                 with (
-                    patch("ui.photo_inspector_dialog.QInputDialog.getItem", return_value=("Alice", True)),
-                    patch("ui.photo_inspector_dialog.QInputDialog.getText", return_value=("Cara", True)),
+                    patch("ui.photo_inspector_dialog.EntityPickerDialog.exec", return_value=QDialog.DialogCode.Accepted),
+                    patch("ui.photo_inspector_dialog.EntityPickerDialog.selected_value", side_effect=("Alice", "Cara")),
                 ):
                     dialog._rename_selected_faces()
 
@@ -10017,6 +10066,24 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertIn(paths[1].name, dialog.windowTitle())
 
                 dialog.close()
+
+    def test_photo_inspector_requests_full_resolution_once_per_photo_zoom(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "zoom-source.jpg"
+            Image.new("RGB", (96, 96), (20, 30, 40)).save(image_path)
+            with patch.object(PhotoInspectorDialog, "_load_preview"), patch.object(
+                PhotoInspectorDialog, "_load_metadata_async"
+            ), patch.object(PhotoInspectorDialog, "_prefetch_neighbors"):
+                dialog = PhotoInspectorDialog(image_paths=[str(image_path)], display_mode="basic")
+                calls: list[tuple[str, bool]] = []
+                dialog._load_preview = lambda path, *, request_id, full_res: calls.append((str(path), bool(full_res)))  # type: ignore[method-assign]
+                try:
+                    dialog._on_zoom_changed(1.2)
+                    dialog._on_zoom_changed(1.5)
+                    self.assertEqual([(str(image_path), True)], calls)
+                    self.assertTrue(dialog._full_res_requested)
+                finally:
+                    dialog.close()
 
     def test_photo_inspector_metadata_render_emphasizes_key_fields(self):
         metadata = SimpleNamespace(

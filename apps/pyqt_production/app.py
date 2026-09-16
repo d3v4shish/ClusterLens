@@ -483,6 +483,10 @@ class ProductionClusterApp(QMainWindow):
         self.source_pane = SourcePane(self)
         self.source_pane.setMinimumWidth(220)
         self.source_pane.setMaximumWidth(280)
+        self.source_pane.set_data_home_summary(
+            str(self.runtime_layout.root),
+            detail="Indexes, previews, models, recovery, backups, and reports",
+        )
 
         self.workspace_stack = QStackedWidget(self)
         self.clustering_workspace = QWidget(self.workspace_stack)
@@ -1419,6 +1423,7 @@ class ProductionClusterApp(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.source_pane.scope_changed.connect(self._on_active_scope_changed)
+        self.source_pane.data_home_requested.connect(lambda: self.open_settings_dialog("Storage"))
         self.source_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         self.source_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.source_pane.run_requested.connect(self.run_clustering)
@@ -1438,6 +1443,7 @@ class ProductionClusterApp(QMainWindow):
         self.gallery_pane.empty_run_requested.connect(self.run_clustering)
         self.runtime_badge.clicked.connect(self._open_runtime_status_details)
         self.gallery_pane.paths_removed.connect(self._on_gallery_paths_removed)
+        self.gallery_pane.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.gallery_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.photo_gallery.organize_requested.connect(self.run_gallery_organize)
         self.photo_gallery.analyze_requested.connect(self._analyze_photo_set_in_clustering)
@@ -1445,6 +1451,7 @@ class ProductionClusterApp(QMainWindow):
         self.photo_gallery.return_to_folder_requested.connect(self._return_to_folder_photo_gallery)
         self.photo_gallery.return_to_source_requested.connect(self._return_to_photo_set_source)
         self.photo_gallery.paths_removed.connect(self._on_gallery_paths_removed)
+        self.photo_gallery.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.photo_gallery.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.tags_pane.run_tag_filter_requested.connect(self._run_tag_filter_from_tags_workspace)
         self.tags_pane.generate_suggestions_requested.connect(self.generate_cluster_tag_suggestions)
@@ -1452,6 +1459,7 @@ class ProductionClusterApp(QMainWindow):
         self.tags_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.tags_pane.open_in_gallery_requested.connect(self._open_tagged_photos_in_gallery)
         self.library_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
+        self.library_pane.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.library_pane.open_in_gallery_requested.connect(self._open_library_photos_in_gallery)
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
@@ -3371,6 +3379,67 @@ class ProductionClusterApp(QMainWindow):
                 clear_pixmaps=False,
                 reset_scroll=False,
             )
+
+    def _on_gallery_paths_renamed(self, changed_paths: list[tuple[str, str]]) -> None:
+        """Keep every in-memory workspace reference coherent after a journaled rename."""
+        replacements = {
+            str(source): str(target)
+            for source, target in changed_paths
+            if str(source).strip() and str(target).strip() and str(source) != str(target)
+        }
+        if not replacements:
+            return
+        self._gallery_paths = [replacements.get(path, path) for path in self._gallery_paths]
+        route = self._photo_set_route
+        if route is not None:
+            self._photo_set_route = replace(
+                route,
+                paths=tuple(replacements.get(path, path) for path in route.paths),
+                context_by_path={
+                    replacements.get(path, path): context
+                    for path, context in route.context_by_path.items()
+                },
+            )
+        self._main_gallery_context_overrides = {
+            replacements.get(path, path): context
+            for path, context in self._main_gallery_context_overrides.items()
+        }
+        self.cluster_data = {
+            comparison_key: {
+                cluster_id: [replacements.get(path, path) for path in image_paths]
+                for cluster_id, image_paths in clusters.items()
+            }
+            for comparison_key, clusters in self.cluster_data.items()
+        }
+        self.membership_by_image = {
+            replacements.get(path, path): payload
+            for path, payload in self.membership_by_image.items()
+        }
+        self.image_tags_by_path = {
+            replacements.get(path, path): payload
+            for path, payload in self.image_tags_by_path.items()
+        }
+        self.cluster_explanations = {}
+        self.cluster_meanings = {}
+        self.cluster_pane.update_clusters(
+            self.cluster_data,
+            membership_by_image=self.membership_by_image,
+            metrics_by_backend=self.metrics_by_backend,
+            cluster_summaries=self.cluster_tag_summaries,
+            cluster_explanations=self.cluster_explanations,
+            cluster_meanings=self.cluster_meanings,
+            preserve_selection=True,
+        )
+        current_target = self.cluster_pane.current_selection_target()
+        if current_target is not None:
+            self.gallery_pane.update_gallery_with_options(
+                images=current_target.as_list(),
+                clear_pixmaps=True,
+                reset_scroll=False,
+            )
+        self.footer_bar.set_status(f"Renamed {len(replacements)} photo(s); in-memory workspace references were updated.")
+        self._set_activity("Refreshing after batch rename...")
+        self._start_cluster_tag_context_refresh()
 
     def _on_gallery_metadata_changed(self, paths: list[str]) -> None:
         changed = {str(path) for path in paths if path}

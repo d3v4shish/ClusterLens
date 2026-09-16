@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 
 from app.path_scope import PathScope
 from app.services.thumbnails import ThumbnailService
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.common import HelpIconButton
 from ui.error_mbox import confirmBox
+from ui.entity_picker import EntityPickerDialog
 from ui.gallery_pane import GalleryPane
 from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
@@ -1211,13 +1212,19 @@ class NamesPane(QWidget):
         source = self._choose_metadata_source_name(paths, preferred=self._current_name() or self._selected_name)
         if not source:
             return
-        name, accepted = QInputDialog.getText(
-            self,
+        dialog = EntityPickerDialog(
             "Rename selected face labels",
             f"New name for {source} face label(s) in the selected photo(s):",
+            choices=self._saved_name_choices(),
+            initial=self._current_name() or self._selected_name,
+            allow_create=True,
+            entity_label="person name",
+            parent=self,
         )
-        target = str(name or "").strip()
-        if not accepted or not target or target == source:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dialog.selected_value()
+        if not target or target.casefold() == source.casefold():
             return
         self._start_selected_image_mutation(
             operation="rename",
@@ -1277,25 +1284,22 @@ class NamesPane(QWidget):
         if not counts:
             return ""
         names = sorted(counts, key=lambda value: (value.casefold(), value))
-        labels = [
-            f"{name} — {counts[name][0]} region(s) in {counts[name][1]} photo(s)" if counts[name][0] else f"{name} — saved legacy label"
-            for name in names
-        ]
-        selected_index = names.index(preferred) if preferred in names else 0
-        selected, accepted = QInputDialog.getItem(
-            self,
+        dialog = EntityPickerDialog(
             "Choose face-region name",
             "Name currently stored in selected photo regions:",
-            labels,
-            selected_index,
-            False,
+            choices=names,
+            initial=preferred if preferred in names else names[0],
+            allow_create=False,
+            entity_label="saved name",
+            parent=self,
         )
-        if not accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return ""
-        try:
-            return names[labels.index(str(selected))]
-        except ValueError:
-            return ""
+        selected = dialog.selected_value()
+        return selected if selected.casefold() in {name.casefold() for name in names} else ""
+
+    def _saved_name_choices(self) -> list[str]:
+        return [str(entry.title) for entry in self._entries if str(entry.title or "").strip()]
 
     def _start_selected_image_mutation(
         self,

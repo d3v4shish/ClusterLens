@@ -1,5 +1,17 @@
 # Benchmarks
 
+## 2026-09-16 filename-date catalog and batch-rename safety
+
+Method: `bash scripts/benchmark.sh --library-catalog-only --photos 120 --timeline-photos 1200 --repeats 5` generated fresh JPEG/XMP and SQLite-only timeline fixtures. Before any retained timeline hot-path change, it measured a 23.796 ms catalog scan, 0.406 ms warm FTS query, and 1.072 ms full 1,200-row timeline query/grouping median. The profile attributes catalog time to canonical filesystem paths, Pillow metadata reads, and bounded SQLite writes; timeline time is indexed SQLite fetching plus timestamp bucketing. No user media, runtime cache, model, GPU, or network data was used.
+
+An attempted Python fast path for ISO month extraction regressed a subsequent noisy run and profiled worse than CPython's `datetime.fromisoformat`, so it was removed. There is intentionally no speedup claim for the filename-date policy. Batch rename is a safety workflow rather than a throughput claim: deterministic recovery tests cover template rendering, collision blocking, journalling, cancellation boundaries, and restore.
+
+## 2026-09-16 shared autocomplete control
+
+Method: `bash scripts/benchmark.sh --entity-picker-only --names 10000 --repeats 7` creates 10,000 generated saved-person names in an offscreen Qt process, then measures one `EntityPicker` population plus a contains query. It opens no database, source photo, model, network connection, or persistent runtime data.
+
+The initial implementation measured a 3.253 ms median. Its cProfile result identified repeated `casefold()` scans while both filtering and checking whether the typed name already existed. The picker now retains normalized search keys when choices arrive; the same fixture measured a 2.879 ms median. This is a host-specific UI-control regression benchmark, not an end-to-end Faces latency claim. The remaining population cost is intentional bounded normalization/sorting performed when a background name query publishes a new saved-name list; keystroke filtering itself remains below 1 ms in the profile.
+
 ## 2026-09-16 Clean performance pass
 
 Method: `bash scripts/benchmark.sh` ran the complete shipped deterministic suite in a fresh temporary runtime, then the affected fixtures were profiled and rerun after each code change. No command read user photos, runtime data, caches, or model files. The broad baseline reported 360.755 ms CPU and 108.548 ms selected-CUDA median cosine K-means, 377.587 ms native CPU and 365.642 ms selected-runtime HDBSCAN (native fallback because cuML was unavailable), 11.009 ms JPEG/XMP merge/readback, 33.364 ms global Tags inventory, 10.193 ms selected-runtime deep face search, 21.468 ms sectioned Faces model publication, 121.775 ms bounded face-index scheduling, 39.295 ms Library scan, and 0.988 ms Timeline grouping. These are host-specific regression baselines, not end-to-end photo-library claims.

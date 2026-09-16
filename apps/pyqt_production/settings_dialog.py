@@ -134,6 +134,7 @@ class OperationJournalTableModel(QAbstractTableModel):
         return {
             "delete_to_trash": "Moved to ClusterLens Trash",
             "move": "Moved photos",
+            "rename": "Renamed photos",
             "copy": "Copied photos",
             "restore": "Restored photos",
             "write_exif_comment": "Updated photo metadata",
@@ -1328,7 +1329,7 @@ class ProductionSettingsDialog(QDialog):
         entry = self._selected_journal_entry()
         if not entry:
             return []
-        if str(entry.get("operation") or "") not in {"delete_to_trash", "move"}:
+        if str(entry.get("operation") or "") not in {"delete_to_trash", "move", "rename"}:
             return []
         changed = entry.get("changed_paths") or []
         pairs: list[tuple[str, str]] = []
@@ -1441,7 +1442,7 @@ class ProductionSettingsDialog(QDialog):
     def _reveal_selected_journal_target(self) -> None:
         pairs = self._selected_restorable_paths()
         if not pairs:
-            self.journal_status_label.setText("Select a move or ClusterLens Trash operation with changed paths to reveal.")
+            self.journal_status_label.setText("Select a move, rename, or ClusterLens Trash operation with changed paths to reveal.")
             return
         _original, current = pairs[0]
         target = Path(str(current))
@@ -1454,7 +1455,7 @@ class ProductionSettingsDialog(QDialog):
             return
         pairs = self._selected_restorable_paths()
         if not pairs:
-            self.journal_status_label.setText("Select a move or ClusterLens Trash operation with changed paths to restore.")
+            self.journal_status_label.setText("Select a move, rename, or ClusterLens Trash operation with changed paths to restore.")
             return
         conflict_preview = ""
         if str(conflict_policy).lower() == "unique_name":

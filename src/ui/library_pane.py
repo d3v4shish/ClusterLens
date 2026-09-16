@@ -32,6 +32,7 @@ from app.services.duplicate_review import DuplicateGroup, DuplicateReviewService
 from app.services.library_catalog import CatalogQuery, CatalogTimeline, ClusterContextRecord, LibraryCatalogService, SmartAlbum
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.error_mbox import confirmBox, errorBox
+from ui.entity_picker import EntityPicker, EntityPickerDialog
 from ui.gallery_pane import GalleryPane
 from ui.job_manager import JobManager
 from ui.sectioned_gallery import GallerySection, SectionedGallery
@@ -45,10 +46,11 @@ class LibraryPane(QWidget):
 
     open_in_gallery_requested = pyqtSignal(list, str)
     metadata_changed = pyqtSignal(list)
+    paths_renamed = pyqtSignal(list)
 
     PAGE_SIZE = 240
     _TAB_HEIGHTS = {
-        "Timeline": 116,
+        "Timeline": 148,
         "Search": 236,
         "Cleanup": 270,
         "People Cleanup": 300,
@@ -90,6 +92,8 @@ class LibraryPane(QWidget):
         self._duplicate_job: AsyncJob | None = None
         self._people_generation = 0
         self._people_job: AsyncJob | None = None
+        self._people_name_generation = 0
+        self._people_name_job: AsyncJob | None = None
         self._context_search_generation = 0
         self._context_search_job: AsyncJob | None = None
         self._timeline_loaded = False
@@ -101,6 +105,7 @@ class LibraryPane(QWidget):
         self._selected_cluster_key = ""
         self._selected_cluster_members: tuple[str, ...] = ()
         self._read_only_mode = False
+        self._force_catalog_date_refresh = False
         self._build_ui()
         self._restore_context_settings()
         self.refresh_roots()
@@ -207,11 +212,13 @@ class LibraryPane(QWidget):
         self.gallery.set_action_visibility(show_actions=True, show_metadata_actions=True, show_file_actions=True)
         self.gallery.set_empty_state("Library timeline", "Register and refresh a library root to browse local photos.")
         self.gallery.metadata_changed.connect(self.metadata_changed.emit)
+        self.gallery.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.timeline_gallery = SectionedGallery(body)
         self.timeline_gallery.set_job_manager(self.job_manager)
         self.timeline_gallery.set_embedded_timeline_mode(True)
         self.timeline_gallery.set_empty_state("Register and refresh a library root to browse the full local timeline.")
         self.timeline_gallery.metadata_changed.connect(self.metadata_changed.emit)
+        self.timeline_gallery.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.gallery_stack = QStackedWidget(body)
         self.gallery_stack.addWidget(self.timeline_gallery)
         self.gallery_stack.addWidget(self.gallery)
@@ -244,6 +251,7 @@ class LibraryPane(QWidget):
         start_label = QLabel("From")
         end_label = QLabel("To")
         camera_label = QLabel("Camera")
+        date_source_label = QLabel("Timeline date")
         self.timeline_start = QLineEdit(page)
         self.timeline_start.setPlaceholderText("YYYY-MM-DD")
         self.timeline_start.setToolTip("Optional inclusive start date in YYYY-MM-DD format.")
@@ -253,10 +261,23 @@ class LibraryPane(QWidget):
         self.timeline_camera = QLineEdit(page)
         self.timeline_camera.setPlaceholderText("Camera contains")
         self.timeline_camera.setToolTip("Optional case-insensitive camera model filter.")
+        self.timeline_date_source = QComboBox(page)
+        self.timeline_date_source.addItem("Metadata, then filename", "metadata_or_filename")
+        self.timeline_date_source.addItem("Metadata only", "metadata_only")
+        self.timeline_date_source.addItem("Prefer filename", "prefer_filename")
+        self.timeline_date_source.addItem("Filename only", "filename_only")
+        current_policy = str(getattr(self.catalog, "filename_date_policy", "metadata_or_filename"))
+        current_index = self.timeline_date_source.findData(current_policy)
+        self.timeline_date_source.setCurrentIndex(max(0, current_index))
+        self.timeline_date_source.setToolTip(
+            "Choose the source used for Timeline capture time. Filename recognition accepts only unambiguous year-first dates. "
+            "Changing this re-reads catalog metadata on the next Refresh; it never writes EXIF or XMP."
+        )
         self.timeline_reload_button = QPushButton("Show timeline")
         self.timeline_reload_button.setToolTip("Apply the date and camera filters to the selected Library root.")
         self.timeline_reload_button.setProperty("kind", "primary")
         self.timeline_reload_button.clicked.connect(self.load_timeline)
+        self.timeline_date_source.currentIndexChanged.connect(self._on_timeline_date_source_changed)
         for field in (self.timeline_start, self.timeline_end, self.timeline_camera):
             field.setMinimumWidth(122)
         layout.addWidget(start_label, 0, 0)
@@ -266,6 +287,8 @@ class LibraryPane(QWidget):
         layout.addWidget(camera_label, 1, 0)
         layout.addWidget(self.timeline_camera, 1, 1, 1, 2)
         layout.addWidget(self.timeline_reload_button, 1, 3)
+        layout.addWidget(date_source_label, 2, 0)
+        layout.addWidget(self.timeline_date_source, 2, 1, 1, 3)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)
         self.tabs.addTab(page, "Timeline")
@@ -342,7 +365,7 @@ class LibraryPane(QWidget):
         name_row = QHBoxLayout()
         name_row.setSpacing(8)
         name_label = QLabel("Name")
-        self.people_name_field = QLineEdit(page)
+        self.people_name_field = EntityPicker(page, allow_create=True, entity_label="person name")
         self.people_name_field.setPlaceholderText("Name selected group")
         self.people_name_field.setToolTip("Enter the durable name to apply to every face in the selected review group.")
         self.people_apply_button = QPushButton("Apply name")
@@ -636,12 +659,27 @@ class LibraryPane(QWidget):
         if not root_ids:
             self.status_label.setText("No registered active roots to refresh. Register the active roots first.")
             return
+        force = bool(self._force_catalog_date_refresh)
+        self._force_catalog_date_refresh = False
         self.status_label.setText("Refreshing registered roots…")
         self._start_job(
             "Refreshing Library",
-            lambda progress, cancel: self.catalog.scan_roots(root_ids, progress_callback=progress, cancel_check=cancel),
+            lambda progress, cancel: self.catalog.scan_roots(
+                root_ids,
+                force=force,
+                progress_callback=progress,
+                cancel_check=cancel,
+            ),
             lambda result: self._catalog_scan_completed(result),
         )
+
+    def _on_timeline_date_source_changed(self, _index: int) -> None:
+        policy = str(self.timeline_date_source.currentData() or "metadata_or_filename")
+        setter = getattr(self.catalog, "set_filename_date_policy", None)
+        if callable(setter):
+            setter(policy)
+        self._force_catalog_date_refresh = True
+        self.status_label.setText("Timeline date source changed. Refresh registered roots to update derived timeline dates.")
 
     def _catalog_scan_completed(self, result: dict[str, int]) -> None:
         self.status_label.setText(
@@ -1031,6 +1069,7 @@ class LibraryPane(QWidget):
         if face_service is None:
             errorBox("Faces are not ready", "Open Faces once to prepare the local face index, then return to People Cleanup.", parent=self)
             return
+        self._request_people_name_choices(face_service)
         self._people_generation += 1
         generation = self._people_generation
         if self._people_job is not None:
@@ -1144,11 +1183,31 @@ class LibraryPane(QWidget):
     def merge_people_names(self) -> None:
         if self._people_service is None or self._read_only_mode:
             return
-        source, accepted = _simple_text_prompt(self, "Merge people", "Merge saved name")
-        if not accepted or not source.strip():
+        choices = self.people_name_field.choices
+        source_dialog = EntityPickerDialog(
+            "Merge people",
+            "Saved name to merge into another person:",
+            choices=choices,
+            allow_create=False,
+            entity_label="person name",
+            parent=self,
+        )
+        if source_dialog.exec() != source_dialog.DialogCode.Accepted:
             return
-        target, accepted = _simple_text_prompt(self, "Merge people", "Into saved name")
-        if not accepted or not target.strip() or source.strip().casefold() == target.strip().casefold():
+        source = source_dialog.selected_value()
+        target_dialog = EntityPickerDialog(
+            "Merge people",
+            f"Merge {source or 'saved name'} into:",
+            choices=choices,
+            initial=self.people_name_field.text(),
+            allow_create=True,
+            entity_label="person name",
+            parent=self,
+        )
+        if not source or target_dialog.exec() != target_dialog.DialogCode.Accepted:
+            return
+        target = target_dialog.selected_value()
+        if not target or source.casefold() == target.casefold():
             return
 
         def _done(_result) -> None:
@@ -1295,9 +1354,46 @@ class LibraryPane(QWidget):
         if generation == self._people_generation:
             self._people_job = None
 
+    def _request_people_name_choices(self, face_service: object) -> None:
+        loader = getattr(face_service, "list_known_person_names", None)
+        if not callable(loader):
+            return
+        self._people_name_generation += 1
+        generation = self._people_name_generation
+        if self._people_name_job is not None:
+            self._people_name_job.cancel()
+
+        def _run(_progress, cancel):
+            return list(loader(cancel_check=cancel) or ())
+
+        def _done(names: object) -> None:
+            if generation != self._people_name_generation:
+                return
+            self._people_name_job = None
+            values = [str(name) for name in names or ()]
+            self.people_name_field.set_choices(values)
+
+        job = self._start_job("Loading saved people names", _run, _done)
+        self._people_name_job = job
+        job.failed.connect(lambda _message: self._clear_people_name_job(generation))
+        job.cancelled.connect(lambda: self._clear_people_name_job(generation))
+
+    def _clear_people_name_job(self, generation: int) -> None:
+        if generation == self._people_name_generation:
+            self._people_name_job = None
+
     def _clear_context_search_job(self, generation: int) -> None:
         if generation == self._context_search_generation:
             self._context_search_job = None
+
+    def _on_gallery_paths_renamed(self, changed_paths: list[tuple[str, str]]) -> None:
+        changed = [(str(source), str(target)) for source, target in changed_paths if str(source) and str(target)]
+        if not changed:
+            return
+        self.paths_renamed.emit(changed)
+        self.status_label.setText(
+            f"Renamed {len(changed)} photo(s). Refresh registered roots to update the derived Library catalog; source metadata was not changed."
+        )
 
     def _active_scope(self) -> PathScope:
         try:
@@ -1439,9 +1535,3 @@ class LibraryPane(QWidget):
         gallery_ready = self.gallery.shutdown_jobs(timeout_ms=timeout_ms)
         timeline_ready = self.timeline_gallery.shutdown_jobs(timeout_ms=timeout_ms)
         return gallery_ready and timeline_ready and ready
-
-
-def _simple_text_prompt(parent, title: str, label: str) -> tuple[str, bool]:
-    from PyQt6.QtWidgets import QInputDialog
-
-    return QInputDialog.getText(parent, title, label)

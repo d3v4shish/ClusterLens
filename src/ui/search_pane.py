@@ -12,12 +12,11 @@ from threading import Event, Lock
 from time import perf_counter
 from uuid import uuid4
 
-from PyQt6.QtCore import QAbstractListModel, QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, QStringListModel, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QAbstractListModel, QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QImageReader, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QCompleter,
     QFrame,
     QFileDialog,
     QComboBox,
@@ -112,6 +111,7 @@ from infra.logging_config import get_logger
 from infra.qt_diagnostics import append_qt_diagnostic
 from infra.settings import get_settings
 from ui.common import HelpIconButton, build_help_inline
+from ui.entity_picker import EntityPicker
 from ui.error_mbox import confirmBox, errorBox, infoBox
 from ui.async_job import AsyncJob, Cancelled, detach_running_async_job, start_job_in_thread, wait_for_thread_shutdown
 from ui.gallery_pane import GalleryPane
@@ -159,54 +159,11 @@ class PasteAwareLineEdit(QLineEdit):
         super().insertFromMimeData(source)
 
 
-class FaceNameLineEdit(QLineEdit):
-    """Face-name editor with a case-insensitive saved-name dropdown."""
+class FaceNameLineEdit(EntityPicker):
+    """Compatibility name for the shared autocomplete identity picker."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self._name_model = QStringListModel(self)
-        self._name_completer = QCompleter(self._name_model, self)
-        self._name_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._name_completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self._name_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self._name_completer.activated[str].connect(self._commit_completion)
-        self._show_completions_on_focus = True
-        self.setCompleter(self._name_completer)
-
-    def set_name_choices(self, names: list[str] | tuple[str, ...]) -> None:
-        unique: dict[str, str] = {}
-        for raw_name in list(names or ()):
-            name = str(raw_name or "").strip()
-            if name:
-                unique.setdefault(name.casefold(), name)
-        self._name_model.setStringList(sorted(unique.values(), key=lambda value: (value.casefold(), value)))
-
-    def _commit_completion(self, completion: str = "") -> bool:
-        selected = str(completion or self._name_completer.currentCompletion() or "").strip()
-        if not selected:
-            return False
-        self._show_completions_on_focus = False
-        self.setText(selected)
-        self.setCursorPosition(len(selected))
-        self._name_completer.popup().hide()
-        return True
-
-    def event(self, event) -> bool:  # type: ignore[override]
-        if event.type() == QEvent.Type.KeyPress and event.key() in {
-            Qt.Key.Key_Return,
-            Qt.Key.Key_Enter,
-            Qt.Key.Key_Tab,
-        }:
-            popup = self._name_completer.popup()
-            if popup.isVisible() and self._commit_completion():
-                event.accept()
-                return True
-        return super().event(event)
-
-    def focusInEvent(self, event) -> None:  # type: ignore[override]
-        super().focusInEvent(event)
-        if self._show_completions_on_focus and self._name_model.rowCount() > 0:
-            QTimer.singleShot(0, self._name_completer.complete)
+        super().__init__(parent, allow_create=True, entity_label="identity name")
 
 
 class FaceNameDialog(QDialog):

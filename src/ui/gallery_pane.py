@@ -7,10 +7,10 @@ from time import perf_counter
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage, QImageReader
-from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QListView, QMenu, QProgressBar, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
 from app.selection import SelectionTarget
-from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
+from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService, RenamePreviewItem
 from app.services.image_tags import ImageTagService
 from app.services.photo_metadata import MetadataSidecarService
 from app.services.thumbnails import ThumbnailService
@@ -97,6 +97,11 @@ GALLERY_HELP = {
         "Selected photos take priority.\n"
         "Moved files keep their image tags by updating the tag database paths."
     ),
+    "rename_selection": (
+        "Preview an in-place batch rename before any file is changed.\n"
+        "The template keeps each original extension and supports {stem}, {index}, {date}, {year}, {month}, and {day}.\n"
+        "Any collision blocks the whole operation. Completed renames are available from Safety & Recovery."
+    ),
     "delete_selection": (
         "Move selected photos to ClusterLens Trash, or use the current group if nothing is selected.\n"
         "Selected photos take priority.\n"
@@ -108,6 +113,71 @@ GALLERY_HELP = {
         "Use it after temporary IO errors or when files become available again."
     ),
 }
+
+
+class BatchRenameDialog(QDialog):
+    """A deliberately small, review-first surface for source filename edits."""
+
+    def __init__(self, image_paths: list[str], parent=None) -> None:
+        super().__init__(parent)
+        self._image_paths = list(image_paths)
+        self.setWindowTitle("Preview batch rename")
+        self.setModal(True)
+        self.resize(720, 500)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Template creates the filename before its existing extension. "
+            "Use {stem}, {index}, {date}, {year}, {month}, or {day}; date fields use the file modification date here. "
+            "For example: {date}_{index:04d}_{stem}.",
+            self,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.template_input = QLineEdit("{date}_{index:04d}_{stem}", self)
+        self.template_input.setAccessibleName("Batch rename template")
+        self.template_input.setToolTip(GALLERY_HELP["rename_selection"])
+        self.template_input.textChanged.connect(self._refresh_preview)
+        layout.addWidget(self.template_input)
+        self.summary_label = QLabel("", self)
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+        self.preview_text = QPlainTextEdit(self)
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setAccessibleName("Batch rename preview")
+        layout.addWidget(self.preview_text, stretch=1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, self)
+        self.apply_button = self.buttons.addButton("Rename files", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.apply_button.setToolTip("Apply only this complete, collision-free preview. Every completed rename is journaled for Recovery.")
+        self.buttons.rejected.connect(self.reject)
+        self.apply_button.clicked.connect(self.accept)
+        layout.addWidget(self.buttons)
+        self._preview: list[RenamePreviewItem] = []
+        self._refresh_preview()
+
+    @property
+    def preview(self) -> list[RenamePreviewItem]:
+        return list(self._preview)
+
+    @property
+    def template(self) -> str:
+        return self.template_input.text().strip()
+
+    def _refresh_preview(self) -> None:
+        self._preview = GalleryActionService.preview_renames(self._image_paths, self.template_input.text())
+        ready = [item for item in self._preview if item.is_ready]
+        blocked = [item for item in self._preview if not item.is_ready]
+        self.summary_label.setText(
+            f"{len(ready)} of {len(self._preview)} files are ready. "
+            + ("Fix every blocked row before renaming." if blocked else "Review the targets, then confirm to start a cancellable job.")
+        )
+        rows = []
+        for item in self._preview:
+            source = Path(item.source_path).name or item.source_path
+            target = Path(item.target_path).name if item.target_path else "—"
+            suffix = f"  [BLOCKED: {item.reason}]" if item.reason else ""
+            rows.append(f"{source}  →  {target}{suffix}")
+        self.preview_text.setPlainText("\n".join(rows))
+        self.apply_button.setEnabled(bool(ready) and not blocked)
 
 
 class ThumbnailRequestQueue:
@@ -214,6 +284,7 @@ class GalleryPane(QWidget):
     add_to_review_requested = pyqtSignal(list)
     remove_from_review_requested = pyqtSignal(list)
     paths_removed = pyqtSignal(list)
+    paths_renamed = pyqtSignal(list)
     metadata_changed = pyqtSignal(list)
     visible_paths_changed = pyqtSignal(list)
     empty_select_folder_requested = pyqtSignal()
@@ -384,6 +455,7 @@ class GalleryPane(QWidget):
         self.import_sidecars_action = self._add_menu_action(self.metadata_menu, "Import sidecars", GALLERY_HELP["metadata_menu"], self.slotImportMetadataSidecars)
         self.copy_selection_action = self._add_menu_action(self.file_ops_menu, "Copy current target", GALLERY_HELP["copy_selection"], self.slotCopySelected)
         self.move_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target", GALLERY_HELP["move_selection"], self.slotMoveSelected)
+        self.rename_selection_action = self._add_menu_action(self.file_ops_menu, "Preview batch rename for current target", GALLERY_HELP["rename_selection"], self.slotPreviewBatchRename)
         self.delete_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target to ClusterLens Trash", GALLERY_HELP["delete_selection"], self.slotDeleteSelect)
         self.delete_selection_action.setIcon(themed_icon("delete", color="#FFAAA6"))
         self.copy_paths_action = self._add_menu_action(self.more_menu, "Copy paths", GALLERY_HELP["copy_paths"], self.slotCopySelectedPaths)
@@ -418,6 +490,7 @@ class GalleryPane(QWidget):
             self.tags_checked_group_action,
             self.copy_selection_action,
             self.move_selection_action,
+            self.rename_selection_action,
             self.delete_selection_action,
             self.import_sidecars_action,
         ]
@@ -509,8 +582,10 @@ class GalleryPane(QWidget):
         menu.addSeparator()
         move_to_trash = menu.addAction("Move to ClusterLens Trash (selection)")
         move_to_dir = menu.addAction("Move To... (Selection)")
+        rename_selection = menu.addAction("Preview Batch Rename (Selection)")
         move_to_trash.setEnabled(not self.read_only_mode)
         move_to_dir.setEnabled(not self.read_only_mode)
+        rename_selection.setEnabled(not self.read_only_mode)
         action = menu.exec(self.list_view.viewport().mapToGlobal(pos))
         if action in context_callbacks:
             context_callbacks[action]()
@@ -564,6 +639,8 @@ class GalleryPane(QWidget):
             self.slotDeleteSelect()
         elif action == move_to_dir:
             self.slotMoveSelected()
+        elif action == rename_selection:
+            self.slotPreviewBatchRename()
 
     def select_current_group(self) -> None:
         target = self.current_group_target()
@@ -798,6 +875,57 @@ class GalleryPane(QWidget):
             self._show_action_result("Move complete", result, verb="Moved", target_label=target.label, changed_label="moves")
 
         self._start_action_job("Moving images", _run, _done)
+
+    def slotPreviewBatchRename(self) -> None:
+        if not self._require_write_enabled("rename photo files"):
+            return
+        target = self._selection_for_actions()
+        if target is None:
+            return
+        source_paths = target.as_list()
+        dialog = BatchRenameDialog(source_paths, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Batch rename cancelled. No files were changed.")
+            return
+        preview = dialog.preview
+        if not preview or any(not item.is_ready for item in preview):
+            self.status_label.setText("Batch rename preview is no longer safe. No files were changed.")
+            return
+        if not self._confirm_write_operation(
+            "Rename photo files?",
+            f"Rename with template: {dialog.template}",
+            target,
+            source_paths,
+            destination="Same folders; filenames only",
+            recoverability="Each completed rename is journaled and can be restored from Safety & Recovery while the renamed file remains available.",
+        ):
+            self.status_label.setText("Batch rename cancelled. No files were changed.")
+            return
+
+        def _run(progress, cancel_check):
+            # Rebuild immediately before mutation so a file created after the
+            # user inspected the preview becomes a visible blocked result.
+            refreshed = self.action_service.preview_renames(source_paths, dialog.template)
+            return self.action_service.rename_files(refreshed, progress_callback=progress, cancel_check=cancel_check)
+
+        def _done(result) -> None:
+            changed = list(getattr(result, "changed_paths", []))
+            if self.image_tag_service is not None and changed:
+                try:
+                    self.image_tag_service.sync_moved_paths(changed)
+                except Exception:
+                    LOGGER.exception("Could not update tag paths after batch rename")
+            if changed:
+                replacements = {str(source): str(destination) for source, destination in changed}
+                self.update_gallery_with_options(
+                    images=[replacements.get(str(path), str(path)) for path in self.images],
+                    clear_pixmaps=True,
+                    reset_scroll=False,
+                )
+                self.paths_renamed.emit(changed)
+            self._show_action_result("Batch rename complete", result, verb="Renamed", target_label=target.label, changed_label="renames")
+
+        self._start_action_job("Renaming photo files", _run, _done)
 
     def slotAddExif(self):
         if not self._require_write_enabled("write EXIF metadata"):
@@ -1372,6 +1500,7 @@ class GalleryPane(QWidget):
             (self.tags_checked_group_action, "Tag current target"),
             (self.copy_selection_action, "Copy current target"),
             (self.move_selection_action, "Move current target"),
+            (self.rename_selection_action, "Preview batch rename for current target"),
             (self.delete_selection_action, "Move current target to ClusterLens Trash"),
             (self.copy_paths_action, "Copy paths"),
             (self.export_paths_action, "Export paths"),

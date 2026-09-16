@@ -28,7 +28,8 @@ class JobIndicatorWidget(QWidget):
         self.cancel_btn.setAccessibleName("Cancel active job")
         self.cancel_btn.setVisible(False)
         self.jobs_btn = QPushButton("Jobs…")
-        self.jobs_btn.setAccessibleName("Open job history")
+        self.jobs_btn.setAccessibleName("Open all visible jobs and job history")
+        self.jobs_btn.setToolTip("Open every active, queued, completed, cancelled, and failed job.")
 
         layout.addWidget(self.label)
         layout.addWidget(self.progress)
@@ -48,10 +49,15 @@ class JobIndicatorWidget(QWidget):
 
     def _refresh(self, *_args) -> None:
         job = self._active_job()
+        active_count = self.job_manager.active_count()
+        self.jobs_btn.setText(f"Jobs ({active_count})" if active_count else "Jobs")
+        self.jobs_btn.setToolTip(
+            f"Open all visible jobs and job history. {active_count} job(s) are currently running or cancelling."
+        )
         if job is None:
-            background_count = self.job_manager.active_count()
-            if background_count:
-                self.label.setText(f"{background_count} background job(s) running")
+            if active_count:
+                self.label.setText(f"{active_count} background job(s) running — open Jobs to view or cancel")
+                self.label.setToolTip("Background work is visible and cancellable from Jobs.")
                 self.label.show()
             else:
                 self.label.clear()
@@ -62,7 +68,6 @@ class JobIndicatorWidget(QWidget):
             self.cancel_btn.setVisible(False)
             return
 
-        active_count = self.job_manager.active_count()
         text = f"{job.origin}: {job.label}"
         if job.text:
             text += f" | {job.text}"
@@ -101,9 +106,14 @@ class JobsDialog(QDialog):
         self.resize(860, 420)
         layout = QVBoxLayout(self)
 
+        self.summary_label = QLabel("", self)
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setToolTip("All registered work is retained here, including background work and completed/cancelled jobs.")
+        layout.addWidget(self.summary_label)
+
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
-        self.table.setHorizontalHeaderLabels(["Origin", "Label", "Status", "Progress", "Cache", "Text", "Started", "Finished"])
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels(["Origin", "Task", "Priority", "Status", "Progress", "Cache", "Details", "Started", "Finished"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -127,15 +137,21 @@ class JobsDialog(QDialog):
         self.refresh()
 
     def refresh(self, *_args) -> None:
-        jobs = self.job_manager.history(limit=200)
+        jobs = self.job_manager.history(limit=500)
+        active_count = self.job_manager.active_count()
+        self.summary_label.setText(
+            f"{active_count} active job(s). Select any cancellable running job to stop it safely; "
+            "completed, cancelled, and failed work remains visible below."
+        )
         self.table.setRowCount(len(jobs))
         for row, job in enumerate(jobs):
             started = datetime.fromtimestamp(job.started_at_s).strftime("%H:%M:%S")
             finished = "" if job.finished_at_s is None else datetime.fromtimestamp(job.finished_at_s).strftime("%H:%M:%S")
-            values = [job.origin, job.label, job.status, "", job.cache_status, job.text, started, finished]
+            priority = "Visible" if job.foreground else "Background"
+            values = [job.origin, job.label, priority, job.status, "", job.cache_status, job.text, started, finished]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if col == 2:
+                if col == 3:
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 if col == 1 and job.error:
                     item.setToolTip(job.error)
@@ -150,7 +166,7 @@ class JobsDialog(QDialog):
             else:
                 progress.setRange(0, 100)
                 progress.setValue(max(0, min(100, int(job.progress or 0))))
-            self.table.setCellWidget(row, 3, progress)
+            self.table.setCellWidget(row, 4, progress)
         self.table.resizeColumnsToContents()
         self._update_cancel_state()
 

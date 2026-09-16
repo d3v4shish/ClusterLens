@@ -271,6 +271,7 @@ class ClusterGalleryApp(QMainWindow):
         self.gallery_pane.first_paint_ready.connect(self.on_gallery_first_paint)
         self.gallery_pane.image_selected.connect(self.on_center_gallery_image_selected)
         self.gallery_pane.paths_removed.connect(self.on_gallery_paths_removed)
+        self.gallery_pane.paths_renamed.connect(self.on_gallery_paths_renamed)
         self.gallery_pane.metadata_changed.connect(self.on_gallery_metadata_changed)
 
         self.cluster_pane = ClusterPane(self)
@@ -1677,6 +1678,53 @@ class ClusterGalleryApp(QMainWindow):
             images = current_target.as_list()
             self.gallery_pane.update_gallery_with_options(images=images, clear_pixmaps=False, reset_scroll=False)
             return
+
+    def on_gallery_paths_renamed(self, changed_paths: list[tuple[str, str]]) -> None:
+        replacements = {
+            str(source): str(target)
+            for source, target in changed_paths
+            if str(source).strip() and str(target).strip() and str(source) != str(target)
+        }
+        if not replacements:
+            return
+        self._main_gallery_context_overrides = {
+            replacements.get(path, path): context
+            for path, context in self._main_gallery_context_overrides.items()
+        }
+        self.cluster_data = {
+            backend: {
+                cluster_id: [replacements.get(path, path) for path in image_paths]
+                for cluster_id, image_paths in clusters.items()
+            }
+            for backend, clusters in self.cluster_data.items()
+        }
+        self.membership_by_image = {
+            replacements.get(path, path): payload
+            for path, payload in self.membership_by_image.items()
+        }
+        self.image_tags_by_path = {
+            replacements.get(path, path): payload
+            for path, payload in self.image_tags_by_path.items()
+        }
+        self.cluster_explanations = {}
+        self.cluster_meanings = {}
+        self._refresh_cluster_tag_context()
+        self.cluster_pane.update_clusters(
+            self.cluster_data,
+            self.membership_by_image,
+            self.metrics_by_backend,
+            self.cluster_tag_summaries,
+            self.cluster_explanations,
+            self.cluster_meanings,
+            preserve_selection=True,
+        )
+        current_target = self.cluster_pane.current_selection_target()
+        if current_target is not None:
+            self.gallery_pane.update_gallery_with_options(
+                images=current_target.as_list(),
+                clear_pixmaps=True,
+                reset_scroll=False,
+            )
 
     def on_gallery_metadata_changed(self, paths: list[str]) -> None:
         self._refresh_cluster_tag_context()

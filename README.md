@@ -6,6 +6,8 @@ ClusterLens is a desktop image-clustering workspace for local photo folders. It 
 
 The **Library** workspace is a local-first curation layer over explicit, user-registered roots. It incrementally catalogs filenames, scalar EXIF, and XMP sidecars without editing source photos, then provides a virtualized timeline, text search, dynamic smart albums, a manual duplicate/burst review queue, and a registered-root People Cleanup Inbox. Disabled roots are visibly excluded from all global work.
 
+Timeline has an explicit **Timeline date** policy: metadata only, metadata then an unambiguous year-first filename date, filename first, or filename only. Changing it refreshes only derived catalog rows; it never rewrites EXIF/XMP. The current source is stored with each catalogued timestamp.
+
 Duplicate and burst results are review-only: ClusterLens proposes a keeper but moves nothing until the user explicitly sends selected candidates to recoverable ClusterLens Trash. People cleanup keeps name, reject, split, hide, and merge actions explicit; source-changing actions run in visible Jobs and respect read-only safety mode.
 
 Library can also store searchable cluster context. Manual description is always explicit. Automatic description remains off until enabled in Library. The default provider is a local Ollama vision endpoint; an OpenAI-compatible endpoint is available only after the user configures it and confirms, for the current app run, that the representative photo plus displayed scalar EXIF/XMP may leave the device. Generated descriptions are clearable from Library and never write source metadata. Settings → Storage reports the Library catalog’s managed path and size; **Clear Library Cache** removes only derived photo metadata and generated descriptions, preserving registered roots, smart albums, review decisions, face labels, and source media.
@@ -15,6 +17,8 @@ Library can also store searchable cluster context. Manual description is always 
 The Folder pane separates browsing from scope. Clicking a tree row only browses it; checking a row or using **Add browsed** adds that directory to the persisted shared **Active roots** set. Every root includes descendants, and nested selections fold into their selected parent so source photos are never discovered twice. The scope strip remains visible when the Folder pane is hidden.
 
 Gallery, Clustering, Faces, Names, Tags, and Library use the active roots by default. Faces album/review/search/clustering and Names searches stay inside that set; Names provides an explicit **All indexed faces** override. Library remains explicit: selecting an active root never scans it until **Register active roots** is chosen.
+
+The Sources pane also points to the separate **ClusterLens Data Home**. It contains indexes, previews, models, recovery journals, backups, logs, and reports; it is never a photo source. Storage exposes its managed categories and safe clear/recovery controls.
 
 ## Public Repository Contents
 
@@ -32,6 +36,8 @@ Runtime data is created under the user's application data directory, such as `~/
 ## Maintenance and release evidence
 
 Settings → Storage lists the managed generated-data categories, their paths, and their sizes. Each clear action is explicit and runs in the background; source photos, tags, durable face labels, recovery history, and settings are never part of a category clear. The safe command-line cleanup preview remains available through `python scripts/cleanup_production_runtime.py`.
+
+Gallery **File actions** and its right-click menu include **Preview batch rename**. Templates support `{stem}`, `{index}`, `{date}`, `{year}`, `{month}`, and `{day}` while keeping each original extension. Every collision blocks the full preview; the confirmed operation runs in Jobs, can stop between files, and each completed rename can be restored from Settings → Safety & Recovery.
 
 Create deterministic, non-private release inputs and evidence with:
 
@@ -128,6 +134,12 @@ To benchmark only Timeline's full filtered catalog read and virtual Year → Mon
 bash scripts/benchmark.sh --library-timeline-only
 ```
 
+To benchmark the shared saved-name autocomplete control with a generated 10,000-name fixture (no database, photos, models, or network):
+
+```bash
+bash scripts/benchmark.sh --entity-picker-only --names 10000 --repeats 7
+```
+
 ## Model Downloads
 
 Model weights are not checked into the repository and are not bundled by default. The app asks before downloading missing model files and stores them in the runtime cache. On Linux, normal source launches keep managed face-model files in `~/.local/share/ClusterLens/cache/face_model_assets` and reusable download archives in `~/.local/share/ClusterLens/cache/face_model_downloads`, so they remain available after restarts. The source launcher ignores only stale `/tmp` runtime overrides; explicit persistent runtime locations remain supported.
@@ -148,7 +160,7 @@ The top-level **Tags** workspace is the durable photo-tag hub. It pages tags fro
 
 **Open in Gallery** from Faces, Names, Tags, or a selected cluster always opens the top-level Photos workspace as a session-only route. Its toolbar identifies the source and provides return, folder, analysis, and face-review actions. Analyze uses only the routed/selected paths; Review Faces transfers the same paths to Faces but never starts detection by itself. Per-photo face context is preserved while the route is active and discarded when returning to the normal folder gallery, so opening a result set does not create durable state.
 
-The **Photos** workspace and the main gallery always expose **Edit Face Regions** outside read-only mode, even before Faces or Names has been opened. Its face filter distinguishes **Unlabelled Faces** (one or more saved regions, none named) from **No Face Regions** (a scanned photo with no detected region). The requested local face service prepares through the visible Jobs flow and either opens the inspector or explains the missing local requirement; it never blocks the window. In the inspector, scan or draw a box, save it, select that face region, then use **Apply Name**, **Rename**, or **Unlabel** in the **Selected face regions** section. A JPEG receives standard MWG/XMP face regions plus a ClusterLens EXIF mirror; PNG and other formats, or an image with an existing `.xmp` sidecar, use that sidecar without rewriting pixels. An explicit selected-region name is user intent and is saved even when automatic prototype quality would reject that region; automatic matching, suggestions, search, and clustering continue to use their configured quality filters. On re-index, an existing durable database label wins over a conflicting external XMP name.
+The **Photos** workspace and the main gallery always expose **Edit Face Regions** outside read-only mode, even before Faces or Names has been opened. Its face filter distinguishes **Unlabelled Faces** (one or more saved regions, none named) from **No Face Regions** (a scanned photo with no detected region). The requested local face service prepares through the visible Jobs flow and either opens the inspector or explains the missing local requirement; it never blocks the window. In the inspector, use Fit, 1:1, deep zoom (up to 6400%), scroll-wheel cursor zoom, or middle-button pan to inspect a photo; full resolution is requested once only after zooming past preview scale. Scan or draw a box, save it, select that face region, then use **Apply Name**, **Rename**, or **Unlabel** in the **Selected face regions** section. A JPEG receives standard MWG/XMP face regions plus a ClusterLens EXIF mirror; PNG and other formats, or an image with an existing `.xmp` sidecar, use that sidecar without rewriting pixels. An explicit selected-region name is user intent and is saved even when automatic prototype quality would reject that region; automatic matching, suggestions, search, and clustering continue to use their configured quality filters. On re-index, an existing durable database label wins over a conflicting external XMP name.
 
 Downloaded face and clustering models are not part of **Clear Rebuildable Caches**. On startup ClusterLens performs a local-only reconciliation before showing model selectors: it promotes a fully staged face install, restores a missing managed face bundle from its verified retained download archive when possible, and repairs a stale Hugging Face snapshot reference. It never downloads during this recovery. The rebuildable thumbnail SQLite index likewise reconciles only its own cache directory after missing/corrupt/interrupted state; it never touches source photos. **Clear Model Caches** remains the explicit action that removes downloaded model files.
 

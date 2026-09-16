@@ -9,12 +9,13 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, pyqtSlot
 from PyQt6.QtGui import QIcon, QImage, QImageReader, QKeyEvent, QKeySequence, QPainter, QPixmap, QShortcut
-from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
 
 from app.services.face_types import EditableFaceInput
 from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from ui.error_mbox import confirmBox, errorBox
+from ui.entity_picker import EntityPicker, EntityPickerDialog
 from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel
 from ui.zoomable_image import ZoomableImageView
@@ -77,12 +78,15 @@ class PhotoInspectorDialog(QDialog):
         self._prefetch_job = None
         self._face_edit_thread = None
         self._face_edit_job = None
+        self._face_name_suggestion_thread = None
+        self._face_name_suggestion_job = None
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
         self._thread_jobs: dict[object, object | None] = {}
         self._progress_jobs: dict[int, dict[str, object]] = {}
         self._progress_sequence = 0
         self._request_id = 0
         self._full_res_loaded = False
+        self._full_res_requested = False
         self._context_provider = context_provider
         self._base_context: dict[str, object] = dict(context or {})
         self._display_mode = "advanced" if str(display_mode).strip().lower() == "advanced" else "basic"
@@ -117,15 +121,33 @@ class PhotoInspectorDialog(QDialog):
 
         nav = QHBoxLayout()
         nav.setContentsMargins(0, 0, 0, 0)
-        self.prev_button = QPushButton("<")
-        self.next_button = QPushButton(">")
+        self.prev_button = QPushButton("Previous")
+        self.next_button = QPushButton("Next")
         self.fit_button = QPushButton("Fit")
+        self.actual_size_button = QPushButton("1:1")
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_in_button = QPushButton("+")
+        self.full_screen_button = QPushButton("Full screen")
+        self.zoom_label = QLabel("Fit")
+        self.prev_button.setToolTip("Previous photo (Left or A)")
+        self.next_button.setToolTip("Next photo (Right or D)")
+        self.fit_button.setToolTip("Fit the image to the viewer (F)")
+        self.actual_size_button.setToolTip("Show source pixels at 1:1 (1)")
+        self.zoom_out_button.setToolTip("Zoom out (−)")
+        self.zoom_in_button.setToolTip("Zoom in (+)")
+        self.full_screen_button.setToolTip("Toggle full-screen viewer (F11)")
+        self.zoom_label.setToolTip("Mouse-wheel zoom is centered on the pointer. Middle-drag pans a zoomed photo.")
         self.index_label = QLabel("")
         self.index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         nav.addWidget(self.prev_button)
         nav.addWidget(self.next_button)
         nav.addWidget(self.fit_button)
+        nav.addWidget(self.actual_size_button)
+        nav.addWidget(self.zoom_out_button)
+        nav.addWidget(self.zoom_in_button)
+        nav.addWidget(self.zoom_label)
         nav.addWidget(self.index_label, stretch=1)
+        nav.addWidget(self.full_screen_button)
         image_layout.addLayout(nav)
 
         self.details_panel = QWidget(self.content_splitter)
@@ -235,7 +257,7 @@ class PhotoInspectorDialog(QDialog):
         face_name_row.setContentsMargins(0, 0, 0, 0)
         face_name_label = QLabel("&Name", self.face_name_group)
         face_name_label.setMinimumWidth(42)
-        self.face_name_input = QLineEdit(self.face_name_group)
+        self.face_name_input = EntityPicker(self.face_name_group, allow_create=True, entity_label="person name")
         self.face_name_input.setPlaceholderText("Name for the selected face region(s)")
         self.face_name_input.setClearButtonEnabled(True)
         self.face_name_input.setMinimumHeight(32)
@@ -336,6 +358,10 @@ class PhotoInspectorDialog(QDialog):
         self.prev_button.clicked.connect(lambda: self._step(-1))
         self.next_button.clicked.connect(lambda: self._step(1))
         self.fit_button.clicked.connect(self.preview_view.fit_to_window)
+        self.actual_size_button.clicked.connect(self.preview_view.actual_size)
+        self.zoom_out_button.clicked.connect(self.preview_view.zoom_out)
+        self.zoom_in_button.clicked.connect(self.preview_view.zoom_in)
+        self.full_screen_button.clicked.connect(self._toggle_full_screen)
         self.face_rescan_button.clicked.connect(self._auto_scan_current_image_faces)
         self.face_draw_button.clicked.connect(self._toggle_draw_face_box)
         self.face_remove_button.clicked.connect(self._remove_selected_faces)
@@ -359,6 +385,7 @@ class PhotoInspectorDialog(QDialog):
         self.preview_view.face_box_resized.connect(self._on_preview_face_box_resized)
         self._install_shortcuts()
         self._apply_display_mode()
+        self._request_face_name_suggestions()
 
         self._update_nav_state()
         if self._image_paths:
@@ -368,6 +395,7 @@ class PhotoInspectorDialog(QDialog):
         self._request_id += 1
         request_id = self._request_id
         self._full_res_loaded = False
+        self._full_res_requested = False
         self._update_identity(image_path)
         self._update_nav_state()
         self._update_window_title(image_path)
@@ -469,6 +497,38 @@ class PhotoInspectorDialog(QDialog):
         )
         self._active_thread = thread
 
+    def _request_face_name_suggestions(self) -> None:
+        """Populate the shared name picker without reading SQLite on the UI thread."""
+        service = self.face_service
+        loader = getattr(service, "list_known_person_names", None) if service is not None else None
+        if not callable(loader) or self._face_name_suggestion_job is not None:
+            return
+
+        def _run(_progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            try:
+                names = loader(cancel_check=cancel_check)
+            except TypeError:
+                names = loader()
+            raise_if_cancelled(cancel_check)
+            return [str(name or "").strip() for name in list(names or ())]
+
+        job = AsyncJob(_run)
+        self._track_operation_job(job, "Loading saved person names", foreground=False)
+
+        def _completed(names) -> None:
+            self.face_name_input.set_choices(names)
+
+        job.completed.connect(_completed)
+        self._face_name_suggestion_job = job
+        thread = start_job_in_thread(job)
+        self._thread_jobs[thread] = job
+        thread.finished.connect(
+            lambda thread=thread: self._on_async_thread_finished(thread),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._face_name_suggestion_thread = thread
+
     def _load_preview(self, image_path: str, *, request_id: int, full_res: bool) -> None:
         target_size = self.preview_view.viewport().size()
 
@@ -513,6 +573,9 @@ class PhotoInspectorDialog(QDialog):
 
         def _on_failed(_message: str) -> None:
             if request_id != self._request_id:
+                return
+            if full_res:
+                self._full_res_requested = False
                 return
             self.preview_view.set_pixmap(None)
 
@@ -574,6 +637,10 @@ class PhotoInspectorDialog(QDialog):
             self._face_edit_thread = None
             if self._face_edit_job is job:
                 self._face_edit_job = None
+        if self._face_name_suggestion_thread is thread:
+            self._face_name_suggestion_thread = None
+            if self._face_name_suggestion_job is job:
+                self._face_name_suggestion_job = None
 
     def _handle_finished_thread(self, thread) -> None:
         if thread is None:
@@ -1449,9 +1516,17 @@ class PhotoInspectorDialog(QDialog):
             return
         name = self.face_name_input.text().strip()
         if not name:
-            name, accepted = QInputDialog.getText(self, "Name selected face regions", "Identity name")
-            name = str(name or "").strip()
-            if not accepted or not name:
+            dialog = EntityPickerDialog(
+                "Name selected face regions",
+                "Choose a saved person or create a new person for the selected face region(s).",
+                choices=self.face_name_input.choices,
+                entity_label="person name",
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            name = dialog.selected_value()
+            if not name:
                 return
         image_path = self._current_editable_path()
 
@@ -1491,8 +1566,15 @@ class PhotoInspectorDialog(QDialog):
             return ""
         if len(names) == 1:
             return names[0]
-        name, accepted = QInputDialog.getItem(self, title, "Current face-region name", names, 0, False)
-        return str(name or "").strip() if accepted else ""
+        dialog = EntityPickerDialog(
+            title,
+            "Choose the current person name on the selected face region(s).",
+            choices=names,
+            allow_create=False,
+            entity_label="person name",
+            parent=self,
+        )
+        return dialog.selected_value() if dialog.exec() == QDialog.DialogCode.Accepted else ""
 
     def _rename_selected_faces(self) -> None:
         if not self._selected_saved_face_refs() or self.face_service is None:
@@ -1503,9 +1585,18 @@ class PhotoInspectorDialog(QDialog):
         refs = self._selected_saved_face_refs(person_name=source)
         if not refs:
             return
-        target, accepted = QInputDialog.getText(self, "Rename selected face regions", f"New name for {source}")
-        target = str(target or "").strip()
-        if not accepted or not target or target == source:
+        dialog = EntityPickerDialog(
+            "Rename selected face regions",
+            f"Choose a saved person or create the new name for {source}.",
+            choices=self.face_name_input.choices,
+            initial=source,
+            entity_label="person name",
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dialog.selected_value()
+        if not target or target == source:
             return
         image_path = self._current_editable_path()
 
@@ -1616,6 +1707,7 @@ class PhotoInspectorDialog(QDialog):
             (self._face_thumbnail_job, self._face_thumbnail_thread),
             (self._prefetch_job, self._prefetch_thread),
             (self._face_edit_job, self._face_edit_thread),
+            (self._face_name_suggestion_job, self._face_name_suggestion_thread),
             *self._retained_async_refs,
         ]
         for job, thread in active_pairs:
@@ -1644,15 +1736,27 @@ class PhotoInspectorDialog(QDialog):
         self._prefetch_thread = None
         self._face_edit_job = None
         self._face_edit_thread = None
+        self._face_name_suggestion_job = None
+        self._face_name_suggestion_thread = None
         if ready_to_close:
             self._retained_async_refs = []
             self._thread_jobs = {}
         return ready_to_close
 
     def _on_zoom_changed(self, zoom: float) -> None:
-        if zoom <= 1.01 or self._full_res_loaded or not self._image_paths:
+        self.zoom_label.setText(f"{int(round(float(zoom) * 100.0))}%")
+        if zoom <= 1.01 or self._full_res_loaded or self._full_res_requested or not self._image_paths:
             return
+        self._full_res_requested = True
         self._load_preview(self._image_paths[self._index], request_id=self._request_id, full_res=True)
+
+    def _toggle_full_screen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.full_screen_button.setText("Full screen")
+        else:
+            self.showFullScreen()
+            self.full_screen_button.setText("Exit full screen")
 
     def _prefetch_neighbors(self) -> None:
         if not self._image_paths:
@@ -1704,6 +1808,10 @@ class PhotoInspectorDialog(QDialog):
             ("A", lambda: self._step(-1)),
             ("D", lambda: self._step(1)),
             ("F", self.preview_view.fit_to_window),
+            ("1", self.preview_view.actual_size),
+            ("+", self.preview_view.zoom_in),
+            ("-", self.preview_view.zoom_out),
+            ("F11", self._toggle_full_screen),
             ("Ctrl+Z", self._undo_face_edit),
             ("Ctrl+Y", self._redo_face_edit),
         ]

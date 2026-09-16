@@ -33,9 +33,9 @@ COLORS = {
 }
 
 METRICS = {
-    "body_font_px": 13,
-    "helper_font_px": 11,
-    "control_min_height_px": 32,
+    "body_font_px": 14,
+    "helper_font_px": 12,
+    "control_min_height_px": 34,
     "radius_px": 8,
     "space_px": 8,
 }
@@ -46,7 +46,7 @@ ULTRA_DARK_QSS = """
 QWidget {
   background: #0B0D10;
   color: #F2F5F8;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 QToolTip {
@@ -199,7 +199,7 @@ QToolButton[helpIcon="true"] {
   border: 1px solid #2E2E2E;
   border-radius: 8px;
   padding: 0px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
 }
 QToolButton[helpIcon="true"]:hover {
@@ -224,7 +224,7 @@ QPushButton[nav="true"]:checked {
 
 QPushButton[paneToggle="true"] {
   padding: 4px 8px;
-  font-size: 12px;
+  font-size: 13px;
   color: #B9B9B9;
 }
 QPushButton[paneToggle="true"]:checked {
@@ -402,7 +402,7 @@ QWidget#workspaceFooter {
 }
 QWidget#workspaceFooter QLabel {
   color: #B5BEC9;
-  font-size: 12px;
+  font-size: 13px;
 }
 QLabel#footerFolderChip {
   color: #DCEBFF;
@@ -436,8 +436,8 @@ QWidget#emptyStateCard {
   border-radius: 12px;
 }
 QLabel[role="title"] { font-size: 20px; font-weight: 700; color: #F2F5F8; }
-QLabel[role="section"] { font-size: 15px; font-weight: 650; color: #F2F5F8; }
-QLabel[role="helper"] { font-size: 11px; color: #B5BEC9; }
+QLabel[role="section"] { font-size: 16px; font-weight: 650; color: #F2F5F8; }
+QLabel[role="helper"] { font-size: 12px; color: #B5BEC9; }
 QPushButton#facesStatusStrip {
   background: transparent;
   border: 0;

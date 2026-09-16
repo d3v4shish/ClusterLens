@@ -95,6 +95,42 @@ class ProductionSafetyTests(unittest.TestCase):
             self.assertEqual(1, entries[-1]["failure_count"])
             self.assertEqual("failed", entries[-1]["file_results"][0]["status"])
 
+    def test_batch_rename_preview_blocks_collisions_and_journals_recoverable_renames(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.jpg"
+            second = root / "second.jpg"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            service = GalleryActionService(audit_log_path=root / "logs" / "file_operations.jsonl")
+
+            collision = service.preview_renames([str(first), str(second)], "same")
+            self.assertTrue(all(not item.is_ready for item in collision))
+            blocked = service.rename_files(collision)
+            self.assertEqual(2, len(blocked.failures))
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+
+            preview = service.preview_renames(
+                [str(first), str(second)],
+                "{date}_{index:02d}_{stem}",
+                capture_times={str(first.resolve()): "2024-05-06T12:34:56+00:00", str(second.resolve()): "2024-05-06T12:34:56+00:00"},
+            )
+            self.assertTrue(all(item.is_ready for item in preview))
+            self.assertEqual("20240506_01_first.jpg", Path(preview[0].target_path).name)
+            renamed = service.rename_files(preview)
+            self.assertFalse(renamed.failures)
+            self.assertEqual(2, len(renamed.changed_paths))
+            self.assertTrue(all(Path(target).is_file() for _source, target in renamed.changed_paths))
+
+            restored = service.restore_changed_paths(renamed.changed_paths)
+            self.assertFalse(restored.failures)
+            self.assertEqual(b"first", first.read_bytes())
+            self.assertEqual(b"second", second.read_bytes())
+            entries = service.read_audit_entries(limit=10)
+            self.assertEqual(["rename", "restore"], [entry["operation"] for entry in entries])
+            self.assertEqual("restorable", entries[0]["recovery_status"])
+
     def test_unavailable_operation_journal_blocks_file_mutation(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
