@@ -47,6 +47,9 @@ def candidate_runtime_roots(app_name: str) -> list[Path]:
     override = runtime_root_override()
     if override:
         roots.append(Path(override))
+    configured = configured_data_home(app_name)
+    if configured is not None:
+        roots.append(configured)
     roots.extend(_platform_runtime_roots(app_name))
     roots.append(Path.cwd() / ".runtime" / app_name)
     deduped: list[Path] = []
@@ -58,6 +61,34 @@ def candidate_runtime_roots(app_name: str) -> list[Path]:
         seen.add(key)
         deduped.append(candidate)
     return deduped
+
+
+def data_home_config_path(app_name: str) -> Path:
+    """Return the small control-plane file, deliberately outside Data Home.
+
+    A relocation cannot keep its active-location pointer only inside the
+    directory being moved.  The config file contains no photo data and lets a
+    failed new Data Home fall back to the platform default on the next launch.
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / app_name / "data_home.json"
+
+
+def configured_data_home(app_name: str) -> Path | None:
+    config_path = data_home_config_path(app_name)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        value = str(payload.get("data_home", "") or "").strip()
+        if not value:
+            return None
+        return Path(value).expanduser()
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _platform_runtime_roots(app_name: str) -> list[Path]:

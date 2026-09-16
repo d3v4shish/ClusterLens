@@ -12,4 +12,7 @@ export IMAGE_CLUSTERING_APP_DIR="$test_runtime"
 export PYTHONPYCACHEPREFIX="$pycache_root"
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 cd "$repo_root"
-uv run --frozen --with pytest python -m pytest -p no:cacheprovider tests "$@"
+if (( "$#" == 0 )); then
+    set -- tests
+fi
+uv run --frozen --with pytest python -m pytest -p no:cacheprovider "$@"

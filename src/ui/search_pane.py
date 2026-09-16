@@ -3218,10 +3218,8 @@ class SearchPane(QWidget):
             if name:
                 unique.setdefault(name.casefold(), name)
         self._face_known_names = sorted(unique.values(), key=lambda value: (value.casefold(), value))
-        for widget_name in ("face_name_query", "face_label_name", "person_name"):
-            widget = getattr(self, widget_name, None)
-            if isinstance(widget, FaceNameLineEdit):
-                widget.set_name_choices(self._face_known_names)
+        for widget in self.findChildren(FaceNameLineEdit):
+            widget.set_name_choices(self._face_known_names)
 
     def _request_face_name_suggestions(self) -> None:
         if self._is_shutting_down:
@@ -16264,24 +16262,24 @@ class SearchPane(QWidget):
             self.face_cluster_outlier_policy_combo.addItem(label, item_id)
         self.face_cluster_outlier_policy_combo.setToolTip(FACE_HELP["face_cluster_backend"])
         self.face_cluster_outlier_policy_combo.setCurrentIndex(self.face_cluster_outlier_policy_combo.findData("isolate"))
-        self.merge_source_person = QLineEdit()
+        self.merge_source_person = FaceNameLineEdit()
         self.merge_source_person.setPlaceholderText("Existing saved name")
-        self.merge_target_person = QLineEdit()
+        self.merge_target_person = FaceNameLineEdit()
         self.merge_target_person.setPlaceholderText("Saved name to keep")
-        self.face_people_query_names = QLineEdit()
+        self.face_people_query_names = FaceNameLineEdit()
         self.face_people_query_names.setPlaceholderText("Alice, Bob")
-        self.face_primary_person_query = QLineEdit()
+        self.face_primary_person_query = FaceNameLineEdit()
         self.face_primary_person_query.setPlaceholderText("Primary person name")
         self.face_query_builder_faces_state = QComboBox()
         self.face_query_builder_faces_state.addItems(["Any", "Has faces", "No faces"])
         self.face_query_builder_face_count = QSpinBox()
         self.face_query_builder_face_count.setRange(0, 99)
         self.face_query_builder_face_count.setSpecialValueText("Any")
-        self.face_query_builder_person = QLineEdit()
+        self.face_query_builder_person = FaceNameLineEdit()
         self.face_query_builder_person.setPlaceholderText("Exact person")
         self.face_query_builder_partial = QLineEdit()
         self.face_query_builder_partial.setPlaceholderText("Partial person text")
-        self.face_query_builder_people = QLineEdit()
+        self.face_query_builder_people = FaceNameLineEdit()
         self.face_query_builder_people.setPlaceholderText("Alice, Bob")
         self.face_query_builder_people_mode = QComboBox()
         self.face_query_builder_people_mode.addItems(["All", "Any"])
@@ -16531,7 +16529,7 @@ class SearchPane(QWidget):
         self.face_find_group = find_group
 
         find_name_group, find_name_layout = self._group_box("Find by Name", tooltip=FACE_HELP["find_photos_saved_name"])
-        self.face_find_name_query = QLineEdit(find_name_group)
+        self.face_find_name_query = FaceNameLineEdit(find_name_group)
         self.face_find_name_query.setPlaceholderText("Saved person name")
         self.face_find_name_query.setToolTip(FACE_HELP["find_photos_saved_name"])
         self.face_find_name_button = QPushButton("Find by Name + Similar")
@@ -16858,7 +16856,7 @@ class SearchPane(QWidget):
         identity_filter_row = QWidget(tab_body)
         identity_filter_layout = FlowLayout(identity_filter_row)
         identity_filter_layout.setContentsMargins(0, 0, 0, 0)
-        self.face_identity_search = QLineEdit(identity_filter_row)
+        self.face_identity_search = FaceNameLineEdit(identity_filter_row)
         self.face_identity_search.setPlaceholderText("Search saved identities")
         self.face_identity_search.setAccessibleName("Search saved identities")
         self.face_identity_filter = QComboBox(identity_filter_row)
@@ -16950,7 +16948,7 @@ class SearchPane(QWidget):
         self.face_identity_pin_button = QPushButton("Pin Canonical Example")
         self.face_identity_pin_button.clicked.connect(self._pin_selected_identity_prototype_face)
         identity_management_layout.addWidget(self.face_identity_pin_button)
-        self.face_identity_merge_target = QLineEdit()
+        self.face_identity_merge_target = FaceNameLineEdit()
         self.face_identity_merge_target.setPlaceholderText("Saved identity to keep")
         identity_management_layout.addWidget(self._field_widget("Merge into", self.face_identity_merge_target, tooltip=FACE_HELP["merge_target"]))
         self.face_identity_merge_button = QPushButton("Merge Selected Identity Into Target")

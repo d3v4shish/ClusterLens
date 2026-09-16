@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
+from app.services.data_home import DataHomeInventory, DataHomeManager
 from app.services.clustering_options import clustering_model_names, model_label
 from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService
 from app.services.face_model_installer import FaceModelInstaller, face_model_runtime_root_dir
@@ -168,6 +169,8 @@ class ProductionSettingsDialog(QDialog):
         clear_runtime_reports: Callable[[], CacheClearResult] | None = None,
         clear_model_assets: Callable[[], CacheClearResult] | None = None,
         can_clear_rebuildable_caches: Callable[[], bool] | None = None,
+        data_home_manager: DataHomeManager | None = None,
+        active_source_roots_provider: Callable[[], tuple[str, ...]] | None = None,
         runtime_layout: RuntimeLayout,
         support_metadata_provider,
         model_download_controller: ModelDownloadController | None = None,
@@ -192,6 +195,8 @@ class ProductionSettingsDialog(QDialog):
         self.clear_model_assets = clear_model_assets
         self.can_clear_rebuildable_caches = can_clear_rebuildable_caches or (lambda: True)
         self.runtime_layout = runtime_layout
+        self.data_home_manager = data_home_manager
+        self.active_source_roots_provider = active_source_roots_provider or (lambda: ())
         self.support_metadata_provider = support_metadata_provider
         self._owns_model_download_controller = model_download_controller is None
         self.model_download_controller = model_download_controller or ModelDownloadController(runtime_layout, self)
@@ -205,6 +210,9 @@ class ProductionSettingsDialog(QDialog):
         self._cache_usage_thread = None
         self._cache_clear_job = None
         self._cache_clear_thread = None
+        self._data_home_job = None
+        self._data_home_thread = None
+        self._data_home_recovery_entries: tuple[dict[str, object], ...] = ()
         self._model_job = None
         self._model_thread = None
         self._active_model_download_name: str | None = None
@@ -285,9 +293,14 @@ class ProductionSettingsDialog(QDialog):
         self.thumbnail_size.setRange(96, 512)
         self.runtime_badge = QCheckBox("Show runtime status in the application header")
         self.dense_ui = QCheckBox("Use compact spacing")
+        self.power_user_mode = QCheckBox("Power-user mode: show all advanced controls and diagnostics")
+        self.power_user_mode.setToolTip(
+            "Shows advanced workspace controls and diagnostics without relaxing confirmations, cancellation, or read-only safety."
+        )
         form.addRow("Photo thumbnail size", self.thumbnail_size)
         form.addRow(self.runtime_badge)
         form.addRow(self.dense_ui)
+        form.addRow(self.power_user_mode)
         note = QLabel("Common appearance and workspace preferences apply after you choose OK.")
         note.setWordWrap(True)
         form.addRow(note)
@@ -309,6 +322,14 @@ class ProductionSettingsDialog(QDialog):
         self.performance_profile.addItem("Maximum speed", "max_speed")
         self.performance_profile.setToolTip(
             "Choose a validated balance of throughput and memory use. Advanced values remain available below."
+        )
+        self.gpu_conflict_policy = QComboBox()
+        self.gpu_conflict_policy.addItem("Ask for each conflict", "ask")
+        self.gpu_conflict_policy.addItem("Queue for GPU", "queue")
+        self.gpu_conflict_policy.addItem("Use CPU fallback", "cpu")
+        self.gpu_conflict_policy.setToolTip(
+            "When independent CUDA-capable jobs overlap, either ask, queue for the GPU, or run the later job on CPU. "
+            "Every fallback is shown in Jobs."
         )
         self.thumbnail_workers = QSpinBox()
         self.thumbnail_workers.setRange(1, max(8, self.system_resources.logical_cpu_count))
@@ -349,6 +370,7 @@ class ProductionSettingsDialog(QDialog):
         advanced_form.addRow("CUDA batch size", self.batch_size_gpu)
         advanced_form.addRow("Decode workers", self.decode_workers)
         advanced_form.addRow("CUDA memory reserve", self.vram_headroom_mb)
+        advanced_form.addRow("GPU conflict behavior", self.gpu_conflict_policy)
         advanced_form.addRow("Thumbnail workers", self.thumbnail_workers)
         advanced_form.addRow("Thumbnail prefetch rows", self.prefetch_rows)
         advanced_form.addRow(self.gpu_warmup)
@@ -491,6 +513,9 @@ class ProductionSettingsDialog(QDialog):
         self.config_location_label.setWordWrap(True)
         self.cache_root_label = QLabel(str(self.app_settings.cache_dir))
         self.cache_root_label.setWordWrap(True)
+        self.data_home_inventory_text = QTextEdit()
+        self.data_home_inventory_text.setReadOnly(True)
+        self.data_home_inventory_text.setPlaceholderText("Scanning ClusterLens Data Home categories...")
         self.generated_storage_text = QTextEdit()
         self.generated_storage_text.setReadOnly(True)
         self.generated_storage_text.setPlaceholderText("Scanning generated storage usage...")
@@ -500,6 +525,7 @@ class ProductionSettingsDialog(QDialog):
         form.addRow("Runtime root", self.runtime_root_label)
         form.addRow("Config location", self.config_location_label)
         form.addRow("Runtime cache location", self.cache_root_label)
+        form.addRow("Data Home categories", self.data_home_inventory_text)
         form.addRow("Generated storage usage", self.generated_storage_text)
         form.addRow("Rebuildable cache usage", self.cache_usage_text)
         layout.addLayout(form)
@@ -514,6 +540,26 @@ class ProductionSettingsDialog(QDialog):
         self.clear_logs_button = QPushButton("Clear Logs")
         self.clear_runtime_reports_button = QPushButton("Clear Reports")
         self.clear_model_assets_button = QPushButton("Clear Installed Model Assets")
+        self.backup_data_home_button = QPushButton("Backup Data Home")
+        self.verify_data_home_backup_button = QPushButton("Verify Backup")
+        self.relocate_data_home_button = QPushButton("Relocate Data Home")
+        self.backup_data_home_button.setToolTip("Copy only managed ClusterLens data to a new checksummed backup folder.")
+        self.verify_data_home_backup_button.setToolTip("Verify every file in a managed-data backup against its saved checksum manifest.")
+        self.relocate_data_home_button.setToolTip("Copy, checksum-verify, and safely switch the managed Data Home on the next launch.")
+        apply_icon(self.backup_data_home_button, "restore")
+        apply_icon(self.verify_data_home_backup_button, "scan")
+        apply_icon(self.relocate_data_home_button, "retry")
+        self.data_home_recovery_combo = QComboBox()
+        self.data_home_recovery_combo.setAccessibleName("Incomplete Data Home migrations")
+        self.data_home_recovery_combo.setToolTip(
+            "Interrupted derived-data moves. Source photos and the active Data Home remain unchanged until a move verifies."
+        )
+        self.resume_data_home_button = QPushButton("Resume Data Home Move")
+        self.rollback_data_home_button = QPushButton("Discard Staged Move")
+        self.resume_data_home_button.setToolTip("Resume a checksummed copy from its safe staging area.")
+        self.rollback_data_home_button.setToolTip("Discard only the incomplete staged copy; source photos and the active Data Home stay unchanged.")
+        apply_icon(self.resume_data_home_button, "recovery")
+        apply_icon(self.rollback_data_home_button, "delete")
         actions.addWidget(self.refresh_cache_usage_button, 0, 0)
         actions.addWidget(self.clear_cache_button, 0, 1)
         actions.addWidget(self.clear_runtime_temp_button, 0, 2)
@@ -523,6 +569,12 @@ class ProductionSettingsDialog(QDialog):
         actions.addWidget(self.clear_logs_button, 2, 0)
         actions.addWidget(self.clear_runtime_reports_button, 2, 1)
         actions.addWidget(self.clear_model_assets_button, 2, 2)
+        actions.addWidget(self.backup_data_home_button, 3, 0)
+        actions.addWidget(self.verify_data_home_backup_button, 3, 1)
+        actions.addWidget(self.relocate_data_home_button, 3, 2)
+        actions.addWidget(self.data_home_recovery_combo, 4, 0)
+        actions.addWidget(self.resume_data_home_button, 4, 1)
+        actions.addWidget(self.rollback_data_home_button, 4, 2)
         layout.addLayout(actions)
         self.cache_status_label = QLabel(
             "Each clear action affects only the named generated-data category. Source photos, tags, durable face labels, "
@@ -584,6 +636,11 @@ class ProductionSettingsDialog(QDialog):
                 self.clear_model_assets,
             )
         )
+        self.backup_data_home_button.clicked.connect(self._backup_data_home)
+        self.verify_data_home_backup_button.clicked.connect(self._verify_data_home_backup)
+        self.relocate_data_home_button.clicked.connect(self._relocate_data_home)
+        self.resume_data_home_button.clicked.connect(self._resume_data_home_migration)
+        self.rollback_data_home_button.clicked.connect(self._rollback_data_home_migration)
 
     def _build_updates_tab(self) -> None:
         tab = QWidget(self)
@@ -764,6 +821,7 @@ class ProductionSettingsDialog(QDialog):
         self._set_combo_data(self.execution_mode, registry.get(self.settings_store, "runtime/preferred_mode", self.app_settings.preferred_execution_mode))
         self._set_combo_data(self.precision_mode, registry.get(self.settings_store, "runtime/precision", "auto"))
         self._set_combo_data(self.performance_profile, registry.get(self.settings_store, "performance/profile", self.app_settings.default_performance_profile))
+        self._set_combo_data(self.gpu_conflict_policy, registry.get(self.settings_store, "runtime/gpu_conflict_policy", "ask"))
         self.batch_size_cpu.setValue(int(registry.get(self.settings_store, "performance/batch_size_cpu", self.app_settings.batch_size_cpu)))
         self.batch_size_gpu.setValue(int(registry.get(self.settings_store, "performance/batch_size_gpu", self.app_settings.batch_size_gpu)))
         self.decode_workers.setValue(int(registry.get(self.settings_store, "performance/decode_workers", self.system_resources.logical_cpu_count)))
@@ -773,6 +831,7 @@ class ProductionSettingsDialog(QDialog):
         self.keep_worker_warm.setChecked(bool(registry.get(self.settings_store, "performance/keep_worker_warm", False)))
         self.runtime_badge.setChecked(bool(registry.get(self.settings_store, "runtime/show_badge", self.app_settings.show_runtime_badge)))
         self.dense_ui.setChecked(bool(registry.get(self.settings_store, "workspace/dense_ui", self.app_settings.default_dense_ui)))
+        self.power_user_mode.setChecked(bool(registry.get(self.settings_store, "workspace/power_user_mode", False)))
         self.offline_model_downloads.setChecked(
             bool(registry.get(self.settings_store, "models/offline_mode", bool(getattr(sys, "frozen", False))))
         )
@@ -788,6 +847,7 @@ class ProductionSettingsDialog(QDialog):
             "runtime/preferred_mode": str(self.execution_mode.currentData() or "auto"),
             "runtime/precision": str(self.precision_mode.currentData() or "auto"),
             "performance/profile": str(self.performance_profile.currentData() or "balanced"),
+            "runtime/gpu_conflict_policy": str(self.gpu_conflict_policy.currentData() or "ask"),
             "runtime/allow_gpu_warmup": bool(self.gpu_warmup.isChecked()),
             "performance/keep_worker_warm": bool(self.keep_worker_warm.isChecked()),
             "performance/batch_size_cpu": int(self.batch_size_cpu.value()),
@@ -800,6 +860,7 @@ class ProductionSettingsDialog(QDialog):
             "gallery/thumbnail_workers": int(self.thumbnail_workers.value()),
             "gallery/prefetch_rows": int(self.prefetch_rows.value()),
             "workspace/dense_ui": bool(self.dense_ui.isChecked()),
+            "workspace/power_user_mode": bool(self.power_user_mode.isChecked()),
             "models/offline_mode": bool(self.offline_model_downloads.isChecked()),
             "faces/model_root": self._external_face_model_root,
             "safety/read_only_mode": bool(self.read_only_mode.isChecked()),
@@ -1555,6 +1616,17 @@ class ProductionSettingsDialog(QDialog):
         lines.extend(["", f"Total generated storage size: {self._format_bytes(summary.total_bytes)}"])
         return "\n".join(lines)
 
+    def _format_data_home_inventory(self, inventory: DataHomeInventory) -> str:
+        lines = [
+            f"Data Home: {inventory.root}",
+            "Contains only ClusterLens-managed data; it is never a photo source.",
+            "",
+        ]
+        for category, size in inventory.categories.items():
+            lines.append(f"{category}: {self._format_bytes(size)}")
+        lines.extend(["", f"Total: {inventory.files} files, {self._format_bytes(inventory.bytes)}"])
+        return "\n".join(lines)
+
     def refresh_runtime_diagnostics(self, details: dict[str, object] | None = None) -> None:
         if details is None:
             details = self.runtime_service.diagnostics(str(self.execution_mode.currentData() or "auto"))
@@ -1760,7 +1832,7 @@ class ProductionSettingsDialog(QDialog):
             self.refresh_runtime_diagnostics()
 
     def _cache_actions_busy(self) -> bool:
-        return any(job is not None for job in (self._cache_usage_job, self._cache_clear_job))
+        return any(job is not None for job in (self._cache_usage_job, self._cache_clear_job, self._data_home_job))
 
     def _update_cache_action_state(self) -> None:
         busy = self._cache_actions_busy()
@@ -1777,12 +1849,25 @@ class ProductionSettingsDialog(QDialog):
             (self.clear_model_assets_button, self.clear_model_assets),
         ):
             button.setEnabled((not busy) and bool(callback) and bool(self.can_clear_rebuildable_caches()))
+        data_home_available = self.data_home_manager is not None
+        self.backup_data_home_button.setEnabled((not busy) and data_home_available)
+        self.verify_data_home_backup_button.setEnabled((not busy) and data_home_available)
+        self.relocate_data_home_button.setEnabled((not busy) and data_home_available)
+        has_recovery = bool(self._data_home_recovery_entries)
+        self.data_home_recovery_combo.setEnabled((not busy) and has_recovery)
+        self.resume_data_home_button.setEnabled((not busy) and has_recovery)
+        self.rollback_data_home_button.setEnabled((not busy) and has_recovery)
         if not allow_clear and not busy:
             self.cache_status_label.setText("Cache clearing is unavailable while clustering or another production background task is running.")
 
     def refresh_cache_usage(self) -> None:
-        if self.describe_rebuildable_caches is None and self.describe_generated_storage is None:
+        if (
+            self.describe_rebuildable_caches is None
+            and self.describe_generated_storage is None
+            and self.data_home_manager is None
+        ):
             self.cache_usage_text.setPlainText("Cache usage is unavailable.")
+            self.data_home_inventory_text.setPlainText("Data Home inventory is unavailable.")
             self.generated_storage_text.setPlainText("Generated storage usage is unavailable.")
             self._update_cache_action_state()
             return
@@ -1795,6 +1880,7 @@ class ProductionSettingsDialog(QDialog):
             raise_if_cancelled(cancel_check)
             result = None
             generated = None
+            data_home = None
             if self.describe_rebuildable_caches is not None:
                 try:
                     result = self.describe_rebuildable_caches(
@@ -1815,8 +1901,14 @@ class ProductionSettingsDialog(QDialog):
                     if "unexpected keyword" not in str(exc):
                         raise
                     generated = self.describe_generated_storage()
+            if self.data_home_manager is not None:
+                data_home = self.data_home_manager.inventory(
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
             raise_if_cancelled(cancel_check)
-            return result, generated
+            recovery_entries = self.data_home_manager.recovery_journals() if self.data_home_manager is not None else ()
+            return result, generated, data_home, recovery_entries
 
         job = AsyncJob(_run_usage)
         self._cache_usage_job = job
@@ -1824,6 +1916,8 @@ class ProductionSettingsDialog(QDialog):
         def _done(result: object) -> None:
             cache_result = result[0] if isinstance(result, tuple) and result else result
             generated_result = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            data_home_result = result[2] if isinstance(result, tuple) and len(result) > 2 else None
+            recovery_entries = result[3] if isinstance(result, tuple) and len(result) > 3 else ()
             if isinstance(cache_result, CacheUsageSummary):
                 lines = [f"Runtime cache root: {cache_result.cache_root}", ""]
                 for name, size in cache_result.target_bytes.items():
@@ -1844,10 +1938,16 @@ class ProductionSettingsDialog(QDialog):
                 self.generated_storage_text.setPlainText(self._format_generated_storage(generated_result))
             elif self.describe_generated_storage is not None:
                 self.generated_storage_text.setPlainText("Generated storage usage is unavailable.")
+            if isinstance(data_home_result, DataHomeInventory):
+                self.data_home_inventory_text.setPlainText(self._format_data_home_inventory(data_home_result))
+            elif self.data_home_manager is not None:
+                self.data_home_inventory_text.setPlainText("Data Home inventory is unavailable.")
+            self._set_data_home_recovery_entries(recovery_entries)
             self._update_cache_action_state()
 
         def _failed(message: str) -> None:
             self.cache_usage_text.setPlainText("Failed to scan cache usage.")
+            self.data_home_inventory_text.setPlainText("Failed to scan Data Home categories.")
             self.generated_storage_text.setPlainText("Failed to scan generated storage usage.")
             self.cache_status_label.setText(f"Cache usage refresh failed: {message}")
             self._update_cache_action_state()
@@ -1856,6 +1956,7 @@ class ProductionSettingsDialog(QDialog):
         job.failed.connect(_failed)
         def _cancelled() -> None:
             self.cache_usage_text.setPlainText("Cache usage scan cancelled.")
+            self.data_home_inventory_text.setPlainText("Data Home inventory scan cancelled.")
             self.generated_storage_text.setPlainText("Generated storage scan cancelled.")
             self.cache_status_label.setText("Cache usage scan cancelled.")
             self._update_cache_action_state()
@@ -1864,6 +1965,164 @@ class ProductionSettingsDialog(QDialog):
         thread = start_job_in_thread(job)
         self._track_thread(thread, job, role="cache_usage")
         self._cache_usage_thread = thread
+
+    def _run_data_home_job(self, label: str, fn, completed_message: Callable[[object], str]) -> None:
+        if self.data_home_manager is None or self._thread_is_running(self._data_home_thread):
+            return
+        self.cache_status_label.setText(label + "...")
+        self._update_cache_action_state()
+        job = AsyncJob(fn)
+        self._data_home_job = job
+
+        def _done(result: object) -> None:
+            self.cache_status_label.setText(completed_message(result))
+            self._data_home_job = None
+            self._data_home_thread = None
+            self._update_cache_action_state()
+            self.refresh_cache_usage()
+
+        def _failed(message: str) -> None:
+            self.cache_status_label.setText(f"{label} failed: {message}")
+            self._data_home_job = None
+            self._data_home_thread = None
+            self._update_cache_action_state()
+
+        def _cancelled() -> None:
+            self.cache_status_label.setText(f"{label} cancelled. Existing source data was preserved.")
+            self._data_home_job = None
+            self._data_home_thread = None
+            self._update_cache_action_state()
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        thread = start_job_in_thread(job)
+        self._track_thread(thread, job, role="data_home")
+        self._data_home_thread = thread
+
+    def _backup_data_home(self) -> None:
+        if self.data_home_manager is None:
+            return
+        destination = QFileDialog.getExistingDirectory(self, "Choose backup destination")
+        if not destination:
+            return
+
+        self._run_data_home_job(
+            "Backing up Data Home",
+            lambda progress, cancel_check: self.data_home_manager.create_backup(
+                destination,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            ),
+            lambda result: f"Data Home backup verified by manifest: {getattr(result, 'backup_root', '')}",
+        )
+
+    def _verify_data_home_backup(self) -> None:
+        if self.data_home_manager is None:
+            return
+        backup_root = QFileDialog.getExistingDirectory(self, "Choose ClusterLens backup folder")
+        if not backup_root:
+            return
+
+        def _run(progress, cancel_check):
+            return self.data_home_manager.verify_backup(
+                backup_root,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
+
+        def _message(result: object) -> str:
+            valid, failures = result if isinstance(result, tuple) and len(result) == 2 else (False, ("Invalid verification result",))
+            return "Backup checksums verified." if valid else "Backup verification found: " + "; ".join(list(failures)[:3])
+
+        self._run_data_home_job("Verifying Data Home backup", _run, _message)
+
+    def _relocate_data_home(self) -> None:
+        if self.data_home_manager is None:
+            return
+        target = QFileDialog.getExistingDirectory(self, "Choose a new empty ClusterLens Data Home")
+        if not target:
+            return
+        if not confirmBox(
+            "Relocate Data Home?",
+            "ClusterLens will copy and checksum-verify only its managed data, then request a restart. "
+            "Source photos remain untouched and the current Data Home is kept until you explicitly clean it later.",
+            parent=self,
+        ):
+            return
+        source_roots = tuple(self.active_source_roots_provider() or ())
+        self._run_data_home_job(
+            "Relocating Data Home",
+            lambda progress, cancel_check: self.data_home_manager.relocate(
+                target,
+                source_roots=source_roots,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            ),
+            lambda result: "Data Home relocation verified. Restart ClusterLens to use the new location.",
+        )
+
+    def _set_data_home_recovery_entries(self, entries: object) -> None:
+        normalized = tuple(
+            entry
+            for entry in (entries if isinstance(entries, (tuple, list)) else ())
+            if isinstance(entry, dict)
+            and str(entry.get("status", "")) in {"copying", "failed", "cancelled", "verified", "rollback_cancelled"}
+            and str(entry.get("journal_path", ""))
+        )
+        self._data_home_recovery_entries = normalized
+        self.data_home_recovery_combo.blockSignals(True)
+        self.data_home_recovery_combo.clear()
+        for entry in normalized:
+            label = f"{entry.get('status', 'incomplete')}: {entry.get('target_root', 'unknown target')}"
+            self.data_home_recovery_combo.addItem(label, str(entry["journal_path"]))
+        if not normalized:
+            self.data_home_recovery_combo.addItem("No incomplete Data Home moves", "")
+        self.data_home_recovery_combo.blockSignals(False)
+        self._update_cache_action_state()
+
+    def _selected_data_home_journal_path(self) -> str:
+        return str(self.data_home_recovery_combo.currentData() or "").strip()
+
+    def _resume_data_home_migration(self) -> None:
+        if self.data_home_manager is None:
+            return
+        journal_path = self._selected_data_home_journal_path()
+        if not journal_path:
+            return
+        roots = tuple(self.active_source_roots_provider() or ())
+        self._run_data_home_job(
+            "Resuming Data Home relocation",
+            lambda progress, cancel_check: self.data_home_manager.resume_migration(
+                journal_path,
+                source_roots=roots,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            ),
+            lambda result: "Data Home relocation verified. Restart ClusterLens to use the new location.",
+        )
+
+    def _rollback_data_home_migration(self) -> None:
+        if self.data_home_manager is None:
+            return
+        journal_path = self._selected_data_home_journal_path()
+        if not journal_path:
+            return
+        if not confirmBox(
+            "Discard staged Data Home move?",
+            "Only the incomplete staged copy will be removed. The active Data Home and every source photo remain unchanged.",
+            parent=self,
+        ):
+            return
+        self._run_data_home_job(
+            "Discarding staged Data Home relocation",
+            lambda progress, cancel_check: self.data_home_manager.rollback_migration(
+                journal_path,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            ),
+            lambda _result: "Staged Data Home move discarded. The active Data Home remains in use.",
+        )
 
     def _clear_rebuildable_caches(self) -> None:
         if self.clear_rebuildable_caches is None:
@@ -2146,6 +2405,7 @@ class ProductionSettingsDialog(QDialog):
                 "face_cache_clear": "Clearing reusable face downloads",
                 "journal_restore": "Recovering files",
                 "journal_refresh": "Refreshing recovery history",
+                "data_home": "Managing Data Home",
             }.get(str(role), "Settings task")
             job_id = self.job_manager.register_job(
                 label,
@@ -2239,6 +2499,12 @@ class ProductionSettingsDialog(QDialog):
             self._journal_refresh_thread = None
             if self._journal_refresh_job is job:
                 self._journal_refresh_job = None
+        if role == "data_home" and self._data_home_thread is thread:
+            self._data_home_thread = None
+            if self._data_home_job is job:
+                self._data_home_job = None
+            self._update_cache_action_state()
+            return
         if not self._settings_job_ids:
             self.operation_progress_bar.hide()
 
@@ -2258,6 +2524,7 @@ class ProductionSettingsDialog(QDialog):
             self._face_model_job,
             self._journal_restore_job,
             self._journal_refresh_job,
+            self._data_home_job,
         )
         return tuple(job for job in jobs if job is not None)
 
@@ -2299,6 +2566,7 @@ class ProductionSettingsDialog(QDialog):
             (self._face_model_job, self._face_model_thread),
             (self._journal_restore_job, self._journal_restore_thread),
             (self._journal_refresh_job, self._journal_refresh_thread),
+            (self._data_home_job, self._data_home_thread),
         )
         for job, thread in jobs:
             if job is not None:
@@ -2337,6 +2605,8 @@ class ProductionSettingsDialog(QDialog):
             self._journal_restore_thread = None
             self._journal_refresh_job = None
             self._journal_refresh_thread = None
+            self._data_home_job = None
+            self._data_home_thread = None
             self._thread_roles = {}
             self._settings_job_ids = {}
         return ready_to_close

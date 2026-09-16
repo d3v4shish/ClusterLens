@@ -4274,7 +4274,10 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
-        pane.current_scope_paths_provider = lambda: ["/hidden/selected.jpg"]
+        # The production shell now uses the shared active-root provider.  A
+        # missing active root must remain a harmless, source-read-only scan
+        # input rather than falling back to the old hidden candidate list.
+        pane.current_scope_roots_provider = lambda: ("/hidden/selected.jpg",)
         pane.face_folder_path.setText("/photos")
         pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
 
@@ -4287,7 +4290,7 @@ class UiSmokeTests(unittest.TestCase):
                 and pane.face_named_people_list.count() + pane.face_unlabeled_groups_list.count() == 2
             )
         )
-        self.assertEqual([{"directory": "/photos", "recursive": True}], service.index_directory_calls)
+        self.assertEqual([], service.index_directory_calls)
         self.assertEqual([], service.index_paths_calls)
         self.assertEqual("/photos", service.load_folder_review_images_calls[-1]["directory"])
         self.assertEqual([], service.load_folder_review_images_calls[-1]["candidate_paths"])
@@ -5075,7 +5078,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(self._wait_until(lambda: self._list_view_count(pane.face_results_groups_list) == 1))
             self.assertEqual(0, self._list_view_count(pane.face_results_merged_groups_list))
 
-            with patch("ui.search_pane.QInputDialog.getText", return_value=("Charlie", True)):
+            with patch.object(pane, "_prompt_for_face_identity_name", return_value="Charlie"):
                 pane._name_selected_face_result_group_immediately()
 
             self.assertEqual("Charlie", service.records[0].person_name)
@@ -5163,7 +5166,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(2, self._selected_list_view_count(pane.face_results_groups_list))
             self.assertTrue(pane.face_results_name_clusters_button.isEnabled())
 
-            with patch("ui.search_pane.QInputDialog.getText", return_value=("Charlie", True)):
+            with patch.object(pane, "_prompt_for_face_identity_name", return_value="Charlie"):
                 pane._name_selected_face_result_groups_immediately()
 
             self.assertEqual(1, len(service.label_indexed_faces_immediately_calls))
@@ -5225,7 +5228,7 @@ class UiSmokeTests(unittest.TestCase):
             APP.processEvents()
 
             self.assertTrue(pane.face_results_name_button.isEnabled())
-            with patch("ui.search_pane.QInputDialog.getText", return_value=("Dana", True)):
+            with patch.object(pane, "_prompt_for_face_identity_name", return_value="Dana"):
                 pane._prepare_name_selected_face_results()
 
             self.assertEqual(0, len(service.label_indexed_faces_calls))
@@ -8507,7 +8510,7 @@ class UiSmokeTests(unittest.TestCase):
         pane._save_face_refs_name = lambda refs, **kwargs: save_calls.append((list(refs), dict(kwargs)))  # type: ignore[method-assign]
         pane._search_by_name = lambda: search_calls.append(pane.face_name_query.text())  # type: ignore[method-assign]
 
-        with patch("ui.search_pane.QInputDialog.getText", return_value=("Alice", True)):
+        with patch.object(pane, "_prompt_for_face_identity_name", return_value="Alice"):
             menu = pane._build_detected_faces_context_menu()
             action_map = {
                 action.text(): action
@@ -8578,7 +8581,7 @@ class UiSmokeTests(unittest.TestCase):
 
         save_calls: list[tuple[list[tuple[str, int]], dict[str, object]]] = []
         pane._save_face_refs_name = lambda refs, **kwargs: save_calls.append((list(refs), dict(kwargs)))  # type: ignore[method-assign]
-        with patch("ui.search_pane.QInputDialog.getText", return_value=("Alice", True)):
+        with patch.object(pane, "_prompt_for_face_identity_name", return_value="Alice"):
             action_map["Name Selected Faces..."].trigger()
 
         self.assertEqual(1, len(save_calls))

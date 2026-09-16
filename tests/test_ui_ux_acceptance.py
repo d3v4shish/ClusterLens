@@ -34,6 +34,9 @@ class UiUxAcceptanceTests(unittest.TestCase):
             for key in store.allKeys()
         }
         store.setValue("runtime/preferred_mode", "cpu")
+        store.setValue("workspace/default_view", "gallery")
+        store.setValue("workspace/faces_mode", "basic")
+        store.setValue("workspace/power_user_mode", False)
         store.sync()
 
     @staticmethod
@@ -99,8 +102,10 @@ class UiUxAcceptanceTests(unittest.TestCase):
             ]
             active_mode = window.mode_selector.currentText()
             self.assertIn(active_mode, {"Basic", "Advanced"})
-            for label in ("Gallery", "Clustering", "Faces", "Names", "Tags", active_mode, "View", "Settings"):
+            for label in ("Gallery", "Clustering", "Faces", "Names", "Tags", "Library", "View", "Settings"):
                 self.assertIn(label, labels)
+            self.assertNotIn(active_mode, labels)
+            self.assertTrue(window.mode_selector.isHidden())
             window.set_active_workspace("clustering")
             window.set_clustering_mode("advanced")
             self.assertTrue(all(widget.isHidden() for widget in (

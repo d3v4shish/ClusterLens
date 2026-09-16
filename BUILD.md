@@ -7,6 +7,7 @@ bash scripts/build.sh
 bash scripts/run.sh
 bash scripts/test.sh
 bash scripts/benchmark.sh
+bash scripts/cli.sh status
 ```
 
 The canonical scripts use the locked dependency graph. Tests and the synthetic benchmark use isolated temporary runtime/bytecode directories; the benchmark uses a fixed seed and reads no user photos or mutable application cache. To benchmark the CUDA runtime instead of the default source interpreter:
@@ -37,6 +38,12 @@ The GPU setup is deliberately separate from `uv sync --frozen`, so CPU source en
 The CPU and CUDA packages are separate artifacts. The CUDA variant requires a compatible NVIDIA driver and CUDA-enabled Torch/ONNX Runtime packages. In Settings → Support, **Rescan GPU Resources** is a visible background-only checklist for Torch CUDA, CUDA ONNX, and cuML HDBSCAN. It does not install packages or download/move model files; use it to inspect the active process after hardware changes.
 
 `scripts/benchmark.sh` runs generated, isolated fixtures for vector work, JPEG/XMP merge/readback, thumbnail-index recovery, SQLite tag queries, deep face search, Faces-tab arrangement, face-index scheduling, progressive folder-review paging, the registered-root catalog, and large name-picker filtering. The catalog fixture also includes a Timeline query/grouping and active-root union discovery baseline. They are comparable only within their own fixtures. Run just the active-root union fixture with `bash scripts/benchmark.sh --multi-root-discovery-only --photos 40 --repeats 5`; it creates two effective generated roots plus one nested duplicate root and reads no user media. Run the autocomplete benchmark with `bash scripts/benchmark.sh --entity-picker-only --names 10000 --repeats 7`; it uses synthetic names in an offscreen Qt process. `--face-indexing-only` writes deterministic temporary JPEGs, uses a fixture detector/embedder (no model load), and reports bounded decode/quality/batch/write scheduling. `--face-review-paging-only` uses temporary seeded SQLite rows only, verifies the `0, 500, 1000` source-order pages, and measures query/review-object publication without source-media decoding. The other focused modes remain `--thumbnail-index-only`, `--tag-workspace-only`, `--deep-face-search-only`, `--faces-arrangement-only`, `--library-catalog-only`, and `--library-timeline-only`. End-to-end photo-pipeline claims still require the fixed photo fixture described in `BENCHMARKS.md`.
+
+`bash scripts/benchmark.sh --ux-workflow-only` measures deterministic 500 and
+10,000-row virtual-list first-content/full-publication latency with no I/O,
+cache, model, user media, or GPU backend. `scripts/cli.sh` is intentionally
+limited to read-only inspection plus explicit Data Home backup/verification;
+source-changing workflows are GUI-only.
 
 ## Release evidence
 

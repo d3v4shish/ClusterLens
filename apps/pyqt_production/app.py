@@ -33,6 +33,7 @@ install_crash_handlers(RUNTIME_LAYOUT)
 from app.selection import SelectionTarget  # noqa: E402
 from app.path_scope import PathScope  # noqa: E402
 from app.services.cache_maintenance import CacheClearResult, CacheMaintenanceService, RuntimeStorageSummary  # noqa: E402
+from app.services.data_home import DataHomeManager  # noqa: E402
 from app.services.cluster_explanations import ClusterExplanation  # noqa: E402
 from app.services.cluster_context import VisionLanguageSettings  # noqa: E402
 from app.services.cluster_meanings import ClusterMeaning  # noqa: E402
@@ -57,6 +58,7 @@ from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait
 from ui.job_manager import JobManager  # noqa: E402
 from ui.job_presentation import JobPresentationController  # noqa: E402
 from ui.job_widgets import JobIndicatorWidget  # noqa: E402
+from ui.work_coordinator import WorkCoordinator  # noqa: E402
 from ui.library_pane import LibraryPane  # noqa: E402
 from ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
 from ui.recent_folders import RecentFolderHistory  # noqa: E402
@@ -165,6 +167,13 @@ class ProductionClusterApp(QMainWindow):
         self.recent_folder_history = RecentFolderHistory(self.settings_store)
         self.runtime_service = RuntimeCapabilityService()
         self.job_manager = JobManager(self)
+        self.work_coordinator = WorkCoordinator(
+            self.job_manager,
+            self,
+            gpu_policy=self._gpu_conflict_policy(),
+        )
+        self.work_coordinator.gpu_conflict_requested.connect(self._show_gpu_conflict_choice)
+        self._gpu_conflict_menus: list[QMenu] = []
         self.system_resources = detect_system_resources()
         self.performance_profile = self._effective_performance_profile()
         self.execution_policy = ExecutionPolicy(
@@ -175,6 +184,7 @@ class ProductionClusterApp(QMainWindow):
         self.image_tag_service = ImageTagService()
         self.saved_search_service = SavedSearchService()
         self.cache_maintenance_service = CacheMaintenanceService(self.settings)
+        self.data_home_manager = DataHomeManager(PRODUCTION_DISPLAY_NAME, runtime_layout.root)
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
         self.session_controller = ClusteringSessionController(runtime_layout, self)
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
@@ -1544,6 +1554,8 @@ class ProductionClusterApp(QMainWindow):
             clear_runtime_reports=self._clear_runtime_reports,
             clear_model_assets=self._clear_model_assets,
             can_clear_rebuildable_caches=lambda: not self._background_runtime_work_active(),
+            data_home_manager=self.data_home_manager,
+            active_source_roots_provider=lambda: tuple(self.source_pane.active_scope.roots),
             runtime_layout=self.runtime_layout,
             support_metadata_provider=self._support_metadata,
             model_download_controller=self.model_download_controller,
@@ -1562,6 +1574,33 @@ class ProductionClusterApp(QMainWindow):
 
     def _preferred_execution_mode(self) -> str:
         return str(self.settings_registry.get(self.settings_store, "runtime/preferred_mode", self.settings.preferred_execution_mode))
+
+    def _gpu_conflict_policy(self) -> str:
+        return str(self.settings_registry.get(self.settings_store, "runtime/gpu_conflict_policy", "ask") or "ask")
+
+    def _show_gpu_conflict_choice(self, job_id: int, label: str) -> None:
+        """Offer an asynchronous resource choice without nesting the event loop."""
+        menu = QMenu(self)
+        menu.setTitle("GPU is busy")
+        queue_action = menu.addAction("Queue for GPU")
+        cpu_action = menu.addAction("Run on CPU for now")
+        cancel_action = menu.addAction("Cancel this job")
+        queue_action.setToolTip("Keep this job queued until the active GPU job reaches a safe checkpoint.")
+        cpu_action.setToolTip("Run this independent job with the CPU fallback. Jobs will record the fallback.")
+        cancel_action.setToolTip("Cancel before this job starts; no work has been performed.")
+        queue_action.triggered.connect(lambda: self.work_coordinator.resolve_gpu_conflict(job_id, "queue"))
+        cpu_action.triggered.connect(lambda: self.work_coordinator.resolve_gpu_conflict(job_id, "cpu"))
+        cancel_action.triggered.connect(lambda: self.work_coordinator.resolve_gpu_conflict(job_id, "cancel"))
+
+        def _discard() -> None:
+            if menu in self._gpu_conflict_menus:
+                self._gpu_conflict_menus.remove(menu)
+            menu.deleteLater()
+
+        menu.aboutToHide.connect(_discard)
+        self._gpu_conflict_menus.append(menu)
+        self.footer_bar.set_status(f"GPU is busy for {label}. Choose Queue, CPU fallback, or Cancel in Jobs.")
+        menu.popup(self.mapToGlobal(self.rect().center()))
 
     def _preferred_performance_profile(self) -> str:
         return str(self.settings_registry.get(self.settings_store, "performance/profile", self.settings.default_performance_profile))
@@ -1878,6 +1917,11 @@ class ProductionClusterApp(QMainWindow):
 
     def _apply_workspace_preferences(self) -> None:
         thumbnail_size = int(self.settings_registry.get(self.settings_store, "gallery/thumbnail_size", self.settings.thumbnail_size))
+        power_user_mode = bool(self.settings_registry.get(self.settings_store, "workspace/power_user_mode", False))
+        self.setProperty("powerUserMode", power_user_mode)
+        if power_user_mode:
+            self.set_clustering_mode("advanced")
+            self.set_faces_mode("advanced")
         self.performance_profile = self._effective_performance_profile()
         seen_face_services: set[int] = set()
         for service in tuple(getattr(self, "_face_service_cache", {}).values()):
@@ -3996,6 +4040,8 @@ class ProductionClusterApp(QMainWindow):
             clear_runtime_reports=self._clear_runtime_reports,
             clear_model_assets=self._clear_model_assets,
             can_clear_rebuildable_caches=lambda: not self._background_runtime_work_active(),
+            data_home_manager=self.data_home_manager,
+            active_source_roots_provider=lambda: tuple(self.source_pane.active_scope.roots),
             runtime_layout=self.runtime_layout,
             support_metadata_provider=self._support_metadata,
             model_download_controller=self.model_download_controller,
@@ -4036,6 +4082,7 @@ class ProductionClusterApp(QMainWindow):
             self.settings_registry.set(self.settings_store, key, value)
         self.settings_store.sync()
         self._apply_runtime_status()
+        self.work_coordinator.gpu_policy = self._gpu_conflict_policy()
         self._apply_workspace_preferences()
         self._apply_safety_state()
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())

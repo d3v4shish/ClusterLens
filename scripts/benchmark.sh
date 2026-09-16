@@ -66,6 +66,11 @@ if [[ "${1:-}" == "--entity-picker-only" ]]; then
     "$benchmark_python" scripts/benchmark_entity_picker.py "$@"
     exit 0
 fi
+if [[ "${1:-}" == "--ux-workflow-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_ux_workflows.py "$@"
+    exit 0
+fi
 "$benchmark_python" scripts/benchmark_acceleration.py "$@"
 "$benchmark_python" scripts/benchmark_face_region_metadata.py
 "$benchmark_python" scripts/benchmark_thumbnail_index.py
@@ -76,3 +81,4 @@ fi
 "$benchmark_python" scripts/benchmark_face_review_paging.py
 "$benchmark_python" scripts/benchmark_library_catalog.py
 "$benchmark_python" scripts/benchmark_entity_picker.py
+"$benchmark_python" scripts/benchmark_ux_workflows.py

@@ -2,6 +2,19 @@
 
 - Timeline reads all matching catalog rows by design, but it reads only `image_path` and `captured_at` in a cancellable worker. The 1,200-row generated fixture measured a 1.072 ms median before the filename-date policy addition. Its remaining per-row ISO timestamp bucketing is already handled by CPython's C-backed `datetime.fromisoformat`; an attempted Python string fast path profiled slower and was not retained. Keep media metadata parsing, file stats, and thumbnail decode out of this path.
 
+- Virtual workspace publication keeps its input list in a model and exposes
+  500-row pages. The 2026-09-16 generated 10,000-row baseline profiled the
+  one-time sort and normalized title keys as the material cost (3.194 ms in one
+  profiled pass); the 19 virtual page insertions totalled 0.111 ms. Do not
+  replace it with one QWidget per photo/face/name, re-sort it per visible page,
+  or perform I/O/model work while publishing the first page.
+
+- Data Home inventory, backup verification, relocation, resume, and staged
+  rollback are filesystem-proportional but always run as cancellable worker
+  jobs. The manager only walks known owned categories, verifies reused staged
+  files by checksum, and serializes competing Data Home writers; never include
+  photo roots in this traversal or turn a status refresh into a source scan.
+
 - Batch rename is deliberately latency-secondary to correctness: it preflights every source/target and rejects the entire preview on a collision, then performs individual same-directory atomic moves with a durable journal row before each change. Do not add automatic collision suffixes, cross-folder moves, or unjournaled background renames merely to shorten the operation; run it in its visible cancellable Job.
 
 - Shared autocomplete choices are normalized and sorted once when an asynchronous service publishes a new list. The generated 10,000-name fixture measured a 2.879 ms median for population plus a contains filter after normalized-key reuse, down from 3.253 ms before eliminating duplicate case-fold scans. Do not query SQLite, rebuild the choice list, or create widgets on every keystroke; populate choices from cancellable workers and retain the normalized keys for filtering.

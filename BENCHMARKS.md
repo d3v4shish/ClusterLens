@@ -167,3 +167,21 @@ Before batching, the initial scan samples were 121.527, 118.741, 121.507, 121.48
 Method: `bash scripts/benchmark.sh --library-timeline-only --timeline-photos 1200 --repeats 3` created three independent SQLite catalogs with 1,200 deterministic rows spanning capture months. It deliberately created no source images, so the measurement covers only the full filtered scalar query and Year → Month grouping used by Timeline; the `CatalogQuery` page limit was set to 240 and intentionally ignored. The UI consumes the result through its virtual section model, so thumbnail decode is outside this measurement.
 
 Samples were 1.198, 1.020, and 1.087 ms (1.087 ms median). This is an initial regression baseline rather than a before/after performance claim. The profile attributes 0.453 ms to 1,200 ISO timestamp buckets and 0.344 ms to six SQLite cursor fetches; it confirms there is no EXIF/XMP deserialization or source-file I/O in the Timeline query path. Larger-library measurements must use the same source-free catalog fixture and report the row count, warm/cold policy, and environment.
+
+## 2026-09-16 virtual workspace publication baseline
+
+Method: `bash scripts/benchmark.sh --ux-workflow-only` created generated
+in-memory `ListEntry` rows only and ran seven repetitions per size in an
+offscreen Qt process. It reads no files, user media, cache, database, model,
+or network data. Queue delay is therefore 0 ms and cache/I/O/GPU fallback are
+explicitly not applicable; this is a UI publication baseline, not an end-to-end
+photo throughput claim.
+
+For 500 rows, first content was 0.027 ms p50 / 0.040 ms p95 and full virtual
+publication was 0.000 ms p50 / 0.002 ms p95. For 10,000 rows, first content
+was 0.748 ms p50 / 0.879 ms p95 and full publication was 0.090 ms p50 / 0.114
+ms p95. The profile attributed the 10,000-row path to `PagedListEntryModel`
+source/filter rebuilding (3.194 ms profiled once), chiefly the one-time sort
+and 10,000 normalized-title key calls; 19 page insertions totalled 0.111 ms.
+The host's RSS provider was unavailable, so no memory claim is made. Re-run the
+same command and repeat count before comparing a change.

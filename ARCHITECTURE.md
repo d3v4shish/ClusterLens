@@ -4,6 +4,20 @@ ClusterLens is a local PyQt desktop application. `apps.pyqt_production` builds t
 
 The shared **Sources** pane is the single persisted `PathScope` editor for all workspaces. It intentionally distinguishes selected photo roots from the separate managed **Data Home**; Data Home is the runtime location for indexes, previews, models, operation journals, backups, logs, and reports, while source photos remain outside managed storage unless an explicit photo action changes them. The production shell routes Data Home management to Storage and keeps every registered foreground/background job visible through the header Jobs control and Activity history. Reusable `EntityPicker` controls receive their choices from background service work and provide consistent click/Enter/Tab completion plus explicit create rows; the Photo Inspector uses the same picker for face mapping and name edits.
 
+`DataHomeManager` is the single ownership boundary for managed-data inventory,
+checksummed backup verification, and relocation. Relocation copies only known
+managed categories into a sibling staging directory, verifies a manifest,
+atomically switches the directory, and writes the next-launch pointer only
+after verification. Its source-side journal supports preview, resume, and
+discard of an incomplete staging area; no photo root is eligible as a target.
+Storage starts these actions in `AsyncJob` workers, exposes them in Jobs, and
+includes them in dialog cancellation/shutdown. `WorkCoordinator` is the
+resource declaration layer for newly migrated independent Jobs: it permits
+unrelated work, serializes declared Data Home/source/GPU conflicts, propagates
+failed dependencies, and offers Queue, CPU fallback, or Cancel for CUDA
+contention according to the persisted policy. Remaining legacy job entry
+points are tracked explicitly in `TODO.md` until migrated.
+
 Library owns a managed runtime SQLite catalog (`cache/library_catalog.sqlite3`) for explicit registered roots. A background scan reads supported media paths, scalar EXIF, and embedded/sidecar XMP, then maintains ordinary SQLite indexes plus FTS5 when available. The catalog never writes source media. Its capture-time policy chooses EXIF, an unambiguous filename date, and modification time in a user-selected order; a forced derived-data refresh recomputes it without changing a photo. Timeline performs a cancellable full filtered SQLite read of only `image_path` and `captured_at`, then publishes a virtual nested Year → Month `SectionedGallery`; only the newest month starts expanded and thumbnail work remains viewport-bound. Search and saved-album browsing remain 240-photo paged `GalleryPane` views. Its People Cleanup service lazily opens the existing durable face index only for catalogued, enabled-root paths; its duplicate service combines exact SHA-256 groups, pHash candidates, optional existing visual vectors, and capture-time bursts into review-only groups. Duplicate review reads only its in-scope persisted vectors in bounded SQLite batches, not the complete global index. Gallery file actions use one append-only SQLite journal for copy/move/Trash/rename; in-place renames are previewed as an all-or-nothing collision check, applied as individually atomic same-directory moves, and can use the existing restore path. Settings reports the catalog as a separate generated-storage category; clearing it is a background operation that removes derived asset/context rows while retaining registered roots, albums, and curation feedback.
 
 `ClusterContextService` selects one deterministic representative per cluster (catalogued capture time, then path), resizes it in a worker, and sends it with scalar EXIF/XMP only to a selected local Ollama or explicitly consented OpenAI-compatible provider. Generated title/description/keywords and cluster membership stay in the Library catalog for FTS-backed, cluster-first text search. Automatic generation is a sequential, opt-in Library Job after clustering; it is disabled by default and does not run a remote provider without fresh per-run consent.

@@ -56,6 +56,27 @@ The launch and native-display checks are release/clean-VM commands: they require
 bash scripts/run_app.sh
 ```
 
+## Command-line companion
+
+`scripts/cli.sh` is a deliberately scoped companion for read-only inspection
+and explicit managed-data maintenance. It never indexes media, changes photo
+metadata, assigns faces, renames/moves/trashes/restores photos, or installs
+models; those reviewed source-changing workflows remain GUI-only.
+
+```bash
+bash scripts/cli.sh status
+bash scripts/cli.sh --json storage inventory
+bash scripts/cli.sh storage backup --destination /absolute/backup-parent
+bash scripts/cli.sh storage verify --backup /absolute/backup-folder
+bash scripts/cli.sh storage recovery list
+```
+
+Settings → Storage is the equivalent visual surface. It lists each Data Home
+category, creates and verifies checksummed backups, and can relocate only
+managed derived data. An interrupted relocation retains the active Data Home
+and a safe staging directory; choose **Resume Data Home Move** or **Discard
+Staged Move** in Storage. Neither choice touches source photos.
+
 On Windows, the PowerShell helper uses the local virtual environment:
 
 ```powershell
@@ -138,6 +159,13 @@ To benchmark the shared saved-name autocomplete control with a generated 10,000-
 
 ```bash
 bash scripts/benchmark.sh --entity-picker-only --names 10000 --repeats 7
+```
+
+To measure virtual first-content and complete publication for generated 500
+and 10,000-row workspace lists (no filesystem, model, cache, or user data):
+
+```bash
+bash scripts/benchmark.sh --ux-workflow-only
 ```
 
 ## Model Downloads
