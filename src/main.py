@@ -35,12 +35,12 @@ from ui.job_presentation import JobPresentationController
 from ui.job_widgets import JobIndicatorWidget
 from ui.recent_folders import RecentFolderHistory
 from ui.mode_panes import ClusteringOptionsPane, SourcePane
-from ui.names_pane import NamesPane
 from ui.runtime_widgets import RuntimeBadge
 from ui.theme import apply_ultra_dark
 
 if TYPE_CHECKING:
     from app.services.face_search import FaceIndexService
+    from ui.names_pane import NamesPane
 
 LOGGER = get_logger(__name__)
 
@@ -232,6 +232,7 @@ class ClusterGalleryApp(QMainWindow):
 
     def init_ui(self) -> None:
         from ui.gallery_pane import GalleryPane
+        from ui.names_pane import NamesPane
         from ui.search_pane import SearchPane
 
         self.central_widget = QWidget(self)

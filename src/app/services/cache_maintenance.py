@@ -90,12 +90,14 @@ class CacheMaintenanceService:
         runtime_temp = int(rebuildable_summary.target_bytes.get("tmp/", 0))
         rebuildable = max(0, int(rebuildable_summary.total_bytes - runtime_temp))
         tag_db = self._path_size(self.settings.image_tags_db, cancel_check=cancel_check)
+        library_catalog = self._library_catalog_size(cancel_check=cancel_check)
         cache_total = self._path_size(self.settings.cache_dir, cancel_check=cancel_check)
-        other_cache = max(0, int(cache_total - rebuildable - runtime_temp - tag_db))
+        other_cache = max(0, int(cache_total - rebuildable - runtime_temp - tag_db - library_catalog))
         target_bytes = {
             "rebuildable_caches": rebuildable,
             "runtime_temp_files": runtime_temp,
             "tag_database": tag_db,
+            "library_catalog": library_catalog,
             "other_cache_data": other_cache,
             "logs": self._path_size(runtime_layout.logs_dir, cancel_check=cancel_check),
             "crash_reports": self._path_size(runtime_layout.crash_dir, cancel_check=cancel_check),
@@ -154,6 +156,7 @@ class CacheMaintenanceService:
                 rebuildable["cluster_meanings/"],
                 rebuildable["embedding_indexes/"],
             ),
+            "library_catalog": self._library_catalog_paths(),
             "face_databases": self._face_database_paths(),
             "ann_files": self._ann_file_paths(),
             "model_caches": (
@@ -381,6 +384,13 @@ class CacheMaintenanceService:
     def _face_database_paths(self) -> tuple[Path, ...]:
         cache_dir = self.settings.cache_dir
         return tuple(sorted(cache_dir.glob("face_search*.db*")))
+
+    def _library_catalog_paths(self) -> tuple[Path, ...]:
+        catalog = self.settings.cache_dir / "library_catalog.sqlite3"
+        return (catalog, catalog.with_name(f"{catalog.name}-wal"), catalog.with_name(f"{catalog.name}-shm"))
+
+    def _library_catalog_size(self, *, cancel_check=None) -> int:
+        return sum(self._path_size(path, cancel_check=cancel_check) for path in self._library_catalog_paths())
 
     def _ann_file_paths(self) -> tuple[Path, ...]:
         cache_dir = self.settings.cache_dir

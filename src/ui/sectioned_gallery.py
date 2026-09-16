@@ -42,6 +42,7 @@ class GallerySection:
     title: str = ""
     anchor_path: str = ""
     anchor_face_index: int = -1
+    children: tuple["GallerySection", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class _GridRow:
     kind: str
     section_id: str
     paths: tuple[str, ...] = ()
+    depth: int = 0
 
 
 class SectionedGalleryModel(QAbstractTableModel):
@@ -64,6 +66,9 @@ class SectionedGalleryModel(QAbstractTableModel):
         self._sections: list[GallerySection] = []
         self._rows: list[_GridRow] = []
         self._sections_by_id: dict[str, GallerySection] = {}
+        self._paths_by_section: dict[str, tuple[str, ...]] = {}
+        self._depth_by_section: dict[str, int] = {}
+        self._all_paths: tuple[str, ...] = ()
         self._paths: set[str] = set()
         self._collapsed: set[str] = set()
         self._checked_sections: set[str] = set()
@@ -101,7 +106,7 @@ class SectionedGalleryModel(QAbstractTableModel):
                 return section
             if role == Qt.ItemDataRole.AccessibleTextRole:
                 state = "collapsed" if section.section_id in self._collapsed else "expanded"
-                return f"{self.header_text(section)}, {state}, {len(section.paths)} photos"
+                return f"{self.header_text(section)}, {state}, {len(self.paths_for_section(section.section_id))} photos"
             return None
         path = self.path_at(index)
         if not path:
@@ -144,13 +149,34 @@ class SectionedGalleryModel(QAbstractTableModel):
         return self._sections_by_id.get(row.section_id) if row.kind == "header" else None
 
     def sections(self) -> list[GallerySection]:
+        """Return every visible hierarchy node in presentation order."""
+
+        return list(self._sections_by_id.values())
+
+    def root_sections(self) -> list[GallerySection]:
+        """Return only top-level sections for hierarchy-preserving updates."""
+
         return list(self._sections)
 
     def all_paths(self) -> list[str]:
-        return [path for section in self._sections for path in section.paths]
+        return list(self._all_paths)
 
     def paths_for_sections(self, section_ids: set[str]) -> list[str]:
-        return [path for section in self._sections if section.section_id in section_ids for path in section.paths]
+        return list(
+            dict.fromkeys(
+                path
+                for section_id in section_ids
+                for path in self.paths_for_section(section_id)
+            )
+        )
+
+    def paths_for_section(self, section_id: str) -> tuple[str, ...]:
+        """Return direct and descendant paths for one selectable header."""
+
+        return self._paths_by_section.get(str(section_id), ())
+
+    def section_depth(self, section_id: str) -> int:
+        return int(self._depth_by_section.get(str(section_id), 0))
 
     def checked_section_ids(self) -> set[str]:
         return set(self._checked_sections)
@@ -169,20 +195,52 @@ class SectionedGalleryModel(QAbstractTableModel):
         unique: list[GallerySection] = []
         seen_paths: set[str] = set()
         seen_ids: set[str] = set()
-        for section in sections:
+
+        def _normalize(section: GallerySection) -> GallerySection | None:
             section_id = str(section.section_id or "").strip()
             if not section_id or section_id in seen_ids:
-                continue
-            paths = tuple(path for path in section.paths if path and path not in seen_paths)
-            if not paths:
-                continue
+                return None
             seen_ids.add(section_id)
+            paths = tuple(str(path) for path in section.paths if path and str(path) not in seen_paths)
             seen_paths.update(paths)
-            unique.append(GallerySection(section_id, paths, section.kind, section.title, section.anchor_path, section.anchor_face_index))
+            children = tuple(child for child in (_normalize(item) for item in section.children) if child is not None)
+            if not paths and not children:
+                return None
+            return GallerySection(
+                section_id,
+                paths,
+                section.kind,
+                section.title,
+                section.anchor_path,
+                section.anchor_face_index,
+                children,
+            )
+
+        for section in sections:
+            normalized = _normalize(section)
+            if normalized is not None:
+                unique.append(normalized)
         self.beginResetModel()
         self._sections = unique
-        self._sections_by_id = {section.section_id: section for section in unique}
-        valid_paths = {path for section in unique for path in section.paths}
+        self._sections_by_id = {}
+        self._paths_by_section = {}
+        self._depth_by_section = {}
+
+        def _index(section: GallerySection, depth: int) -> tuple[str, ...]:
+            self._sections_by_id[section.section_id] = section
+            self._depth_by_section[section.section_id] = depth
+            paths = list(section.paths)
+            for child in section.children:
+                paths.extend(_index(child, depth + 1))
+            unique_paths = tuple(dict.fromkeys(paths))
+            self._paths_by_section[section.section_id] = unique_paths
+            return unique_paths
+
+        all_paths: list[str] = []
+        for section in unique:
+            all_paths.extend(_index(section, 0))
+        self._all_paths = tuple(dict.fromkeys(all_paths))
+        valid_paths = set(self._all_paths)
         self._paths = valid_paths
         self._collapsed.intersection_update(self._sections_by_id)
         self._checked_sections.intersection_update(self._sections_by_id)
@@ -204,12 +262,18 @@ class SectionedGalleryModel(QAbstractTableModel):
 
     def _rebuild_rows(self) -> None:
         rows: list[_GridRow] = []
-        for section in self._sections:
-            rows.append(_GridRow("header", section.section_id))
+
+        def _append(section: GallerySection, depth: int) -> None:
+            rows.append(_GridRow("header", section.section_id, depth=depth))
             if section.section_id in self._collapsed:
-                continue
+                return
             for offset in range(0, len(section.paths), self._columns):
-                rows.append(_GridRow("photos", section.section_id, section.paths[offset : offset + self._columns]))
+                rows.append(_GridRow("photos", section.section_id, section.paths[offset : offset + self._columns], depth))
+            for child in section.children:
+                _append(child, depth + 1)
+
+        for section in self._sections:
+            _append(section, 0)
         self._rows = rows
 
     def toggle_collapsed(self, section_id: str) -> None:
@@ -233,6 +297,18 @@ class SectionedGalleryModel(QAbstractTableModel):
         self.endResetModel()
         return True
 
+    def set_collapsed_sections(self, section_ids: set[str]) -> bool:
+        """Set a deliberate initial hierarchy state without rebuilding tiles."""
+
+        target = {str(section_id) for section_id in section_ids if str(section_id) in self._sections_by_id}
+        if target == self._collapsed:
+            return False
+        self.beginResetModel()
+        self._collapsed = target
+        self._rebuild_rows()
+        self.endResetModel()
+        return True
+
     def toggle_checked_section(self, section_id: str) -> None:
         if section_id not in self._sections_by_id:
             return
@@ -248,7 +324,7 @@ class SectionedGalleryModel(QAbstractTableModel):
                 break
 
     def set_checked_paths(self, paths: set[str]) -> None:
-        self._checked_paths = {path for path in paths if path in set(self.all_paths())}
+        self._checked_paths = {path for path in paths if path in self._paths}
 
     def set_image(self, path: str, image: QImage) -> None:
         if not path or path not in self._paths:
@@ -306,6 +382,8 @@ class _SectionedPhotoDelegate(QStyledItemDelegate):
     def _paint_header(self, painter: QPainter, rect: QRect, section: GallerySection, model) -> None:
         selected = section.section_id in model.checked_section_ids()
         collapsed = section.section_id in model._collapsed  # noqa: SLF001 - model owns the state
+        paths = model.paths_for_section(section.section_id)
+        depth = model.section_depth(section.section_id)
         painter.save()
         background = QColor(COLORS["surface_selected"] if selected else COLORS["surface_sunken"])
         border = QColor(COLORS["info"] if selected else COLORS["border"])
@@ -319,13 +397,14 @@ class _SectionedPhotoDelegate(QStyledItemDelegate):
         preview_left = preview_right - (preview_size * 3) - (preview_gap * 2)
         show_previews = preview_left > rect.left() + 110
         title_right = preview_left - 8 if show_previews else rect.right() - 105
-        title_rect = QRect(rect.left() + 12, rect.top(), max(1, title_right - rect.left() - 12), rect.height())
+        title_left = rect.left() + 12 + depth * 18
+        title_rect = QRect(title_left, rect.top(), max(1, title_right - title_left), rect.height())
         painter.drawText(
             title_rect,
             Qt.AlignmentFlag.AlignVCenter,
-            f"{'▸' if collapsed else '▾'}  {model.header_text(section)}  ·  {len(section.paths)} photos",
+            f"{'▸' if collapsed else '▾'}  {model.header_text(section)}  ·  {len(paths)} photos",
         )
-        for offset, path in enumerate(section.paths[:3] if show_previews else ()):
+        for offset, path in enumerate(paths[:3] if show_previews else ()):
             preview_rect = QRect(preview_left + offset * (preview_size + preview_gap), rect.center().y() - preview_size // 2, preview_size, preview_size)
             painter.fillRect(preview_rect, QColor(COLORS["surface"]))
             image = model.image_for_path(path)
@@ -444,9 +523,9 @@ class _GroupHoverPreviewPopup(QFrame):
         layout.addWidget(self.note)
         self.setFixedWidth(240)
 
-    def set_group(self, section: GallerySection, image: QImage, *, loading: bool) -> None:
-        self.title.setText(f"{section.title or 'Photos'} · {len(section.paths)} photos")
-        self.note.setText(f"+{max(0, len(section.paths) - 9)} more" if len(section.paths) > 9 else "")
+    def set_group(self, section: GallerySection, image: QImage, *, paths: tuple[str, ...], loading: bool) -> None:
+        self.title.setText(f"{section.title or 'Photos'} · {len(paths)} photos")
+        self.note.setText(f"+{max(0, len(paths) - 9)} more" if len(paths) > 9 else "")
         if image.isNull():
             self.image.setPixmap(QPixmap())
             self.image.setText("Loading preview..." if loading else "Preview unavailable")
@@ -663,6 +742,29 @@ class SectionedGallery(QWidget):
         self._refresh_group_bar()
         QTimer.singleShot(0, self._queue_visible_loads)
 
+    def set_sections_with_collapsed(
+        self,
+        sections: list[GallerySection],
+        *,
+        collapsed_section_ids: set[str],
+        status: str = "",
+    ) -> None:
+        """Publish sections and an explicit initial expansion state together."""
+
+        if self._shutting_down:
+            return
+        self._hide_hover_preview()
+        self._finish_viewport_job(status="cancelled")
+        self._generation += 1
+        self._loading_paths.clear()
+        self._label_paths.clear()
+        self._model.set_sections(sections)
+        self._model.set_collapsed_sections(collapsed_section_ids)
+        self._apply_table_geometry()
+        self.status_label.setText(status or f"Showing {len(self._model.all_paths())} photos.")
+        self._refresh_group_bar()
+        QTimer.singleShot(0, self._queue_visible_loads)
+
     def set_empty_state(self, text: str, *, can_organize: bool = False) -> None:
         if self._shutting_down:
             return
@@ -676,12 +778,47 @@ class SectionedGallery(QWidget):
         self._actions.set_read_only_mode(enabled)
         self.group_tag.setEnabled(not enabled)
 
-    def set_view_preferences(self, *, thumbnail_size: int, cache_size: int) -> None:
+    def set_view_preferences(self, *, thumbnail_size: int, cache_size: int, worker_count: int | None = None) -> None:
         self._tile_size = max(96, int(thumbnail_size))
         self._delegate = _SectionedPhotoDelegate(self._tile_size, self)
         self.table.setItemDelegate(self._delegate)
         self._thumbnail_service.set_qimage_cache_size(max(64, int(cache_size)))
+        if worker_count is not None:
+            self._job_pool.setMaxThreadCount(max(1, min(4, int(worker_count))))
         self._apply_table_geometry()
+
+    def set_embedded_timeline_mode(self, enabled: bool) -> None:
+        """Keep Library Timeline focused while retaining selected-photo actions."""
+
+        if not enabled:
+            return
+        self.route_label.hide()
+        self.organize_button.hide()
+        self.analyze_button.hide()
+        self.review_faces_button.hide()
+        self.back_to_folder_button.hide()
+        self.return_to_source_button.hide()
+        self.table.setAccessibleName("Library timeline photos")
+
+    def configure_photo_tools(
+        self,
+        *,
+        metadata_service=None,
+        image_tag_service=None,
+        face_service_provider=None,
+        face_edit_request_handler=None,
+        face_edit_saved_callback=None,
+        inspector_context_provider=None,
+    ) -> None:
+        """Use the production Gallery services for timeline photo actions."""
+
+        self._metadata_service = metadata_service or self._metadata_service
+        self._actions.metadata_service = metadata_service
+        self._actions.image_tag_service = image_tag_service
+        self.face_service_provider = face_service_provider
+        self.face_edit_request_handler = face_edit_request_handler
+        self.face_edit_saved_callback = face_edit_saved_callback
+        self.inspector_context_provider = inspector_context_provider
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -735,7 +872,7 @@ class SectionedGallery(QWidget):
                 continue
             section = self._model.section_at_header(index)
             if section is not None:
-                preview_paths.extend(section.paths[:3])
+                preview_paths.extend(self._model.paths_for_section(section.section_id)[:3])
         visible_paths = [self._model.path_at(index) for index in self._visible_indexes()]
         self._queue_paths((preview_paths + visible_paths)[:48])
 
@@ -877,7 +1014,7 @@ class SectionedGallery(QWidget):
         self._apply_table_geometry()
         self._refresh_group_bar()
         if expanding and section is not None:
-            self._queue_paths(section.paths[:48])
+            self._queue_paths(self._model.paths_for_section(section.section_id)[:48])
         self._queue_visible_loads_after_layout()
 
     def expand_all_sections(self) -> None:
@@ -921,7 +1058,7 @@ class SectionedGallery(QWidget):
             return
         self._hover_section_id = section.section_id
         self._hover_index = index
-        self._queue_paths(section.paths[:9])
+        self._queue_paths(self._model.paths_for_section(section.section_id)[:9])
         self._refresh_hover_preview(section)
         self._position_hover_preview()
         self._hover_popup.show()
@@ -930,7 +1067,7 @@ class SectionedGallery(QWidget):
         if not self._hover_section_id:
             return
         section = next((item for item in self._model.sections() if item.section_id == self._hover_section_id), None)
-        if section is not None and path in section.paths[:9]:
+        if section is not None and path in self._model.paths_for_section(section.section_id)[:9]:
             self._refresh_hover_preview(section)
 
     def _refresh_hover_preview(self, section: GallerySection) -> None:
@@ -939,7 +1076,8 @@ class SectionedGallery(QWidget):
         painter = QPainter(canvas)
         cell = 72
         loading = False
-        for offset, path in enumerate(section.paths[:9]):
+        paths = self._model.paths_for_section(section.section_id)
+        for offset, path in enumerate(paths[:9]):
             target = QRect((offset % 3) * cell, (offset // 3) * cell, cell, cell)
             image = self._model.image_for_path(path)
             if image is None or image.isNull():
@@ -953,7 +1091,7 @@ class SectionedGallery(QWidget):
             painter.setPen(QPen(QColor(COLORS["border"])))
             painter.drawRect(target.adjusted(0, 0, -1, -1))
         painter.end()
-        self._hover_popup.set_group(section, canvas, loading=loading)
+        self._hover_popup.set_group(section, canvas, paths=paths, loading=loading)
 
     def _position_hover_preview(self) -> None:
         if not self._hover_index.isValid():
@@ -1004,14 +1142,15 @@ class SectionedGallery(QWidget):
         section = next((item for item in self._model.sections() if item.section_id == section_id), None)
         if section is None:
             return
+        paths = self._model.paths_for_section(section.section_id)
         menu = QMenu(self)
-        menu.addAction("Inspect photos", lambda: self._inspect_paths(list(section.paths)))
-        menu.addAction("Reveal folders", lambda: self._run_for_paths(section.paths, self._actions.slotOpenSelectedFolders))
-        menu.addAction("Tag photos", lambda: self._run_for_paths(section.paths, self._actions.slotEditTags))
+        menu.addAction("Inspect photos", lambda: self._inspect_paths(list(paths)))
+        menu.addAction("Reveal folders", lambda: self._run_for_paths(paths, self._actions.slotOpenSelectedFolders))
+        menu.addAction("Tag photos", lambda: self._run_for_paths(paths, self._actions.slotEditTags))
         menu.addSeparator()
-        menu.addAction("Copy photos", lambda: self._run_for_paths(section.paths, self._actions.slotCopySelected))
-        menu.addAction("Move photos", lambda: self._run_for_paths(section.paths, self._actions.slotMoveSelected))
-        menu.addAction("Move to ClusterLens Trash", lambda: self._run_for_paths(section.paths, self._actions.slotDeleteSelect))
+        menu.addAction("Copy photos", lambda: self._run_for_paths(paths, self._actions.slotCopySelected))
+        menu.addAction("Move photos", lambda: self._run_for_paths(paths, self._actions.slotMoveSelected))
+        menu.addAction("Move to ClusterLens Trash", lambda: self._run_for_paths(paths, self._actions.slotDeleteSelect))
         menu.exec(point)
 
     def _show_photo_menu(self, pos: QPoint) -> None:
@@ -1063,7 +1202,7 @@ class SectionedGallery(QWidget):
         if not path:
             return
         section = self._section_for_path(path)
-        paths = list(section.paths) if section is not None else [path]
+        paths = list(self._model.paths_for_section(section.section_id)) if section is not None else [path]
         dialog = PhotoInspectorDialog(
             image_paths=paths,
             start_index=paths.index(path),
@@ -1139,10 +1278,23 @@ class SectionedGallery(QWidget):
         removed = {str(path) for path in paths if path}
         if not removed:
             return
-        sections = [
-            GallerySection(section.section_id, tuple(path for path in section.paths if path not in removed), section.kind, section.title, section.anchor_path, section.anchor_face_index)
-            for section in self._model.sections()
-        ]
+
+        def _remove(section: GallerySection) -> GallerySection | None:
+            children = tuple(child for child in (_remove(item) for item in section.children) if child is not None)
+            remaining = tuple(path for path in section.paths if path not in removed)
+            if not remaining and not children:
+                return None
+            return GallerySection(
+                section.section_id,
+                remaining,
+                section.kind,
+                section.title,
+                section.anchor_path,
+                section.anchor_face_index,
+                children,
+            )
+
+        sections = [section for section in (_remove(item) for item in self._model.root_sections()) if section is not None]
         self.set_sections(sections, status=f"Removed {len(removed)} photo(s) from the gallery.")
         self.paths_removed.emit(sorted(removed))
 

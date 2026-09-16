@@ -37,6 +37,9 @@ class PerceptualHashIndexService:
         connection.execute("PRAGMA journal_mode=WAL;")
         connection.execute("PRAGMA synchronous=NORMAL;")
         connection.execute("PRAGMA temp_store=MEMORY;")
+        # Indexing and duplicate review can overlap in separate workers. Wait
+        # briefly for a writer instead of surfacing SQLite's transient lock.
+        connection.execute("PRAGMA busy_timeout=5000;")
         return connection
 
     def _init_db(self) -> None:
@@ -146,13 +149,18 @@ class PerceptualHashIndexService:
         if not stats:
             return 0
 
-        placeholders = ",".join(["?"] * len(stats))
+        existing: dict[str, tuple[int, int]] = {}
         with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT image_path, mtime_ns, file_size FROM phash_index WHERE image_path IN ({placeholders})",
-                list(stats.keys()),
-            ).fetchall()
-        existing = {row[0]: (int(row[1]), int(row[2])) for row in rows}
+            paths = list(stats)
+            for start in range(0, len(paths), 900):
+                raise_if_cancelled(cancel_check)
+                chunk = paths[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT image_path, mtime_ns, file_size FROM phash_index WHERE image_path IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                existing.update({row[0]: (int(row[1]), int(row[2])) for row in rows})
 
         to_update = [p for p, st in stats.items() if existing.get(p) != st]
         return self.build_index(to_update, cancel_check=cancel_check)
@@ -227,6 +235,45 @@ class PerceptualHashIndexService:
                 matches.append(HashMatch(image_path=image_path, hash_distance=int(distance), hash_backend=hash_backend))
         matches.sort(key=lambda item: (item.hash_distance, item.image_path))
         return matches
+
+    def load_hash_values(
+        self,
+        image_paths: list[str],
+        *,
+        hash_backend: str = "phash",
+        cancel_check=None,
+    ) -> dict[str, int]:
+        """Return indexed 64-bit hash values for batch duplicate grouping.
+
+        The caller receives primitive integers so it can form cache-friendly
+        candidate buckets without repeatedly opening a SQLite connection for
+        every photo pair.
+        """
+        if hash_backend not in self.SUPPORTED_HASHES:
+            raise ValueError(f"Unsupported hash backend: {hash_backend}")
+        normalized = [str(Path(path)) for path in image_paths if str(path or "")]
+        self.ensure_index(normalized, cancel_check=cancel_check)
+        if not normalized:
+            return {}
+        column = f"{hash_backend}_u64"
+        values: dict[str, int] = {}
+        with self._connect() as connection:
+            for start in range(0, len(normalized), 900):
+                raise_if_cancelled(cancel_check)
+                chunk = normalized[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT image_path, {column} FROM phash_index WHERE image_path IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for image_path, blob in rows:
+                    if blob is None:
+                        continue
+                    try:
+                        values[str(image_path)] = int.from_bytes(blob, byteorder="big", signed=False)
+                    except (TypeError, ValueError):
+                        continue
+        return values
 
     @staticmethod
     def compute_hash_hexes(image_path: str) -> dict[str, str]:

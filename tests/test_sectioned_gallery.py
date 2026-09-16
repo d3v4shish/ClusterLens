@@ -70,6 +70,43 @@ def test_sectioned_gallery_exposes_header_and_photo_roles() -> None:
     assert model.flags(header) == Qt.ItemFlag.ItemIsEnabled
 
 
+def test_sectioned_gallery_nested_headers_keep_only_the_latest_month_open() -> None:
+    model = SectionedGalleryModel()
+    model.set_column_count(2)
+    model.set_sections(
+        [
+            GallerySection(
+                "year:2026",
+                (),
+                kind="timeline_year",
+                title="2026",
+                children=(
+                    GallerySection("month:2026-03", ("/march-a.jpg", "/march-b.jpg"), kind="timeline_month", title="March 2026"),
+                    GallerySection("month:2026-02", ("/february.jpg",), kind="timeline_month", title="February 2026"),
+                ),
+            ),
+            GallerySection(
+                "year:2025",
+                (),
+                kind="timeline_year",
+                title="2025",
+                children=(GallerySection("month:2025-12", ("/december.jpg",), kind="timeline_month", title="December 2025"),),
+            ),
+        ]
+    )
+    model.set_collapsed_sections({"month:2026-02", "year:2025", "month:2025-12"})
+
+    assert model.all_paths() == ["/march-a.jpg", "/march-b.jpg", "/february.jpg", "/december.jpg"]
+    assert model.paths_for_sections({"year:2026"}) == ["/march-a.jpg", "/march-b.jpg", "/february.jpg"]
+    assert [model.data(model.index(row, 0), model.HeaderRole).section_id for row in range(model.rowCount()) if model.data(model.index(row, 0), model.HeaderRole)] == [
+        "year:2026",
+        "month:2026-03",
+        "month:2026-02",
+        "year:2025",
+    ]
+    assert model.rowCount() == 5  # 2026 header, March header/grid, February header, 2025 header
+
+
 def test_sectioned_gallery_reflows_after_its_table_receives_a_real_width() -> None:
     app = QApplication.instance() or QApplication([])
     from ui.sectioned_gallery import SectionedGallery

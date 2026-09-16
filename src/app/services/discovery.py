@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.path_scope import PathScope
 from infra.cancel import Cancelled
 from infra.settings import get_settings
 
@@ -26,6 +27,80 @@ class ImageDiscoveryService:
 
     def discover(self, directory: str, recursive: bool | None = None) -> list[str]:
         return list(self.discover_result(directory, recursive=recursive).paths)
+
+    def discover_roots_result(
+        self,
+        roots: list[str] | tuple[str, ...],
+        recursive: bool | None = None,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> DiscoveryResult:
+        """Discover a deterministic, de-duplicated union of active roots.
+
+        This intentionally composes the existing cancellable single-root walk
+        instead of making Qt enumerate a filesystem model.  ``PathScope`` has
+        already removed ancestor/descendant overlap; inode/realpath keys still
+        protect against symlink aliases across distinct roots.
+        """
+
+        scope = PathScope.from_paths(roots)
+        if scope.is_empty:
+            return DiscoveryResult(paths=(), snapshot_key=hashlib.sha256(b"").hexdigest(), image_count=0, fingerprints=())
+
+        records_by_identity: dict[object, tuple[str, int, int]] = {}
+        complete = True
+        warning_count = 0
+        total_roots = len(scope.roots)
+        for root_index, root in enumerate(scope.roots, start=1):
+            if callable(cancel_check) and cancel_check():
+                raise Cancelled()
+            if not Path(root).is_dir():
+                complete = False
+                warning_count += 1
+                if progress_callback:
+                    progress_callback(-1, f"Skipping unavailable root {root_index}/{total_roots}: {root}")
+                continue
+
+            def _progress(value: int, message: str, *, index=root_index, current_root=root) -> None:
+                if progress_callback is None:
+                    return
+                prefix = f"Root {index}/{total_roots} ({Path(current_root).name or current_root})"
+                progress_callback(value, f"{prefix}: {message}")
+
+            result = self.discover_result(
+                root,
+                recursive=recursive,
+                progress_callback=_progress,
+                cancel_check=cancel_check,
+            )
+            complete = bool(complete and result.complete)
+            warning_count += int(result.warning_count)
+            for path, mtime_ns, size in result.fingerprints:
+                if callable(cancel_check) and cancel_check():
+                    raise Cancelled()
+                try:
+                    stat_result = os.stat(path, follow_symlinks=True)
+                    inode = int(getattr(stat_result, "st_ino", 0) or 0)
+                    identity: object = (int(getattr(stat_result, "st_dev", 0) or 0), inode) if inode else os.path.realpath(path)
+                except OSError:
+                    identity = os.path.realpath(path)
+                records_by_identity.setdefault(identity, (path, int(mtime_ns), int(size)))
+
+        records = sorted(records_by_identity.values(), key=lambda item: item[0].casefold())
+        payload = "\n".join(f"{path}|{mtime_ns}|{size}" for path, mtime_ns, size in records)
+        if progress_callback is not None:
+            message = f"Active-root scan complete: {len(records)} image(s) discovered across {total_roots} root(s)."
+            if not complete:
+                message += " Some paths could not be read."
+            progress_callback(0, message)
+        return DiscoveryResult(
+            paths=tuple(path for path, _mtime_ns, _size in records),
+            snapshot_key=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            image_count=len(records),
+            fingerprints=tuple(records),
+            complete=complete,
+            warning_count=warning_count,
+        )
 
     def discover_result(self, directory: str, recursive: bool | None = None, progress_callback=None, cancel_check=None) -> DiscoveryResult:
         recursive = self.settings.recursive_scan if recursive is None else recursive

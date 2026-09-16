@@ -391,16 +391,35 @@ class ThumbnailService:
         self._last_index_flush_s = 0.0
         _discard_process_disk_index_state(self.settings.thumbnail_cache_dir)
 
-    def _managed_disk_cache_path(self, path: Path) -> bool:
+    def _managed_disk_cache_path(self, path: Path, *, resolved_cache_root: Path | None = None) -> bool:
+        """Return whether ``path`` is a safe thumbnail cache entry.
+
+        Reconciliation visits every normal file immediately below the configured
+        cache directory.  That common case needs no costly canonical-path walk:
+        it cannot escape the directory unless it is a symlink.  Retain the
+        canonical check for symlinks and database-originated paths, where the
+        safety boundary matters.
+        """
+
+        if path.suffix.casefold() != ".webp":
+            return False
+        cache_dir = self.settings.thumbnail_cache_dir
         try:
-            cache_root = self.settings.thumbnail_cache_dir.resolve()
+            if path.parent == cache_dir and not path.is_symlink():
+                return True
+            cache_root = resolved_cache_root or cache_dir.resolve()
             resolved_path = path.resolve(strict=False)
         except OSError:
             return False
-        return resolved_path.parent == cache_root and resolved_path.suffix.casefold() == ".webp"
+        return resolved_path.parent == cache_root
 
     def _reconcile_disk_index(self, connection: sqlite3.Connection) -> None:
         """Make the thumbnail index match completed cache files after interruption."""
+
+        try:
+            resolved_cache_root = self.settings.thumbnail_cache_dir.resolve()
+        except OSError:
+            return
 
         indexed_paths = {
             str(cache_path)
@@ -409,7 +428,7 @@ class ThumbnailService:
         existing_rows: list[tuple[str, int, float]] = []
         existing_paths: set[str] = set()
         for path in self.settings.thumbnail_cache_dir.glob("*.webp"):
-            if not self._managed_disk_cache_path(path):
+            if not self._managed_disk_cache_path(path, resolved_cache_root=resolved_cache_root):
                 continue
             try:
                 stat = path.stat()
@@ -423,7 +442,8 @@ class ThumbnailService:
         stale_paths = [
             (cache_path,)
             for cache_path in indexed_paths
-            if not self._managed_disk_cache_path(Path(cache_path)) or cache_path not in existing_paths
+            if not self._managed_disk_cache_path(Path(cache_path), resolved_cache_root=resolved_cache_root)
+            or cache_path not in existing_paths
         ]
         if stale_paths:
             connection.executemany("DELETE FROM thumbnail_cache_entries WHERE cache_path=?", stale_paths)

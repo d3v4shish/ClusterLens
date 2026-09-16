@@ -4,6 +4,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import ExifTags, Image
@@ -11,11 +12,13 @@ from PIL import ExifTags, Image
 from infra.cancel import raise_if_cancelled
 from infra.atomic_io import atomic_write_text
 from infra.settings import get_settings
-from ml.embeddings import EmbeddingService
 from ml.vector_compute import VectorComputeService
 
 from .discovery import ImageDiscoveryService
 from .perceptual_hash import PerceptualHashIndexService
+
+if TYPE_CHECKING:
+    from ml.embeddings import EmbeddingService
 
 try:
     import cv2
@@ -104,6 +107,9 @@ class GlobalImageIndexService:
         connection.execute("PRAGMA journal_mode=WAL;")
         connection.execute("PRAGMA synchronous=NORMAL;")
         connection.execute("PRAGMA temp_store=MEMORY;")
+        # Embedding writers and Library duplicate reads are separate
+        # background jobs, so absorb short writer overlap safely.
+        connection.execute("PRAGMA busy_timeout=5000;")
         return connection
 
     def _init_db(self) -> None:
@@ -232,22 +238,43 @@ class GlobalImageIndexService:
 
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
-        return [
-            IndexedImageRecord(
-                image_path=row[0],
-                embedding=np.frombuffer(row[1], dtype=np.float32).copy(),
-                embedding_dim=int(row[2]) if int(row[2] or 0) > 0 else int(len(row[1]) // 4),
-                phash_hex=row[3],
-                folder=row[4],
-                file_ext=row[5],
-                width=int(row[6]),
-                height=int(row[7]),
-                camera=row[8],
-                mtime_ns=int(row[9]),
-                file_size=int(row[10]),
-            )
-            for row in rows
-        ]
+        return [self._record_from_row(row) for row in rows]
+
+    def load_records_for_paths(self, model_name: str, image_paths: list[str], *, cancel_check=None) -> list[IndexedImageRecord]:
+        """Load only requested vectors in bounded SQLite batches."""
+        paths = tuple(dict.fromkeys(str(Path(path)) for path in image_paths if str(path or "")))
+        if not paths:
+            return []
+        rows = []
+        with self._connect() as connection:
+            for start in range(0, len(paths), 900):
+                raise_if_cancelled(cancel_check)
+                chunk = paths[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        "SELECT image_path, embedding, embedding_dim, phash_hex, folder, file_ext, width, height, camera, mtime_ns, file_size "
+                        f"FROM image_search_index WHERE model_name=? AND image_path IN ({placeholders})",
+                        [model_name, *chunk],
+                    ).fetchall()
+                )
+        return [self._record_from_row(row) for row in rows]
+
+    @staticmethod
+    def _record_from_row(row) -> IndexedImageRecord:
+        return IndexedImageRecord(
+            image_path=row[0],
+            embedding=np.frombuffer(row[1], dtype=np.float32).copy(),
+            embedding_dim=int(row[2]) if int(row[2] or 0) > 0 else int(len(row[1]) // 4),
+            phash_hex=row[3],
+            folder=row[4],
+            file_ext=row[5],
+            width=int(row[6]),
+            height=int(row[7]),
+            camera=row[8],
+            mtime_ns=int(row[9]),
+            file_size=int(row[10]),
+        )
 
     @staticmethod
     def _read_metadata(path: Path) -> dict[str, object]:
@@ -275,7 +302,14 @@ class SimilaritySearchService:
         index_service: GlobalImageIndexService | None = None,
     ) -> None:
         self.discovery_service = discovery_service or ImageDiscoveryService()
-        self.embedding_service = embedding_service or EmbeddingService()
+        if embedding_service is None:
+            # The persisted vector index is used independently by Library
+            # duplicate review. Defer heavyweight Torch/ONNX imports until a
+            # real embedding/search operation is requested.
+            from ml.embeddings import EmbeddingService
+
+            embedding_service = EmbeddingService()
+        self.embedding_service = embedding_service
         self.phash_service = phash_service or PerceptualHashIndexService()
         self.index_service = index_service or GlobalImageIndexService()
         model_manager = getattr(self.embedding_service, "model_manager", None)

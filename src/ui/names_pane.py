@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QProgressBar, QPushButton, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 
+from app.path_scope import PathScope
 from app.services.thumbnails import ThumbnailService
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.common import HelpIconButton
@@ -121,9 +122,11 @@ class NamesPane(QWidget):
         parent=None,
         *,
         job_manager: JobManager | None = None,
+        active_scope_provider: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self._face_service_provider = face_service_provider
+        self._active_scope_provider = active_scope_provider
         self.job_manager = job_manager
         self._entries: list[ListEntry] = []
         self._selected_name = ""
@@ -195,6 +198,12 @@ class NamesPane(QWidget):
         self.deep_find_similar_button.setEnabled(False)
         title_row.addWidget(title)
         title_row.addWidget(self.help_button)
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItem("Active roots", "active")
+        self.scope_combo.addItem("All indexed faces", "global")
+        self.scope_combo.setToolTip("Names and similarity searches use active roots by default. Choose All indexed faces only when you intentionally want the global face library.")
+        self.scope_combo.currentIndexChanged.connect(lambda _index: self.active_scope_changed())
+        title_row.addWidget(self.scope_combo)
         title_row.addStretch(1)
         title_row.addWidget(self.open_in_gallery_button)
         title_row.addWidget(self.find_similar_button)
@@ -366,6 +375,45 @@ class NamesPane(QWidget):
         self._read_only_mode = bool(enabled)
         self.gallery.set_read_only_mode(self._read_only_mode)
 
+    def _scope_roots(self) -> tuple[str, ...] | None:
+        if str(self.scope_combo.currentData() or "active") == "global":
+            return None
+        try:
+            value = self._active_scope_provider() if self._active_scope_provider is not None else PathScope()
+        except Exception:
+            return ()
+        if isinstance(value, PathScope):
+            return value.roots
+        if isinstance(value, (list, tuple, set)):
+            return PathScope.from_paths(value).roots
+        return PathScope.from_paths([str(value or "")]).roots
+
+    @staticmethod
+    def _call_scoped(method, *args, scope_roots, **kwargs):
+        """Keep lightweight legacy/test face-service adapters usable."""
+
+        try:
+            return method(*args, scope_roots=scope_roots, **kwargs)
+        except TypeError as exc:
+            if "scope_roots" not in str(exc):
+                raise
+            return method(*args, **kwargs)
+
+    def active_scope_changed(self) -> None:
+        """Discard stale root-scoped results after the shared scope changes."""
+
+        self._refresh_token += 1
+        self._photos_token += 1
+        self._similar_token += 1
+        for job in (self._refresh_job, self._photos_job, self._similar_job, self._deep_similar_job):
+            if job is not None:
+                try:
+                    job.cancel()
+                except Exception:
+                    pass
+        self._clear_similar_face_results()
+        self.refresh_names(preserve_name=self._current_name() or self._selected_name)
+
     def refresh_names(self, *, preserve_name: str | None = None) -> None:
         """Load names asynchronously and recover legacy explicit manual labels once."""
 
@@ -375,6 +423,7 @@ class NamesPane(QWidget):
         service = self._face_service_provider()
         database_key = str(getattr(service, "db_path", "") or id(service))
         recover = database_key not in self._recovered_database_paths
+        scope_roots = self._scope_roots()
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Loading saved names...")
 
@@ -385,7 +434,7 @@ class NamesPane(QWidget):
                 recovery = service.recover_legacy_manual_face_labels()
             if cancel_check():
                 return None
-            return recovery, service.list_named_photo_summaries()
+            return recovery, self._call_scoped(service.list_named_photo_summaries, scope_roots=scope_roots)
 
         def _done(result) -> None:
             if token != self._refresh_token or result is None:
@@ -528,11 +577,12 @@ class NamesPane(QWidget):
         generation: int,
     ) -> None:
         service = self._face_service_provider()
+        scope_roots = self._scope_roots()
 
         def _run(_progress, cancel_check):
             if cancel_check():
                 return None
-            paths = list(service.list_named_photo_paths(name) or [])
+            paths = list(self._call_scoped(service.list_named_photo_paths, name, scope_roots=scope_roots) or [])
             if cancel_check():
                 return None
             image = ThumbnailService(qimage_cache_size=32).build_contact_sheet_qimage(
@@ -665,11 +715,12 @@ class NamesPane(QWidget):
         self.deep_find_similar_button.setEnabled(bool(name))
         self._deep_similar_review = {}
         service = self._face_service_provider()
+        scope_roots = self._scope_roots()
         self.status_label.setText(f"Loading photos for {name}...")
 
         def _run(progress, cancel_check):
             progress(-1, f"Loading photos for {name}...")
-            paths = service.list_named_photo_paths(name)
+            paths = self._call_scoped(service.list_named_photo_paths, name, scope_roots=scope_roots)
             if cancel_check():
                 return None
             return paths
@@ -789,13 +840,16 @@ class NamesPane(QWidget):
         self.find_similar_button.setEnabled(False)
         self.status_label.setText(f"Finding faces similar to {name}...")
         service = self._face_service_provider()
+        scope_roots = self._scope_roots()
 
         def _run(progress, cancel_check):
             progress(-1, f"Searching faces similar to {name}...")
             results = list(
-                service.search_by_person_name(
+                self._call_scoped(
+                    service.search_by_person_name,
                     name,
                     top_k=NAME_SIMILAR_FACE_LIMIT,
+                    scope_roots=scope_roots,
                     include_tiny_faces=True,
                 )
                 or []
@@ -838,10 +892,13 @@ class NamesPane(QWidget):
         self.deep_find_similar_button.setEnabled(False)
         self.status_label.setText(f"Deep-searching faces for {name}...")
         service = self._face_service_provider()
+        scope_roots = self._scope_roots()
 
         def _run(progress, cancel_check):
-            expansion = service.deep_search_by_person_name(
+            expansion = self._call_scoped(
+                service.deep_search_by_person_name,
                 name,
+                scope_roots=scope_roots,
                 include_tiny_faces=True,
                 progress=progress,
                 cancel_check=cancel_check,

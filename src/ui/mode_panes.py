@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import QDir, pyqtSignal
+from PyQt6.QtCore import QDir, Qt, pyqtSignal
 from PyQt6.QtGui import QFileSystemModel
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QPushButton,
     QSpinBox,
@@ -34,6 +36,7 @@ from app.services.clustering_options import (
     normalize_embedding_models,
 )
 from app.services.similarity_modes import SUPPORTED_SIMILARITY_MODES, normalize_similarity_modes
+from app.path_scope import PathScope, path_is_within_scope
 from infra.settings import get_settings
 from .common import build_help_inline, build_help_label
 
@@ -116,8 +119,49 @@ CLUSTERING_HELP = {
 }
 
 
+class ActiveRootFileSystemModel(QFileSystemModel):
+    """Filesystem tree model with lightweight active-root check state."""
+
+    root_toggle_requested = pyqtSignal(str, bool)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._active_scope = PathScope()
+
+    def set_active_scope(self, scope: PathScope) -> None:
+        self._active_scope = scope
+        # QFileSystemModel materializes rows lazily; a layout notification is
+        # cheaper and safer than recursively walking every visible descendant.
+        self.layoutChanged.emit()
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
+        if role == Qt.ItemDataRole.CheckStateRole and index.isValid() and index.column() == 0:
+            path = self.filePath(index)
+            if path in self._active_scope.roots:
+                return Qt.CheckState.Checked
+            if any(path_is_within_scope(root, path) for root in self._active_scope.roots):
+                return Qt.CheckState.PartiallyChecked
+            return Qt.CheckState.Unchecked
+        return super().data(index, role)
+
+    def flags(self, index):  # type: ignore[override]
+        flags = super().flags(index)
+        if index.isValid() and index.column() == 0 and self.isDir(index):
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):  # type: ignore[override]
+        if role == Qt.ItemDataRole.CheckStateRole and index.isValid() and self.isDir(index):
+            path = self.filePath(index)
+            checked = value == Qt.CheckState.Checked or int(value) == int(Qt.CheckState.Checked)
+            self.root_toggle_requested.emit(path, bool(checked))
+            return True
+        return super().setData(index, value, role)
+
+
 class SourcePane(QWidget):
     directory_changed = pyqtSignal(str)
+    scope_changed = pyqtSignal(object)
     recent_folder_remove_requested = pyqtSignal(str)
     recent_folders_clear_requested = pyqtSignal()
     state_changed = pyqtSignal()
@@ -132,6 +176,7 @@ class SourcePane(QWidget):
         # user selection. Keeping these states separate prevents a fresh launch
         # from reporting both `/home` and "No folder selected".
         self.selected_directory = ""
+        self.active_scope = PathScope()
         self._recent_directories: list[str] = []
         self._browse_root = "C:/" if os.name == "nt" else "/"
         self._build_ui()
@@ -175,11 +220,38 @@ class SourcePane(QWidget):
         self.selected_folder_label.setObjectName("selectedFolderRoot")
         self.selected_folder_label.setWordWrap(False)
         self.selected_folder_label.setToolTip(
-            "Choose a folder to use for clustering. The complete tree remains visible under the chosen browse root."
+            "Browsing a folder does not change the active scope. Check folders in the tree to include them."
         )
         layout.addWidget(self.selected_folder_label)
 
-        self.file_model = QFileSystemModel()
+        active_heading = QLabel("Active roots (include subfolders)", self)
+        active_heading.setProperty("role", "help")
+        active_heading.setToolTip("These checked roots are shared by every workspace. Overlapping child roots are folded into their parent.")
+        layout.addWidget(active_heading)
+        self.active_roots_list = QListWidget(self)
+        self.active_roots_list.setObjectName("activeRootsList")
+        self.active_roots_list.setMinimumHeight(54)
+        self.active_roots_list.setMaximumHeight(112)
+        self.active_roots_list.setToolTip("Active roots shared by Gallery, Clustering, Faces, Names, Tags, and Library.")
+        self.active_roots_list.itemSelectionChanged.connect(self._refresh_active_root_action_state)
+        layout.addWidget(self.active_roots_list)
+        active_actions = QHBoxLayout()
+        active_actions.setContentsMargins(0, 0, 0, 0)
+        self.add_browsed_root_button = QPushButton("Add browsed")
+        self.remove_active_root_button = QPushButton("Remove")
+        self.clear_active_roots_button = QPushButton("Clear")
+        self.add_browsed_root_button.setToolTip("Add the currently browsed folder to the shared active roots.")
+        self.remove_active_root_button.setToolTip("Remove the selected active root without touching source files.")
+        self.clear_active_roots_button.setToolTip("Clear the shared active scope. No workspace will scan or search folders until roots are selected again.")
+        self.add_browsed_root_button.clicked.connect(lambda: self.add_active_root(self.selected_directory))
+        self.remove_active_root_button.clicked.connect(self.remove_selected_active_root)
+        self.clear_active_roots_button.clicked.connect(self.clear_active_roots)
+        active_actions.addWidget(self.add_browsed_root_button)
+        active_actions.addWidget(self.remove_active_root_button)
+        active_actions.addWidget(self.clear_active_roots_button)
+        layout.addLayout(active_actions)
+
+        self.file_model = ActiveRootFileSystemModel(self)
         self.file_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
         self.file_model.setRootPath(self._browse_root)
 
@@ -196,6 +268,7 @@ class SourcePane(QWidget):
             "QTreeView::item { height: 24px; padding: 3px; }"
         )
         self.file_tree.clicked.connect(self.on_directory_selected)
+        self.file_model.root_toggle_requested.connect(self._on_tree_root_toggled)
         layout.addWidget(self.file_tree, stretch=1)
 
         self.basic_action_section = QWidget(self)
@@ -215,6 +288,7 @@ class SourcePane(QWidget):
         self.set_running(False)
         self.basic_action_section.hide()
         self.set_recent_directories([])
+        self._refresh_active_roots_ui()
 
     @staticmethod
     def _recent_folder_label(path: str) -> str:
@@ -260,14 +334,16 @@ class SourcePane(QWidget):
         self.directory_combobox.addItems(drives)
 
     def on_directory_selected(self, index) -> None:
-        self.set_selected_directory(self.file_model.filePath(index), emit_state=True)
+        # Tree-row activation is navigation only; the checkbox is the explicit
+        # multi-root inclusion control.
+        self.set_selected_directory(self.file_model.filePath(index), emit_state=True, activate_scope=False)
 
     def on_directory_changed(self, _index) -> None:
         root_directory = self.directory_combobox.currentText()
         self._browse_root = root_directory
         self.file_model.setRootPath(root_directory)
         self.file_tree.setRootIndex(self.file_model.index(root_directory))
-        self.set_selected_directory(root_directory, emit_state=True)
+        self.set_selected_directory(root_directory, emit_state=True, activate_scope=False)
 
     @staticmethod
     def _path_is_within(directory: str, root: str) -> bool:
@@ -321,7 +397,7 @@ class SourcePane(QWidget):
         self.file_tree.setCurrentIndex(selected_index)
         self.file_tree.scrollTo(selected_index)
 
-    def set_selected_directory(self, directory: str, *, emit_state: bool = False) -> None:
+    def set_selected_directory(self, directory: str, *, emit_state: bool = False, activate_scope: bool = True) -> None:
         directory = str(directory or "").strip()
         if not directory or not os.path.exists(directory):
             return
@@ -338,9 +414,80 @@ class SourcePane(QWidget):
         self._reveal_selected_directory(directory)
         self.selected_folder_label.setText(f"Selected: {directory}")
         self.selected_folder_label.setToolTip(directory)
+        self._refresh_active_root_action_state()
         self.directory_changed.emit(self.selected_directory)
+        if activate_scope:
+            # Preserve the historical programmatic/recent-folder contract.
+            # Interactive tree browsing opts out above, so it never replaces a
+            # deliberate multi-root selection.
+            self.set_active_roots([directory], emit_state=emit_state)
         if emit_state:
             self.state_changed.emit()
+
+    @property
+    def active_roots(self) -> tuple[str, ...]:
+        return self.active_scope.roots
+
+    def set_active_roots(self, roots, *, emit_state: bool = False) -> None:
+        """Replace the shared root set without scanning source media."""
+
+        scope = roots if isinstance(roots, PathScope) else PathScope.from_paths(roots)
+        changed = scope != self.active_scope
+        self.active_scope = scope
+        self.file_model.set_active_scope(scope)
+        self._refresh_active_roots_ui()
+        if changed:
+            self.scope_changed.emit(scope)
+            if emit_state:
+                self.state_changed.emit()
+
+    def add_active_root(self, directory: str) -> None:
+        path = str(directory or "").strip()
+        if not path:
+            return
+        self.set_active_roots([*self.active_scope.roots, path], emit_state=True)
+
+    def remove_active_root(self, directory: str) -> None:
+        target = str(directory or "").strip()
+        if not target:
+            return
+        self.set_active_roots([root for root in self.active_scope.roots if root != target], emit_state=True)
+
+    def remove_selected_active_root(self) -> None:
+        item = self.active_roots_list.currentItem()
+        if item is None:
+            return
+        self.remove_active_root(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+
+    def clear_active_roots(self) -> None:
+        self.set_active_roots((), emit_state=True)
+
+    def _on_tree_root_toggled(self, directory: str, checked: bool) -> None:
+        if checked:
+            self.add_active_root(directory)
+        else:
+            self.remove_active_root(directory)
+
+    def _refresh_active_roots_ui(self) -> None:
+        current = self.active_roots_list.currentItem()
+        selected_path = str(current.data(Qt.ItemDataRole.UserRole) or "") if current is not None else ""
+        self.active_roots_list.blockSignals(True)
+        self.active_roots_list.clear()
+        for root in self.active_scope.roots:
+            label = root if os.path.isdir(root) else f"{root} (unavailable)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, root)
+            item.setToolTip(root)
+            self.active_roots_list.addItem(item)
+            if root == selected_path:
+                self.active_roots_list.setCurrentItem(item)
+        self.active_roots_list.blockSignals(False)
+        self._refresh_active_root_action_state()
+
+    def _refresh_active_root_action_state(self) -> None:
+        self.add_browsed_root_button.setEnabled(bool(self.selected_directory))
+        self.remove_active_root_button.setEnabled(self.active_roots_list.currentItem() is not None)
+        self.clear_active_roots_button.setEnabled(bool(self.active_scope.roots))
 
     def set_running(self, running: bool) -> None:
         self.basic_run_button.setVisible(not running)

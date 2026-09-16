@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from app.path_scope import roots_scope_sql
 from infra.cancel import raise_if_cancelled
 from infra.logging_config import get_logger
 from infra.settings import get_settings
@@ -403,9 +404,15 @@ class ImageTagService:
         ]
 
     @staticmethod
-    def _scope_sql(scope_path: str | Path | None) -> tuple[str, list[object]]:
+    def _scope_sql(
+        scope_path: str | Path | None = None,
+        scope_paths: Iterable[str] | None = None,
+    ) -> tuple[str, list[object]]:
         """Return a portable directory-prefix clause for canonical database paths."""
 
+        if scope_paths is not None:
+            clause, values = roots_scope_sql("image_path", scope_paths)
+            return clause, list(values)
         scope = ImageTagService._canonical_path(str(scope_path or ""))
         if not scope:
             return "", []
@@ -418,6 +425,7 @@ class ImageTagService:
         *,
         query: str = "",
         scope_path: str | Path | None = None,
+        scope_paths: Iterable[str] | None = None,
         limit: int = 100,
         offset: int = 0,
         include_total: bool = True,
@@ -431,7 +439,7 @@ class ImageTagService:
             clauses.append("(tag_norm LIKE ? ESCAPE '\\' OR display_tag LIKE ? ESCAPE '\\')")
             escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             params.extend([f"%{escaped}%", f"%{escaped}%"])
-        scope_clause, scope_params = self._scope_sql(scope_path)
+        scope_clause, scope_params = self._scope_sql(scope_path, scope_paths)
         if scope_clause:
             clauses.append(scope_clause)
             params.extend(scope_params)
@@ -497,6 +505,7 @@ class ImageTagService:
         tag: str,
         *,
         scope_path: str | Path | None = None,
+        scope_paths: Iterable[str] | None = None,
         limit: int = 200,
         offset: int = 0,
         include_total: bool = True,
@@ -508,7 +517,7 @@ class ImageTagService:
             return TagPathPage()
         clauses = ["tag_norm = ?"]
         params: list[object] = [normalized]
-        scope_clause, scope_params = self._scope_sql(scope_path)
+        scope_clause, scope_params = self._scope_sql(scope_path, scope_paths)
         if scope_clause:
             clauses.append(scope_clause)
             params.extend(scope_params)

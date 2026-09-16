@@ -28,6 +28,7 @@ from apps.pyqt_production.session_controller import ClusteringSessionController
 from apps.shared.runtime_migrations import RuntimeMigrationService
 from apps.shared.runtime_support import activate_runtime_root
 from apps.shared.support_bundle import export_support_bundle
+from app.selection import SelectionTarget
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest
 from app.services.model_assets import ModelDownloadPlan, sha256_file
 from infra.runtime import RuntimeCapabilities, RuntimeCapabilityService
@@ -1188,6 +1189,110 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertFalse(window.cluster_pane.basis_label.isHidden())
         window.close()
 
+    def test_production_library_workspace_tracks_cluster_selection(self):
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionLibraryWorkspaceTest")
+                from apps.pyqt_production.app import ProductionClusterApp
+
+                window = ProductionClusterApp(layout)
+                window.show()
+                window.set_active_workspace("library")
+                APP.processEvents()
+
+                self.assertTrue(window.library_workspace_button.isVisible())
+                self.assertIs(window.workspace_stack.currentWidget(), window.library_pane)
+                self.assertTrue(window.source_pane.isHidden())
+                self.assertTrue(window.mode_selector.isHidden())
+                target = SelectionTarget(
+                    paths=("/photos/first.jpg", "/photos/second.jpg"),
+                    kind="cluster",
+                    label="siglip | Cluster 3",
+                    source_context={"comparison_key": "siglip", "cluster_id": 3},
+                )
+                window._on_cluster_selection_target_changed(target)
+                self.assertEqual("siglip:3", window.library_pane._selected_cluster_key)
+                self.assertEqual(target.paths, window.library_pane._selected_cluster_members)
+                window.close()
+
+    def test_library_compact_layout_keeps_actions_and_filters_readable(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import LibraryCatalogService
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            pane.resize(720, 900)
+            pane.show()
+            APP.processEvents()
+
+            self.assertIn("Start here:", pane.start_here_label.text())
+            self.assertEqual(pane._TAB_HEIGHTS["Timeline"], pane.tabs.height())
+            for button in (
+                pane.add_current_root_button,
+                pane.add_root_button,
+                pane.remove_root_button,
+                pane.save_album_button,
+                pane.delete_album_button,
+                pane.timeline_reload_button,
+            ):
+                self.assertGreaterEqual(
+                    button.contentsRect().width(),
+                    button.fontMetrics().horizontalAdvance(button.text()),
+                    button.text(),
+                )
+            self.assertGreaterEqual(pane.timeline_start.width(), pane.timeline_start.minimumWidth())
+            self.assertGreaterEqual(pane.timeline_end.width(), pane.timeline_end.minimumWidth())
+            self.assertGreaterEqual(pane.timeline_camera.width(), pane.timeline_camera.minimumWidth())
+
+            pane.tabs.setCurrentIndex(pane.tabs.indexOf(pane.duplicate_list.parentWidget()))
+            APP.processEvents()
+            self.assertEqual(pane._TAB_HEIGHTS["Cleanup"], pane.tabs.height())
+            pane.close()
+
+    def test_library_timeline_uses_nested_virtual_sections_while_search_stays_paged(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import CatalogTimeline, LibraryCatalogService, TimelineMonth, TimelineYear
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            timeline = CatalogTimeline(
+                years=(
+                    TimelineYear(2026, (TimelineMonth(2026, 3, ("/march.jpg",)), TimelineMonth(2026, 2, ("/february.jpg",)))),
+                    TimelineYear(2025, (TimelineMonth(2025, 12, ("/december.jpg",)),)),
+                ),
+                total_count=3,
+            )
+            sections, collapsed = pane._timeline_sections(timeline)
+            pane.timeline_gallery.set_sections_with_collapsed(sections, collapsed_section_ids=collapsed)
+            pane._timeline_paths = timeline.image_paths
+            pane._update_controls()
+
+            self.assertIs(pane.gallery_stack.currentWidget(), pane.timeline_gallery)
+            self.assertFalse(pane.load_more_button.isVisible())
+            self.assertTrue(pane.open_gallery_button.isEnabled())
+            headers = [
+                pane.timeline_gallery._model.data(pane.timeline_gallery._model.index(row, 0), pane.timeline_gallery._model.HeaderRole).section_id
+                for row in range(pane.timeline_gallery._model.rowCount())
+                if pane.timeline_gallery._model.data(pane.timeline_gallery._model.index(row, 0), pane.timeline_gallery._model.HeaderRole)
+            ]
+            self.assertEqual(["timeline:year:2026", "timeline:year:2026:month:03", "timeline:year:2026:month:02", "timeline:year:2025"], headers)
+
+            pane.tabs.setCurrentIndex(pane.tabs.indexOf(pane.search_field.parentWidget()))
+            APP.processEvents()
+            self.assertIs(pane.gallery_stack.currentWidget(), pane.gallery)
+            self.assertFalse(pane.load_more_button.isHidden())
+            self.assertEqual(240, pane.PAGE_SIZE)
+            pane.close()
+
     def test_production_clustering_controls_use_curated_model_and_backend_surface(self):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
@@ -1340,6 +1445,7 @@ class ProductionSupportTests(unittest.TestCase):
                     "logs": 0,
                     "thumbnails": 0,
                     "rebuildable_caches": 0,
+                    "library_catalog": 0,
                     "face_databases": 0,
                     "ann_files": 0,
                     "model_caches": 0,
@@ -1353,6 +1459,7 @@ class ProductionSupportTests(unittest.TestCase):
                 total_bytes=0,
             ),
             clear_rebuildable_caches=lambda: CacheClearResult((), 0, ()),
+            clear_library_catalog=lambda: CacheClearResult(("library_catalog",), 0, ()),
             clear_runtime_temp_files=lambda: CacheClearResult((), 0, ()),
             clear_face_storage=lambda: CacheClearResult((), 0, ()),
             clear_model_caches=lambda: CacheClearResult((), 0, ()),
@@ -1380,9 +1487,12 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertIn("CPU SIMD dispatch:", dialog.runtime_text.toPlainText())
         self.assertIn("CPU BLAS:", dialog.runtime_text.toPlainText())
         self.assertIn("Face databases", dialog.generated_storage_text.toPlainText())
+        self.assertIn("Library catalog", dialog.generated_storage_text.toPlainText())
+        self.assertEqual("Clear Library Cache", dialog.clear_library_catalog_button.text())
         self.assertEqual("Clear Reports", dialog.clear_runtime_reports_button.text())
         self.assertEqual("Clear Installed Model Assets", dialog.clear_model_assets_button.text())
         self.assertTrue(dialog.clear_runtime_temp_button.isEnabled())
+        self.assertTrue(dialog.clear_library_catalog_button.isEnabled())
         self.assertTrue(dialog.clear_runtime_reports_button.isEnabled())
         self.assertTrue(dialog.clear_model_assets_button.isEnabled())
         self.assertNotIn("face/search", combined_text)

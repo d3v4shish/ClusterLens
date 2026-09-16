@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.path_scope import PathScope
 from app.services.image_tags import ImageTagService, TagInventoryItem
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.gallery_pane import GalleryPane
@@ -39,14 +40,14 @@ class TagsPane(QWidget):
     def __init__(
         self,
         tag_service: ImageTagService,
-        current_folder_provider: Callable[[], str],
+        current_scope_provider: Callable[[], object],
         parent=None,
         *,
         job_manager: JobManager | None = None,
     ) -> None:
         super().__init__(parent)
         self.tag_service = tag_service
-        self.current_folder_provider = current_folder_provider
+        self.current_scope_provider = current_scope_provider
         self.job_manager = job_manager
         self._read_only_mode = False
         self._inventory_offset = 0
@@ -91,8 +92,8 @@ class TagsPane(QWidget):
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(0, 0, 0, 0)
         self.scope_combo = QComboBox(sidebar)
-        self.scope_combo.addItem("All Library", "")
-        self.scope_combo.addItem("Current Folder", "current")
+        self.scope_combo.addItem("All tagged photos", "")
+        self.scope_combo.addItem("Active roots", "active")
         self.scope_combo.currentIndexChanged.connect(self.refresh)
         side.addWidget(QLabel("Scope"))
         side.addWidget(self.scope_combo)
@@ -228,19 +229,29 @@ class TagsPane(QWidget):
             return
         self._load_inventory(reset=True)
 
-    def _scope_path(self) -> str:
-        return str(self.current_folder_provider() or "") if self.scope_combo.currentData() == "current" else ""
+    def _scope_paths(self) -> tuple[str, ...] | None:
+        if self.scope_combo.currentData() != "active":
+            return None
+        try:
+            value = self.current_scope_provider()
+        except Exception:
+            return ()
+        if isinstance(value, PathScope):
+            return value.roots
+        if isinstance(value, (list, tuple, set)):
+            return PathScope.from_paths(value).roots
+        return PathScope.from_paths([str(value or "")]).roots
 
-    def _current_folder_scope_is_unavailable(self) -> bool:
-        return self.scope_combo.currentData() == "current" and not self._scope_path()
+    def _active_scope_is_unavailable(self) -> bool:
+        return self.scope_combo.currentData() == "active" and not self._scope_paths()
 
     def _load_inventory(self, *, reset: bool = False) -> None:
-        if self._current_folder_scope_is_unavailable():
+        if self._active_scope_is_unavailable():
             self.inventory_model.set_items([])
             self._inventory_total = 0
             self._inventory_offset = 0
             self.inventory_count_label.setText("0 tags")
-            self.status_label.setText("Choose a folder to view tags in the current folder.")
+            self.status_label.setText("Choose a folder or one or more active roots to view their tags.")
             self._update_controls()
             return
         if self._inventory_loading:
@@ -252,7 +263,7 @@ class TagsPane(QWidget):
         generation = self._generation
         offset = self._inventory_offset
         query = self.search_field.text().strip()
-        scope = self._scope_path()
+        scope_paths = self._scope_paths()
         self.status_label.setText("Loading tag inventory…")
 
         def _run(progress, cancel_check):
@@ -261,7 +272,7 @@ class TagsPane(QWidget):
                 return None
             return self.tag_service.query_tag_inventory(
                 query=query,
-                scope_path=scope,
+                scope_paths=scope_paths,
                 limit=self.INVENTORY_PAGE_SIZE,
                 offset=offset,
                 include_total=reset,
@@ -326,11 +337,11 @@ class TagsPane(QWidget):
     def _load_photos(self, *, reset: bool = False) -> None:
         if not self._selected_tag:
             return
-        if self._current_folder_scope_is_unavailable():
+        if self._active_scope_is_unavailable():
             self._photo_total = 0
             self._photo_offset = 0
             self.gallery.update_gallery([])
-            self.photo_heading.setText("Choose a folder to view tagged photos in the current folder.")
+            self.photo_heading.setText("Choose a folder or active roots to view tagged photos.")
             self._update_controls()
             return
         if self._photo_loading:
@@ -342,7 +353,7 @@ class TagsPane(QWidget):
         generation = self._generation
         tag = self._selected_tag
         offset = self._photo_offset
-        scope = self._scope_path()
+        scope_paths = self._scope_paths()
         self.photo_heading.setText(f"Photos tagged {tag}")
 
         def _run(progress, cancel_check):
@@ -351,7 +362,7 @@ class TagsPane(QWidget):
                 return None
             return self.tag_service.query_tagged_paths(
                 tag,
-                scope_path=scope,
+                scope_paths=scope_paths,
                 limit=self.PHOTO_PAGE_SIZE,
                 offset=offset,
                 include_total=reset,

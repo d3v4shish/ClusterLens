@@ -38,6 +38,7 @@ class ProductionClusterRequest:
     use_onnx: bool
     reuse_result_cache: bool
     use_embedding_cache_lookup: bool
+    source_roots: list[str] = field(default_factory=list)
     source_paths: list[str] | None = None
     source_fingerprints: list[tuple[str, int, int]] | None = None
     source_snapshot_key: str = ""

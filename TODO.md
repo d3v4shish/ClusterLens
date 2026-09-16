@@ -1,5 +1,83 @@
 # Current implementation plan
 
+## Complete Clean-app performance pass
+
+- [x] Establish fresh deterministic baselines for every shipped benchmark path, including the progressive Faces review request path.
+  Contract: all timing/profiling fixtures use generated temporary media or in-memory/database fixture data only; they never inspect user photos, models, caches, or runtime data.
+  Validation: `bash scripts/benchmark.sh` and the focused Faces paging benchmark each exit successfully and their fixture/configuration/result are recorded in `BENCHMARKS.md`.
+- [x] Profile and remove any measured avoidable UI-thread, repeated-work, or unbounded-work bottleneck without changing visible behavior.
+  Contract: expensive source, SQLite, crop-decoding, and model work stays cancellable and worker-bound; visible lists retain bounded/virtualized publication and stale requests cannot publish.
+  Validation: focused deterministic service/offscreen UI tests cover changed behavior; the affected benchmark is rerun after the change and `HOTSPOTS.md` explains both residual constraints and cache/concurrency bounds.
+- [x] Verify reproducible release health after the performance pass.
+  Contract: a clean checked-out source tree can compile, run its deterministic validations, and execute all benchmark scripts through documented commands.
+  Validation: `bash scripts/build.sh`, relevant isolated `pytest` slices, `git diff --check`, and the relevant `scripts/benchmark.sh` commands pass.
+
+## ClusterLens source-parity reconciliation
+
+- [x] Port source-only behavior without replacing Clean-native Library, Names, or parallel indexing implementations.
+  Contract: Clean remains a superset at the user-facing feature level; shared files are reconciled feature-by-feature rather than copied over dirty local work.
+  Validation: reconciled the source worktree against Clean-native equivalents; focused service and offscreen UI coverage exercises the newly ported behavior, with documented deterministic checks below.
+- [x] Add durable per-face ignore/restore and catalog-name completion from the current ClusterLens workspace.
+  Contract: ignored regions leave normal Face search/clustering and are recoverable in an explicit Faces view; all face naming fields and prompts autocomplete saved names while accepting new names.
+  Validation: `uv run --with pytest python -m pytest tests/test_services.py -k 'face_folder_review_distinguishes_detected_no_faces_tiny_hidden_and_not_scanned or hidden_people_and_faces_persist_and_are_excluded_by_default or nested_external_scrfd_and_arcface_files_are_discovered_without_copying'` and `QT_QPA_PLATFORM=offscreen uv run --with pytest python -m pytest tests/test_ui_smoke.py -k 'faces_filter_ignored_and_unlabelled_photo_views_and_name_picker'` pass.
+- [x] Publish Faces progressively while folder-review and selected All Faces group data is still loading.
+  Contract: a folder review resolves bounded, source-ordered 500-image pages in workers and shows its first page before later pages finish; detected-face tiles receive later pages incrementally and display visible loading feedback. All Faces requests 500 members per selected group page and automatically continues until that group is complete, cancelling a stale folder/filter/sort/mode/tab/group request. The final folder view applies the user's selected sort only after all page metadata is available; face crop decoding remains viewport-bounded.
+  Validation: deterministic service paging covers 1,005 candidates and page offsets; offscreen UI coverage holds later pages behind an event to prove the initial 500 folder-review items and All Faces members publish before completion, then verifies all 1,001 items and automatic offsets `0, 500, 1000`. Focused service/UI suite, compilation, and whitespace checks pass.
+
+## Adaptive GPU face-indexing pipeline
+
+- [x] Feed the verified CUDA face pipeline with bounded parallel decode/quality work, cross-photo embedding batches, and batched durable writes.
+  Contract: normal indexing remains incremental, cancellable, source-read-only, and label-safe; the actual detector/embedder provider and CPU fallback are visible throughout the Job.
+  Validation: deterministic scheduler/persistence coverage, focused offscreen UI coverage, generated fixture benchmark/profile, CUDA SCRFD/ArcFace smoke, and documentation updates. Full-suite/build validation remains pending.
+- [x] Add an explicit, cancellable **Reindex active roots** action.
+  Contract: normal indexing keeps unchanged rows; the visible force action reports its active-root scope, preserves compatible durable labels, and has no hidden source mutation.
+  Validation: focused offscreen action/force-request coverage and service-level replacement/label preservation coverage; full-suite/build validation remains pending.
+- [ ] Complete a full-suite run in an environment that permits the suite to exceed the current 30-second command window.
+  Contract: no test process is forcibly truncated before pytest prints its terminal summary.
+  Validation: `bash scripts/test.sh` exits 0 and the complete summary is recorded; on 2026-09-16 it reached 58% with no failures before stalling in the existing offscreen UI segment for more than 90 seconds without another progress line or a terminal summary. Focused service/path-scope/offscreen Faces slices, `bash scripts/build.sh`, `git diff --check`, and the complete generated benchmark suite pass.
+
+## Shared multi-root workspace scope
+
+- [x] Replace the single selected source folder with a persisted, canonical active-root set shared by Gallery, Clustering, Faces, Names, Tags, and Library.
+  Contract: each active root includes descendants; overlapping roots are collapsed; root changes cancel obsolete visible work and no workspace silently widens to the filesystem.
+  Validation: deterministic path-scope/discovery/service coverage verifies persistence-compatible root normalization, overlap de-duplication, source-safe union discovery, and explicit empty-scope behavior; focused offscreen UI coverage verifies the active-root lifecycle.
+- [x] Add a checkbox-based active-root picker and an always-visible workspace scope summary.
+  Contract: clicking a tree row only browses; checking it changes the active scope; every workspace can inspect/edit the same roots even when the folder pane is hidden.
+  Validation: focused offscreen coverage verifies browse-versus-scope behavior, nested-root collapse, root-list state, removal/clear, and scope-strip visibility.
+- [x] Apply root-union discovery and multi-prefix database filtering to every workspace.
+  Contract: Gallery and Clustering consume one deterministic union snapshot; Faces/Names/Tags/Library query only selected roots unless their visible global override is chosen; Library registration remains explicit.
+  Validation: 21 temporary-root path/discovery/Tags/Faces/Library tests and five focused offscreen UI tests pass; the generated 80-photo root-union discovery benchmark records the current baseline and profile.
+
+## Virtual nested Library timeline
+
+- [x] Replace Timeline's 240-photo page with a cancellable full-filtered lightweight catalog read and Gallery-style nested Year → Month sections.
+  Contract: Timeline lists every matching registered photo by catalogued capture month without source reads or UI-thread database work; newest month is initially open; header expansion/collapse is virtualized; Search remains paged and source-changing Gallery actions retain their current safety behavior.
+  Validation: deterministic service/UI coverage includes 1,001 matches despite `limit=240`, chronological Year/Month grouping, cancellation, default/latest expansion, and Search paging preservation; the source-free 1,200-row `--library-timeline-only` baseline recorded 1.087 ms median query/grouping cost (2026-09-14).
+
+## Library workspace usability and compact-layout pass
+
+- [x] Rework Library's first-run guidance, protected control widths, action rows, and tab heights for a readable production layout.
+  Contract: every Library action remains visible with an intelligible label at the supported compact workspace width; the initial empty state explains the next action; Timeline, Search, Cleanup, People Cleanup, and Cluster Context retain their existing source-safe/background-job behavior.
+  Validation: deterministic offscreen UI coverage checks protected sidebar/filter/action geometry and initial guidance at the compact 720 px workspace width; the focused production Library workspace and local-archive suite passed 11/11, and desktop/compact offscreen renders were visually reviewed.
+
+## Library correctness and performance audit
+
+- [x] Make Library request publication, cancellation, source revision, and large-catalog database access robust under repeated user actions.
+  Contract: an obsolete Library request cannot publish over a newer view; cancellation remains a cancellation; photo/XMP revisions invalidate generated context; and catalog/hash reads remain bounded by SQLite parameter limits.
+  Validation: the deterministic local-archive suite passed 9/9 (including source-revision, cancellation, and >999-path hash coverage); focused production Library/vector/startup checks passed, and the full deterministic suite was rerun with an isolated runtime.
+
+## Local archive curation suite
+
+- [x] Add registered library roots, a cancellable incremental local catalog, and virtualized Library timeline/search/smart-album views.
+  Contract: only explicit enabled roots participate in global work; all catalog scans and metadata/index refreshes run in visible background Jobs and never modify source photos.
+  Validation: six deterministic temporary-root catalog/context/feedback tests (including XMP-sidecar refresh and cache-clear preservation), offscreen Library shell coverage, and the isolated generated catalog benchmark.
+- [x] Add a global People Cleanup Inbox and recoverable duplicate/burst review workflow.
+  Contract: face suggestions are constrained to registered roots; confirm/name/reject/split/hide decisions persist safely; duplicate cleanup is always manual and moves only selected files through journaled ClusterLens Trash.
+  Validation: deterministic split and source-revision feedback tests, existing journaled trash/recovery verifier, and Library background-job lifecycle coverage.
+- [x] Add opt-in local-first vision-LLM cluster context and cluster-first textual search.
+  Contract: manual descriptions are always available and automatic descriptions require an explicit setting; a deterministic representative image and scalar EXIF/XMP context are sent only to the chosen provider; remote runs require consent and no source metadata is written.
+  Validation: fake local/remote-provider cache and consent tests, deterministic representative selection, FTS search, and Library Jobs integration coverage.
+
 ## Faces inline unlabelled-similarity arrangement
 
 - [x] Keep similar unlabelled face regions together directly in the folder-review Faces tab without replacing the existing Face Groups workflow.
@@ -340,6 +418,14 @@
 - [x] Make multi-face naming discoverable from Detected Faces.
   Contract: Shift-click selects a contiguous range, Ctrl-click adds/removes individual tiles, and right-clicking any selected tile preserves the selection. Single-face and multi-face menus expose only actions that safely apply to their respective selection sizes; opening either menu does not block the UI event loop.
   Validation: focused offscreen context-menu tests simulate Shift/Ctrl clicks, name two selected faces, and verify the single- and multi-face menu action sets. Full UI smoke: 188 passed; see the completion-check blockers above.
+
+- [x] Add face and similar-face ignore actions to the selected-face context menus.
+  Contract: detected and grouped-result face tiles offer reversible Ignore Face(s), Find Similar, and Ignore Similar Faces actions; multi-selection searches from the aggregate selected-face embedding and ignores only the returned similar indexed faces, never the selected source faces.
+  Validation: isolated offscreen UI tests `test_detected_faces_context_menu_searches_and_ignores_similar_faces_from_multi_selection` and `test_detected_faces_context_menu_ignores_only_similar_faces_from_single_selection` passed (2 passed); they verify the multi-source request and that only matched refs—not source refs—are hidden.
+
+- [x] Make the face-name completion popup commit its choice on click, Enter, and Tab.
+  Contract: an activated saved name replaces the input text with its canonical spelling and closes the popup; Enter and Tab commit the currently highlighted completion without accepting the naming dialog or moving focus away from the input.
+  Validation: isolated offscreen UI test `test_face_name_completion_commits_on_activation_enter_and_tab_without_closing_dialog` passed; it activates a completion and sends Enter/Tab while the popup is visible, asserting the input receives the selected name, the popup closes, and the dialog remains open.
 
 - [x] Remove obsolete detached Faces controls that become standalone Qt windows in Advanced mode.
   Contract: the shared-folder/global-library workflow remains intact and no unparented legacy widget can be shown as a popup.

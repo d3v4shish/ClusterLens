@@ -7,11 +7,13 @@ import shutil
 import sqlite3
 import sys
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
+from threading import local
 from time import monotonic
-from typing import Literal
+from typing import Iterable, Literal
 
 import numpy as np
 import torch
@@ -40,7 +42,14 @@ from infra.cancel import raise_if_cancelled
 from infra.atomic_io import atomic_write_text, atomic_write_with
 from infra.runtime import ExecutionPolicy, RuntimeCapabilityService, preload_onnx_cuda_runtime_libraries
 from infra.settings import get_settings
-from app.path_scope import folder_scope_sql, normalize_scoped_path, path_is_within_scope
+from app.path_scope import (
+    PathScope,
+    folder_scope_sql,
+    normalize_scoped_path,
+    normalized_path_is_within_scope,
+    path_is_within_scope,
+    roots_scope_sql,
+)
 from app.services.cluster_explanations import ClusterExplanation
 from app.services.clustering_options import backend_tooltip, clustering_backend_names
 from app.services.model_assets import ModelAssetService
@@ -74,7 +83,11 @@ DEFAULT_BUNDLED_FACE_PROFILE = DEFAULT_HUMAN_FACE_PROFILE_ID
 MAX_FACE_INDEX_PROGRESS_UPDATES = 32
 FACE_INDEX_PROGRESS_MIN_INTERVAL_S = 0.15
 FACE_SCAN_ROW_PREFETCH_CHUNK = 500
+FACE_REVIEW_PAGE_MAX_IMAGES = 500
+FACE_INDEX_MAX_DECODE_QUEUE = 8
+FACE_INDEX_MAX_WRITE_BATCH_IMAGES = 64
 DEEP_FACE_SEARCH_SCORE_BATCH_ROWS = 4096
+MAX_EXTERNAL_FACE_MODEL_FILES = 64
 
 FACE_MODEL_PROFILE_LABELS: dict[str, str] = {
     "accuracy": "Accuracy",
@@ -754,8 +767,123 @@ _RAW_EXTERNAL_EMBEDDER_FILENAMES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _external_onnx_files(model_root: str | Path | None) -> tuple[Path, ...]:
+    """Return a bounded, deterministic list of user-selected ONNX files.
+
+    A selected model directory often contains a downloader-specific nested
+    layout.  Inspect only a small, deterministic set of files so existing
+    SCRFD/ArcFace downloads are usable without moving or re-downloading them.
+    """
+    root = face_model_root_dir(model_root)
+    if root is None or not root.is_dir():
+        return ()
+    files: list[Path] = []
+    try:
+        for directory, child_directories, child_names in os.walk(root, topdown=True, followlinks=False):
+            child_directories.sort(key=str.casefold)
+            for child_name in sorted(child_names, key=str.casefold):
+                if not child_name.casefold().endswith(".onnx"):
+                    continue
+                candidate = Path(directory) / child_name
+                try:
+                    if candidate.stat().st_size <= 0:
+                        continue
+                except OSError:
+                    continue
+                files.append(candidate)
+                if len(files) >= MAX_EXTERNAL_FACE_MODEL_FILES:
+                    return tuple(files)
+    except OSError:
+        return tuple(files)
+    return tuple(files)
+
+
+def _external_onnx_stem(path: Path) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", path.stem.casefold()).strip("_")
+
+
+def _external_scrfd_detector_id(path: Path) -> str | None:
+    stem = _external_onnx_stem(path)
+    if not ("scrfd" in stem or stem.startswith("det_")):
+        return None
+    if "34g" in stem:
+        return "scrfd_34gf_kps"
+    if "10g" in stem:
+        return "scrfd_10g_kps"
+    if "2_5g" in stem or "25g" in stem:
+        return "scrfd_2.5g_kps"
+    if "500m" in stem:
+        return "scrfd_500m_kps"
+    return None
+
+
+def _external_arcface_embedder_id(path: Path) -> str | None:
+    stem = _external_onnx_stem(path)
+    if any(marker in stem for marker in ("glintr100", "glint360k", "arcface_r100", "w600k_r100")):
+        return "arcface_r100_glint360k"
+    if any(marker in stem for marker in ("w600k_r50", "arcface_r50")):
+        return "arcface_r50"
+    if "arcface" in stem:
+        return "arcface_r100_glint360k"
+    return None
+
+
+def _external_scrfd_detector_bundle(path: Path, detector_id: str) -> FaceDetectorBundle:
+    details = {
+        "scrfd_500m_kps": ("External SCRFD 500M", "edge", "CPU or CUDA", "mobilefacenet_arcface"),
+        "scrfd_2.5g_kps": ("External SCRFD 2.5G", "balanced", "CPU or CUDA", "arcface_r50"),
+        "scrfd_10g_kps": ("External SCRFD 10G", "latest_gpu", "Desktop GPU", "arcface_r100_glint360k"),
+        "scrfd_34gf_kps": ("External SCRFD 34GF", "max_accuracy", "Desktop GPU", "adaface_r100"),
+    }
+    display_name, profile, hardware_class, recommended_pair_id = details[detector_id]
+    return FaceDetectorBundle(
+        mode="human",
+        detector_id=detector_id,
+        display_name=display_name,
+        backend_family="scrfd",
+        source_kind="external",
+        bundle_dir=path.parent,
+        detector_path=path,
+        detector_input_size=(640, 640),
+        detector_score_threshold=0.35,
+        detector_boxes_normalized=False,
+        detector_max_detections=DEFAULT_FACE_MAX_DETECTIONS,
+        profile=profile,
+        summary="User-provided raw SCRFD ONNX detector.",
+        hardware_class=hardware_class,
+        recommended_pair_id=recommended_pair_id,
+        license="User-provided external model; verify its license before distribution.",
+        availability_message=f"Ready at {path}.",
+    )
+
+
+def _external_arcface_embedder_bundle(path: Path, embedder_id: str) -> FaceEmbedderBundle:
+    details = {
+        "arcface_r50": ("External ArcFace R50", "balanced", "CPU or CUDA", "scrfd_2.5g_kps"),
+        "arcface_r100_glint360k": ("External ArcFace R100 Glint360K", "latest_gpu", "Desktop GPU", "scrfd_10g_kps"),
+    }
+    display_name, profile, hardware_class, recommended_pair_id = details[embedder_id]
+    return FaceEmbedderBundle(
+        mode="human",
+        embedder_id=embedder_id,
+        display_name=display_name,
+        source_kind="external",
+        bundle_dir=path.parent,
+        embedder_path=path,
+        embedder_input_size=(112, 112),
+        embedder_mean=(127.5, 127.5, 127.5),
+        embedder_std=(128.0, 128.0, 128.0),
+        profile=profile,
+        summary="User-provided raw ArcFace ONNX embedder.",
+        hardware_class=hardware_class,
+        recommended_pair_id=recommended_pair_id,
+        license="User-provided external model; verify its license before distribution.",
+        availability_message=f"Ready at {path}.",
+    )
+
+
 def _raw_external_model_paths(model_root: str | Path | None, filenames: tuple[str, ...]) -> tuple[Path, ...]:
-    """Return direct, user-selected ONNX files without scanning arbitrary folders."""
+    """Return common direct external ONNX filenames before recursive discovery."""
     root = face_model_root_dir(model_root)
     if root is None or not root.is_dir():
         return ()
@@ -859,6 +987,10 @@ def list_face_detector_bundles(model_root: str | Path | None, mode: str | None) 
                     )
                 )
                 break
+        for model_path in _external_onnx_files(model_root):
+            detector_id = _external_scrfd_detector_id(model_path)
+            if detector_id:
+                bundles.append(_external_scrfd_detector_bundle(model_path, detector_id))
     deduped: dict[str, FaceDetectorBundle] = {}
     for bundle in bundles:
         deduped[bundle.detector_id] = _prefer_available_detector(deduped.get(bundle.detector_id), bundle)
@@ -934,6 +1066,10 @@ def list_face_embedder_bundles(model_root: str | Path | None, mode: str | None) 
                     )
                 )
                 break
+        for model_path in _external_onnx_files(model_root):
+            embedder_id = _external_arcface_embedder_id(model_path)
+            if embedder_id:
+                bundles.append(_external_arcface_embedder_bundle(model_path, embedder_id))
     deduped: dict[str, FaceEmbedderBundle] = {}
     for bundle in bundles:
         deduped[bundle.embedder_id] = _prefer_available_embedder(deduped.get(bundle.embedder_id), bundle)
@@ -1347,12 +1483,108 @@ class DetectedFace:
 
 
 @dataclass(frozen=True)
+class FaceIndexPerformanceConfig:
+    """Bounded producer/consumer limits for one background face-index job.
+
+    CUDA face detectors supplied by the supported SCRFD packs expose a static
+    image batch of one.  One compute lane therefore avoids competing ONNX
+    CUDA sessions while image decode, crop-quality work, and SQLite work can
+    overlap it safely.
+    """
+
+    decode_workers: int = 1
+    quality_workers: int = 1
+    embedding_batch_size: int = 1
+    write_batch_images: int = 1
+    max_decoded_images: int = 1
+
+    @classmethod
+    def from_performance_profile(
+        cls,
+        profile: object | None,
+        execution_policy: ExecutionPolicy,
+    ) -> "FaceIndexPerformanceConfig":
+        if profile is None:
+            return cls()
+        logical_cpus = max(1, int(getattr(profile, "logical_cpu_count", os.cpu_count() or 1) or 1))
+        configured_decode = max(1, int(getattr(profile, "thumbnail_workers", 1) or 1))
+        configured_quality = max(1, int(getattr(profile, "embedding_preprocess_workers", 1) or 1))
+        cpu_budget = max(2, logical_cpus - 4)
+        decode_workers = max(1, min(configured_decode, FACE_INDEX_MAX_DECODE_QUEUE, cpu_budget))
+        quality_workers = max(1, min(configured_quality, max(1, cpu_budget - decode_workers)))
+        requested_batch = (
+            int(getattr(profile, "gpu_batch_size", 1) or 1)
+            if execution_policy.uses_onnx_cuda or execution_policy.uses_cuda
+            else int(getattr(profile, "cpu_batch_size", 1) or 1)
+        )
+        embedding_batch_size = max(1, min(256, requested_batch))
+        return cls(
+            decode_workers=decode_workers,
+            quality_workers=quality_workers,
+            embedding_batch_size=embedding_batch_size,
+            write_batch_images=max(1, min(FACE_INDEX_MAX_WRITE_BATCH_IMAGES, embedding_batch_size)),
+            max_decoded_images=max(1, min(FACE_INDEX_MAX_DECODE_QUEUE, decode_workers)),
+        )
+
+
+@dataclass(frozen=True)
+class FaceIndexRuntimeInfo:
+    detector_provider: str
+    embedder_provider: str
+    decode_workers: int
+    quality_workers: int
+    embedding_batch_size: int
+    write_batch_images: int
+
+
+@dataclass
+class _FaceIndexImageWork:
+    image_path: str
+    mtime_ns: int
+    file_size: int
+    image_width: int
+    image_height: int
+    remaining_faces: int
+    records: list[FaceIndexRecord]
+
+
+@dataclass(frozen=True)
+class _FaceEmbeddingWorkItem:
+    image_work: _FaceIndexImageWork
+    face_index: int
+    face: DetectedFace
+
+
+@dataclass(frozen=True)
+class _DecodedFaceIndexImage:
+    image_path: str
+    mtime_ns: int
+    file_size: int
+    image: Image.Image | None
+
+
+class _FaceIndexWriteConnectionLease:
+    """Keep per-image persistence helpers inside one explicit writer batch."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._connection
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+        # The enclosing face-index batch owns commit/rollback and close.
+        return False
+
+
+@dataclass(frozen=True)
 class FaceSearchRequest:
     query_face_image: str
     query_face_bbox: tuple[int, int, int, int] | None = None
     top_k: int = 30
     min_face_score: float = 0.35
     cluster_people: bool = False
+    scope_roots: list[str] | tuple[str, ...] | None = None
     candidate_paths: list[str] | None = None
     include_tiny_faces: bool = True
 
@@ -1593,6 +1825,21 @@ class FaceFolderReviewImage:
     hidden_face_count: int
     image_width: int = 0
     image_height: int = 0
+    # A per-face user hide is a reversible ignore decision, distinct from a
+    # hidden person profile.  Keep it outside visible_faces so normal review,
+    # search, and clustering do not accidentally revive it.
+    ignored_faces: tuple[IndexedFaceRecord, ...] = ()
+    ignored_face_count: int = 0
+
+
+@dataclass(frozen=True)
+class FaceFolderReviewPage:
+    """One bounded, source-ordered page of a folder face review."""
+
+    items: tuple[FaceFolderReviewImage, ...]
+    total_count: int
+    offset: int
+    next_offset: int | None
 
 
 @dataclass(frozen=True)
@@ -2049,11 +2296,20 @@ class FaceDetectionService:
             self.max_detections = max(1, int(max_detections or DEFAULT_FACE_MAX_DETECTIONS))
 
     def detect_faces(self, image_path: str) -> list[DetectedFace]:
-        detector = self._get_detector()
         try:
             rgb_image = _open_display_rgb_image(image_path)
         except Exception:
             return []
+        try:
+            return self.detect_faces_in_image(image_path, rgb_image)
+        finally:
+            try:
+                rgb_image.close()
+            except Exception:
+                pass
+
+    def detect_faces_in_image(self, image_path: str, rgb_image: Image.Image) -> list[DetectedFace]:
+        detector = self._get_detector()
 
         landmarks = None
         try:
@@ -2236,12 +2492,21 @@ class AnimalFaceDetectionService:
             self.max_detections = max(1, int(max_detections or DEFAULT_FACE_MAX_DETECTIONS))
 
     def detect_faces(self, image_path: str) -> list[DetectedFace]:
-        bundle = self._get_bundle()
-        session = self._get_session()
         try:
             rgb_image = _open_display_rgb_image(image_path)
         except Exception:
             return []
+        try:
+            return self.detect_faces_in_image(image_path, rgb_image)
+        finally:
+            try:
+                rgb_image.close()
+            except Exception:
+                pass
+
+    def detect_faces_in_image(self, image_path: str, rgb_image: Image.Image) -> list[DetectedFace]:
+        bundle = self._get_bundle()
+        session = self._get_session()
         if bundle.backend_family == "scrfd":
             faces = self._detect_scrfd(session, rgb_image, image_path)
             faces.sort(key=lambda face: (-float(face.confidence), -((face.bbox[2] - face.bbox[0]) * (face.bbox[3] - face.bbox[1]))))
@@ -2739,12 +3004,21 @@ class YuNetFaceDetectionService:
         self._detector_key = None
 
     def detect_faces(self, image_path: str) -> list[DetectedFace]:
-        bundle = self._get_bundle()
-        detector = self._get_detector()
         try:
             rgb_image = _open_display_rgb_image(image_path)
         except Exception:
             return []
+        try:
+            return self.detect_faces_in_image(image_path, rgb_image)
+        finally:
+            try:
+                rgb_image.close()
+            except Exception:
+                pass
+
+    def detect_faces_in_image(self, image_path: str, rgb_image: Image.Image) -> list[DetectedFace]:
+        bundle = self._get_bundle()
+        detector = self._get_detector()
         if hasattr(detector, "setInputSize"):
             try:
                 detector.setInputSize((int(rgb_image.width), int(rgb_image.height)))
@@ -2880,12 +3154,18 @@ class FaceIndexService:
         animal_model_root: str | Path | None = None,
         db_path: str | Path | None = None,
         reset_db: bool = False,
+        performance_profile: object | None = None,
+        index_performance: FaceIndexPerformanceConfig | None = None,
     ) -> None:
         self.settings = get_settings()
         self.mode: FaceMode = normalize_face_mode(mode)
         self.mode_label = face_mode_label(self.mode)
         self.runtime_service = runtime_service or RuntimeCapabilityService()
         self.execution_policy = execution_policy or self.runtime_service.select_policy(self.settings.preferred_execution_mode)
+        self.index_performance = index_performance or FaceIndexPerformanceConfig.from_performance_profile(
+            performance_profile,
+            self.execution_policy,
+        )
         self.model_root = str(model_root or animal_model_root or "").strip()
         self.animal_model_root = self.model_root
         self.detector_id = normalize_face_component_id(detector_id, default_face_detector_id(self.model_root, self.mode))
@@ -3033,6 +3313,7 @@ class FaceIndexService:
         self._ann_index = None
         self._ann_records: list[tuple[str, int]] = []
         self._ann_fingerprint: tuple[int, int] | None = None
+        self._face_index_write_context = local()
         self._init_db()
 
     def _resolved_detector_display_name(self) -> str:
@@ -3631,6 +3912,9 @@ class FaceIndexService:
         return events
 
     def _connect(self) -> sqlite3.Connection:
+        active_write_connection = getattr(self._face_index_write_context, "connection", None)
+        if active_write_connection is not None:
+            return _FaceIndexWriteConnectionLease(active_write_connection)  # type: ignore[return-value]
         connection = sqlite3.connect(str(self.db_path))
         connection.execute("PRAGMA journal_mode=WAL;")
         return connection
@@ -3740,6 +4024,62 @@ class FaceIndexService:
         if candidate_paths:
             return cls._normalize_path_for_match(image_path) in candidate_paths
         return True
+
+    @staticmethod
+    def _normalized_path_is_in_scope(
+        normalized_path: str,
+        *,
+        root_scope: PathScope | None,
+        normalized_folder_prefix: str,
+    ) -> bool:
+        """Compare already canonical path keys without repeating filesystem resolution."""
+
+        if root_scope is not None:
+            return any(
+                normalized_path_is_within_scope(normalized_path, root)
+                for root in root_scope.roots
+            )
+        if normalized_folder_prefix:
+            return normalized_path_is_within_scope(normalized_path, normalized_folder_prefix)
+        return True
+
+    def _candidate_path_snapshot(
+        self,
+        candidate_paths: list[str] | None,
+        *,
+        root_scope: PathScope | None,
+        normalized_folder_prefix: str,
+        precomputed_normalized_paths: dict[str, str] | None = None,
+    ) -> tuple[list[str], dict[str, str], list[str]]:
+        """Normalize a candidate snapshot once and retain its source order.
+
+        A progressive Faces page uses the same bounded candidates for its SQL,
+        scan-state, and result filters.  Keeping their canonical keys here
+        prevents those paths from being resolved separately in each stage.
+        """
+
+        sql_paths: list[str] = []
+        normalized_by_path: dict[str, str] = {}
+        scoped_paths: list[str] = []
+        seen_sql_paths: set[str] = set()
+        for value in list(candidate_paths or []):
+            path = str(value or "").strip()
+            if not path:
+                continue
+            normalized = (precomputed_normalized_paths or {}).get(path)
+            if normalized is None:
+                normalized = self._normalize_path_for_match(path)
+            if path not in seen_sql_paths:
+                sql_paths.append(path)
+                seen_sql_paths.add(path)
+            normalized_by_path.setdefault(path, normalized)
+            if normalized and self._normalized_path_is_in_scope(
+                normalized,
+                root_scope=root_scope,
+                normalized_folder_prefix=normalized_folder_prefix,
+            ):
+                scoped_paths.append(path)
+        return sql_paths, normalized_by_path, scoped_paths
 
     @staticmethod
     def _face_is_visible(face_bbox: tuple[int, int, int, int], *, include_tiny_faces: bool) -> bool:
@@ -4244,8 +4584,9 @@ class FaceIndexService:
                     max(0, int(image_height)),
                 ),
             )
-        self._invalidate_identity_caches()
-        self._invalidate_ann_index()
+        if not bool(getattr(self._face_index_write_context, "batch_active", False)):
+            self._invalidate_identity_caches()
+            self._invalidate_ann_index()
 
     def _assess_face_records(
         self,
@@ -4443,6 +4784,7 @@ class FaceIndexService:
         min_face_score: float,
         top_k: int,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         exclude: set[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
@@ -4454,6 +4796,7 @@ class FaceIndexService:
         eligible_records: list[IndexedFaceRecord] = []
         for record in self.load_all_records(
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
         ):
@@ -4528,6 +4871,171 @@ class FaceIndexService:
             sorted_hits = reranked + sorted_hits[rerank_top_n:]
         return [result for result, _record in sorted_hits[: max(1, top_k)]]
 
+    @staticmethod
+    def _component_execution_provider(component: object, execution_policy: ExecutionPolicy) -> str:
+        session = getattr(component, "_session", None)
+        if session is not None:
+            try:
+                providers = list(session.get_providers() or [])
+                if providers:
+                    return str(providers[0])
+            except Exception:
+                pass
+        device = getattr(component, "device", None)
+        if device is not None:
+            return f"torch:{device}"
+        if execution_policy.uses_onnx_cuda:
+            return "CUDAExecutionProvider (initializing)"
+        if execution_policy.uses_cuda:
+            return "torch:cuda"
+        return "CPU"
+
+    def face_index_runtime_info(self) -> FaceIndexRuntimeInfo:
+        """Return the provider actually retained by each initialized component."""
+
+        return FaceIndexRuntimeInfo(
+            detector_provider=self._component_execution_provider(self.detection_service, self.execution_policy),
+            embedder_provider=self._component_execution_provider(self.embedding_service, self.execution_policy),
+            decode_workers=int(self.index_performance.decode_workers),
+            quality_workers=int(self.index_performance.quality_workers),
+            embedding_batch_size=int(self.index_performance.embedding_batch_size),
+            write_batch_images=int(self.index_performance.write_batch_images),
+        )
+
+    def configure_index_performance(self, performance_profile: object | None) -> None:
+        """Apply GUI worker and batch limits to subsequent index jobs.
+
+        Existing records and model sessions stay intact.  This deliberately
+        makes a Settings performance change effective without a model reload
+        or a re-index.
+        """
+
+        self.index_performance = FaceIndexPerformanceConfig.from_performance_profile(
+            performance_profile,
+            self.execution_policy,
+        )
+
+    @staticmethod
+    def _decode_face_index_image(
+        image_path: str,
+        mtime_ns: int,
+        file_size: int,
+    ) -> _DecodedFaceIndexImage:
+        try:
+            image = _open_display_rgb_image(image_path)
+        except Exception:
+            image = None
+        return _DecodedFaceIndexImage(
+            image_path=str(image_path),
+            mtime_ns=int(mtime_ns),
+            file_size=int(file_size),
+            image=image,
+        )
+
+    @staticmethod
+    def _close_face_image(image: Image.Image | None) -> None:
+        if image is None:
+            return
+        try:
+            image.close()
+        except Exception:
+            pass
+
+    def _detect_faces_with_policy_in_image(self, image_path: str, rgb_image: Image.Image) -> list[DetectedFace]:
+        def _detect(service: object) -> list[DetectedFace]:
+            detect_in_image = getattr(service, "detect_faces_in_image", None)
+            if callable(detect_in_image):
+                return list(detect_in_image(str(image_path), rgb_image) or [])
+            # Test doubles and third-party detectors retain the path-only API.
+            return list(service.detect_faces(str(image_path)) or [])
+
+        primary_faces = self._dedupe_detected_faces(_detect(self.detection_service))
+        fallback_service = getattr(self, "fallback_detection_service", None)
+        fallback_id = normalize_face_component_id(getattr(fallback_service, "detector_id", self.fallback_detector_id), self.detector_id)
+        if (
+            self.detector_policy == "single"
+            or fallback_service is None
+            or fallback_service is self.detection_service
+            or fallback_id == self.detector_id
+        ):
+            return primary_faces
+        fallback_faces: list[DetectedFace] = []
+        should_run_fallback = False
+        if self.detector_policy == "rescue_on_no_faces":
+            should_run_fallback = not self._usable_detected_faces(str(image_path), primary_faces)
+        elif self.detector_policy == "rescue_on_low_confidence":
+            best_confidence = max((float(face.confidence or 0.0) for face in primary_faces), default=0.0)
+            should_run_fallback = best_confidence < self._quality_threshold("review_confidence", 0.55)
+        elif self.detector_policy in {"consensus", "union_then_verify"}:
+            should_run_fallback = True
+        if should_run_fallback:
+            fallback_faces = self._dedupe_detected_faces(_detect(fallback_service))
+        if self.detector_policy == "rescue_on_no_faces":
+            return primary_faces if primary_faces else fallback_faces
+        if self.detector_policy == "rescue_on_low_confidence":
+            if not fallback_faces:
+                return primary_faces
+            primary_best = max((float(face.confidence or 0.0) for face in primary_faces), default=0.0)
+            fallback_best = max((float(face.confidence or 0.0) for face in fallback_faces), default=0.0)
+            return fallback_faces if fallback_best > primary_best else primary_faces
+        if self.detector_policy == "consensus":
+            return self._consensus_faces(str(image_path), primary_faces, fallback_faces)
+        if self.detector_policy == "union_then_verify":
+            union_faces = self._dedupe_detected_faces(list(primary_faces) + list(fallback_faces))
+            return [face for face in union_faces if self._verify_detected_face(str(image_path), face)]
+        return primary_faces
+
+    def _index_face_quality(self, item: _FaceEmbeddingWorkItem) -> tuple[str, float, tuple[str, ...]]:
+        work = item.image_work
+        return self._assess_face_quality(
+            image_path=work.image_path,
+            bbox=tuple(item.face.bbox),
+            confidence=float(item.face.confidence or 0.0),
+            crop=item.face.crop,
+            landmarks=tuple(getattr(item.face, "landmarks", ()) or ()),
+            image_width=int(work.image_width),
+            image_height=int(work.image_height),
+        )
+
+    def _persist_face_index_batch(
+        self,
+        works: list[_FaceIndexImageWork],
+        *,
+        cancel_check=None,
+    ) -> int:
+        if not works:
+            return 0
+        connection = sqlite3.connect(str(self.db_path))
+        connection.execute("PRAGMA journal_mode=WAL;")
+        self._face_index_write_context.connection = connection
+        self._face_index_write_context.batch_active = True
+        try:
+            for work in works:
+                raise_if_cancelled(cancel_check)
+                self._replace_image_records(
+                    work.image_path,
+                    list(work.records),
+                    mtime_ns=int(work.mtime_ns),
+                    file_size=int(work.file_size),
+                    image_width=int(work.image_width),
+                    image_height=int(work.image_height),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            self._face_index_write_context.batch_active = False
+            self._face_index_write_context.connection = None
+            connection.close()
+        self._invalidate_identity_caches()
+        self._invalidate_ann_index()
+        named_paths = [work.image_path for work in works if work.records]
+        for paths in self._chunked_values(named_paths, size=FACE_INDEX_MAX_WRITE_BATCH_IMAGES):
+            raise_if_cancelled(cancel_check)
+            self.import_face_region_names([str(path) for path in paths])
+        return sum(len(work.records) for work in works)
+
     def index_directory(
         self,
         directory: str,
@@ -4562,17 +5070,41 @@ class FaceIndexService:
         progress_callback=None,
         cancel_check=None,
         force: bool = False,
-    ) -> dict[str, int]:
-        from infra.cancel import raise_if_cancelled
+    ) -> dict[str, object]:
+        """Index paths through bounded decode, GPU, quality, and writer stages.
 
+        The detector lane stays serial because the supported SCRFD model has a
+        static image batch of one.  The dynamic ArcFace embedder receives
+        crops from multiple detected photos together, while decode and crop
+        quality use bounded CPU workers around that lane.
+        """
+
+        started_at = monotonic()
         total_faces = 0
         done = 0
         skipped_unchanged = 0
         skipped_disabled = 0
+        skipped_unavailable = 0
         total = len(image_paths)
+        decoded_count = 0
+        detected_count = 0
+        embedded_count = 0
+        written_count = 0
+        max_decoded_queue_depth = 0
+        stage_seconds = {"cache": 0.0, "decode": 0.0, "detect": 0.0, "quality": 0.0, "embed": 0.0, "write": 0.0}
         progress_step = max(1, (max(1, total) + MAX_FACE_INDEX_PROGRESS_UPDATES - 1) // MAX_FACE_INDEX_PROGRESS_UPDATES)
         last_progress_done = -1
         last_progress_s = monotonic()
+
+        def _runtime_label() -> str:
+            info = self.face_index_runtime_info()
+            provider = info.detector_provider
+            if provider == "CUDAExecutionProvider":
+                provider = "CUDA ONNX"
+            return (
+                f"{provider} · decode {info.decode_workers} · quality {info.quality_workers} "
+                f"· embed batch {info.embedding_batch_size} · write {info.write_batch_images}"
+            )
 
         def _emit_progress(status: str, *, force: bool = False) -> None:
             nonlocal last_progress_done, last_progress_s
@@ -4586,10 +5118,37 @@ class FaceIndexService:
                     return
             progress_callback(
                 100 if total <= 0 else int(done * 100 / max(1, total)),
-                str(status),
+                f"{status} [{_runtime_label()}]",
             )
             last_progress_done = done
             last_progress_s = now
+
+        def _result() -> dict[str, object]:
+            info = self.face_index_runtime_info()
+            elapsed = max(0.0, monotonic() - started_at)
+            return {
+                "images_done": int(done),
+                "images_total": int(total),
+                "faces_indexed": int(total_faces),
+                "skipped_unchanged": int(skipped_unchanged),
+                "skipped_recognition_disabled": int(skipped_disabled),
+                "skipped_unavailable": int(skipped_unavailable),
+                "decoded_images": int(decoded_count),
+                "detected_images": int(detected_count),
+                "embedded_faces": int(embedded_count),
+                "written_images": int(written_count),
+                "decode_queue_peak": int(max_decoded_queue_depth),
+                "detector_provider": info.detector_provider,
+                "embedder_provider": info.embedder_provider,
+                "decode_workers": int(info.decode_workers),
+                "quality_workers": int(info.quality_workers),
+                "embedding_batch_size": int(info.embedding_batch_size),
+                "write_batch_images": int(info.write_batch_images),
+                "stage_seconds": {name: round(value, 6) for name, value in stage_seconds.items()},
+                "elapsed_seconds": round(elapsed, 6),
+                "images_per_second": round(float(done) / elapsed, 3) if elapsed else 0.0,
+                "faces_per_second": round(float(total_faces) / elapsed, 3) if elapsed else 0.0,
+            }
 
         if not self.face_recognition_enabled():
             for _image_path in image_paths:
@@ -4598,19 +5157,19 @@ class FaceIndexService:
                 skipped_disabled += 1
                 _emit_progress(f"{done}/{total} images, face recognition disabled")
             _emit_progress(f"{done}/{total} images skipped because face recognition is disabled", force=True)
-            return {
-                "images_done": int(done),
-                "images_total": int(total),
-                "faces_indexed": 0,
-                "skipped_unchanged": 0,
-                "skipped_recognition_disabled": int(skipped_disabled),
-            }
+            return _result()
+
+        cache_started = monotonic()
         existing_scan_rows = self._load_existing_face_scan_rows(image_paths)
+        candidates: list[tuple[str, int, int]] = []
         for image_path in image_paths:
             raise_if_cancelled(cancel_check)
             try:
                 stat = Path(image_path).stat()
             except FileNotFoundError:
+                skipped_unavailable += 1
+                done += 1
+                _emit_progress(f"{done}/{total} images, skipped {skipped_unavailable} unavailable")
                 continue
             scan_row = existing_scan_rows.get(str(image_path))
             if (
@@ -4621,66 +5180,181 @@ class FaceIndexService:
             ):
                 skipped_unchanged += 1
                 done += 1
-                _emit_progress(f"{done}/{total} images, skipped {skipped_unchanged} unchanged, extracted {total_faces} faces")
+                _emit_progress(f"{done}/{total} images, skipped {skipped_unchanged} unchanged")
                 continue
-            image_width, image_height = self._image_dimensions(image_path)
-            faces = self._detect_faces_with_policy(image_path)
-            if not faces:
-                self._replace_image_records(
-                    image_path,
-                    [],
-                    mtime_ns=stat.st_mtime_ns,
-                    file_size=stat.st_size,
-                    image_width=image_width,
-                    image_height=image_height,
-                )
-                done += 1
-                _emit_progress(f"{done}/{total} images, extracted {total_faces} faces")
-                continue
-            embeddings = self.embedding_service.embed_faces([face.crop for face in faces])
-            records = []
-            for face_index, face in enumerate(faces):
-                status, score, reasons = self._assess_face_quality(
-                    image_path=image_path,
-                    bbox=tuple(face.bbox),
-                    confidence=float(face.confidence or 0.0),
-                    crop=face.crop,
-                    landmarks=tuple(getattr(face, "landmarks", ()) or ()),
-                    image_width=image_width,
-                    image_height=image_height,
-                )
-                records.append(
-                    FaceIndexRecord(
-                        image_path=image_path,
-                        face_index=face_index,
-                        face_bbox=face.bbox,
-                        face_confidence=face.confidence,
-                        embedding=embeddings[face_index],
-                        quality_status=status,
-                        quality_score=score,
-                        quality_reasons=reasons,
+            candidates.append((str(image_path), int(stat.st_mtime_ns), int(stat.st_size)))
+        stage_seconds["cache"] += monotonic() - cache_started
+        _emit_progress(f"Prepared {len(candidates)} changed image(s); {skipped_unchanged} unchanged")
+
+        completed_works: list[_FaceIndexImageWork] = []
+        pending_embeddings: list[_FaceEmbeddingWorkItem] = []
+
+        def _persist_completed(*, force_flush: bool = False) -> None:
+            nonlocal done, total_faces, written_count
+            batch_size = max(1, int(self.index_performance.write_batch_images))
+            while completed_works and (force_flush or len(completed_works) >= batch_size):
+                take = min(batch_size, len(completed_works))
+                batch = completed_works[:take]
+                del completed_works[:take]
+                write_started = monotonic()
+                indexed = self._persist_face_index_batch(batch, cancel_check=cancel_check)
+                stage_seconds["write"] += monotonic() - write_started
+                total_faces += int(indexed)
+                written_count += len(batch)
+                done += len(batch)
+                _emit_progress(f"{done}/{total} images, indexed {total_faces} face(s), writing durable batches")
+
+        def _complete_work(work: _FaceIndexImageWork) -> None:
+            if work.remaining_faces != 0:
+                return
+            completed_works.append(work)
+            _persist_completed()
+
+        def _flush_embeddings(*, force_flush: bool = False) -> None:
+            nonlocal embedded_count
+            batch_size = max(1, int(self.index_performance.embedding_batch_size))
+            while pending_embeddings and (force_flush or len(pending_embeddings) >= batch_size):
+                take = min(batch_size, len(pending_embeddings))
+                batch = pending_embeddings[:take]
+                del pending_embeddings[:take]
+                quality_started = monotonic()
+                quality_futures: list[Future[tuple[str, float, tuple[str, ...]]]] = []
+                try:
+                    quality_futures = [quality_executor.submit(self._index_face_quality, item) for item in batch]
+                    qualities: list[tuple[str, float, tuple[str, ...]]] = []
+                    for future in quality_futures:
+                        raise_if_cancelled(cancel_check)
+                        qualities.append(future.result())
+                    stage_seconds["quality"] += monotonic() - quality_started
+                    embed_started = monotonic()
+                    embeddings = self.embedding_service.embed_faces([item.face.crop for item in batch])
+                finally:
+                    for future in quality_futures:
+                        if not future.done():
+                            future.cancel()
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                    for item in batch:
+                        self._close_face_image(item.face.crop)
+                stage_seconds["embed"] += monotonic() - embed_started
+                if len(embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"Face embedder returned {len(embeddings)} vectors for {len(batch)} detected face crops."
                     )
-                )
-            self.save_face_records(
-                records,
-                stat.st_mtime_ns,
-                stat.st_size,
-                image_width=image_width,
-                image_height=image_height,
-                assess_quality=False,
-            )
-            self.import_face_region_names([image_path])
-            total_faces += len(records)
-            done += 1
-            _emit_progress(f"{done}/{total} images, extracted {total_faces} faces")
-        _emit_progress(f"{done}/{total} images, extracted {total_faces} faces", force=True)
-        return {
-            "images_done": int(done),
-            "images_total": int(total),
-            "faces_indexed": int(total_faces),
-            "skipped_unchanged": int(skipped_unchanged),
-            "skipped_recognition_disabled": int(skipped_disabled),
-        }
+                for item, embedding, (status, score, reasons) in zip(batch, embeddings, qualities):
+                    work = item.image_work
+                    work.records.append(
+                        FaceIndexRecord(
+                            image_path=work.image_path,
+                            face_index=int(item.face_index),
+                            face_bbox=tuple(item.face.bbox),
+                            face_confidence=float(item.face.confidence),
+                            embedding=np.asarray(embedding, dtype=np.float32),
+                            quality_status=str(status),
+                            quality_score=float(score),
+                            quality_reasons=tuple(reasons),
+                        )
+                    )
+                    work.remaining_faces -= 1
+                    if work.remaining_faces == 0:
+                        _complete_work(work)
+                embedded_count += len(batch)
+
+        candidate_iter = iter(candidates)
+        pending_decodes: dict[Future[_DecodedFaceIndexImage], tuple[str, int, int, float]] = {}
+
+        def _schedule_decodes(decode_executor: ThreadPoolExecutor) -> None:
+            nonlocal max_decoded_queue_depth
+            max_queue = max(1, int(self.index_performance.max_decoded_images))
+            while len(pending_decodes) < max_queue:
+                try:
+                    image_path, mtime_ns, file_size = next(candidate_iter)
+                except StopIteration:
+                    break
+                decode_started = monotonic()
+                future = decode_executor.submit(self._decode_face_index_image, image_path, mtime_ns, file_size)
+                pending_decodes[future] = (image_path, mtime_ns, file_size, decode_started)
+                max_decoded_queue_depth = max(max_decoded_queue_depth, len(pending_decodes))
+
+        decode_executor = ThreadPoolExecutor(max_workers=max(1, int(self.index_performance.decode_workers)))
+        quality_executor = ThreadPoolExecutor(max_workers=max(1, int(self.index_performance.quality_workers)))
+        try:
+            _schedule_decodes(decode_executor)
+            while pending_decodes:
+                raise_if_cancelled(cancel_check)
+                finished, _pending = wait(tuple(pending_decodes), return_when=FIRST_COMPLETED)
+                for future in finished:
+                    image_path, mtime_ns, file_size, decode_started = pending_decodes.pop(future)
+                    decoded = future.result()
+                    stage_seconds["decode"] += monotonic() - decode_started
+                    decoded_count += 1
+                    image = decoded.image
+                    image_width = int(image.width) if image is not None else 0
+                    image_height = int(image.height) if image is not None else 0
+                    work = _FaceIndexImageWork(
+                        image_path=image_path,
+                        mtime_ns=mtime_ns,
+                        file_size=file_size,
+                        image_width=image_width,
+                        image_height=image_height,
+                        remaining_faces=0,
+                        records=[],
+                    )
+                    faces: list[DetectedFace] = []
+                    if image is not None:
+                        detect_started = monotonic()
+                        try:
+                            faces = self._detect_faces_with_policy_in_image(image_path, image)
+                        finally:
+                            self._close_face_image(image)
+                        stage_seconds["detect"] += monotonic() - detect_started
+                        detected_count += 1
+                    if not faces:
+                        _complete_work(work)
+                    else:
+                        work.remaining_faces = len(faces)
+                        for face_index, face in enumerate(faces):
+                            pending_embeddings.append(_FaceEmbeddingWorkItem(work, face_index, face))
+                        _flush_embeddings()
+                    _schedule_decodes(decode_executor)
+            _flush_embeddings(force_flush=True)
+            _persist_completed(force_flush=True)
+        finally:
+            # Cancellation can arrive while decode or quality workers retain
+            # PIL images.  Release those bounded buffers before their worker
+            # pools are joined, then wait for threads without leaking a full
+            # resolution photo or face crop into a cancelled job.
+            for future in tuple(pending_decodes):
+                future.cancel()
+                if future.cancelled() or not future.done():
+                    continue
+                try:
+                    self._close_face_image(future.result().image)
+                except Exception:
+                    pass
+            for item in pending_embeddings:
+                self._close_face_image(item.face.crop)
+            quality_executor.shutdown(wait=True, cancel_futures=True)
+            decode_executor.shutdown(wait=True, cancel_futures=True)
+            for future in tuple(pending_decodes):
+                if future.cancelled() or not future.done():
+                    continue
+                try:
+                    self._close_face_image(future.result().image)
+                except Exception:
+                    pass
+
+        _emit_progress(f"{done}/{total} images, indexed {total_faces} face(s)", force=True)
+        metrics = _result()
+        LOGGER.info(
+            "FaceIndexService index_paths_complete mode=%s db=%s metrics=%s",
+            self.mode,
+            self.db_path,
+            metrics,
+        )
+        return metrics
 
     def save_face_records(
         self,
@@ -4730,11 +5404,13 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
     ) -> list[IndexedFaceRecord]:
         folder_prefix = str(folder_prefix or "").strip()
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
         allowed_paths = self._normalized_path_set(candidate_paths)
         query = """
             SELECT
@@ -4756,7 +5432,11 @@ class FaceIndexService:
             LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
         """
         args: list[object] = []
-        if folder_prefix:
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("i.image_path", scope_roots)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+        elif folder_prefix:
             scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
             query += f" WHERE {scope_clause}"
             args.extend(scope_args)
@@ -4783,7 +5463,8 @@ class FaceIndexService:
         return [
             record
             for record in records
-            if self._path_in_scope(record.image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths)
+            if (root_scope is None or root_scope.contains(record.image_path))
+            and self._path_in_scope(record.image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths)
             and self._face_is_visible(record.face_bbox, include_tiny_faces=include_tiny_faces)
             and (include_hidden or not bool(record.hidden))
         ]
@@ -4803,12 +5484,14 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
     ) -> list[FaceAlbumRecord]:
         raise_if_cancelled(cancel_check)
         folder_prefix = str(folder_prefix or "").strip()
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
         allowed_paths = self._normalized_path_set(candidate_paths)
         query = """
             SELECT
@@ -4828,7 +5511,11 @@ class FaceIndexService:
             LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
         """
         args: list[object] = []
-        if folder_prefix:
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("i.image_path", scope_roots)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+        elif folder_prefix:
             scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
             query += f" WHERE {scope_clause}"
             args.extend(scope_args)
@@ -4850,7 +5537,11 @@ class FaceIndexService:
             image_path = str(row[0] or "")
             face_index = int(row[1] or 0)
             face_bbox = tuple(json.loads(row[2] or "[]"))
-            if not self._path_in_scope(image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths):
+            if (root_scope is not None and not root_scope.contains(image_path)) or not self._path_in_scope(
+                image_path,
+                folder_prefix=folder_prefix,
+                candidate_paths=allowed_paths,
+            ):
                 continue
             if not self._face_is_visible(face_bbox, include_tiny_faces=include_tiny_faces):
                 continue
@@ -4890,7 +5581,11 @@ class FaceIndexService:
             record = record_by_ref.get(ref)
             if record is None:
                 continue
-            if not self._path_in_scope(str(record.image_path), folder_prefix=folder_prefix, candidate_paths=allowed_paths):
+            if (root_scope is not None and not root_scope.contains(str(record.image_path))) or not self._path_in_scope(
+                str(record.image_path),
+                folder_prefix=folder_prefix,
+                candidate_paths=allowed_paths,
+            ):
                 continue
             if bool(record.hidden):
                 continue
@@ -4919,12 +5614,14 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
     ) -> tuple[list[FaceAlbumGroupSummary], list[FaceAlbumRecord]]:
         members = self.load_face_album_members(
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
             cancel_check=cancel_check,
@@ -4959,12 +5656,17 @@ class FaceIndexService:
         column: str,
         *,
         folder_prefix: str,
+        scope_roots: list[str] | tuple[str, ...] | None,
         candidate_scope: bool,
         include_tiny_faces: bool,
     ) -> tuple[str, list[object]]:
         conditions: list[str] = []
         args: list[object] = []
-        if str(folder_prefix or "").strip():
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql(column, scope_roots)
+            conditions.append(scope_clause)
+            args.extend(scope_args)
+        elif str(folder_prefix or "").strip():
             scope_clause, scope_args = folder_scope_sql(column, folder_prefix)
             conditions.append(scope_clause)
             args.extend(scope_args)
@@ -4980,6 +5682,7 @@ class FaceIndexService:
         offset: int = 0,
         limit: int = 100,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         group_kinds: tuple[str, ...] | list[str] | None = None,
@@ -5000,12 +5703,14 @@ class FaceIndexService:
             base_scope, base_args = self._face_album_scope_sql(
                 "i.image_path",
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_scope=candidate_scope,
                 include_tiny_faces=include_tiny_faces,
             )
             pending_scope, pending_args = self._face_album_scope_sql(
                 "p.image_path",
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_scope=candidate_scope,
                 include_tiny_faces=include_tiny_faces,
             )
@@ -5131,6 +5836,7 @@ class FaceIndexService:
         offset: int = 0,
         limit: int = 200,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
@@ -5145,6 +5851,7 @@ class FaceIndexService:
             scope_clause, scope_args = self._face_album_scope_sql(
                 path_column,
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_scope=candidate_scope,
                 include_tiny_faces=include_tiny_faces,
             )
@@ -5228,12 +5935,14 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
     ) -> list[FaceAlbumGroupSummary]:
         members = self.load_face_album_members(
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
             cancel_check=cancel_check,
@@ -5490,19 +6199,43 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
+        _normalized_candidate_paths: dict[str, str] | None = None,
     ) -> list[FaceScanImageRecord]:
         folder_prefix = str(folder_prefix or "").strip()
-        allowed_paths = self._normalized_path_set(candidate_paths)
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
+        normalized_folder_prefix = self._normalize_path_for_match(folder_prefix) if folder_prefix else ""
+        candidate_sql_paths, normalized_candidate_paths, _scoped_candidate_paths = self._candidate_path_snapshot(
+            candidate_paths,
+            root_scope=root_scope,
+            normalized_folder_prefix=normalized_folder_prefix,
+            precomputed_normalized_paths=_normalized_candidate_paths,
+        )
+        allowed_paths = set(normalized_candidate_paths.values())
         query = """
             SELECT image_path, mtime_ns, file_size, face_count, image_width, image_height, indexed_at
             FROM face_scan_images
         """
         args: list[object] = []
-        if folder_prefix:
+        has_where = False
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("image_path", scope_roots)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+            has_where = True
+        elif folder_prefix:
             scope_clause, scope_args = folder_scope_sql("image_path", folder_prefix)
             query += f" WHERE {scope_clause}"
             args.extend(scope_args)
+            has_where = True
+        # Progressively rendered folder reviews pass at most 500 paths.  Keep
+        # the scan-state lookup bounded to that page instead of reading every
+        # indexed photo again for each UI page.
+        if 0 < len(candidate_sql_paths) <= FACE_REVIEW_PAGE_MAX_IMAGES:
+            placeholders = ", ".join("?" for _path in candidate_sql_paths)
+            query += f" {'AND' if has_where else 'WHERE'} image_path IN ({placeholders})"
+            args.extend(candidate_sql_paths)
         query += " ORDER BY image_path"
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
@@ -5518,25 +6251,39 @@ class FaceIndexService:
             )
             for row in rows
         ]
-        return [
-            record
-            for record in records
-            if self._path_in_scope(record.image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths)
-        ]
+        filtered_records: list[FaceScanImageRecord] = []
+        for record in records:
+            normalized_path = normalized_candidate_paths.get(record.image_path)
+            if normalized_path is None:
+                normalized_path = self._normalize_path_for_match(record.image_path)
+            if not self._normalized_path_is_in_scope(
+                normalized_path,
+                root_scope=root_scope,
+                normalized_folder_prefix="" if root_scope is not None else normalized_folder_prefix,
+            ):
+                continue
+            if allowed_paths and normalized_path not in allowed_paths:
+                continue
+            filtered_records.append(record)
+        return filtered_records
 
     def load_folder_review_images(
         self,
         directory: str,
         *,
         recursive: bool = True,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
         cancel_check=None,
+        _normalized_candidate_paths: dict[str, str] | None = None,
     ) -> list[FaceFolderReviewImage]:
         raise_if_cancelled(cancel_check)
         directory = str(directory or "").strip()
-        if not directory:
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
+        normalized_directory = self._normalize_path_for_match(directory) if directory else ""
+        if not directory and (root_scope is None or root_scope.is_empty):
             return []
         LOGGER.info(
             "FaceIndexService load_folder_review_images mode=%s db=%s directory=%s recursive=%s include_tiny=%s candidate_paths=%s",
@@ -5547,12 +6294,20 @@ class FaceIndexService:
             include_tiny_faces,
             0 if not candidate_paths else len(candidate_paths),
         )
+        candidate_sql_paths, normalized_candidate_paths, scoped_candidate_paths = self._candidate_path_snapshot(
+            candidate_paths,
+            root_scope=root_scope,
+            normalized_folder_prefix="" if root_scope is not None else normalized_directory,
+            precomputed_normalized_paths=_normalized_candidate_paths,
+        )
         if candidate_paths is not None:
-            discovered_paths = [
-                str(path)
-                for path in list(candidate_paths or [])
-                if self._path_in_scope(str(path), folder_prefix=directory)
-            ]
+            discovered_paths = scoped_candidate_paths
+        elif root_scope is not None:
+            discovered_paths = self.discovery_service.discover_roots_result(
+                list(root_scope.roots),
+                recursive=recursive,
+                cancel_check=cancel_check,
+            ).paths
         else:
             discovered_paths = self.discovery_service.discover_result(
                 directory,
@@ -5560,12 +6315,16 @@ class FaceIndexService:
                 cancel_check=cancel_check,
             ).paths
         raise_if_cancelled(cancel_check)
-        allowed_paths = self._normalized_path_set(candidate_paths)
+        allowed_paths = set(normalized_candidate_paths.values())
         if allowed_paths:
-            discovered_paths = [
-                path for path in discovered_paths
-                if self._normalize_path_for_match(path) in allowed_paths
-            ]
+            filtered_discovered_paths: list[str] = []
+            for path in discovered_paths:
+                normalized_path = normalized_candidate_paths.get(path)
+                if normalized_path is None:
+                    normalized_path = self._normalize_path_for_match(path)
+                if normalized_path in allowed_paths:
+                    filtered_discovered_paths.append(path)
+            discovered_paths = filtered_discovered_paths
         if len(discovered_paths) <= int(MAX_EAGER_FACE_REVIEW_MIGRATION_PATHS):
             self._migrate_legacy_face_coordinate_space(discovered_paths)
         elif discovered_paths:
@@ -5596,10 +6355,24 @@ class FaceIndexService:
             LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
         """
         args: list[object] = []
-        if directory:
+        has_where = False
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("i.image_path", scope_roots)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+            has_where = True
+        elif directory:
             scope_clause, scope_args = folder_scope_sql("i.image_path", directory)
             query += f" WHERE {scope_clause}"
             args.extend(scope_args)
+            has_where = True
+        # See load_scan_image_records: the progressive page API only calls
+        # this path with a bounded candidate slice, so avoid a full face-index
+        # read for every page.
+        if 0 < len(candidate_sql_paths) <= FACE_REVIEW_PAGE_MAX_IMAGES:
+            placeholders = ", ".join("?" for _path in candidate_sql_paths)
+            query += f" {'AND' if has_where else 'WHERE'} i.image_path IN ({placeholders})"
+            args.extend(candidate_sql_paths)
         query += """
             ORDER BY
                 CASE WHEN COALESCE(l.person_name, '') = '' THEN 1 ELSE 0 END,
@@ -5611,15 +6384,33 @@ class FaceIndexService:
             rows = connection.execute(query, args).fetchall()
         scan_state_by_path = {
             record.image_path: record
-            for record in self.load_scan_image_records(folder_prefix=directory, candidate_paths=candidate_paths)
+            for record in self.load_scan_image_records(
+                folder_prefix=directory,
+                scope_roots=scope_roots,
+                candidate_paths=candidate_paths,
+                _normalized_candidate_paths=normalized_candidate_paths,
+            )
         }
         records_by_path: dict[str, list[IndexedFaceRecord]] = {}
+        ignored_by_path: dict[str, list[IndexedFaceRecord]] = {}
+        hidden_person_by_path: dict[str, list[IndexedFaceRecord]] = {}
         empty_embedding = np.empty(0, dtype=np.float32)
         for row in rows:
             raise_if_cancelled(cancel_check)
             image_path = str(row[0])
-            if not self._path_in_scope(image_path, folder_prefix=directory, candidate_paths=allowed_paths):
+            normalized_path = normalized_candidate_paths.get(image_path)
+            if normalized_path is None:
+                normalized_path = self._normalize_path_for_match(image_path)
+            if not self._normalized_path_is_in_scope(
+                normalized_path,
+                root_scope=root_scope,
+                normalized_folder_prefix="" if root_scope is not None else normalized_directory,
+            ):
                 continue
+            if allowed_paths and normalized_path not in allowed_paths:
+                continue
+            face_hidden = bool(row[9])
+            person_hidden = bool(row[10])
             record = IndexedFaceRecord(
                 image_path=image_path,
                 face_index=int(row[1]),
@@ -5631,14 +6422,22 @@ class FaceIndexService:
                 quality_reasons=tuple(str(value) for value in json.loads(row[6] or "[]")),
                 person_name=str(row[7] or ""),
                 label_confidence=float(row[8] or 0.0),
-                hidden=bool(row[9] or row[10]),
+                hidden=bool(face_hidden or person_hidden),
             )
             if record.hidden and not include_hidden:
+                if face_hidden:
+                    ignored_by_path.setdefault(image_path, []).append(record)
+                else:
+                    hidden_person_by_path.setdefault(image_path, []).append(record)
                 continue
+            if face_hidden:
+                ignored_by_path.setdefault(image_path, []).append(record)
+            elif person_hidden:
+                hidden_person_by_path.setdefault(image_path, []).append(record)
             records_by_path.setdefault(image_path, []).append(record)
         if not discovered_paths:
             discovered_paths = sorted(
-                set(scan_state_by_path).union(records_by_path),
+                set(scan_state_by_path).union(records_by_path).union(ignored_by_path).union(hidden_person_by_path),
                 key=str.lower,
             )
 
@@ -5646,6 +6445,8 @@ class FaceIndexService:
         for image_path in discovered_paths:
             raise_if_cancelled(cancel_check)
             image_records = list(records_by_path.get(image_path, ()))
+            ignored_records = list(ignored_by_path.get(image_path, ()))
+            hidden_person_records = list(hidden_person_by_path.get(image_path, ()))
             visible_records = [
                 record
                 for record in image_records
@@ -5660,6 +6461,10 @@ class FaceIndexService:
                     review_status = "tiny_hidden"
                 else:
                     review_status = "detected"
+            elif ignored_records:
+                review_status = "ignored_only"
+            elif hidden_person_records:
+                review_status = "hidden_person_only"
             elif scan_state is not None:
                 review_status = "no_faces"
             else:
@@ -5673,6 +6478,8 @@ class FaceIndexService:
                     hidden_face_count=hidden_face_count,
                     image_width=int(getattr(scan_state, "image_width", 0) or 0),
                     image_height=int(getattr(scan_state, "image_height", 0) or 0),
+                    ignored_faces=tuple(ignored_records),
+                    ignored_face_count=len(ignored_records),
                 )
             )
         LOGGER.info(
@@ -5684,6 +6491,77 @@ class FaceIndexService:
             len(review_images),
         )
         return review_images
+
+    def load_folder_review_image_page(
+        self,
+        directory: str,
+        *,
+        offset: int = 0,
+        limit: int = FACE_REVIEW_PAGE_MAX_IMAGES,
+        recursive: bool = True,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        include_hidden: bool = False,
+        cancel_check=None,
+    ) -> FaceFolderReviewPage:
+        """Load a bounded page without re-querying face rows outside it.
+
+        Callers that already know their source paths should pass them through
+        ``candidate_paths``.  This is the normal UI path and keeps each page
+        deterministic and source ordered while the next page is fetched.
+        """
+        raise_if_cancelled(cancel_check)
+        directory = str(directory or "").strip()
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
+        page_offset = max(0, int(offset))
+        page_limit = max(1, min(FACE_REVIEW_PAGE_MAX_IMAGES, int(limit)))
+        if not directory and (root_scope is None or root_scope.is_empty):
+            return FaceFolderReviewPage(items=(), total_count=0, offset=page_offset, next_offset=None)
+        if candidate_paths is not None:
+            normalized_directory = self._normalize_path_for_match(directory) if directory else ""
+            _candidate_sql_paths, normalized_candidate_paths, source_paths = self._candidate_path_snapshot(
+                candidate_paths,
+                root_scope=root_scope,
+                normalized_folder_prefix="" if root_scope is not None else normalized_directory,
+            )
+        elif root_scope is not None:
+            source_paths = list(
+                self.discovery_service.discover_roots_result(
+                    list(root_scope.roots), recursive=recursive, cancel_check=cancel_check
+                ).paths
+            )
+        else:
+            source_paths = list(
+                self.discovery_service.discover_result(
+                    directory, recursive=recursive, cancel_check=cancel_check
+                ).paths
+            )
+        source_paths = list(dict.fromkeys(source_paths))
+        raise_if_cancelled(cancel_check)
+        page_paths = source_paths[page_offset : page_offset + page_limit]
+        page_normalized_paths = {
+            path: normalized_candidate_paths[path]
+            for path in page_paths
+            if candidate_paths is not None and path in normalized_candidate_paths
+        }
+        page_items = self.load_folder_review_images(
+            directory,
+            recursive=recursive,
+            scope_roots=scope_roots,
+            candidate_paths=page_paths,
+            include_tiny_faces=include_tiny_faces,
+            include_hidden=include_hidden,
+            cancel_check=cancel_check,
+            _normalized_candidate_paths=page_normalized_paths,
+        )
+        next_offset = page_offset + len(page_paths)
+        return FaceFolderReviewPage(
+            items=tuple(page_items),
+            total_count=len(source_paths),
+            offset=page_offset,
+            next_offset=next_offset if next_offset < len(source_paths) else None,
+        )
 
     def count_indexed_faces(
         self,
@@ -6060,6 +6938,7 @@ class FaceIndexService:
             query_embedding,
             min_face_score=max(float(request.min_face_score), float(self.recognition_min_score)),
             top_k=request.top_k,
+            scope_roots=request.scope_roots,
             candidate_paths=request.candidate_paths,
             include_tiny_faces=request.include_tiny_faces,
             cancel_check=cancel_check,
@@ -6083,6 +6962,7 @@ class FaceIndexService:
         *,
         top_k: int = 30,
         min_face_score: float = 0.35,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
@@ -6101,6 +6981,7 @@ class FaceIndexService:
             query_embedding,
             min_face_score=max(float(min_face_score), float(self.recognition_min_score)),
             top_k=top_k,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
             cancel_check=cancel_check,
@@ -6114,6 +6995,7 @@ class FaceIndexService:
         top_k: int = 30,
         min_score: float = 0.35,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
@@ -6138,6 +7020,7 @@ class FaceIndexService:
             min_face_score=max(float(min_score), float(self.recognition_min_score)),
             top_k=top_k,
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             exclude={(record.image_path, record.face_index)},
             include_tiny_faces=include_tiny_faces,
@@ -6160,6 +7043,7 @@ class FaceIndexService:
         top_k: int = 30,
         min_score: float = 0.35,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
@@ -6184,6 +7068,7 @@ class FaceIndexService:
             min_face_score=max(float(min_score), float(self.recognition_min_score)),
             top_k=top_k,
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             exclude=exclude,
             include_tiny_faces=include_tiny_faces,
@@ -6197,6 +7082,7 @@ class FaceIndexService:
         min_face_score: float,
         top_k: int,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         exclude: set[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
@@ -6214,6 +7100,7 @@ class FaceIndexService:
                 min_face_score=min_face_score,
                 top_k=top_k,
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_paths=candidate_paths,
                 exclude=exclude,
                 include_tiny_faces=include_tiny_faces,
@@ -6226,12 +7113,14 @@ class FaceIndexService:
                 min_face_score=min_face_score,
                 top_k=top_k,
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_paths=candidate_paths,
                 exclude=exclude,
                 include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
         allowed_paths = self._normalized_path_set(candidate_paths)
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
         cached_records: dict[tuple[str, int], IndexedFaceRecord | None] = {}
         hits: list[tuple[FaceSearchResult, IndexedFaceRecord]] = []
         total = len(ann_refs)
@@ -6247,6 +7136,7 @@ class FaceIndexService:
                     min_face_score=min_face_score,
                     top_k=top_k,
                     folder_prefix=folder_prefix,
+                    scope_roots=scope_roots,
                     candidate_paths=candidate_paths,
                     exclude=exclude,
                     include_tiny_faces=include_tiny_faces,
@@ -6264,7 +7154,7 @@ class FaceIndexService:
                     continue
                 seen.add(ref)
                 image_path, face_index = ref
-                if not self._path_in_scope(image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths):
+                if (root_scope is not None and not root_scope.contains(image_path)) or not self._path_in_scope(image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths):
                     continue
                 record = cached_records.get(ref)
                 if record is None and ref not in cached_records:
@@ -6308,9 +7198,10 @@ class FaceIndexService:
             return self._search_by_embedding_bruteforce(
                 query_vector[0],
                 min_face_score=min_face_score,
-                top_k=top_k,
-                folder_prefix=folder_prefix,
-                candidate_paths=candidate_paths,
+                    top_k=top_k,
+                    folder_prefix=folder_prefix,
+                    scope_roots=scope_roots,
+                    candidate_paths=candidate_paths,
                 exclude=exclude,
                 include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
@@ -6326,6 +7217,7 @@ class FaceIndexService:
         outlier_policy: str = "assign",
         backend_options: dict[str, object] | None = None,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         face_refs: list[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
@@ -6345,6 +7237,7 @@ class FaceIndexService:
         records = self._clusterable_face_records(
             min_face_score=min_face_score,
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             face_refs=face_refs,
             include_tiny_faces=include_tiny_faces,
@@ -6358,6 +7251,7 @@ class FaceIndexService:
             outlier_policy=outlier_policy,
             backend_options_by_backend={backend_id: dict(backend_options or {})},
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             face_refs=face_refs,
             include_tiny_faces=include_tiny_faces,
@@ -6382,6 +7276,7 @@ class FaceIndexService:
         outlier_policy: str = "isolate",
         backend_options_by_backend: dict[str, dict[str, object]] | None = None,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         face_refs: list[tuple[str, int]] | None = None,
         include_tiny_faces: bool = True,
@@ -6391,6 +7286,7 @@ class FaceIndexService:
         records = self._clusterable_face_records(
             min_face_score=min_face_score,
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             face_refs=face_refs,
             include_tiny_faces=include_tiny_faces,
@@ -6460,6 +7356,7 @@ class FaceIndexService:
         *,
         min_face_score: float,
         folder_prefix: str,
+        scope_roots: list[str] | tuple[str, ...] | None,
         candidate_paths: list[str] | None,
         face_refs: list[tuple[str, int]] | None,
         include_tiny_faces: bool,
@@ -6472,6 +7369,7 @@ class FaceIndexService:
         records: list[IndexedFaceRecord] = []
         for record in self.load_all_records(
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
         ):
@@ -7338,21 +8236,60 @@ class FaceIndexService:
     def unhide_person(self, person_name: str) -> None:
         self.set_person_hidden(person_name, False)
 
-    def set_face_hidden(self, image_path: str, face_index: int, hidden: bool = True) -> None:
+    def set_faces_hidden(
+        self,
+        face_refs: Iterable[tuple[str, int]],
+        hidden: bool = True,
+    ) -> int:
+        """Apply a reversible per-face visibility decision in one transaction."""
+        refs: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for image_path, face_index in list(face_refs or ()):
+            path = str(image_path or "").strip()
+            if not path:
+                continue
+            ref = (path, int(face_index))
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+        if not refs:
+            return 0
+
+        changed = 0
+        action = "hide_face" if bool(hidden) else "unhide_face"
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE face_index SET hidden=? WHERE image_path=? AND face_index=?",
-                (1 if bool(hidden) else 0, str(image_path), int(face_index)),
-            )
-            self._record_action_audit(
-                "hide_face" if bool(hidden) else "unhide_face",
-                target=f"{image_path}#{int(face_index)}",
-                details={"image_path": str(image_path), "face_index": int(face_index), "hidden": bool(hidden)},
-                reversible=True,
-                connection=connection,
-            )
-        self._invalidate_identity_caches()
-        self._invalidate_ann_index()
+            for image_path, face_index in refs:
+                cursor = connection.execute(
+                    """
+                    UPDATE face_index
+                    SET hidden=?
+                    WHERE image_path=? AND face_index=? AND COALESCE(hidden, 0)<>?
+                    """,
+                    (1 if bool(hidden) else 0, image_path, face_index, 1 if bool(hidden) else 0),
+                )
+                if int(cursor.rowcount or 0) <= 0:
+                    continue
+                changed += 1
+                self._record_action_audit(
+                    action,
+                    target=f"{image_path}#{face_index}",
+                    details={"image_path": image_path, "face_index": face_index, "hidden": bool(hidden)},
+                    reversible=True,
+                    connection=connection,
+                )
+        if changed:
+            self._invalidate_identity_caches()
+            self._invalidate_ann_index()
+        return changed
+
+    def set_face_hidden(self, image_path: str, face_index: int, hidden: bool = True) -> None:
+        self.set_faces_hidden([(image_path, int(face_index))], hidden)
+
+    def hide_faces(self, face_refs: Iterable[tuple[str, int]]) -> int:
+        return self.set_faces_hidden(face_refs, True)
+
+    def unhide_faces(self, face_refs: Iterable[tuple[str, int]]) -> int:
+        return self.set_faces_hidden(face_refs, False)
 
     def hide_face(self, image_path: str, face_index: int) -> None:
         self.set_face_hidden(image_path, face_index, True)
@@ -7754,6 +8691,7 @@ class FaceIndexService:
         self,
         *,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         limit: int = 200,
         include_tiny_faces: bool = True,
@@ -7772,7 +8710,11 @@ class FaceIndexService:
             LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
         """
         args: list[object] = []
-        if folder_prefix:
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("i.image_path", scope_roots)
+            query += f" WHERE {scope_clause}"
+            args.extend(scope_args)
+        elif folder_prefix:
             scope_clause, scope_args = folder_scope_sql("i.image_path", folder_prefix)
             query += f" WHERE {scope_clause}"
             args.extend(scope_args)
@@ -7838,6 +8780,39 @@ class FaceIndexService:
             )
         return profiles[: max(1, int(limit))]
 
+    def list_known_person_names(self, *, cancel_check=None) -> list[str]:
+        """Return confirmed, non-hidden identity names for UI name pickers."""
+        raise_if_cancelled(cancel_check)
+        query = """
+            SELECT name, source_rank
+            FROM (
+                SELECT TRIM(person_name) AS name, 0 AS source_rank
+                FROM person_profiles
+                WHERE COALESCE(hidden, 0)=0
+                UNION ALL
+                SELECT TRIM(p.person_name) AS name, 1 AS source_rank
+                FROM person_prototypes p
+                LEFT JOIN person_profiles pp ON pp.person_name=p.person_name
+                WHERE COALESCE(pp.hidden, 0)=0
+                UNION ALL
+                SELECT TRIM(l.person_name) AS name, 2 AS source_rank
+                FROM face_labels l
+                LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                WHERE COALESCE(pp.hidden, 0)=0
+            )
+            WHERE name <> ''
+            ORDER BY source_rank ASC, LOWER(name) ASC, name ASC
+        """
+        with self._connect() as connection:
+            rows = connection.execute(query).fetchall()
+        names: dict[str, str] = {}
+        for raw_name, _source_rank in rows:
+            raise_if_cancelled(cancel_check)
+            name = str(raw_name or "").strip()
+            if name:
+                names.setdefault(name.casefold(), name)
+        return sorted(names.values(), key=lambda value: (value.casefold(), value))
+
     def label_counts(self) -> dict[str, int]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -7852,6 +8827,7 @@ class FaceIndexService:
         top_k: int = 60,
         min_score: float | None = None,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
     ) -> list[FaceSearchResult]:
@@ -7870,6 +8846,7 @@ class FaceIndexService:
             min_face_score=threshold,
             top_k=max(1, int(top_k)),
             folder_prefix=folder_prefix,
+            scope_roots=scope_roots,
             candidate_paths=candidate_paths,
             include_tiny_faces=include_tiny_faces,
         )
@@ -7898,6 +8875,7 @@ class FaceIndexService:
         *,
         min_score: float | None = None,
         folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         progress=None,
@@ -7926,6 +8904,7 @@ class FaceIndexService:
             record
             for record in self.load_all_records(
                 folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
                 candidate_paths=candidate_paths,
                 include_tiny_faces=include_tiny_faces,
             )
@@ -9179,6 +10158,7 @@ class FaceIndexService:
     def list_named_photo_summaries(
         self,
         *,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
     ) -> list[NamedPhotoSummary]:
@@ -9196,6 +10176,11 @@ class FaceIndexService:
             LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
         """
         conditions: list[str] = []
+        args: list[object] = []
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("l.image_path", scope_roots)
+            conditions.append(scope_clause)
+            args.extend(scope_args)
         if not include_tiny_faces:
             conditions.append("COALESCE(i.is_tiny, 0)=0")
         if not include_hidden:
@@ -9204,7 +10189,7 @@ class FaceIndexService:
             query += " WHERE " + " AND ".join(conditions)
         query += " GROUP BY l.person_name ORDER BY lower(l.person_name), l.person_name"
         with self._connect() as connection:
-            rows = connection.execute(query).fetchall()
+            rows = connection.execute(query, args).fetchall()
         return [
             NamedPhotoSummary(
                 person_name=str(row[0] or ""),
@@ -9219,6 +10204,7 @@ class FaceIndexService:
         self,
         person_name: str,
         *,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
     ) -> list[str]:
@@ -9235,6 +10221,10 @@ class FaceIndexService:
             WHERE l.person_name=?
         """
         args: list[object] = [name]
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("l.image_path", scope_roots)
+            query += f" AND {scope_clause}"
+            args.extend(scope_args)
         if not include_tiny_faces:
             query += " AND COALESCE(i.is_tiny, 0)=0"
         if not include_hidden:

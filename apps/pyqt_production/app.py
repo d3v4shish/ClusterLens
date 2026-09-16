@@ -31,8 +31,10 @@ configure_rotating_logging(RUNTIME_LAYOUT)
 install_crash_handlers(RUNTIME_LAYOUT)
 
 from app.selection import SelectionTarget  # noqa: E402
+from app.path_scope import PathScope  # noqa: E402
 from app.services.cache_maintenance import CacheClearResult, CacheMaintenanceService, RuntimeStorageSummary  # noqa: E402
 from app.services.cluster_explanations import ClusterExplanation  # noqa: E402
+from app.services.cluster_context import VisionLanguageSettings  # noqa: E402
 from app.services.cluster_meanings import ClusterMeaning  # noqa: E402
 from app.services.clustering_options import model_label, normalize_clustering_backends, normalize_embedding_models  # noqa: E402
 from app.services.face_model_installer import FaceModelInstaller  # noqa: E402
@@ -55,6 +57,7 @@ from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait
 from ui.job_manager import JobManager  # noqa: E402
 from ui.job_presentation import JobPresentationController  # noqa: E402
 from ui.job_widgets import JobIndicatorWidget  # noqa: E402
+from ui.library_pane import LibraryPane  # noqa: E402
 from ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
 from ui.recent_folders import RecentFolderHistory  # noqa: E402
 from ui.runtime_widgets import RuntimeBadge  # noqa: E402
@@ -232,6 +235,8 @@ class ProductionClusterApp(QMainWindow):
         self._photo_set_route: PhotoSetRoute | None = None
         self._pending_face_review_paths: tuple[str, ...] = ()
         self._active_cluster_directory = ""
+        self._active_cluster_scope_signature = ""
+        self._scope_editor_pinned = False
         self._pane_visibility = {"source": True, "controls": True, "details": True}
         self._advanced_pane_visibility = {"source": True, "controls": True, "details": True}
         self._pane_restore_widths = {"source": 250, "controls": 420, "details": 440}
@@ -246,6 +251,8 @@ class ProductionClusterApp(QMainWindow):
         self.names_pane = None
         self.names_placeholder = None
         self.tags_pane = None
+        self.library_pane = None
+        self._library_catalog_refresh_pending = False
         self._tag_suggestion_job = None
         self._tag_suggestion_thread = None
         self._tag_suggestion_job_id: int | None = None
@@ -271,11 +278,14 @@ class ProductionClusterApp(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._refresh_recent_folder_menus()
+        restored_roots = self._restore_active_roots()
+        self.source_pane.set_active_roots(restored_roots)
         restored_folder = str(self.settings_store.value("workspace/selected_folder", "") or "").strip()
-        if restored_folder and Path(restored_folder).is_dir():
-            self.source_pane.set_selected_directory(restored_folder)
+        browse_root = restored_folder or self.source_pane.active_scope.primary_root
+        if browse_root and Path(browse_root).is_dir():
+            self.source_pane.set_selected_directory(browse_root, activate_scope=False)
         else:
-            self._on_directory_changed("")
+            self._update_scope_summary(self.source_pane.active_scope)
         self._apply_workspace_preferences()
         self.runtime_badge.update_runtime(None, None)
         self._apply_safety_state()
@@ -449,6 +459,22 @@ class ProductionClusterApp(QMainWindow):
         layout.setSpacing(6)
         layout.addWidget(self._build_toolbar())
 
+        self.scope_strip = QWidget(central)
+        scope_layout = QHBoxLayout(self.scope_strip)
+        scope_layout.setContentsMargins(8, 4, 8, 4)
+        scope_layout.setSpacing(8)
+        self.scope_summary_label = QLabel("No active roots", self.scope_strip)
+        self.scope_summary_label.setObjectName("workspaceScopeSummary")
+        self.scope_summary_label.setToolTip("Shared root scope for Gallery, Clustering, Faces, Names, Tags, and Library. Active roots include all descendants.")
+        self.scope_summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.edit_roots_button = QPushButton("Edit roots", self.scope_strip)
+        self.edit_roots_button.setToolTip("Show the shared root picker. Selecting roots does not scan, catalog, or modify photos.")
+        self.edit_roots_button.clicked.connect(self._edit_active_roots)
+        scope_layout.addWidget(QLabel("Scope:", self.scope_strip))
+        scope_layout.addWidget(self.scope_summary_label, stretch=1)
+        scope_layout.addWidget(self.edit_roots_button)
+        layout.addWidget(self.scope_strip)
+
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setHandleWidth(6)
@@ -528,18 +554,37 @@ class ProductionClusterApp(QMainWindow):
         self.names_placeholder = self._build_names_placeholder()
         self.tags_pane = TagsPane(
             self.image_tag_service,
-            lambda: self.source_pane.selected_directory,
+            lambda: self.source_pane.active_scope,
             self.workspace_stack,
             job_manager=self.job_manager,
         )
         self.tags_pane.gallery.metadata_service = self.photo_metadata_service
         self.tags_pane.set_read_only_mode(self._read_only_mode())
+        self.library_pane = LibraryPane(
+            lambda: self.source_pane.active_scope,
+            lambda: self.face_service_global,
+            self.workspace_stack,
+            job_manager=self.job_manager,
+            context_settings_provider=self._library_context_settings,
+            context_settings_changed=self._save_library_context_settings,
+        )
+        self.library_pane.context_auto.setChecked(self._library_auto_context_enabled())
+        self.library_pane.configure_photo_tools(
+            metadata_service=self.photo_metadata_service,
+            image_tag_service=self.image_tag_service,
+            face_service_provider=lambda: self.face_service_global,
+            face_edit_request_handler=self._request_photo_face_tools,
+            face_edit_saved_callback=self._on_main_gallery_face_labels_changed,
+            inspector_context_provider=self._gallery_context_for_path,
+        )
+        self.library_pane.set_read_only_mode(self._read_only_mode())
 
         self.workspace_stack.addWidget(self.photo_gallery_workspace)
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_placeholder)
         self.workspace_stack.addWidget(self.names_placeholder)
         self.workspace_stack.addWidget(self.tags_pane)
+        self.workspace_stack.addWidget(self.library_pane)
         self.workspace_stack.setMinimumWidth(1040)
 
         self.main_splitter.addWidget(self.source_pane)
@@ -735,6 +780,7 @@ class ProductionClusterApp(QMainWindow):
             int(self.settings_registry.get(self.settings_store, "faces/max_detections/human", 50)),
         )
         cache_dir = Path(self.settings.cache_dir)
+        performance_profile = self.performance_profile
         if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
             self.names_placeholder_detail.setText("Opening the saved global face-label database…")
         if self._can_update_widget(getattr(self, "names_placeholder_button", None)):
@@ -764,6 +810,7 @@ class ProductionClusterApp(QMainWindow):
                 embedder_id=embedder,
                 detector_score_threshold=detector_score,
                 detector_max_detections=max_detections,
+                performance_profile=performance_profile,
                 db_path=db_path,
             )
             raise_if_cancelled(cancel_check)
@@ -892,6 +939,7 @@ class ProductionClusterApp(QMainWindow):
         preferred_execution_mode = self._preferred_execution_mode()
         reset_face_session = bool(self._faces_session_reset_pending)
         cache_dir = Path(self.settings.cache_dir)
+        performance_profile = self.performance_profile
         if getattr(self, "faces_placeholder_detail", None) is not None:
             self.faces_placeholder_detail.setText("Checking runtime and opening the saved face library…")
         if getattr(self, "faces_placeholder_button", None) is not None:
@@ -941,6 +989,7 @@ class ProductionClusterApp(QMainWindow):
                     embedder_id=embedder,
                     detector_score_threshold=detector_score,
                     detector_max_detections=max_detections,
+                    performance_profile=performance_profile,
                     db_path=_db_path(scope),
                 )
                 service_cache[(scope, mode, detector, embedder)] = service
@@ -1057,7 +1106,8 @@ class ProductionClusterApp(QMainWindow):
             supported_face_modes=["human"],
         )
         pane.set_face_service_provider(self._face_service_for_pipeline)
-        pane.current_directory_provider = lambda: self.source_pane.selected_directory
+        pane.current_directory_provider = lambda: self.source_pane.active_scope.primary_root
+        pane.current_scope_roots_provider = lambda: self.source_pane.active_scope.roots
         pane.clustering_filter_state_provider = self._current_clustering_filter_state
         pane.use_onnx_provider = lambda: bool(self.clustering_pane.onnx_checkbox.isChecked())
         pane.job_manager = self.job_manager
@@ -1076,8 +1126,8 @@ class ProductionClusterApp(QMainWindow):
             report.face_message if report is not None else "Checking CUDA and downloaded face models…",
         )
         pane.set_read_only_mode(self._read_only_mode())
-        if self.source_pane.selected_directory:
-            pane.face_folder_path.setText(self.source_pane.selected_directory)
+        if self.source_pane.active_scope.primary_root:
+            pane.face_folder_path.setText(self.source_pane.active_scope.primary_root)
         pane.setMinimumWidth(self._layout_widths()["faces"])
         self.faces_pane = pane
         self._connect_faces_signals(pane)
@@ -1112,6 +1162,7 @@ class ProductionClusterApp(QMainWindow):
             lambda: self.face_service_global,
             self.workspace_stack,
             job_manager=self.job_manager,
+            active_scope_provider=lambda: self.source_pane.active_scope,
         )
         pane.gallery.job_manager = self.job_manager
         pane.gallery.metadata_service = self.photo_metadata_service
@@ -1198,8 +1249,9 @@ class ProductionClusterApp(QMainWindow):
 
     def _set_shared_source_folder(self, directory: str) -> None:
         directory = str(directory or "").strip()
-        if directory and Path(directory).is_dir() and directory != self.source_pane.selected_directory:
-            self.source_pane.set_selected_directory(directory)
+        if directory and Path(directory).is_dir():
+            self.source_pane.set_selected_directory(directory, activate_scope=False)
+            self.source_pane.set_active_roots([directory])
 
     def _refresh_recent_folder_menus(self) -> None:
         paths = self.recent_folder_history.paths()
@@ -1258,6 +1310,13 @@ class ProductionClusterApp(QMainWindow):
         self.tags_workspace_button.setToolTip("Browse, edit, filter, and cluster durable photo tags.")
         apply_icon(self.tags_workspace_button, "search")
         self.tags_workspace_button.clicked.connect(lambda: self.set_active_workspace("tags"))
+        self.library_workspace_button = QPushButton("Library")
+        self.library_workspace_button.setCheckable(True)
+        self.library_workspace_button.setProperty("nav", True)
+        self.library_workspace_button.setAccessibleName("Open Library workspace")
+        self.library_workspace_button.setToolTip("Browse registered local photo roots, review duplicates, clean up people, and search generated cluster context.")
+        apply_icon(self.library_workspace_button, "workspace")
+        self.library_workspace_button.clicked.connect(lambda: self.set_active_workspace("library"))
         self.current_folder_label = QLabel("No folder selected")
         self.current_folder_label.setAccessibleName("Current folder")
         self.current_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1327,6 +1386,7 @@ class ProductionClusterApp(QMainWindow):
         row.addWidget(self.faces_workspace_button)
         row.addWidget(self.names_workspace_button)
         row.addWidget(self.tags_workspace_button)
+        row.addWidget(self.library_workspace_button)
         row.addWidget(self.current_folder_label, stretch=1)
         row.addWidget(self.mode_selector)
         row.addWidget(self.view_button)
@@ -1345,7 +1405,8 @@ class ProductionClusterApp(QMainWindow):
         QWidget.setTabOrder(self.clustering_workspace_button, self.faces_workspace_button)
         QWidget.setTabOrder(self.faces_workspace_button, self.names_workspace_button)
         QWidget.setTabOrder(self.names_workspace_button, self.tags_workspace_button)
-        QWidget.setTabOrder(self.tags_workspace_button, self.mode_selector)
+        QWidget.setTabOrder(self.tags_workspace_button, self.library_workspace_button)
+        QWidget.setTabOrder(self.library_workspace_button, self.mode_selector)
         QWidget.setTabOrder(self.mode_selector, self.view_button)
         QWidget.setTabOrder(self.view_button, self.jobs_widget)
         QWidget.setTabOrder(self.jobs_widget, self.runtime_badge)
@@ -1357,12 +1418,12 @@ class ProductionClusterApp(QMainWindow):
         self.set_active_workspace_mode(mode)
 
     def _connect_signals(self) -> None:
-        self.source_pane.directory_changed.connect(self._on_directory_changed)
+        self.source_pane.scope_changed.connect(self._on_active_scope_changed)
         self.source_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         self.source_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.source_pane.run_requested.connect(self.run_clustering)
         self.source_pane.cancel_requested.connect(self.cancel_clustering)
-        self.source_pane.hide_requested.connect(lambda: self._set_pane_visible("source", False))
+        self.source_pane.hide_requested.connect(self._hide_source_pane)
         self.clustering_pane.run_requested.connect(self.run_clustering)
         self.clustering_pane.cancel_requested.connect(self.cancel_clustering)
         self.clustering_pane.hide_requested.connect(lambda: self._set_pane_visible("controls", False))
@@ -1390,6 +1451,8 @@ class ProductionClusterApp(QMainWindow):
         self.tags_pane.apply_suggestions_requested.connect(self.apply_cluster_tag_suggestions)
         self.tags_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.tags_pane.open_in_gallery_requested.connect(self._open_tagged_photos_in_gallery)
+        self.library_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
+        self.library_pane.open_in_gallery_requested.connect(self._open_library_photos_in_gallery)
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
         self.session_controller.progress.connect(self._on_clustering_progress)
@@ -1412,6 +1475,7 @@ class ProductionClusterApp(QMainWindow):
             ("Ctrl+3", lambda: self.set_active_workspace("faces")),
             ("Ctrl+4", lambda: self.set_active_workspace("names")),
             ("Ctrl+5", lambda: self.set_active_workspace("tags")),
+            ("Ctrl+6", lambda: self.set_active_workspace("library")),
             ("Ctrl+J", self._open_jobs_dialog),
             ("Ctrl+,", self.open_settings_dialog),
             ("Ctrl+O", self._focus_folder_picker),
@@ -1454,7 +1518,7 @@ class ProductionClusterApp(QMainWindow):
     def _show_keyboard_help(self) -> None:
         infoBox(
             "Keyboard shortcuts",
-            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+4 Names\nCtrl+5 Tags\nCtrl+J Jobs\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
+            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+4 Names\nCtrl+5 Tags\nCtrl+6 Library\nCtrl+J Jobs\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
         )
 
     def _open_runtime_status_details(self) -> None:
@@ -1464,6 +1528,7 @@ class ProductionClusterApp(QMainWindow):
             describe_rebuildable_caches=self.cache_maintenance_service.describe_rebuildable_caches,
             describe_generated_storage=self._describe_generated_storage,
             clear_rebuildable_caches=self._clear_rebuildable_caches,
+            clear_library_catalog=self._clear_library_catalog,
             clear_runtime_temp_files=self._clear_runtime_temp_files,
             clear_face_storage=self._clear_face_storage,
             clear_model_caches=self._clear_model_caches,
@@ -1485,6 +1550,7 @@ class ProductionClusterApp(QMainWindow):
         dialog.tabs.setCurrentIndex(support_index)
         if dialog.exec() == dialog.DialogCode.Accepted:
             self._apply_settings_values(dialog.values())
+        self._refresh_workspace_ui()
 
     def _preferred_execution_mode(self) -> str:
         return str(self.settings_registry.get(self.settings_store, "runtime/preferred_mode", self.settings.preferred_execution_mode))
@@ -1648,6 +1714,40 @@ class ProductionClusterApp(QMainWindow):
     def _read_only_mode(self) -> bool:
         return bool(self.settings_registry.get(self.settings_store, "safety/read_only_mode", False))
 
+    def _library_context_settings(self) -> VisionLanguageSettings:
+        provider = str(self.settings_registry.get(self.settings_store, "library/vision_provider", "ollama") or "ollama")
+        model = str(self.settings_registry.get(self.settings_store, "library/vision_model", "") or "")
+        endpoint = str(self.settings_registry.get(self.settings_store, "library/vision_endpoint", "http://127.0.0.1:11434") or "")
+        key_environment = str(
+            self.settings_registry.get(
+                self.settings_store,
+                "library/vision_api_key_environment",
+                "CLUSTERLENS_LLM_API_KEY",
+            )
+            or "CLUSTERLENS_LLM_API_KEY"
+        )
+        return VisionLanguageSettings(
+            provider=provider,
+            ollama_url=endpoint if provider == "ollama" else "http://127.0.0.1:11434",
+            ollama_model=model if provider == "ollama" else "",
+            openai_url=endpoint if provider == "openai-compatible" else "",
+            openai_model=model if provider == "openai-compatible" else "",
+            api_key_environment=key_environment,
+            remote_consent=False,
+        )
+
+    def _library_auto_context_enabled(self) -> bool:
+        return bool(self.settings_registry.get(self.settings_store, "library/auto_cluster_context", False))
+
+    def _save_library_context_settings(self, settings: VisionLanguageSettings, auto_enabled: bool) -> None:
+        self.settings_registry.set(self.settings_store, "library/vision_provider", settings.provider)
+        self.settings_registry.set(self.settings_store, "library/vision_model", settings.model)
+        endpoint = settings.ollama_url if settings.provider == "ollama" else settings.openai_url
+        self.settings_registry.set(self.settings_store, "library/vision_endpoint", endpoint)
+        self.settings_registry.set(self.settings_store, "library/vision_api_key_environment", settings.api_key_environment)
+        self.settings_registry.set(self.settings_store, "library/auto_cluster_context", bool(auto_enabled))
+        self.settings_store.sync()
+
     def _clear_face_session_dbs(self) -> None:
         for path in self.settings.cache_dir.glob("face_search*_session*.db*"):
             try:
@@ -1666,6 +1766,8 @@ class ProductionClusterApp(QMainWindow):
             return "names"
         if text in {"tags", "tag", "tag manager"}:
             return "tags"
+        if text in {"library", "archive", "photo library"}:
+            return "library"
         return "clustering"
 
     @staticmethod
@@ -1735,6 +1837,7 @@ class ProductionClusterApp(QMainWindow):
                 embedder_id=embedder,
                 detector_score_threshold=self._preferred_face_detector_score_threshold(mode_id),
                 detector_max_detections=self._preferred_face_max_detections(mode_id),
+                performance_profile=self.performance_profile,
                 db_path=self._face_db_path_for_pipeline(scope_id, mode_id, detector, embedder),
             )
             self._face_service_cache[key] = service
@@ -1768,6 +1871,14 @@ class ProductionClusterApp(QMainWindow):
     def _apply_workspace_preferences(self) -> None:
         thumbnail_size = int(self.settings_registry.get(self.settings_store, "gallery/thumbnail_size", self.settings.thumbnail_size))
         self.performance_profile = self._effective_performance_profile()
+        seen_face_services: set[int] = set()
+        for service in tuple(getattr(self, "_face_service_cache", {}).values()):
+            if id(service) in seen_face_services:
+                continue
+            seen_face_services.add(id(service))
+            configure = getattr(service, "configure_index_performance", None)
+            if callable(configure):
+                configure(self.performance_profile)
         self.gallery_pane.apply_view_preferences(
             thumbnail_size=thumbnail_size,
             worker_count=self.performance_profile.thumbnail_workers,
@@ -1807,6 +1918,14 @@ class ProductionClusterApp(QMainWindow):
                 pixmap_cache_size=self.performance_profile.pixmap_cache_size,
                 qimage_cache_size=self.performance_profile.qimage_cache_size,
             )
+        if self.library_pane is not None:
+            self.library_pane.apply_view_preferences(
+                thumbnail_size=thumbnail_size,
+                worker_count=self.performance_profile.thumbnail_workers,
+                prefetch_rows=self.performance_profile.thumbnail_prefetch_rows,
+                pixmap_cache_size=self.performance_profile.pixmap_cache_size,
+                qimage_cache_size=self.performance_profile.qimage_cache_size,
+            )
         self.runtime_badge.setVisible(bool(self.settings_registry.get(self.settings_store, "runtime/show_badge", self.settings.show_runtime_badge)))
         self._reflow_main_splitter(force=False)
 
@@ -1830,15 +1949,18 @@ class ProductionClusterApp(QMainWindow):
             "faces": self.faces_workspace_button,
             "names": self.names_workspace_button,
             "tags": self.tags_workspace_button,
+            "library": self.library_workspace_button,
         }.items():
             button.blockSignals(True)
             button.setChecked(self._active_workspace == key)
             button.blockSignals(False)
 
     def _source_pane_visible(self) -> bool:
+        if self._scope_editor_pinned:
+            return True
         if self._active_workspace == "gallery":
             return True
-        if self._active_workspace in {"names", "tags"}:
+        if self._active_workspace in {"names", "tags", "library"}:
             return False
         if self._active_workspace == "faces":
             return bool(self._advanced_pane_visibility["source"])
@@ -1846,12 +1968,24 @@ class ProductionClusterApp(QMainWindow):
             return True
         return bool(self._pane_visibility["source"])
 
+    def _edit_active_roots(self) -> None:
+        self._scope_editor_pinned = True
+        self._reflow_main_splitter(force=True)
+        self.source_pane.file_tree.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.footer_bar.set_status("Edit the checked active roots. This does not start a scan.")
+
+    def _hide_source_pane(self) -> None:
+        self._scope_editor_pinned = False
+        self._set_pane_visible("source", False)
+        self._reflow_main_splitter(force=True)
+
     def _refresh_workspace_ui(self) -> None:
         is_gallery = self._active_workspace == "gallery"
         is_clustering = self._active_workspace == "clustering"
         is_faces = self._active_workspace == "faces"
         is_names = self._active_workspace == "names"
         is_tags = self._active_workspace == "tags"
+        is_library = self._active_workspace == "library"
         faces_pane = self._ensure_faces_workspace() if is_faces else None
         names_pane = self._ensure_names_workspace() if is_names else None
         if is_gallery:
@@ -1862,6 +1996,12 @@ class ProductionClusterApp(QMainWindow):
             self.workspace_stack.setCurrentWidget(self.tags_pane)
             if self.tags_pane.inventory_model.rowCount() == 0:
                 self.tags_pane.refresh()
+        elif is_library:
+            self.workspace_stack.setCurrentWidget(self.library_pane)
+            if self._library_catalog_refresh_pending:
+                self._library_catalog_refresh_pending = False
+                self.library_pane.invalidate_catalog_view()
+            self.library_pane.ensure_timeline_loaded()
         else:
             self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
         if is_faces and self.faces_pane is not None:
@@ -1879,7 +2019,7 @@ class ProductionClusterApp(QMainWindow):
         self.controls_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.details_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.source_view_action.setVisible((is_faces) or (is_clustering and self._clustering_mode == "advanced"))
-        self.mode_selector.setVisible(not is_gallery and not is_names and not is_tags)
+        self.mode_selector.setVisible(not is_gallery and not is_names and not is_tags and not is_library)
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -1894,7 +2034,7 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_workspace_ui()
 
     def set_active_workspace_mode(self, mode: str) -> None:
-        if self._active_workspace in {"gallery", "names", "tags"}:
+        if self._active_workspace in {"gallery", "names", "tags", "library"}:
             return
         if self._active_workspace == "faces":
             self.set_faces_mode(mode)
@@ -2085,7 +2225,7 @@ class ProductionClusterApp(QMainWindow):
                 continue
             can_run = clustering_ready and not run_in_progress
             if button is getattr(self.gallery_pane, "empty_run_button", None):
-                can_run = can_run and bool(self.source_pane.selected_directory)
+                can_run = can_run and not self.source_pane.active_scope.is_empty
             elif button is getattr(getattr(self, "photo_gallery", None), "organize_button", None):
                 can_run = can_run and len(self._gallery_paths) >= 2
             button.setEnabled(can_run)
@@ -2133,7 +2273,7 @@ class ProductionClusterApp(QMainWindow):
             scope="production",
         )
         return ProductionClusterRequest(
-            directory=self.source_pane.selected_directory,
+            directory=self.source_pane.active_scope.primary_root,
             embedding_models=embedding_models,
             num_clusters=int(self.clustering_pane.cluster_spinbox.value()),
             clustering_backends=clustering_backends,
@@ -2144,6 +2284,7 @@ class ProductionClusterApp(QMainWindow):
             use_onnx=bool(self.clustering_pane.onnx_checkbox.isChecked()),
             reuse_result_cache=bool(self.clustering_pane.result_cache_checkbox.isChecked()),
             use_embedding_cache_lookup=bool(self.clustering_pane.embedding_cache_lookup_checkbox.isChecked()),
+            source_roots=list(self.source_pane.active_scope.roots),
             source_paths=source_paths,
             performance_profile=self._preferred_performance_profile(),
             batch_size_cpu=int(self.performance_profile.cpu_batch_size),
@@ -2352,6 +2493,7 @@ class ProductionClusterApp(QMainWindow):
             return False
         self.current_run_origin = str(run_origin or "folder")
         self._active_cluster_directory = str(request.directory or "")
+        self._active_cluster_scope_signature = PathScope.from_paths(request.source_roots).signature if request.source_roots else ""
         self.current_tag_filter = tuple(request.tag_filter)
         self.current_tag_match = request.tag_match or "Any"
         self._cancel_cluster_tag_context_refresh()
@@ -2414,7 +2556,7 @@ class ProductionClusterApp(QMainWindow):
         self._preflight_generation += 1
         generation = self._preflight_generation
         self._set_running_state(True)
-        self.footer_bar.set_status("Scanning selected folder...")
+        self.footer_bar.set_status("Scanning active roots...")
         self._set_activity("Preparing clustering run...")
         self._update_footer_storage_state()
         job_id = self.job_manager.register_job(
@@ -2427,18 +2569,27 @@ class ProductionClusterApp(QMainWindow):
             from app.services.discovery import ImageDiscoveryService
             from app.services.embedding_index import EmbeddingIndexService
 
-            progress(-1, "Scanning selected folder...")
-            discovered = ImageDiscoveryService().discover_result(
-                request_copy.directory,
-                recursive=bool(request_copy.recursive),
-                progress_callback=progress,
-                cancel_check=cancel_check,
-            )
+            progress(-1, "Scanning active roots...")
+            discovery_service = ImageDiscoveryService()
+            if request_copy.source_roots:
+                discovered = discovery_service.discover_roots_result(
+                    list(request_copy.source_roots),
+                    recursive=bool(request_copy.recursive),
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
+            else:
+                discovered = discovery_service.discover_result(
+                    request_copy.directory,
+                    recursive=bool(request_copy.recursive),
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
             raise_if_cancelled(cancel_check)
             discovered_count = int(discovered.image_count)
             if discovered_count == 0:
-                raise ValueError("No images were discovered in the selected folder.")
-            progress(10, f"Folder scan complete: {discovered_count} image(s) discovered.")
+                raise ValueError("No images were discovered in the active roots.")
+            progress(10, f"Active-root scan complete: {discovered_count} image(s) discovered.")
 
             if not request_copy.tag_filter:
                 requested_paths = tuple(request_copy.source_paths or ())
@@ -2617,32 +2768,80 @@ class ProductionClusterApp(QMainWindow):
         if job_id is not None:
             self.job_manager.update(job_id, progress=value, text=status)
 
-    def _on_directory_changed(self, directory: str) -> None:
-        self.settings_store.setValue("workspace/selected_folder", str(directory or ""))
-        if directory and self.recent_folder_history.record(directory):
-            self._refresh_recent_folder_menus()
-        self.current_folder_label.setText(directory or "No folder selected")
-        self.current_folder_label.setToolTip(directory or "")
-        self.footer_bar.set_selected_folder(directory)
-        if directory:
-            self.footer_bar.set_status(f"Folder selected: {directory}")
-            self._set_activity("Folder ready")
+    def _restore_active_roots(self) -> tuple[str, ...]:
+        raw_value = self.settings_store.value("workspace/active_roots", None)
+        roots: list[str] = []
+        if isinstance(raw_value, (list, tuple)):
+            roots = [str(value) for value in raw_value if str(value or "").strip()]
+        elif str(raw_value or "").strip():
+            try:
+                payload = json.loads(str(raw_value))
+                if isinstance(payload, list):
+                    roots = [str(value) for value in payload if str(value or "").strip()]
+            except (TypeError, ValueError):
+                roots = [str(raw_value)]
+        if not roots:
+            legacy = str(self.settings_store.value("workspace/selected_folder", "") or "").strip()
+            if legacy:
+                roots = [legacy]
+        return PathScope.from_paths(roots).roots
+
+    def _update_scope_summary(self, scope: PathScope) -> None:
+        if scope.is_empty:
+            text = "No active roots"
+            tooltip = "Choose one or more roots. No workspace will scan or root-scope search until then."
+        elif len(scope.roots) == 1:
+            text = f"1 active root · {Path(scope.primary_root).name or scope.primary_root}"
+            tooltip = scope.primary_root
         else:
-            self.footer_bar.set_status("Select a folder to start clustering.")
-            self._set_activity("Idle")
-        if directory and self.faces_pane is not None:
-            if self.faces_pane.face_folder_path.text().strip() != directory:
-                self.faces_pane.face_folder_path.blockSignals(True)
-                self.faces_pane.face_folder_path.setText(directory)
-                self.faces_pane.face_folder_path.blockSignals(False)
-                self.faces_pane._update_face_scope_summary()
+            text = f"{len(scope.roots)} active roots · includes subfolders"
+            tooltip = "\n".join(scope.roots)
+        self.scope_summary_label.setText(text)
+        self.scope_summary_label.setToolTip(tooltip)
+        self.current_folder_label.setText(text)
+        self.current_folder_label.setToolTip(tooltip)
+        self.footer_bar.set_selected_folder(text)
+
+    def _on_directory_changed(self, directory: str) -> None:
+        """Compatibility entry point for older callers that set one folder."""
+
+        self.source_pane.set_active_roots([directory] if str(directory or "").strip() else ())
+
+    def _on_active_scope_changed(self, value: object) -> None:
+        scope = value if isinstance(value, PathScope) else PathScope.from_paths(value if isinstance(value, (list, tuple, set)) else ())
+        self.settings_store.setValue("workspace/active_roots", json.dumps(list(scope.roots)))
+        self.settings_store.setValue("workspace/selected_folder", scope.primary_root)
+        changed_history = False
+        for root in scope.roots:
+            changed_history = self.recent_folder_history.record(root) or changed_history
+        if changed_history:
+            self._refresh_recent_folder_menus()
+        self._update_scope_summary(scope)
         self._photo_set_route = None
         self.photo_gallery.set_photo_set_route()
-        self._load_gallery_folder(directory)
+        if self.faces_pane is not None:
+            self.faces_pane.current_scope_roots_provider = lambda: self.source_pane.active_scope.roots
+            if scope.primary_root and self.faces_pane.face_folder_path.text().strip() != scope.primary_root:
+                self.faces_pane.face_folder_path.blockSignals(True)
+                self.faces_pane.face_folder_path.setText(scope.primary_root)
+                self.faces_pane.face_folder_path.blockSignals(False)
+            self.faces_pane.active_scope_changed()
+        if self.names_pane is not None:
+            self.names_pane.active_scope_changed()
+        if self.tags_pane is not None and self._active_workspace == "tags":
+            self.tags_pane.refresh()
+        if self.library_pane is not None:
+            self.library_pane.active_scope_changed()
+        self._load_gallery_scope(scope)
         self._apply_startup_workflow_gate()
 
     def _load_gallery_folder(self, directory: str) -> None:
-        """Discover on a worker so selecting a folder never blocks the photo view."""
+        """Compatibility wrapper for focused legacy callers/tests."""
+
+        self._load_gallery_scope(PathScope.from_paths([directory]))
+
+    def _load_gallery_scope(self, scope: PathScope) -> None:
+        """Discover the active-root union in a worker without blocking Qt."""
         self._gallery_discovery_generation += 1
         generation = self._gallery_discovery_generation
         previous = self._gallery_discovery_job
@@ -2653,16 +2852,16 @@ class ProductionClusterApp(QMainWindow):
                 pass
         self._gallery_paths = []
         self._gallery_snapshot_key = ""
-        if not directory or not Path(directory).is_dir():
-            self.photo_gallery.set_empty_state("Choose a folder to show its photos.")
+        if scope.is_empty:
+            self.photo_gallery.set_empty_state("Choose active roots to show their photos.")
             return
-        self.photo_gallery.set_loading_state("Finding photos in this folder…")
+        self.photo_gallery.set_loading_state(f"Finding photos in {len(scope.roots)} active root(s)…")
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
 
-            return ImageDiscoveryService().discover_result(
-                directory,
+            return ImageDiscoveryService().discover_roots_result(
+                list(scope.roots),
                 recursive=bool(self.clustering_pane.recursive_checkbox.isChecked()),
                 progress_callback=progress,
                 cancel_check=cancel_check,
@@ -2670,7 +2869,7 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._gallery_discovery_job = job
-        self.job_manager.bind_async_job(job, "Finding folder photos", origin="Gallery")
+        self.job_manager.bind_async_job(job, "Finding active-root photos", origin="Gallery")
 
         def _finished(result) -> None:
             if generation != self._gallery_discovery_generation or self._is_shutting_down:
@@ -2678,18 +2877,23 @@ class ProductionClusterApp(QMainWindow):
             self._gallery_paths = list(getattr(result, "paths", ()) or ())
             self._gallery_snapshot_key = str(getattr(result, "snapshot_key", "") or "")
             if not self._gallery_paths:
-                self.photo_gallery.set_empty_state("No supported photos were found in this folder.", can_organize=False)
+                self.photo_gallery.set_empty_state("No supported photos were found in the active roots.", can_organize=False)
                 self._apply_startup_workflow_gate()
                 return
+            sections = []
+            for root in scope.roots:
+                paths = tuple(path for path in self._gallery_paths if PathScope.from_paths([root]).contains(path))
+                if paths:
+                    sections.append(GallerySection(f"root:{root}", paths, kind="all", title=Path(root).name or root))
             self.photo_gallery.set_sections(
-                [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
-                status=f"Showing {len(self._gallery_paths)} photos. Organize when you are ready.",
+                sections or [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
+                status=f"Showing {len(self._gallery_paths)} photos across {len(scope.roots)} active root(s). Organize when you are ready.",
             )
             self._apply_startup_workflow_gate()
 
         def _failed(message: str) -> None:
             if generation == self._gallery_discovery_generation and not self._is_shutting_down:
-                self.photo_gallery.set_empty_state(f"Could not read this folder: {message}")
+                self.photo_gallery.set_empty_state(f"Could not read the active roots: {message}")
 
         job.completed.connect(_finished)
         job.failed.connect(_failed)
@@ -3034,7 +3238,7 @@ class ProductionClusterApp(QMainWindow):
             cluster_meanings=self.cluster_meanings,
         )
         self.gallery_pane.set_membership_context(self.membership_by_image, self.metrics_by_backend)
-        if self._gallery_paths and self._active_cluster_directory == self.source_pane.selected_directory:
+        if self._gallery_paths and self._active_cluster_scope_signature == self.source_pane.active_scope.signature:
             self.photo_gallery.set_sections(
                 self._gallery_sections_from_clusters(),
                 status="Photos organized by the current primary clustering result.",
@@ -3053,6 +3257,8 @@ class ProductionClusterApp(QMainWindow):
             self.footer_bar.set_status(f"Clustering finished with no clusters to preview.{fallback_notice}{warm_note}")
         self._set_activity("Refreshing tag summaries...")
         self._start_cluster_tag_context_refresh()
+        if self.library_pane is not None:
+            self.library_pane.describe_completed_clusters(self.cluster_data)
         self._refresh_footer_storage_usage()
 
     def _on_clustering_failed(self, message: str) -> None:
@@ -3333,6 +3539,8 @@ class ProductionClusterApp(QMainWindow):
             self.faces_pane.setMinimumWidth(widths["faces"])
         if self.names_pane is not None:
             self.names_pane.setMinimumWidth(widths["faces"])
+        if self.library_pane is not None:
+            self.library_pane.setMinimumWidth(widths["faces"])
         self._reflow_main_splitter(force=True)
 
     def _layout_widths(self) -> dict[str, int]:
@@ -3392,6 +3600,8 @@ class ProductionClusterApp(QMainWindow):
             self.faces_pane.set_read_only_mode(read_only)
         if self.names_pane is not None:
             self.names_pane.set_read_only_mode(read_only)
+        if self.library_pane is not None:
+            self.library_pane.set_read_only_mode(read_only)
         self._refresh_health_badge()
 
     def _apply_runtime_status(self) -> None:
@@ -3411,6 +3621,17 @@ class ProductionClusterApp(QMainWindow):
     def _on_cluster_selection_target_changed(self, _target: SelectionTarget | None) -> None:
         self.gallery_pane.refresh_selection_target_hint()
         self._refresh_tags_suggestion_state()
+        if self.library_pane is not None:
+            target = _target
+            if target is None:
+                self.library_pane.set_selected_cluster("", ())
+            else:
+                comparison_key = str(target.source_context.get("comparison_key") or target.source_context.get("backend") or "cluster")
+                try:
+                    cluster_id = int(target.source_context.get("cluster_id", -1) or -1)
+                except (TypeError, ValueError):
+                    cluster_id = -1
+                self.library_pane.set_selected_cluster(f"{comparison_key}:{cluster_id}", target.as_list())
 
     @staticmethod
     def _cluster_selection_identity(target: SelectionTarget | None) -> tuple[str, int, tuple[str, ...]] | None:
@@ -3696,7 +3917,15 @@ class ProductionClusterApp(QMainWindow):
             self.settings_store,
             self.runtime_service,
             describe_rebuildable_caches=self.cache_maintenance_service.describe_rebuildable_caches,
+            describe_generated_storage=self._describe_generated_storage,
             clear_rebuildable_caches=self._clear_rebuildable_caches,
+            clear_library_catalog=self._clear_library_catalog,
+            clear_runtime_temp_files=self._clear_runtime_temp_files,
+            clear_face_storage=self._clear_face_storage,
+            clear_model_caches=self._clear_model_caches,
+            clear_logs=self._clear_logs,
+            clear_runtime_reports=self._clear_runtime_reports,
+            clear_model_assets=self._clear_model_assets,
             can_clear_rebuildable_caches=lambda: not self._background_runtime_work_active(),
             runtime_layout=self.runtime_layout,
             support_metadata_provider=self._support_metadata,
@@ -3725,11 +3954,13 @@ class ProductionClusterApp(QMainWindow):
             if face_models_changed:
                 self._reload_face_services_from_settings()
                 self._begin_startup_readiness_check()
+            self._refresh_workspace_ui()
             return
         self._apply_settings_values(dialog.values())
         self.footer_bar.set_status("Production settings updated.")
         self._set_activity("Settings updated")
         self._refresh_footer_storage_usage()
+        self._refresh_workspace_ui()
 
     def _apply_settings_values(self, values: dict[str, object]) -> None:
         for key, value in self.settings_registry.validate_values(values).items():
@@ -3944,6 +4175,25 @@ class ProductionClusterApp(QMainWindow):
     def _clear_runtime_temp_files(self, *, progress_callback=None, cancel_check=None):
         return self._clear_generated_storage_categories(
             ("temp_files",), progress_callback=progress_callback, cancel_check=cancel_check
+        )
+
+    def _clear_library_catalog(self, *, progress_callback=None, cancel_check=None):
+        if self.library_pane is None:
+            return CacheClearResult((), 0, ("Library workspace is unavailable.",))
+        catalog = self.library_pane.catalog
+        before = catalog.catalog_storage_bytes()
+        catalog.clear_library_cache(
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+        after = catalog.catalog_storage_bytes()
+        # The dialog owns the worker. Refresh the Qt view on the next normal
+        # workspace update rather than touching widgets from that worker.
+        self._library_catalog_refresh_pending = True
+        return CacheClearResult(
+            cleared_targets=("library_catalog",),
+            freed_bytes=max(0, int(before - after)),
+            failures=(),
         )
 
     def _clear_face_storage(self, *, progress_callback=None, cancel_check=None):
@@ -4215,7 +4465,7 @@ class ProductionClusterApp(QMainWindow):
             "workspace": self._active_workspace,
             "mode": self._clustering_mode,
             "faces_mode": self._faces_mode,
-            "folder": self.source_pane.selected_directory,
+            "active_roots": list(self.source_pane.active_scope.roots),
             "last_run_metrics": self.last_run_metrics,
             "runtime": self.runtime_service.diagnostics(self._preferred_execution_mode()),
             "runtime_root": str(self.runtime_layout.root),
@@ -4330,6 +4580,19 @@ class ProductionClusterApp(QMainWindow):
             return_workspace="tags",
             context_by_path={
                 str(path): {"tag_route": {"tag": tag_name}}
+                for path in self._unique_photo_paths(paths)
+            },
+        )
+
+    def _open_library_photos_in_gallery(self, paths: list[str], source: str) -> None:
+        route_source = str(source or "Library").strip() or "Library"
+        self._open_photo_set_route(
+            paths,
+            source=f"Library · {route_source}",
+            title=route_source,
+            return_workspace="library",
+            context_by_path={
+                str(path): {"library_route": {"source": route_source}}
                 for path in self._unique_photo_paths(paths)
             },
         )
@@ -4733,6 +4996,11 @@ class ProductionClusterApp(QMainWindow):
         if self.tags_pane is not None:
             try:
                 ready_to_close = self.tags_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
+            except Exception:
+                ready_to_close = False
+        if self.library_pane is not None:
+            try:
+                ready_to_close = self.library_pane.shutdown_jobs(timeout_ms=drain_timeout_ms) and ready_to_close
             except Exception:
                 ready_to_close = False
         try:

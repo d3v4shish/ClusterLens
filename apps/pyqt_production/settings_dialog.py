@@ -159,6 +159,7 @@ class ProductionSettingsDialog(QDialog):
         describe_rebuildable_caches: Callable[[], CacheUsageSummary] | None = None,
         describe_generated_storage: Callable[[], GeneratedStorageSummary] | None = None,
         clear_rebuildable_caches: Callable[[], CacheClearResult] | None = None,
+        clear_library_catalog: Callable[[], CacheClearResult] | None = None,
         clear_runtime_temp_files: Callable[[], CacheClearResult] | None = None,
         clear_face_storage: Callable[[], CacheClearResult] | None = None,
         clear_model_caches: Callable[[], CacheClearResult] | None = None,
@@ -181,6 +182,7 @@ class ProductionSettingsDialog(QDialog):
         self.describe_rebuildable_caches = describe_rebuildable_caches
         self.describe_generated_storage = describe_generated_storage
         self.clear_rebuildable_caches = clear_rebuildable_caches
+        self.clear_library_catalog = clear_library_catalog
         self.clear_runtime_temp_files = clear_runtime_temp_files
         self.clear_face_storage = clear_face_storage
         self.clear_model_caches = clear_model_caches
@@ -504,6 +506,7 @@ class ProductionSettingsDialog(QDialog):
         actions = QGridLayout()
         self.refresh_cache_usage_button = QPushButton("Refresh Cache Usage")
         self.clear_cache_button = QPushButton("Clear Rebuildable Caches")
+        self.clear_library_catalog_button = QPushButton("Clear Library Cache")
         self.clear_runtime_temp_button = QPushButton("Clear Temp Files")
         self.clear_face_storage_button = QPushButton("Clear Face DBs / ANN")
         self.clear_model_caches_button = QPushButton("Clear Model Caches")
@@ -513,11 +516,12 @@ class ProductionSettingsDialog(QDialog):
         actions.addWidget(self.refresh_cache_usage_button, 0, 0)
         actions.addWidget(self.clear_cache_button, 0, 1)
         actions.addWidget(self.clear_runtime_temp_button, 0, 2)
-        actions.addWidget(self.clear_face_storage_button, 1, 0)
-        actions.addWidget(self.clear_model_caches_button, 1, 1)
-        actions.addWidget(self.clear_logs_button, 1, 2)
-        actions.addWidget(self.clear_runtime_reports_button, 2, 0)
-        actions.addWidget(self.clear_model_assets_button, 2, 1, 1, 2)
+        actions.addWidget(self.clear_library_catalog_button, 1, 0)
+        actions.addWidget(self.clear_face_storage_button, 1, 1)
+        actions.addWidget(self.clear_model_caches_button, 1, 2)
+        actions.addWidget(self.clear_logs_button, 2, 0)
+        actions.addWidget(self.clear_runtime_reports_button, 2, 1)
+        actions.addWidget(self.clear_model_assets_button, 2, 2)
         layout.addLayout(actions)
         self.cache_status_label = QLabel(
             "Each clear action affects only the named generated-data category. Source photos, tags, durable face labels, "
@@ -530,6 +534,13 @@ class ProductionSettingsDialog(QDialog):
 
         self.refresh_cache_usage_button.clicked.connect(self.refresh_cache_usage)
         self.clear_cache_button.clicked.connect(self._clear_rebuildable_caches)
+        self.clear_library_catalog_button.clicked.connect(
+            lambda: self._clear_generated_storage(
+                "Clear Library Cache?",
+                "This removes derived Library photo metadata and generated cluster descriptions. Registered roots, saved albums, review decisions, source images, and face labels are preserved. Refresh a root to rebuild the catalog.",
+                self.clear_library_catalog,
+            )
+        )
         self.clear_runtime_temp_button.clicked.connect(
             lambda: self._clear_generated_storage(
                 "Clear Temp Files?",
@@ -1526,6 +1537,7 @@ class ProductionSettingsDialog(QDialog):
             "logs": "Logs (recovery journal preserved)",
             "thumbnails": "Thumbnails",
             "rebuildable_caches": "Rebuildable caches",
+            "library_catalog": "Library catalog cache (roots and review choices preserved when cleared)",
             "face_databases": "Face databases",
             "ann_files": "Face ANN files",
             "model_caches": "Model caches",
@@ -1756,6 +1768,7 @@ class ProductionSettingsDialog(QDialog):
         self.clear_cache_button.setEnabled((not busy) and allow_clear)
         for button, callback in (
             (self.clear_runtime_temp_button, self.clear_runtime_temp_files),
+            (self.clear_library_catalog_button, self.clear_library_catalog),
             (self.clear_face_storage_button, self.clear_face_storage),
             (self.clear_model_caches_button, self.clear_model_caches),
             (self.clear_logs_button, self.clear_logs),

@@ -33,6 +33,7 @@ from app.services.face_search import (
     BUILTIN_HUMAN_EMBEDDER_ID,
     EditableFaceInput,
     FaceDetectionService,
+    FaceIndexPerformanceConfig,
     FaceIndexRecord,
     IndexedFaceRecord,
     FaceIndexService,
@@ -567,6 +568,25 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual([], list(cache_dir.glob("*.webp")))
             self.assertEqual(set(), self._thumbnail_index_paths(recovered))
+
+    def test_thumbnail_index_reconciliation_rejects_symlinked_cache_entries(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / "thumbnails"
+            cache_dir.mkdir()
+            external = root / "outside.webp"
+            Image.new("RGB", (16, 16), (30, 60, 90)).save(external, format="WEBP")
+            symlink = cache_dir / "outside-link.webp"
+            try:
+                symlink.symlink_to(external)
+            except OSError as error:
+                self.skipTest(f"Symlinks are unavailable for this test: {error}")
+
+            service = self._thumbnail_service_for_cache(cache_dir)
+
+            self.assertEqual(set(), self._thumbnail_index_paths(service))
+            self.assertTrue(external.exists())
+            self.assertTrue(symlink.is_symlink())
 
     def test_thumbnail_index_reconciliation_is_shared_by_services_for_one_cache_directory(self):
         with TemporaryDirectory() as tmp:
@@ -2612,6 +2632,109 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(10, detector.detect_calls)
             self.assertEqual(1, connect_calls)
 
+    def test_index_paths_batches_embeddings_and_persists_bounded_image_batches(self):
+        class RecordingEmbeddingService(FakeFaceEmbeddingService):
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes: list[int] = []
+
+            def embed_faces(self, face_crops):
+                self.batch_sizes.append(len(face_crops))
+                return super().embed_faces(face_crops)
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_paths: list[str] = []
+            for index in range(5):
+                image_path = root / f"batch-{index}.jpg"
+                Image.new("RGB", (48, 48), (index, index, index)).save(image_path)
+                image_paths.append(str(image_path))
+            embedder = RecordingEmbeddingService()
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=embedder,
+                db_path=root / "faces.sqlite3",
+                index_performance=FaceIndexPerformanceConfig(
+                    decode_workers=2,
+                    quality_workers=2,
+                    embedding_batch_size=3,
+                    write_batch_images=2,
+                    max_decoded_images=2,
+                ),
+            )
+
+            metrics = service.index_paths(image_paths)
+
+            self.assertEqual([3, 2], embedder.batch_sizes)
+            self.assertEqual(5, metrics["embedded_faces"])
+            self.assertEqual(5, metrics["written_images"])
+            self.assertEqual(2, metrics["decode_queue_peak"])
+            self.assertEqual(5, service.count_indexed_faces(include_tiny_faces=True))
+
+    def test_index_paths_cancellation_releases_pending_crops_before_any_batch_write(self):
+        class CancellingDetector(FakeFaceDetectionService):
+            def __init__(self):
+                self.detect_calls = 0
+                self.last_face = None
+
+            def detect_faces(self, image_path):
+                self.detect_calls += 1
+                self.last_face = FakeFace(image_path)
+                return [self.last_face]
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths: list[str] = []
+            for index in range(3):
+                path = root / f"cancel-{index}.jpg"
+                Image.new("RGB", (48, 48), (index, index, index)).save(path)
+                paths.append(str(path))
+            detector = CancellingDetector()
+            service = FaceIndexService(
+                detection_service=detector,
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+                index_performance=FaceIndexPerformanceConfig(
+                    decode_workers=2,
+                    quality_workers=1,
+                    embedding_batch_size=8,
+                    write_batch_images=8,
+                    max_decoded_images=2,
+                ),
+            )
+
+            with self.assertRaises(Cancelled):
+                service.index_paths(paths, force=True, cancel_check=lambda: detector.detect_calls >= 1)
+
+            self.assertEqual(0, service.count_indexed_faces(include_tiny_faces=True))
+            self.assertIsNotNone(detector.last_face)
+            with self.assertRaises(ValueError):
+                detector.last_face.crop.getbbox()
+
+    def test_face_index_performance_config_respects_gpu_profile_and_decode_bound(self):
+        profile = SimpleNamespace(
+            logical_cpu_count=16,
+            thumbnail_workers=12,
+            embedding_preprocess_workers=8,
+            gpu_batch_size=32,
+            cpu_batch_size=24,
+        )
+        policy = ExecutionPolicy(
+            "auto",
+            "cuda",
+            "cuda",
+            "CUDAExecutionProvider",
+            "fixture CUDA policy",
+        )
+
+        config = FaceIndexPerformanceConfig.from_performance_profile(profile, policy)
+
+        self.assertEqual(8, config.decode_workers)
+        self.assertEqual(4, config.quality_workers)
+        self.assertEqual(32, config.embedding_batch_size)
+        self.assertEqual(32, config.write_batch_images)
+        self.assertEqual(8, config.max_decoded_images)
+
     def test_index_paths_throttles_progress_updates_for_large_skipped_batches(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3171,6 +3294,18 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(1, review[str(tiny)].hidden_face_count)
             self.assertEqual("not_scanned", review[str(not_scanned)].review_status)
 
+            self.assertEqual(1, service.hide_faces([(str(detected), 0)]))
+            self.assertEqual(0, service.hide_faces([(str(detected), 0)]))
+            ignored_review = {
+                item.image_path: item
+                for item in service.load_folder_review_images(str(root), include_tiny_faces=False)
+            }
+            self.assertEqual("ignored_only", ignored_review[str(detected)].review_status)
+            self.assertEqual(1, ignored_review[str(detected)].ignored_face_count)
+            self.assertEqual(1, len(ignored_review[str(detected)].ignored_faces))
+            self.assertEqual(1, service.unhide_faces([(str(detected), 0)]))
+            self.assertEqual(0, service.unhide_faces([(str(detected), 0)]))
+
     def test_face_folder_review_uses_indexed_paths_when_candidate_snapshot_is_empty(self):
         class _Face:
             def __init__(self, image_path: str, bbox: tuple[int, int, int, int]):
@@ -3217,6 +3352,35 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(1005, len(review))
             self.assertTrue(all(item.review_status == "not_scanned" for item in review))
+
+    def test_face_folder_review_page_is_bounded_source_ordered_and_reports_next_offset(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+            candidate_paths = [str(root / f"image_{index:04d}.jpg") for index in range(1005)]
+
+            first = service.load_folder_review_image_page(
+                str(root), candidate_paths=candidate_paths, offset=0, limit=999
+            )
+            second = service.load_folder_review_image_page(
+                str(root), candidate_paths=candidate_paths, offset=500, limit=500
+            )
+            last = service.load_folder_review_image_page(
+                str(root), candidate_paths=candidate_paths, offset=1000, limit=500
+            )
+
+            self.assertEqual(1005, first.total_count)
+            self.assertEqual(500, len(first.items))
+            self.assertEqual(500, first.next_offset)
+            self.assertEqual(candidate_paths[:500], [item.image_path for item in first.items])
+            self.assertEqual(candidate_paths[500:1000], [item.image_path for item in second.items])
+            self.assertEqual(1000, second.next_offset)
+            self.assertEqual(candidate_paths[1000:], [item.image_path for item in last.items])
+            self.assertIsNone(last.next_offset)
 
     def test_animal_bundle_status_reports_missing_and_ready_states(self):
         with TemporaryDirectory() as tmp:
@@ -3417,6 +3581,27 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(embedder_path, embedder.embedder_path)
         self.assertIn("Downloaded", detector_labels["scrfd_10g_kps"])
         self.assertIn("Downloaded", embedder_labels["arcface_r100_glint360k"])
+
+    def test_nested_external_scrfd_and_arcface_files_are_discovered_without_copying(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "vendor-cache" / "models"
+            model_dir.mkdir(parents=True)
+            detector_path = model_dir / "custom-scrfd-2.5g-release.onnx"
+            embedder_path = model_dir / "custom-arcface-r50-release.onnx"
+            detector_path.write_bytes(b"detector")
+            embedder_path.write_bytes(b"embedder")
+
+            with patch("app.services.face_search.face_model_runtime_root_dir", return_value=root / "managed"):
+                detector = resolve_face_detector_bundle(root, "human", "scrfd_2.5g_kps")
+                embedder = resolve_face_embedder_bundle(root, "human", "arcface_r50")
+
+        self.assertTrue(detector.available)
+        self.assertTrue(embedder.available)
+        self.assertEqual(detector_path, detector.detector_path)
+        self.assertEqual(embedder_path, embedder.embedder_path)
+        self.assertEqual("external", detector.source_kind)
+        self.assertEqual("external", embedder.source_kind)
 
     def test_selected_face_model_profile_recognizes_latest_gpu_and_opencv_cpu(self):
         self.assertEqual(
@@ -4754,6 +4939,12 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(all(record.hidden for record in hidden_records))
             self.assertEqual([], service.load_person_profiles(include_tiny_faces=True))
             self.assertEqual(["Alice", "Bob"], [profile.person_name for profile in service.load_person_profiles(include_tiny_faces=True, include_hidden=True)])
+            self.assertEqual(["Bob"], service.list_known_person_names())
+            review = {item.image_path: item for item in service.load_folder_review_images(str(Path(tmp)))}
+            self.assertEqual("ignored_only", review[str(image_b)].review_status)
+            self.assertEqual(1, review[str(image_b)].ignored_face_count)
+            self.assertEqual("hidden_person_only", review[str(image_a)].review_status)
+            self.assertEqual(0, review[str(image_a)].ignored_face_count)
 
             reloaded = FaceIndexService(
                 detection_service=FakeFaceDetectionService(),
