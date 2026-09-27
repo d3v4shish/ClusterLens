@@ -48,6 +48,7 @@ src/build/
 src/dist/
 benchmarks/
 benchmarks/**/runtime/
+artifacts/
 model_assets/
 models/
 checkpoints/
