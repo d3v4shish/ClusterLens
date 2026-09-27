@@ -8,7 +8,7 @@ from PyQt6.QtCore import QAbstractListModel, QEvent, QModelIndex, QRect, QSize, 
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionViewItem, QApplication
 
-from ui.theme import COLORS
+from ui.theme import COLORS, theme_revision
 
 MAX_FACE_BOXES_PER_TILE = 16
 
@@ -408,6 +408,14 @@ class GalleryItemDelegate(QStyledItemDelegate):
         self.card_width = image_size + 32
         self.card_height = image_size + 74
         self._copy_icon_size = 18
+        self._theme_revision = -1
+        self._sync_theme_colors()
+
+    def _sync_theme_colors(self) -> None:
+        revision = theme_revision()
+        if revision == self._theme_revision:
+            return
+        self._theme_revision = revision
         # Custom painting bypasses QSS, so use the shared design tokens.
         self._card = QColor(COLORS["surface"])
         self._card_checked = QColor(COLORS["surface_checked"])
@@ -497,6 +505,7 @@ class GalleryItemDelegate(QStyledItemDelegate):
         return left, top, rect_width, rect_height
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        self._sync_theme_colors()
         painter.save()
         rect = self.card_rect_for(option.rect)
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)

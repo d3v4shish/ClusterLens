@@ -13,6 +13,8 @@ from uuid import uuid4
 from app.services.model_assets import (
     HF_CACHE_REQUIRED_FILES,
     HF_CACHE_TEXT_REQUIRED_FILES,
+    HF_MODEL_REPOSITORIES,
+    HF_MODEL_REVISIONS,
     ModelAssetService,
     _complete_hf_cache_snapshot,
 )
@@ -29,11 +31,7 @@ MODEL_DOWNLOAD_LOCK_STALE_SECONDS = 24 * 60 * 60
 # can resolve different revisions while a repository is being updated.  Download
 # the files needed by ClusterLens as one snapshot first, so offline readiness
 # and the runtime agree on the same revision.
-HF_SNAPSHOT_REPOSITORIES = {
-    "clip": "openai/clip-vit-base-patch32",
-    "openclip": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-    "siglip": "google/siglip-base-patch16-224",
-}
+HF_SNAPSHOT_REPOSITORIES = HF_MODEL_REPOSITORIES
 HF_SNAPSHOT_ALLOW_PATTERNS = (
     "*.json",
     "*.txt",
@@ -224,6 +222,7 @@ class ModelDownloadService:
 
         snapshot_download(
             repo_id=repository,
+            revision=HF_MODEL_REVISIONS[str(item.model_name or "").strip().lower()],
             cache_dir=str(Path(self.settings.cache_dir) / "huggingface" / "hub"),
             allow_patterns=HF_SNAPSHOT_ALLOW_PATTERNS,
         )

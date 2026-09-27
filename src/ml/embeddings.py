@@ -12,7 +12,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from app.services.model_assets import BUNDLED_ONNX_INPUT_SIZES, ModelAssetService
+from app.services.model_assets import (
+    BUNDLED_ONNX_INPUT_SIZES,
+    HF_MODEL_REPOSITORIES,
+    HF_MODEL_REVISIONS,
+    ModelAssetService,
+)
 from app.services.onnx_models import OnnxModelService
 from infra.cancel import raise_if_cancelled
 from infra.cache import CacheService
@@ -238,13 +243,18 @@ class ModelManager:
         elif base_model_name == "clip":
             from transformers import AutoImageProcessor, AutoTokenizer, CLIPModel
 
+            model_id = HF_MODEL_REPOSITORIES[base_model_name]
+            revision = HF_MODEL_REVISIONS[base_model_name]
+            revision_kwargs = {"revision": revision} if self.allow_model_downloads else {}
             model = CLIPModel.from_pretrained(
-                "openai/clip-vit-base-patch32",
+                model_id,
+                **revision_kwargs,
                 use_safetensors=True,
                 local_files_only=not self.allow_model_downloads,
             )
             preprocess = AutoImageProcessor.from_pretrained(
-                "openai/clip-vit-base-patch32",
+                model_id,
+                **revision_kwargs,
                 use_fast=True,
                 local_files_only=not self.allow_model_downloads,
             )
@@ -252,7 +262,8 @@ class ModelManager:
                 if not self.load_text_tokenizer:
                     raise LookupError("Text tokenizer not requested")
                 text_tokenizer = AutoTokenizer.from_pretrained(
-                    "openai/clip-vit-base-patch32",
+                    model_id,
+                    **revision_kwargs,
                     use_fast=True,
                     local_files_only=not self.allow_model_downloads,
                 )
@@ -263,14 +274,27 @@ class ModelManager:
         elif base_model_name == "openclip":
             from transformers import AutoImageProcessor, AutoTokenizer, CLIPModel
 
-            model_id = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
-            model = CLIPModel.from_pretrained(model_id, use_safetensors=True, local_files_only=not self.allow_model_downloads)
-            preprocess = AutoImageProcessor.from_pretrained(model_id, use_fast=True, local_files_only=not self.allow_model_downloads)
+            model_id = HF_MODEL_REPOSITORIES[base_model_name]
+            revision = HF_MODEL_REVISIONS[base_model_name]
+            revision_kwargs = {"revision": revision} if self.allow_model_downloads else {}
+            model = CLIPModel.from_pretrained(
+                model_id,
+                **revision_kwargs,
+                use_safetensors=True,
+                local_files_only=not self.allow_model_downloads,
+            )
+            preprocess = AutoImageProcessor.from_pretrained(
+                model_id,
+                **revision_kwargs,
+                use_fast=True,
+                local_files_only=not self.allow_model_downloads,
+            )
             try:
                 if not self.load_text_tokenizer:
                     raise LookupError("Text tokenizer not requested")
                 text_tokenizer = AutoTokenizer.from_pretrained(
                     model_id,
+                    **revision_kwargs,
                     use_fast=True,
                     local_files_only=not self.allow_model_downloads,
                 )
@@ -281,13 +305,18 @@ class ModelManager:
         elif base_model_name == "siglip":
             from transformers import AutoImageProcessor, SiglipModel
 
+            model_id = HF_MODEL_REPOSITORIES[base_model_name]
+            revision = HF_MODEL_REVISIONS[base_model_name]
+            revision_kwargs = {"revision": revision} if self.allow_model_downloads else {}
             model = SiglipModel.from_pretrained(
-                "google/siglip-base-patch16-224",
+                model_id,
+                **revision_kwargs,
                 use_safetensors=True,
                 local_files_only=not self.allow_model_downloads,
             )
             preprocess = AutoImageProcessor.from_pretrained(
-                "google/siglip-base-patch16-224",
+                model_id,
+                **revision_kwargs,
                 use_fast=True,
                 local_files_only=not self.allow_model_downloads,
             )
@@ -297,7 +326,8 @@ class ModelManager:
                 from transformers import AutoTokenizer
 
                 text_tokenizer = AutoTokenizer.from_pretrained(
-                    "google/siglip-base-patch16-224",
+                    model_id,
+                    **revision_kwargs,
                     use_fast=True,
                     local_files_only=not self.allow_model_downloads,
                 )
@@ -315,8 +345,21 @@ class ModelManager:
         elif base_model_name == "dino":
             from timm import create_model
 
+            revision_kwargs = {}
+            if self.allow_model_downloads:
+                revision_kwargs["pretrained_cfg_overlay"] = {
+                    "hf_hub_id": (
+                        f"{HF_MODEL_REPOSITORIES[base_model_name]}@"
+                        f"{HF_MODEL_REVISIONS[base_model_name]}"
+                    )
+                }
             with _huggingface_offline_context(not self.allow_model_downloads):
-                model = create_model("vit_small_patch16_224_dino", pretrained=True, num_classes=0)
+                model = create_model(
+                    "vit_small_patch16_224_dino",
+                    pretrained=True,
+                    num_classes=0,
+                    **revision_kwargs,
+                )
             family = "timm"
             preprocess = self._default_preprocess(input_size)
         elif base_model_name == "dino_large":
@@ -330,15 +373,31 @@ class ModelManager:
         elif base_model_name == "dinov2_base":
             from timm import create_model
 
+            revision_kwargs = {}
+            if self.allow_model_downloads:
+                revision_kwargs["pretrained_cfg_overlay"] = {
+                    "hf_hub_id": (
+                        f"{HF_MODEL_REPOSITORIES[base_model_name]}@"
+                        f"{HF_MODEL_REVISIONS[base_model_name]}"
+                    )
+                }
             with _huggingface_offline_context(not self.allow_model_downloads):
-                model = create_model("vit_base_patch14_dinov2", pretrained=True, num_classes=0)
+                model = create_model(
+                    "vit_base_patch14_dinov2",
+                    pretrained=True,
+                    num_classes=0,
+                    **revision_kwargs,
+                )
             family = "timm"
             preprocess, input_size = self._timm_preprocess(model, fallback_input_size=(518, 518))
         elif base_model_name == "mobileclip":
             from timm import create_model
 
+            model_id = f"hf_hub:{HF_MODEL_REPOSITORIES[base_model_name]}"
+            if self.allow_model_downloads:
+                model_id = f"{model_id}@{HF_MODEL_REVISIONS[base_model_name]}"
             with _huggingface_offline_context(not self.allow_model_downloads):
-                model = create_model("hf_hub:apple/mobileclip_s0_timm", pretrained=True, num_classes=0)
+                model = create_model(model_id, pretrained=True, num_classes=0)
             family = "timm"
             preprocess, input_size = self._timm_preprocess(model, fallback_input_size=(256, 256))
         else:

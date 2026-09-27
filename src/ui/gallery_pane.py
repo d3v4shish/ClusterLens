@@ -7,7 +7,7 @@ from time import perf_counter
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QUrl, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QImage, QImageReader
-from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from app.selection import SelectionTarget
 from app.services.gallery_actions import CLUSTERLENS_TRASH_DIR_NAME, GalleryActionService, RenamePreviewItem
@@ -22,8 +22,11 @@ from .error_mbox import ExifMetadataDialog, ImageTagsDialog, confirmBox, errorBo
 from .gallery_model import GalleryImageModel, GalleryItemDelegate
 from .photo_inspector_dialog import PhotoInspectorDialog
 from .async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
-from .common import build_help_inline
+from .common import ResponsiveFlowLayout, build_help_inline
+from .count_copy import counted, showing, thumbnail_progress
 from .icons import apply_icon, themed_icon
+from .theme import COLORS, get_theme_manager
+from .work_coordinator import JobSpec, WorkCoordinator
 
 LOGGER = get_logger(__name__)
 
@@ -66,7 +69,7 @@ GALLERY_HELP = {
     ),
     "file_ops_menu": (
         "Copy, move, or send selected photos to ClusterLens Trash, or use the current group if nothing is selected.\n"
-        "Destructive actions stay separated from the main gallery row."
+        "Destructive actions stay separated from the primary photo action row."
     ),
     "more_menu": (
         "Less frequent gallery utilities: copy paths, export paths, and retry failed thumbnails.\n"
@@ -186,6 +189,7 @@ class ThumbnailRequestQueue:
         self._queue: PriorityQueue[tuple[int, int, int]] = PriorityQueue()
         self._lock = Lock()
         self._desired_priority: dict[int, int] = {}
+        self._inflight: set[tuple[int, int]] = set()
         self._seq = 0
         self._generation = 0
         self._images: list[str] = []
@@ -200,6 +204,7 @@ class ThumbnailRequestQueue:
             self._images = list(images)
             self._image_size = int(image_size)
             self._desired_priority.clear()
+            self._inflight.clear()
             self._seq = 0
         self.clear_queue()
 
@@ -226,6 +231,28 @@ class ThumbnailRequestQueue:
                 self._seq += 1
                 self._queue.put((priority, self._seq, index))
 
+    def retain_indexes(self, indexes: set[int]) -> set[int]:
+        """Discard queued work that cannot paint in the current viewport.
+
+        Image decoding is not safely interruptible once a worker has started,
+        so active requests are retained until completion.  Queued work is cheap
+        to invalidate and must never hold back a newly visible tile.
+        """
+        allowed = {int(index) for index in indexes if int(index) >= 0}
+        with self._lock:
+            dropped = {index for index in self._desired_priority if index not in allowed}
+            for index in dropped:
+                self._desired_priority.pop(index, None)
+            return dropped
+
+    def complete(self, generation: int, index: int) -> None:
+        with self._lock:
+            self._inflight.discard((int(generation), int(index)))
+
+    def is_inflight(self, index: int) -> bool:
+        with self._lock:
+            return (int(self._generation), int(index)) in self._inflight
+
     def get_next(self, timeout_s: float = 0.2) -> tuple[int, int, str, int] | None:
         if self._stop.is_set():
             return None
@@ -244,6 +271,7 @@ class ThumbnailRequestQueue:
                 # Stale request; a newer priority was queued.
                 return None
             self._desired_priority.pop(index, None)
+            self._inflight.add((generation, index))
         if index >= len(images):
             return None
         return generation, index, images[index], image_size
@@ -276,6 +304,8 @@ class ImageLoaderThread(QThread):
                 self.image_loaded.emit(generation, index, image_path, qimage)
             except Exception as exc:
                 self.image_failed.emit(generation, index, image_path, str(exc))
+            finally:
+                self.request_queue.complete(generation, index)
 
 
 class GalleryPane(QWidget):
@@ -294,6 +324,8 @@ class GalleryPane(QWidget):
         super().__init__(parent)
         self.settings = get_settings()
         self.job_manager = None
+        self.work_coordinator: WorkCoordinator | None = None
+        self.job_origin = "Photos"
         self.image_size = self.settings.thumbnail_size
         self.max_thumbnail_workers = int(self.settings.max_thumbnail_workers)
         self.thumbnail_prefetch_rows = int(self.settings.thumbnail_prefetch_rows)
@@ -312,6 +344,7 @@ class GalleryPane(QWidget):
         self.failed_indexes: set[int] = set()
         self.pending_indexes: set[int] = set()
         self._active_thumbnail_indexes: set[int] = set()
+        self._last_viewport_first_row: int | None = None
         self.pending_ui_items: list[tuple[int, str, QImage]] = []
         self.thumbnail_service = ThumbnailService(qimage_cache_size=self.settings.thumbnail_cache_size)
         self.action_service = GalleryActionService()
@@ -342,7 +375,10 @@ class GalleryPane(QWidget):
         self.review_action_mode = "add"
         self._face_box_drag_state = None
         self.main_layout = QVBoxLayout(self)
-        self.action_bar = QHBoxLayout()
+        # Advanced Organize can leave this gallery a narrow centre column
+        # between the controls and comparison panes. A flow preserves every
+        # action label by using a second row instead of Qt eliding text.
+        self.action_bar = ResponsiveFlowLayout(spacing=6)
         self.status_label = QLabel("")
         self.progress_bar = QProgressBar()
         self.model = GalleryImageModel(self)
@@ -359,7 +395,7 @@ class GalleryPane(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        self.target_hint_label = QLabel("Current group: visible photos")
+        self.target_hint_label = QLabel("Group: visible photos")
         self.select_group_button = QPushButton("Select current group")
         self.selected_tags_button = QPushButton("Tag selected photos")
         self.open_folder_button = QPushButton("Reveal folder")
@@ -375,9 +411,7 @@ class GalleryPane(QWidget):
                 self.target_hint_label,
                 GALLERY_HELP["current_group"],
                 help_key="current_group",
-                primary_stretch=1,
-            ),
-            stretch=1,
+            )
         )
         self.action_bar.addWidget(build_help_inline(self.select_group_button, GALLERY_HELP["select_current_group"], help_key="select_current_group"))
         self.action_bar.addWidget(build_help_inline(self.selected_tags_button, GALLERY_HELP["tags_selected_only"], help_key="tags_selected_only"))
@@ -398,11 +432,13 @@ class GalleryPane(QWidget):
         self.empty_state_description = QLabel("Choose a folder to begin.")
         self.empty_state_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_state_description.setWordWrap(True)
+        self.empty_state_description.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        self._sync_empty_state_description_height()
         empty_actions = QHBoxLayout()
         empty_actions.addStretch(1)
         self.empty_select_folder_button = QPushButton("Choose folder")
         self.empty_select_folder_button.setProperty("kind", "primary")
-        self.empty_run_button = QPushButton("Run clustering")
+        self.empty_run_button = QPushButton("Organize photos")
         apply_icon(self.empty_select_folder_button, "folder")
         apply_icon(self.empty_run_button, "scan")
         self.empty_select_folder_button.clicked.connect(self.empty_select_folder_requested.emit)
@@ -457,7 +493,10 @@ class GalleryPane(QWidget):
         self.move_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target", GALLERY_HELP["move_selection"], self.slotMoveSelected)
         self.rename_selection_action = self._add_menu_action(self.file_ops_menu, "Preview batch rename for current target", GALLERY_HELP["rename_selection"], self.slotPreviewBatchRename)
         self.delete_selection_action = self._add_menu_action(self.file_ops_menu, "Move current target to ClusterLens Trash", GALLERY_HELP["delete_selection"], self.slotDeleteSelect)
-        self.delete_selection_action.setIcon(themed_icon("delete", color="#FFAAA6"))
+        self._refresh_theme_icons()
+        theme_manager = get_theme_manager()
+        if theme_manager is not None:
+            theme_manager.theme_changed.connect(self._refresh_theme_icons)
         self.copy_paths_action = self._add_menu_action(self.more_menu, "Copy paths", GALLERY_HELP["copy_paths"], self.slotCopySelectedPaths)
         self.export_paths_action = self._add_menu_action(self.more_menu, "Export paths", GALLERY_HELP["export_paths"], self.slotExportSelectedPaths)
         self.retry_failed_action = self._add_menu_action(self.more_menu, "Retry failed thumbnails", GALLERY_HELP["retry_failed"], self.retry_failed_visible)
@@ -519,6 +558,10 @@ class GalleryPane(QWidget):
         action.setStatusTip(str(tooltip or "").splitlines()[0] if tooltip else "")
         action.triggered.connect(lambda _checked=False, cb=callback: cb())
         return action
+
+    def _refresh_theme_icons(self, *_args) -> None:
+        if hasattr(self, "delete_selection_action"):
+            self.delete_selection_action.setIcon(themed_icon("delete", color=COLORS["danger_text"]))
 
     def on_context_menu(self, pos) -> None:
         index = self.list_view.indexAt(pos)
@@ -682,10 +725,31 @@ class GalleryPane(QWidget):
         if status:
             self.status_label.setText(status)
 
-    def _start_action_job(self, label: str, fn, on_completed) -> None:
-        if self._active_action_thread is not None:
+    def configure_jobs(
+        self,
+        job_manager,
+        work_coordinator: WorkCoordinator | None = None,
+        *,
+        origin: str = "Photos",
+    ) -> None:
+        self.job_manager = job_manager
+        self.work_coordinator = work_coordinator
+        self.job_origin = str(origin or "Photos")
+
+    def _start_action_job(
+        self,
+        label: str,
+        fn,
+        on_completed,
+        *,
+        source_reads: tuple[str, ...] = (),
+        source_writes: tuple[str, ...] = (),
+        data_home_read: bool = False,
+        data_home_write: bool = False,
+    ) -> None:
+        if self._active_action_job is not None:
             try:
-                if self._active_action_thread.isRunning():
+                if self._active_action_thread is None or self._active_action_thread.isRunning():
                     errorBox("Busy", "Another gallery operation is already running.")
                     return
             except RuntimeError:
@@ -696,8 +760,18 @@ class GalleryPane(QWidget):
         job = AsyncJob(fn)
         job.progress.connect(self._on_action_progress)
         job_id: int | None = None
-        if self.job_manager is not None:
-            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin="Photos")
+        coordinated = self.work_coordinator is not None
+        spec = JobSpec(
+            label,
+            origin=self.job_origin,
+            io_bound=True,
+            source_reads=source_reads,
+            source_writes=source_writes,
+            data_home_read=data_home_read,
+            data_home_write=data_home_write,
+        )
+        if self.job_manager is not None and not coordinated:
+            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin=self.job_origin)
             self._active_action_job_id = job_id
             job.progress.connect(
                 lambda value, text, job_id=job_id: self.job_manager.update(
@@ -708,10 +782,12 @@ class GalleryPane(QWidget):
             )
 
         def _finish(status: str, error: str = "") -> None:
-            if self.job_manager is not None and job_id is not None:
+            if self.job_manager is not None and job_id is not None and not coordinated:
                 self.job_manager.finish(job_id, status=status, error=error)
             if self._active_action_job_id == job_id:
                 self._active_action_job_id = None
+            if self._active_action_job is job and self._active_action_thread is None:
+                self._active_action_job = None
 
         def _on_failed(message: str) -> None:
             self._set_action_busy(False)
@@ -735,16 +811,29 @@ class GalleryPane(QWidget):
         job.cancelled.connect(_on_cancelled)
         job.completed.connect(_on_completed)
         self._active_action_job = job
-        thread = start_job_in_thread(job)
-        self._action_thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_action_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
-        self._active_action_thread = thread
-        self._set_action_busy(True, f"{label} running...")
+        self._set_action_busy(True, f"{label} queued...")
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._action_thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_action_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._active_action_thread = thread
+            self._set_action_busy(True, f"{label} running...")
+
+        if self.work_coordinator is not None:
+            job_id = self.work_coordinator.submit_async_job(spec, job, _launch)
+            state = self.job_manager.get(job_id) if self.job_manager is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._active_action_job_id = job_id
+        else:
+            _launch()
         if self.job_manager is not None and self._active_action_job_id is not None:
-            self.job_manager.update(self._active_action_job_id, progress=None, text="Running")
+            state = self.job_manager.get(self._active_action_job_id)
+            if state is not None and state.status == "running":
+                self.job_manager.update(self._active_action_job_id, progress=None, text="Running")
 
     def _on_action_progress(self, value: int, text: str) -> None:
         try:
@@ -831,7 +920,16 @@ class GalleryPane(QWidget):
                 changed_label="ClusterLens Trash moves",
             )
 
-        self._start_action_job("Moving images to ClusterLens Trash", _run, _done)
+        trash_directories = tuple(
+            str(Path(path).parent / CLUSTERLENS_TRASH_DIR_NAME) for path in source_paths
+        )
+        self._start_action_job(
+            "Moving images to ClusterLens Trash",
+            _run,
+            _done,
+            source_writes=tuple(source_paths) + trash_directories,
+            data_home_write=self.image_tag_service is not None,
+        )
 
     def slotMoveSelected(self):
         if not self._require_write_enabled("move photos"):
@@ -874,7 +972,13 @@ class GalleryPane(QWidget):
                 self.paths_removed.emit(sorted(moved))
             self._show_action_result("Move complete", result, verb="Moved", target_label=target.label, changed_label="moves")
 
-        self._start_action_job("Moving images", _run, _done)
+        self._start_action_job(
+            "Moving images",
+            _run,
+            _done,
+            source_writes=tuple(source_paths) + (str(destination),),
+            data_home_write=self.image_tag_service is not None,
+        )
 
     def slotPreviewBatchRename(self) -> None:
         if not self._require_write_enabled("rename photo files"):
@@ -925,7 +1029,13 @@ class GalleryPane(QWidget):
                 self.paths_renamed.emit(changed)
             self._show_action_result("Batch rename complete", result, verb="Renamed", target_label=target.label, changed_label="renames")
 
-        self._start_action_job("Renaming photo files", _run, _done)
+        self._start_action_job(
+            "Renaming photo files",
+            _run,
+            _done,
+            source_writes=tuple(source_paths) + tuple(item.target_path for item in preview),
+            data_home_write=self.image_tag_service is not None,
+        )
 
     def slotAddExif(self):
         if not self._require_write_enabled("write EXIF metadata"):
@@ -970,7 +1080,12 @@ class GalleryPane(QWidget):
             else:
                 self._show_action_result("EXIF updated", result, verb="Updated EXIF for", target_label=target.label, changed_label="metadata writes")
 
-        self._start_action_job("Writing EXIF", _run, _done)
+        self._start_action_job(
+            "Writing EXIF",
+            _run,
+            _done,
+            source_writes=tuple(source_paths),
+        )
 
     def slotEditTags(self) -> None:
         target = self._selection_for_actions()
@@ -1033,7 +1148,13 @@ class GalleryPane(QWidget):
                 verb = "Added" if mode.casefold() == "add" else "Removed"
                 infoBox("Tags updated", f"{verb} {', '.join(tags)} for {len(affected_paths)} images from {target.label}.")
 
-        self._start_action_job("Updating image tags", _run, _done)
+        self._start_action_job(
+            "Updating image tags",
+            _run,
+            _done,
+            source_writes=tuple(source_paths) if mirror_to_exif else (),
+            data_home_write=True,
+        )
 
     def slotExportMetadataSidecars(self) -> None:
         target = self._selection_for_actions()
@@ -1061,7 +1182,13 @@ class GalleryPane(QWidget):
             self.status_label.setText(f"Exported {count} metadata sidecar file(s).")
             infoBox("Sidecar export complete", f"Exported {count} sidecar file(s) to:\n{output_dir}")
 
-        self._start_action_job("Exporting metadata sidecars", _run, _done)
+        self._start_action_job(
+            "Exporting metadata sidecars",
+            _run,
+            _done,
+            source_writes=(str(output_dir),),
+            data_home_read=True,
+        )
 
     def slotImportMetadataSidecars(self) -> None:
         if not self._require_write_enabled("import metadata sidecars"):
@@ -1094,7 +1221,13 @@ class GalleryPane(QWidget):
             self.status_label.setText(f"Imported {len(paths)} metadata sidecar file(s).")
             infoBox("Sidecar import complete", f"Imported metadata for {len(paths)} image(s).")
 
-        self._start_action_job("Importing metadata sidecars", _run, _done)
+        self._start_action_job(
+            "Importing metadata sidecars",
+            _run,
+            _done,
+            source_reads=tuple(str(path) for path in sidecar_paths),
+            data_home_write=True,
+        )
 
     def slotOpenSelectedFolders(self) -> None:
         target = self._selection_for_actions()
@@ -1168,7 +1301,12 @@ class GalleryPane(QWidget):
             self.status_label.setText(f"Exported {len(source_paths)} path(s) from {target.label}.")
             infoBox("Path export complete", f"Exported {int(count)} path(s) to:\n{export_path}")
 
-        self._start_action_job("Exporting image paths", _run, _done)
+        self._start_action_job(
+            "Exporting image paths",
+            _run,
+            _done,
+            source_writes=(str(export_path),),
+        )
 
     def slotCopySelected(self) -> None:
         if not self._require_write_enabled("copy photos"):
@@ -1210,7 +1348,14 @@ class GalleryPane(QWidget):
             _ = copied
             self._show_action_result("Copy complete", result, verb="Copied", target_label=target.label, changed_label="copies")
 
-        self._start_action_job("Copying images", _run, _done)
+        self._start_action_job(
+            "Copying images",
+            _run,
+            _done,
+            source_reads=tuple(source_paths),
+            source_writes=(str(destination),),
+            data_home_write=self.image_tag_service is not None,
+        )
 
     def update_gallery(self, images=None):
         return self.update_gallery_with_options(images=images, clear_pixmaps=True, reset_scroll=True)
@@ -1249,7 +1394,7 @@ class GalleryPane(QWidget):
         self.list_view.show()
         self.first_paint_start = perf_counter()
         self.first_paint_emitted = False
-        self.status_label.setText(f"Loading {len(self.images)} images...")
+        self.status_label.setText(f"Publishing {counted(len(self.images), 'photo')}…")
         self._ensure_loader()
         self.loader_queue.configure(self.request_generation, self.images, self.image_size)
         self.schedule_visible_refresh()
@@ -1369,10 +1514,10 @@ class GalleryPane(QWidget):
         self.pending_ui_items.clear()
         if self.images:
             if reload_visible:
-                self.status_label.setText("Gallery caches cleared. Reloading visible thumbnails...")
+                self.status_label.setText("Photo caches cleared. Reloading visible thumbnails...")
                 self.schedule_visible_refresh()
             else:
-                self.status_label.setText("Gallery caches cleared.")
+                self.status_label.setText("Photo caches cleared.")
 
     def invalidate_image_paths(self, image_paths: list[str] | set[str] | tuple[str, ...], *, reload_visible: bool = True) -> None:
         if self._shutting_down:
@@ -1430,7 +1575,7 @@ class GalleryPane(QWidget):
             self.first_paint_emitted = False
         self.loader_queue.configure(self.request_generation, self.images, self.image_size)
         self.refresh_selection_target_hint()
-        self.status_label.setText(f"Loading {len(self.images)} images...")
+        self.status_label.setText(f"Publishing {counted(len(self.images), 'photo')}…")
         self._ensure_loader()
         self.schedule_visible_refresh()
 
@@ -1479,10 +1624,10 @@ class GalleryPane(QWidget):
     def refresh_selection_target_hint(self) -> None:
         target = self.current_group_target()
         if target is None:
-            self.target_hint_label.setText("Current group: none")
+            self.target_hint_label.setText("Group: none")
             self._update_action_enabled_state()
             return
-        self.target_hint_label.setText(f"Current group: {target.label} ({len(target.paths)})")
+        self.target_hint_label.setText(f"Group: {target.label} ({len(target.paths)})")
         self.select_group_button.setText(f"Select current group ({len(target.paths)})")
         self._update_action_enabled_state()
 
@@ -1533,7 +1678,7 @@ class GalleryPane(QWidget):
     def _selection_for_explicit_gallery_actions(self) -> SelectionTarget | None:
         selected = tuple(self._selected_gallery_paths())
         if selected:
-            return SelectionTarget(paths=selected, kind="selected_gallery_images", label=f"Selected Gallery Photos ({len(selected)})")
+            return SelectionTarget(paths=selected, kind="selected_gallery_images", label=f"Selected Photos ({len(selected)})")
         checked = tuple(self.model.checked_paths())
         if checked:
             return SelectionTarget(paths=checked, kind="selected_images", label=f"Selected photos ({len(checked)})")
@@ -1616,6 +1761,18 @@ class GalleryPane(QWidget):
         if index.isValid():
             self._open_inspector(index, allow_face_edit=allow_face_edit)
 
+    def _rename_from_inspector(self, image_path: str) -> None:
+        path = str(image_path or "").strip()
+        if not path:
+            return
+        original = self.action_target_provider
+        target = SelectionTarget(paths=(path,), kind="photo_inspector", label="This photo")
+        self.set_action_target_provider(lambda: target)
+        try:
+            self.slotPreviewBatchRename()
+        finally:
+            self.set_action_target_provider(original)
+
     def _open_inspector(self, index, *, allow_face_edit: bool | None = None) -> None:
         image_path = index.data(self.model.PathRole)
         if not image_path:
@@ -1623,11 +1780,7 @@ class GalleryPane(QWidget):
         row = int(index.row())
         face_service = self._active_face_edit_service()
         current_context = self._inspector_context_for_path(str(image_path))
-        edit_enabled = bool(
-            face_service is not None
-            and not self.read_only_mode
-            and (allow_face_edit is True or allow_face_edit is None)
-        )
+        edit_enabled = bool(not self.read_only_mode and (allow_face_edit is True or allow_face_edit is None))
 
         dialog = PhotoInspectorDialog(
             image_path=None,
@@ -1643,7 +1796,11 @@ class GalleryPane(QWidget):
             face_draft_updated_callback=self.face_draft_updated_callback,
             face_edit_saved_callback=self.face_edit_saved_callback,
             face_auto_clean_callback=self.face_auto_clean_callback,
+            allow_metadata_edit=not self.read_only_mode,
+            allow_file_rename=not self.read_only_mode,
+            rename_current_callback=self._rename_from_inspector,
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
             parent=self,
         )
         dialog.exec()
@@ -1829,6 +1986,9 @@ class GalleryPane(QWidget):
                 return _remaining_timeout_ms()
             return max(0, int(timeout_ms))
 
+        coordinated_action_id = self._active_action_job_id if self.work_coordinator is not None else None
+        if coordinated_action_id is not None:
+            self.work_coordinator.cancel(coordinated_action_id)
         action_pairs: list[tuple[object | None, object | None]] = []
         seen_action_threads: set[int] = set()
         for job, thread in [(self._active_action_job, self._active_action_thread), *self._retained_action_refs]:
@@ -1840,31 +2000,30 @@ class GalleryPane(QWidget):
             seen_action_threads.add(thread_id)
             action_pairs.append((job, thread))
         for job, thread in action_pairs:
-            if job is not None:
+            if job is not None and coordinated_action_id is None:
                 try:
                     job.cancel()
                 except Exception:
                     pass
-            try:
-                if thread.isRunning():
-                    wait_timeout_ms = _thread_timeout_ms(thread)
-                    ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
-            except Exception:
-                ready_to_close = False
+            if self._thread_is_running(thread):
+                wait_timeout_ms = _thread_timeout_ms(thread)
+                ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
         if ready_to_close:
+            if coordinated_action_id is not None and self.work_coordinator is not None:
+                self.work_coordinator.finish(coordinated_action_id, status="cancelled")
+            self._active_action_job_id = None
             self._active_action_thread = None
             self._active_action_job = None
             self._retained_action_refs = []
             self._action_thread_jobs = {}
         self.cancel_loader(timeout_ms=_remaining_timeout_ms())
         for thread in list(self._retained_loader_threads):
-            try:
-                if thread.isRunning():
-                    wait_timeout_ms = _thread_timeout_ms(thread)
-                    ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
-            except Exception:
-                ready_to_close = False
-        self._retained_loader_threads = [thread for thread in self._retained_loader_threads if thread.isRunning()]
+            if self._thread_is_running(thread):
+                wait_timeout_ms = _thread_timeout_ms(thread)
+                ready_to_close = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms) and ready_to_close
+        self._retained_loader_threads = [
+            thread for thread in self._retained_loader_threads if self._thread_is_running(thread)
+        ]
         if self.loader_threads or self._retained_loader_threads:
             ready_to_close = False
         return ready_to_close
@@ -1992,11 +2151,30 @@ class GalleryPane(QWidget):
         for row in range(visible_start, visible_end + 1):
             visible.extend(row_to_indexes(row))
 
-        prefetch: list[int] = []
+        # The row estimate bounds the work.  Qt owns the final layout, so use
+        # its visual rectangles to keep the critical lane to tiles actually on
+        # screen and order them from the viewport centre outward.
+        viewport_center = viewport.center()
+        exact_visible: list[tuple[int, int]] = []
+        for index in visible:
+            rect = self.list_view.visualRect(self.model.index(index, 0))
+            if rect.isValid() and rect.intersects(viewport):
+                distance = abs(rect.center().x() - viewport_center.x()) + abs(rect.center().y() - viewport_center.y())
+                exact_visible.append((distance, index))
+        if exact_visible:
+            visible = [index for _distance, index in sorted(exact_visible)]
+
+        before: list[int] = []
         for row in range(prefetch_start, visible_start):
-            prefetch.extend(row_to_indexes(row))
+            before.extend(row_to_indexes(row))
+        after: list[int] = []
         for row in range(visible_end + 1, prefetch_end + 1):
-            prefetch.extend(row_to_indexes(row))
+            after.extend(row_to_indexes(row))
+        # Predict only after the entire viewport.  Directional prefetch makes
+        # fast scrolling feel immediate without decoding a second screen first.
+        moving_down = self._last_viewport_first_row is None or first_row >= self._last_viewport_first_row
+        self._last_viewport_first_row = first_row
+        prefetch = (after + before) if moving_down else (before + after)
         return visible, prefetch
 
     def load_visible_images(self):
@@ -2005,6 +2183,8 @@ class GalleryPane(QWidget):
         visible_indexes, prefetch_indexes = self._visible_and_prefetch_indexes()
         self._emit_visible_paths(visible_indexes)
         self._active_thumbnail_indexes = set(visible_indexes).union(prefetch_indexes)
+        dropped = self.loader_queue.retain_indexes(self._active_thumbnail_indexes)
+        self.pending_indexes.difference_update(dropped)
         evicted = self.model.evict_images_except(self._active_thumbnail_indexes)
         self.loaded_indexes.difference_update(evicted)
         if not visible_indexes and not prefetch_indexes:
@@ -2013,25 +2193,36 @@ class GalleryPane(QWidget):
         visible_missing = [
             index
             for index in visible_indexes
-            if index not in self.loaded_indexes and index not in self.failed_indexes and index not in self.pending_indexes
+            if index not in self.loaded_indexes and index not in self.failed_indexes and not self.loader_queue.is_inflight(index)
         ]
         prefetch_missing = [
             index
             for index in prefetch_indexes
-            if index not in self.loaded_indexes and index not in self.failed_indexes and index not in self.pending_indexes
+            if index not in self.loaded_indexes
+            and index not in self.failed_indexes
+            and index not in self.pending_indexes
+            and not self.loader_queue.is_inflight(index)
         ]
         if not visible_missing and not prefetch_missing:
             self.update_status()
             return
+        all_visible_queued = len(visible_missing) <= MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE
         visible_missing = visible_missing[:MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE]
-        prefetch_missing = prefetch_missing[:MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE]
+        # Do not spend a worker slot on look-ahead while another visible tile
+        # still has not entered the queue.
+        prefetch_missing = (
+            prefetch_missing[:MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE]
+            if all_visible_queued
+            else []
+        )
         self._ensure_loader()
         self.pending_indexes.update(visible_missing)
         self.pending_indexes.update(prefetch_missing)
         self.update_status()
         # Visible items first, then prefetch.
         self.loader_queue.enqueue(visible_missing, priority=0)
-        self.loader_queue.enqueue(prefetch_missing, priority=1)
+        if prefetch_missing:
+            self.loader_queue.enqueue(prefetch_missing, priority=1)
 
     def queueImageForGallery(self, generation, index, image_path, qimage):
         if self._shutting_down:
@@ -2086,7 +2277,7 @@ class GalleryPane(QWidget):
             return
         active = set(self._active_thumbnail_indexes)
         if not active:
-            message = f"Ready · {len(self.images)} photos."
+            message = f"{showing(len(self.images), 'photo')}."
             if last_error:
                 message += f" Last error: {last_error}"
             self.status_label.setText(message)
@@ -2098,9 +2289,15 @@ class GalleryPane(QWidget):
         )
         ready = loaded + failed
         if ready >= len(active) and pending == 0:
-            message = f"Ready · {len(self.images)} photos · {loaded} nearby thumbnails loaded."
+            message = (
+                f"{showing(len(self.images), 'photo')} · "
+                f"{thumbnail_progress(loaded, len(active), done=True, qualifier='nearby')}."
+            )
         else:
-            message = f"Loading nearby thumbnails: {ready} / {len(active)} ready. Pending: {pending}."
+            message = (
+                f"{showing(len(self.images), 'photo')} · "
+                f"{thumbnail_progress(ready, len(active), qualifier='nearby')}; {pending} pending."
+            )
         if failed:
             message += f" Failed nearby: {failed}."
         if last_error:
@@ -2129,11 +2326,28 @@ class GalleryPane(QWidget):
             QGuiApplication.clipboard().setImage(image)
             self.status_label.setText(f"Copied {Path(path).name} to the clipboard.")
 
-        self._start_action_job("Copying image to clipboard", _run, _done)
+        self._start_action_job(
+            "Copying image to clipboard",
+            _run,
+            _done,
+            source_reads=(path,),
+        )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.schedule_visible_refresh()
+
+    def _sync_empty_state_description_height(self) -> None:
+        if hasattr(self, "empty_state_description"):
+            self.empty_state_description.setMinimumHeight(
+                self.empty_state_description.fontMetrics().lineSpacing() * 2
+            )
+
+    def changeEvent(self, event) -> None:
+        result = super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.StyleChange}:
+            self._sync_empty_state_description_height()
+        return result
 
     def closeEvent(self, event) -> None:
         if not self.shutdown_jobs():

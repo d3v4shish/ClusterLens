@@ -50,10 +50,18 @@ class GalleryActionService:
         journal_path: str | Path | None = None,
         temp_dir: str | Path | None = None,
     ) -> None:
-        settings = get_settings()
-        self.audit_log_path = Path(audit_log_path) if audit_log_path is not None else settings.log_dir / "file_operations.jsonl"
+        settings = get_settings() if audit_log_path is None or temp_dir is None else None
+        self.audit_log_path = (
+            Path(audit_log_path)
+            if audit_log_path is not None
+            else settings.log_dir / "file_operations.jsonl"
+        )
         self.journal_path = Path(journal_path) if journal_path is not None else self.audit_log_path.with_suffix(".sqlite3")
-        self.temp_dir = Path(temp_dir) if temp_dir is not None else settings.cache_dir / "tmp" / "file_ops"
+        self.temp_dir = (
+            Path(temp_dir)
+            if temp_dir is not None
+            else settings.cache_dir / "tmp" / "file_ops"
+        )
         # Construction is UI-thread safe. Filesystem and SQLite setup happen
         # lazily inside the background operation that first needs the journal.
         self._journal_schema_ready = False
@@ -74,6 +82,8 @@ class GalleryActionService:
                 progress_callback(int((index / max(1, total)) * 100), f"Moving to ClusterLens Trash {index}/{total}")
             source = Path(image_path)
             file_entry_id = self._record_journal_file(result, source_path=image_path)
+            if file_entry_id is None:
+                continue
             if not source.is_file():
                 failure = f"{image_path}: source file does not exist"
                 result.failures.append(failure)
@@ -83,9 +93,15 @@ class GalleryActionService:
                 trash_dir = source.resolve().parent / CLUSTERLENS_TRASH_DIR_NAME
                 trash_dir.mkdir(parents=True, exist_ok=True)
                 target = self._unique_target(trash_dir, source.name)
+                self._update_journal_file(file_entry_id, result, status="pending", target_path=str(target))
+                self._file_mutation_checkpoint("before_filesystem_mutation", source, target)
                 self._atomic_move(source, target)
+                self._file_mutation_checkpoint("after_filesystem_mutation", source, target)
                 result.changed_paths.append((str(source), str(target)))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=str(target))
+                if cancel_check and cancel_check():
+                    result.cancelled = True
+                    break
             except Exception as exc:
                 failure = f"{image_path}: {exc}"
                 result.failures.append(failure)
@@ -105,6 +121,8 @@ class GalleryActionService:
         result = self._new_result("move")
         if not self._begin_journal_operation(result, requested_paths=image_paths, destination=str(destination)):
             return result
+        if image_paths:
+            self._file_mutation_checkpoint("operation_intent_committed", Path(image_paths[0]), destination)
         total = len(image_paths)
         for index, image_path in enumerate(image_paths, start=1):
             if cancel_check and cancel_check():
@@ -114,6 +132,8 @@ class GalleryActionService:
                 progress_callback(int((index / max(1, total)) * 100), f"Moving {index}/{total}")
             source = Path(image_path)
             file_entry_id = self._record_journal_file(result, source_path=image_path)
+            if file_entry_id is None:
+                continue
             if not source.is_file():
                 failure = f"{image_path}: source file does not exist"
                 result.failures.append(failure)
@@ -122,9 +142,15 @@ class GalleryActionService:
             try:
                 target = self._unique_target(destination, source.name)
                 self._update_journal_file(file_entry_id, result, status="pending", target_path=str(target))
+                self._file_mutation_checkpoint("before_filesystem_mutation", source, target)
                 self._safe_move(source, target)
+                self._file_mutation_checkpoint("after_filesystem_mutation", source, target)
                 result.changed_paths.append((str(source), str(target)))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=str(target))
+                self._file_mutation_checkpoint("file_terminal_recorded", source, target)
+                if cancel_check and cancel_check():
+                    result.cancelled = True
+                    break
             except Exception as exc:
                 failure = f"{image_path}: {exc}"
                 result.failures.append(failure)
@@ -153,6 +179,8 @@ class GalleryActionService:
                 progress_callback(int((index / max(1, total)) * 100), f"Copying {index}/{total}")
             source = Path(image_path)
             file_entry_id = self._record_journal_file(result, source_path=image_path)
+            if file_entry_id is None:
+                continue
             if not source.is_file():
                 failure = f"{image_path}: source file does not exist"
                 result.failures.append(failure)
@@ -161,9 +189,14 @@ class GalleryActionService:
             try:
                 target = self._unique_target(destination, source.name)
                 self._update_journal_file(file_entry_id, result, status="pending", target_path=str(target))
+                self._file_mutation_checkpoint("before_filesystem_mutation", source, target)
                 self._safe_copy(source, target)
+                self._file_mutation_checkpoint("after_filesystem_mutation", source, target)
                 result.changed_paths.append((str(source), str(target)))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=str(target))
+                if cancel_check and cancel_check():
+                    result.cancelled = True
+                    break
             except Exception as exc:
                 failure = f"{image_path}: {exc}"
                 result.failures.append(failure)
@@ -274,6 +307,8 @@ class GalleryActionService:
             source = Path(item.source_path)
             target = Path(item.target_path)
             file_entry_id = self._record_journal_file(result, source_path=str(source), target_path=str(target))
+            if file_entry_id is None:
+                continue
             if not source.is_file():
                 failure = f"{source}: source file does not exist"
                 result.failures.append(failure)
@@ -285,9 +320,14 @@ class GalleryActionService:
                 self._update_journal_file(file_entry_id, result, status="failed", error=failure)
                 continue
             try:
+                self._file_mutation_checkpoint("before_filesystem_mutation", source, target)
                 self._atomic_move(source, target)
+                self._file_mutation_checkpoint("after_filesystem_mutation", source, target)
                 result.changed_paths.append((str(source), str(target)))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=str(target))
+                if cancel_check and cancel_check():
+                    result.cancelled = True
+                    break
             except Exception as exc:
                 failure = f"{source}: {exc}"
                 result.failures.append(failure)
@@ -309,6 +349,73 @@ class GalleryActionService:
             exif[37510] = self.merge_comment_metadata(current, key, value)
 
         self._safe_rewrite_image_exif(image_path, _mutate)
+
+    def write_exif_draft(self, image_path: str, draft: dict[str, object]) -> None:
+        """Embed only stable, textual fields from an inspector draft.
+
+        Ratings, keywords, locations, and arbitrary custom fields have no
+        portable EXIF representation across the supported formats, so they are
+        preserved in the ClusterLens sidecar and mirrored in UserComment.
+        This avoids corrupting proprietary/MakerNote data while retaining a
+        readable embedded copy for JPEG/TIFF users who explicitly request it.
+        """
+        source = Path(image_path)
+        if source.suffix.casefold() not in {".jpg", ".jpeg", ".tif", ".tiff"}:
+            raise ValueError("Only JPEG and TIFF originals support embedded inspector metadata.")
+
+        title = str(draft.get("title", "") or "").strip()
+        description = str(draft.get("description", "") or "").strip()
+        creator = str(draft.get("creator", "") or "").strip()
+        copyright_text = str(draft.get("copyright", "") or "").strip()
+        captured_at = str(draft.get("captured_at", "") or "").strip()
+        try:
+            rating = max(0, min(5, int(draft.get("rating", 0) or 0)))
+        except (TypeError, ValueError):
+            rating = 0
+        comment_values: dict[str, str] = {
+            "ic_title": title,
+            "ic_rating": str(rating),
+            "ic_tags": json.dumps([str(tag).strip() for tag in list(draft.get("tags", []) or []) if str(tag).strip()]),
+            "ic_location": str(draft.get("location", "") or "").strip(),
+        }
+        for key, value in dict(draft.get("custom_fields", {}) or {}).items():
+            normalized_key = str(key).strip()
+            normalized_value = str(value).strip()
+            if normalized_key and normalized_value:
+                comment_values[f"ic_{normalized_key}"] = normalized_value
+
+        def _mutate(exif) -> None:
+            if description or title:
+                exif[270] = description or title  # ImageDescription
+            if creator:
+                exif[315] = creator  # Artist
+            if copyright_text:
+                exif[33432] = copyright_text
+            if captured_at:
+                parsed = self._coerce_exif_datetime(captured_at)
+                if parsed:
+                    exif[36867] = parsed  # DateTimeOriginal
+            current = self._coerce_comment_text(exif.get(37510))
+            for key, value in comment_values.items():
+                if value:
+                    current = self.merge_comment_metadata(current, key, value)
+            exif[37510] = current
+
+        self._safe_rewrite_image_exif(image_path, _mutate)
+
+    @staticmethod
+    def _coerce_exif_datetime(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.strftime("%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            pass
+        if len(raw) >= 19 and raw[4:5] == ":" and raw[7:8] == ":":
+            return raw[:19]
+        return ""
 
     @classmethod
     def read_exif_metadata_value(cls, image_path: str, key: str) -> str:
@@ -332,7 +439,11 @@ class GalleryActionService:
             if progress_callback:
                 progress_callback(int((index / max(1, total)) * 100), f"Writing EXIF {index}/{total}")
             file_entry_id = self._record_journal_file(result, source_path=image_path, target_path=image_path)
+            if file_entry_id is None:
+                continue
             try:
+                source = Path(image_path).resolve()
+                self._metadata_rewrite_checkpoint("rewrite_intent_committed", source, source)
                 self.write_exif_comment(image_path, comment)
                 result.affected_paths.append(str(image_path))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=image_path)
@@ -362,8 +473,42 @@ class GalleryActionService:
             if progress_callback:
                 progress_callback(int((index / max(1, total)) * 100), f"Writing EXIF {index}/{total}")
             file_entry_id = self._record_journal_file(result, source_path=image_path, target_path=image_path)
+            if file_entry_id is None:
+                continue
             try:
                 self.write_exif_metadata_pair(image_path, key, value)
+                result.affected_paths.append(str(image_path))
+                self._update_journal_file(file_entry_id, result, status="completed", target_path=image_path)
+            except Exception as exc:
+                failure = f"{image_path}: {exc}"
+                result.failures.append(failure)
+                self._update_journal_file(file_entry_id, result, status="failed", error=failure)
+        self._write_audit(result, requested_paths=image_paths)
+        return result
+
+    def write_exif_drafts(
+        self,
+        image_paths: list[str],
+        draft: dict[str, object],
+        progress_callback=None,
+        cancel_check=None,
+    ) -> GalleryActionResult:
+        """Journal an explicit inspector embed request, one atomic file at a time."""
+        result = self._new_result("write_exif_draft")
+        if not self._begin_journal_operation(result, requested_paths=image_paths):
+            return result
+        total = len(image_paths)
+        for index, image_path in enumerate(image_paths, start=1):
+            if cancel_check and cancel_check():
+                result.cancelled = True
+                break
+            if progress_callback:
+                progress_callback(int((index / max(1, total)) * 100), f"Embedding metadata {index}/{total}")
+            file_entry_id = self._record_journal_file(result, source_path=image_path, target_path=image_path)
+            if file_entry_id is None:
+                continue
+            try:
+                self.write_exif_draft(image_path, draft)
                 result.affected_paths.append(str(image_path))
                 self._update_journal_file(file_entry_id, result, status="completed", target_path=image_path)
             except Exception as exc:
@@ -537,6 +682,120 @@ class GalleryActionService:
             )
         return entries
 
+    def recover_incomplete_operations(self) -> dict[str, object]:
+        """Reconcile interrupted file operations without guessing or moving files.
+
+        Each per-file journal intent is compared with the two physical paths.
+        A uniquely observable completed move/copy is published as such; an
+        unchanged or ambiguous pair is recorded as a failure for explicit user
+        review. Running this repeatedly is idempotent.
+        """
+
+        recovered_operations: list[str] = []
+        ambiguous_files: list[str] = []
+        try:
+            with self._connect_journal() as connection:
+                operations = connection.execute(
+                    """
+                    SELECT operation_id, operation, requested_count, requested_paths_json, destination
+                    FROM operations
+                    WHERE completed = 0
+                    ORDER BY timestamp_utc ASC, rowid ASC
+                    """
+                ).fetchall()
+                for operation_row in operations:
+                    operation_id = str(operation_row["operation_id"])
+                    operation = str(operation_row["operation"])
+                    file_rows = connection.execute(
+                        """
+                        SELECT id, source_path, target_path, status, error
+                        FROM operation_files
+                        WHERE operation_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (operation_id,),
+                    ).fetchall()
+                    changed_paths: list[tuple[str, str]] = []
+                    failures: list[str] = []
+                    for file_row in file_rows:
+                        source_text = str(file_row["source_path"] or "")
+                        target_text = str(file_row["target_path"] or "")
+                        source = Path(source_text) if source_text else None
+                        target = Path(target_text) if target_text else None
+                        source_exists = bool(source is not None and source.is_file())
+                        target_exists = bool(target is not None and target.is_file())
+                        status = "failed"
+                        error = ""
+                        recovery_status = "failed"
+                        if not target_text:
+                            error = "Interrupted before the operation target was journalled; outcome requires review."
+                        elif source_text == target_text:
+                            error = "Metadata rewrite was interrupted; the source is usable but commit outcome is unknown."
+                            recovery_status = "outcome_unknown"
+                        elif operation == "copy" and source_exists and target_exists:
+                            status = "completed"
+                            recovery_status = "not_applicable"
+                            changed_paths.append((source_text, target_text))
+                        elif operation in {"move", "rename", "delete_to_trash", "restore"} and target_exists and not source_exists:
+                            status = "completed"
+                            recovery_status = "restored" if operation == "restore" else "restorable"
+                            changed_paths.append((source_text, target_text))
+                        elif source_exists and not target_exists:
+                            error = "Interrupted before the file move/copy committed; the original remains unchanged."
+                            recovery_status = "not_applicable"
+                        elif source_exists and target_exists:
+                            error = "Both original and target exist after interruption; no file was removed automatically."
+                            recovery_status = "outcome_unknown"
+                        else:
+                            error = "Neither the original nor target file exists; manual recovery is required."
+                            recovery_status = "outcome_unknown"
+                        if error:
+                            failures.append(f"{source_text or target_text}: {error}")
+                            ambiguous_files.append(source_text or target_text)
+                        connection.execute(
+                            """
+                            UPDATE operation_files
+                            SET status = ?, error = ?, recovery_status = ?, updated_at_utc = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                status,
+                                error,
+                                recovery_status,
+                                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                int(file_row["id"]),
+                            ),
+                        )
+                    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    connection.execute(
+                        """
+                        UPDATE operations
+                        SET changed_paths_json = ?, failure_count = ?, failures_json = ?,
+                            completed = 1, recovery_status = ?, updated_at_utc = ?
+                        WHERE operation_id = ?
+                        """,
+                        (
+                            json.dumps(changed_paths, ensure_ascii=False),
+                            len(failures),
+                            json.dumps(failures, ensure_ascii=False),
+                            _operation_recovery_status(operation, completed=True, changed_paths=changed_paths),
+                            timestamp,
+                            operation_id,
+                        ),
+                    )
+                    recovered_operations.append(operation_id)
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                "recovered_operations": tuple(recovered_operations),
+                "ambiguous_files": tuple(ambiguous_files),
+                "failures": (str(exc),),
+            }
+        return {
+            "recovered_operations": tuple(recovered_operations),
+            "ambiguous_files": tuple(ambiguous_files),
+            "failures": (),
+        }
+
     def restore_changed_paths(
         self,
         changed_paths: list[tuple[str, str]],
@@ -566,6 +825,8 @@ class GalleryActionService:
             original = Path(str(original_path)).resolve()
             current = Path(str(current_path)).resolve()
             file_entry_id = self._record_journal_file(result, source_path=str(current), target_path=str(original))
+            if file_entry_id is None:
+                continue
             if not current.is_file():
                 failure = f"{current_path}: restore source does not exist"
                 result.failures.append(failure)
@@ -648,7 +909,10 @@ class GalleryActionService:
                     ),
                 )
                 return int(cursor.lastrowid)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            result.failures.append(
+                f"Operation journal could not record {source_path}; this file was not changed: {exc}"
+            )
             return None
 
     def _update_journal_file(
@@ -800,9 +1064,21 @@ class GalleryActionService:
                 mutate_exif(exif)
                 image.save(temp_target, exif=exif)
             self._verify_image(temp_target)
+            self._metadata_rewrite_checkpoint("before_replace", source, temp_target)
             os.replace(str(temp_target), str(source))
+            self._metadata_rewrite_checkpoint("after_replace", source, temp_target)
         finally:
             self._cleanup_file(temp_target)
+
+    def _file_mutation_checkpoint(self, _name: str, _source: Path, _target: Path) -> None:
+        """Deterministic fault-injection seam around one journalled mutation."""
+
+        return
+
+    def _metadata_rewrite_checkpoint(self, _name: str, _source: Path, _temporary: Path) -> None:
+        """Deterministic fault-injection seam around an image replacement."""
+
+        return
 
     def _temp_path_for(self, target: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)

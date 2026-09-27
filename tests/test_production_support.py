@@ -4,6 +4,9 @@ import sys
 import time
 import unittest
 import logging
+import gc
+import signal
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +17,7 @@ from zipfile import ZipFile
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import QSettings, QThread
+from PyQt6.QtCore import QCoreApplication, QEvent, QProcess, QSettings, QThread, QTimer
 from PyQt6.QtWidgets import QApplication
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,7 +34,8 @@ from apps.shared.support_bundle import export_support_bundle
 from app.selection import SelectionTarget
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest
 from app.services.model_assets import ModelDownloadPlan, sha256_file
-from infra.runtime import RuntimeCapabilities, RuntimeCapabilityService
+from infra.runtime import ExecutionPolicy, RuntimeCapabilities, RuntimeCapabilityService
+from infra.qt_diagnostics import append_qt_diagnostic
 import infra.settings as settings_mod
 from ml.clustering import ClusteringService
 
@@ -162,11 +166,17 @@ class ProductionSupportTests(unittest.TestCase):
     def _wait_for_storage_idle(cls, window) -> None:
         cls._wait_for(
             lambda: (
-                window._storage_usage_thread is None
-                and window._storage_clear_thread is None
+                window._storage_usage_job is None
+                and window._storage_clear_job is None
+                and window._startup_maintenance_job is None
+                and window._model_storage_recovery_job is None
+                and window._startup_readiness_job is None
                 and bool(getattr(window, "_startup_maintenance_complete", True))
+                and bool(getattr(window, "_model_storage_recovery_complete", True))
+                and not window.job_manager.active_jobs()
+                and not window.job_presentation._refresh_timer.isActive()
             ),
-            timeout_s=5.0,
+            timeout_s=10.0,
         )
 
     class _PollingAsyncQThread(QThread):
@@ -195,6 +205,19 @@ class ProductionSupportTests(unittest.TestCase):
         for key, value in self._production_settings_snapshot.items():
             store.setValue(key, value)
         store.sync()
+        # Production windows own large widget trees and use deferred Qt
+        # deletion. Flush them between cases so later global stylesheet tests
+        # do not repolish every window created earlier in this process.
+        for widget in list(APP.topLevelWidgets()):
+            try:
+                if widget.close():
+                    widget.deleteLater()
+            except RuntimeError:
+                continue
+        for _ in range(4):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            APP.processEvents()
+        gc.collect()
 
     def test_settings_uses_exact_image_clustering_app_dir_override(self):
         with TemporaryDirectory() as tmp:
@@ -251,6 +274,659 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertFalse(window.windowIcon().isNull())
         window.close()
 
+    def test_production_close_shuts_down_modeless_jobs_monitor(self):
+        from PyQt6 import sip
+
+        from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
+
+        window = ProductionClusterApp(RUNTIME_LAYOUT)
+        window.show()
+        window._open_jobs_dialog()
+        APP.processEvents()
+        dialog = window.jobs_widget._jobs_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+
+        window.close()
+        APP.processEvents()
+
+        self.assertTrue(window.jobs_widget._shutting_down)
+        self.assertTrue(dialog._shutting_down)
+        self.assertTrue(sip.isdeleted(dialog) or not dialog.isVisible())
+
+    def test_interactive_close_retains_a_stuck_worker_without_blocking_and_reopens(self):
+        from apps.pyqt_production import app as production_app
+        from apps.pyqt_production.app import ProductionClusterApp
+        from ui.async_job import AsyncJob, start_job_in_thread
+
+        entered = Event()
+        release = Event()
+
+        def _blocked_work(_progress, _cancel_check):
+            entered.set()
+            if not release.wait(timeout=5.0):
+                raise RuntimeError("close-under-load fixture was not released")
+            return "drained"
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "IMAGE_CLUSTERING_APP_DIR": tmp,
+                    "CLUSTERLENS_PACKAGED_LAUNCH_SMOKE": "close-under-load-test",
+                },
+                clear=False,
+            ):
+                settings_mod._RUNTIME_BASE_DIR = None
+                window = ProductionClusterApp(activate_runtime_root("ProductionAsyncCloseTest"))
+                replacement = None
+                session_controller = window.session_controller
+                model_download_controller = window.model_download_controller
+                try:
+                    window.show()
+                    job = AsyncJob(_blocked_work)
+                    thread = start_job_in_thread(job)
+                    window._storage_usage_job = job
+                    window._storage_usage_thread = thread
+                    self._wait_for(entered.is_set)
+
+                    qt_acknowledged: list[bool] = []
+                    with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}, clear=False):
+                        window.close()
+                        QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                        self._wait_for(lambda: bool(qt_acknowledged))
+
+                        self.assertIn(window, production_app._CLOSE_PENDING_WINDOWS)
+                        self.assertTrue(
+                            any(retained_thread is thread for _job, retained_thread in window._retained_async_refs)
+                        )
+                        self.assertTrue(thread.isRunning())
+                        window.close()
+                        window.close()
+                        self.assertEqual(1, production_app._CLOSE_PENDING_WINDOWS.count(window))
+                        self.assertTrue(window._close_retry_scheduled)
+
+                        release.set()
+
+                        def _thread_stopped() -> bool:
+                            try:
+                                return not thread.isRunning()
+                            except RuntimeError:
+                                return True
+
+                        self._wait_for(
+                            lambda: (
+                                _thread_stopped()
+                                and window not in production_app._CLOSE_PENDING_WINDOWS
+                            )
+                        )
+
+                    self.assertIsNone(session_controller._process)
+                    self.assertIsNone(model_download_controller._process)
+
+                    replacement = ProductionClusterApp(
+                        activate_runtime_root("ProductionAsyncCloseRestartTest")
+                    )
+                    replacement.show()
+                    APP.processEvents()
+                    self.assertTrue(replacement.isVisible())
+                finally:
+                    release.set()
+                    if replacement is not None:
+                        replacement.close()
+                    try:
+                        window.close()
+                    except RuntimeError:
+                        pass
+
+    def test_close_under_load_matrix_drains_owned_work_and_preserves_commit_boundaries(self):
+        from apps.pyqt_production import app as production_app
+        from apps.pyqt_production.app import ProductionClusterApp
+        from infra.cancel import Cancelled
+        from ui.async_job import AsyncJob, start_job_in_thread
+        from ui.search_pane import SearchPane
+
+        class _BlockedDecodeThread(QThread):
+            def __init__(self, entered: Event, release: Event):
+                super().__init__()
+                self._entered = entered
+                self._release = release
+                self.setObjectName("CloseMatrixDecodeThread")
+
+            def run(self):
+                self._entered.set()
+                if not self._release.wait(timeout=10.0):
+                    raise RuntimeError("decode close fixture was not released")
+
+        entered = {name: Event() for name in ("probe", "decode", "index", "inference", "database", "journal")}
+        release = {name: Event() for name in entered}
+
+        with TemporaryDirectory() as tmp:
+            environment = {
+                "IMAGE_CLUSTERING_APP_DIR": tmp,
+                "CLUSTERLENS_PACKAGED_LAUNCH_SMOKE": "close-matrix-test",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionCloseMatrixTest")
+                window = ProductionClusterApp(layout)
+                replacement = None
+                journal_marker = Path(tmp) / "journal-committed.json"
+                database_marker = Path(tmp) / "database-uncommitted.json"
+                download_partial = Path(tmp) / "model.partial"
+                download_ready = Path(tmp) / "model.ready"
+
+                def _run_for(name: str, *, commit_path: Path | None = None):
+                    def _run(_progress, cancel_check):
+                        entered[name].set()
+                        if not release[name].wait(timeout=10.0):
+                            raise RuntimeError(f"{name} close fixture was not released")
+                        if commit_path is not None:
+                            commit_path.write_text(name, encoding="utf-8")
+                            return SimpleNamespace(completion_survives_cancellation=True)
+                        if cancel_check():
+                            raise Cancelled()
+                        return name
+
+                    return _run
+
+                def _worker(name: str, *, commit_path: Path | None = None):
+                    job = AsyncJob(_run_for(name, commit_path=commit_path))
+                    return job, start_job_in_thread(job)
+
+                try:
+                    window.show()
+
+                    probe_job, probe_thread = _worker("probe")
+                    window._startup_readiness_job = probe_job
+                    window._startup_readiness_thread = probe_thread
+
+                    database_job, database_thread = _worker("database")
+                    window._storage_clear_job = database_job
+                    window._storage_clear_thread = database_thread
+
+                    inference_job, inference_thread = _worker("inference")
+                    window._tag_suggestion_job = inference_job
+                    window._tag_suggestion_thread = inference_thread
+
+                    people = SearchPane(window, enabled_tabs=[], external_results=True)
+                    people._start_job("Indexing fixture", _run_for("index"), lambda _result: None)
+                    window.faces_pane = people
+
+                    journal_job, journal_thread = _worker("journal", commit_path=journal_marker)
+                    window.gallery_pane._active_action_job = journal_job
+                    window.gallery_pane._active_action_thread = journal_thread
+
+                    decode_thread = _BlockedDecodeThread(entered["decode"], release["decode"])
+                    window.gallery_pane.loader_threads = [decode_thread]
+                    decode_thread.start()
+
+                    process = QProcess(window.model_download_controller)
+                    process.setProgram(sys.executable)
+                    process.setArguments(
+                        [
+                            "-c",
+                            (
+                                "import pathlib, signal, sys, time; "
+                                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                                "pathlib.Path(sys.argv[1]).write_text('partial', encoding='utf-8'); "
+                                "time.sleep(30); "
+                                "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8')"
+                            ),
+                            str(download_partial),
+                            str(download_ready),
+                        ]
+                    )
+                    process.finished.connect(
+                        lambda exit_code, exit_status, process=process: window.model_download_controller._on_finished(
+                            process, exit_code, exit_status
+                        )
+                    )
+                    window.model_download_controller._process = process
+                    process.start()
+
+                    self._wait_for(lambda: all(event.is_set() for event in entered.values()))
+                    self._wait_for(download_partial.exists)
+
+                    qt_acknowledged: list[bool] = []
+                    with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}, clear=False):
+                        window.close()
+                        window.close()
+                        QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                        self._wait_for(lambda: bool(qt_acknowledged))
+                        self.assertEqual(1, production_app._CLOSE_PENDING_WINDOWS.count(window))
+
+                        for name in ("probe", "decode", "index", "inference", "database"):
+                            release[name].set()
+                        self._wait_for(lambda: window.model_download_controller._process is None)
+                        APP.processEvents()
+                        self.assertIn(window, production_app._CLOSE_PENDING_WINDOWS)
+                        self.assertFalse(journal_marker.exists())
+                        self.assertFalse(database_marker.exists())
+                        self.assertTrue(download_partial.exists())
+                        self.assertFalse(download_ready.exists())
+
+                        release["journal"].set()
+                        deadline = time.monotonic() + 5.0
+                        while window in production_app._CLOSE_PENDING_WINDOWS and time.monotonic() < deadline:
+                            APP.processEvents()
+                            time.sleep(0.01)
+                        if window in production_app._CLOSE_PENDING_WINDOWS:
+                            def _running(thread) -> bool:
+                                try:
+                                    return bool(thread is not None and thread.isRunning())
+                                except RuntimeError:
+                                    return False
+
+                            self.fail(
+                                "close matrix did not drain: "
+                                + repr(
+                                    {
+                                        "shell_retained": [
+                                            _running(thread) for _job, thread in window._retained_async_refs
+                                        ],
+                                        "people_active": _running(people._active_thread),
+                                        "gallery_action": _running(window.gallery_pane._active_action_thread),
+                                        "gallery_loaders": [
+                                            _running(thread)
+                                            for thread in window.gallery_pane._retained_loader_threads
+                                        ],
+                                        "download": window.model_download_controller._process is not None,
+                                        "close_retry": window._close_retry_scheduled,
+                                        "shutdown_results": {
+                                            "model": window.model_download_controller.shutdown(0),
+                                            "session": window.session_controller.shutdown(0),
+                                            "gallery": window.gallery_pane.shutdown_jobs(timeout_ms=0),
+                                            "photo_gallery": window.photo_gallery.shutdown_jobs(timeout_ms=0),
+                                            "faces": people.shutdown_jobs(timeout_ms=0),
+                                            "cluster": window.cluster_pane.shutdown_jobs(timeout_ms=0),
+                                        },
+                                    }
+                                )
+                            )
+
+                    self.assertTrue(journal_marker.exists())
+                    self.assertEqual("journal", journal_marker.read_text(encoding="utf-8"))
+                    self.assertFalse(database_marker.exists())
+                    self.assertFalse(download_ready.exists())
+
+                    replacement = ProductionClusterApp(
+                        activate_runtime_root("ProductionCloseMatrixRestartTest")
+                    )
+                    replacement.show()
+                    APP.processEvents()
+                    self.assertTrue(replacement.isVisible())
+                finally:
+                    for event in release.values():
+                        event.set()
+                    if replacement is not None:
+                        replacement.close()
+                    try:
+                        window.close()
+                    except RuntimeError:
+                        pass
+
+    def test_production_library_tags_and_names_share_coordinator_and_queue_declared_work(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.path_scope import PathScope
+        from ui.job_manager import JobManager
+        from ui.gallery_pane import GalleryPane
+        from ui.library_pane import LibraryPane
+        from ui.names_pane import NamesPane
+        from ui.async_job import AsyncJob
+        from ui.photo_inspector_dialog import PhotoInspectorDialog
+        from ui.work_coordinator import JobSpec, WorkCoordinator
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionCoordinatedLibraryTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self.assertIs(window.library_pane.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.tags_pane.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.gallery_pane.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.photo_gallery._actions.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.library_pane.gallery.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.library_pane.timeline_gallery._actions.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.tags_pane.gallery.work_coordinator, window.work_coordinator)
+                    window._build_names_workspace_widget()
+                    self.assertIs(window.names_pane.work_coordinator, window.work_coordinator)
+                    self.assertIs(window.names_pane.gallery.work_coordinator, window.work_coordinator)
+                finally:
+                    window.close()
+
+                manager = JobManager()
+                coordinator = WorkCoordinator(manager)
+                pane = LibraryPane(
+                    lambda: PathScope.from_paths((tmp,)),
+                    lambda: None,
+                    job_manager=manager,
+                    work_coordinator=coordinator,
+                )
+                try:
+                    read_spec = pane._coordination_spec("Loading Library")
+                    refresh_spec = pane._coordination_spec("Refreshing Library")
+                    trash_spec = pane._coordination_spec("Trashing Hash duplicate Candidates")
+                    self.assertEqual("Library", read_spec.origin)
+                    self.assertTrue(read_spec.data_home_read)
+                    self.assertTrue(refresh_spec.data_home_write)
+                    self.assertTrue(refresh_spec.source_reads)
+                    self.assertEqual("Tools", trash_spec.origin)
+                    self.assertTrue(trash_spec.source_writes)
+
+                    blocker = coordinator.submit(
+                        JobSpec("Catalog writer", data_home_write=True),
+                        lambda _job_id, _fallback: None,
+                    )
+                    completed: list[str] = []
+                    worker = pane._start_job(
+                        "Loading Library",
+                        lambda _progress, _cancel: "loaded",
+                        completed.append,
+                    )
+                    coordinated_id = pane._coordinated_job_ids[worker]
+                    self.assertEqual("queued", manager.get(coordinated_id).status)
+                    self.assertFalse(any(job is worker for job, _thread in pane._jobs))
+
+                    coordinator.finish(blocker)
+                    self._wait_for(lambda: completed == ["loaded"])
+                    self._wait_for(lambda: manager.get(coordinated_id).status == "finished")
+                    matching_rows = [state for state in manager.history(500) if state.job_id == coordinated_id]
+                    self.assertEqual(1, len(matching_rows))
+                finally:
+                    pane.close()
+
+                names = NamesPane(
+                    lambda: None,
+                    job_manager=manager,
+                    work_coordinator=coordinator,
+                    active_scope_provider=lambda: PathScope.from_paths((tmp,)),
+                )
+                try:
+                    refresh_spec = names._coordination_spec("refresh")
+                    photos_spec = names._coordination_spec("photos")
+                    deep_spec = names._coordination_spec("deep_similar")
+                    mutation_spec = names._coordination_spec(
+                        "mutation",
+                        source_writes=(str(Path(tmp) / "named.jpg"),),
+                    )
+                    self.assertEqual("People", refresh_spec.origin)
+                    self.assertTrue(refresh_spec.data_home_write)
+                    self.assertTrue(photos_spec.data_home_read)
+                    self.assertFalse(photos_spec.source_reads)
+                    self.assertTrue(deep_spec.data_home_read)
+                    self.assertTrue(deep_spec.model_cache_read)
+                    self.assertEqual((str(Path(tmp)),), tuple(scope.path for scope in deep_spec.normalized().source_reads))
+                    self.assertTrue(mutation_spec.data_home_write)
+                    self.assertEqual(
+                        (str(Path(tmp) / "named.jpg"),),
+                        tuple(scope.path for scope in mutation_spec.normalized().source_writes),
+                    )
+
+                    blocker = coordinator.submit(
+                        JobSpec("Names database writer", data_home_write=True),
+                        lambda _job_id, _fallback: None,
+                    )
+                    completed = []
+                    names._start_job(
+                        "photos",
+                        lambda _progress, _cancel: "loaded",
+                        completed.append,
+                        self.fail,
+                    )
+                    worker = names._photos_job
+                    self.assertIsNotNone(worker)
+                    coordinated_id = names._coordinated_job_ids[worker]
+                    self.assertEqual("queued", manager.get(coordinated_id).status)
+                    self.assertIsNone(names._photos_thread)
+                    self.assertFalse(any(job is worker for job, _thread in names._operation_threads))
+
+                    coordinator.finish(blocker)
+                    self._wait_for(lambda: completed == ["loaded"])
+                    self._wait_for(lambda: manager.get(coordinated_id).status == "finished")
+                    matching_rows = [state for state in manager.history(500) if state.job_id == coordinated_id]
+                    self.assertEqual(1, len(matching_rows))
+                finally:
+                    names.shutdown_jobs(timeout_ms=500)
+                    names.close()
+
+                gallery = GalleryPane()
+                gallery.configure_jobs(manager, coordinator, origin="Photos")
+                photo_path = str(Path(tmp) / "photo.jpg")
+                try:
+                    blocker = coordinator.submit(
+                        JobSpec("Photo writer", source_writes=(photo_path,)),
+                        lambda _job_id, _fallback: None,
+                    )
+                    completed = []
+                    gallery._start_action_job(
+                        "Reading one photo",
+                        lambda _progress, _cancel: "decoded",
+                        completed.append,
+                        source_reads=(photo_path,),
+                    )
+                    coordinated_id = gallery._active_action_job_id
+                    self.assertIsNotNone(coordinated_id)
+                    self.assertEqual("queued", manager.get(coordinated_id).status)
+                    self.assertIsNone(gallery._active_action_thread)
+
+                    coordinator.finish(blocker)
+                    self._wait_for(lambda: completed == ["decoded"])
+                    self._wait_for(lambda: manager.get(coordinated_id).status == "finished")
+                    matching_rows = [state for state in manager.history(500) if state.job_id == coordinated_id]
+                    self.assertEqual(1, len(matching_rows))
+
+                    blocker = coordinator.submit(
+                        JobSpec("Second photo writer", source_writes=(photo_path,)),
+                        lambda _job_id, _fallback: None,
+                    )
+                    cancelled_work = []
+                    gallery._start_action_job(
+                        "Queued photo read",
+                        lambda _progress, _cancel: cancelled_work.append("started"),
+                        lambda _result: cancelled_work.append("completed"),
+                        source_reads=(photo_path,),
+                    )
+                    cancelled_id = gallery._active_action_job_id
+                    self.assertIsNotNone(cancelled_id)
+                    self.assertEqual("queued", manager.get(cancelled_id).status)
+                    self.assertTrue(gallery.shutdown_jobs(timeout_ms=500))
+                    self.assertEqual("cancelled", manager.get(cancelled_id).status)
+                    coordinator.finish(blocker)
+                    APP.processEvents()
+                    self.assertEqual([], cancelled_work)
+                finally:
+                    gallery.shutdown_jobs(timeout_ms=500)
+                    gallery.close()
+
+                blocker = coordinator.submit(
+                    JobSpec("Inspector photo writer", source_writes=(photo_path,)),
+                    lambda _job_id, _fallback: None,
+                )
+                inspector = PhotoInspectorDialog(
+                    image_paths=[],
+                    job_manager=manager,
+                    work_coordinator=coordinator,
+                )
+                completed = []
+                worker = AsyncJob(lambda _progress, _cancel: "inspected")
+                try:
+                    inspector._start_operation_worker(
+                        worker,
+                        "Reading Inspector photo",
+                        foreground=False,
+                        job_attribute="_active_job",
+                        thread_attribute="_active_thread",
+                        source_reads=(photo_path,),
+                    )
+                    coordinated_id = inspector._coordinated_job_ids[worker]
+                    self.assertEqual("queued", manager.get(coordinated_id).status)
+                    self.assertIsNone(inspector._active_thread)
+                    worker.completed.connect(completed.append)
+
+                    coordinator.finish(blocker)
+                    self._wait_for(lambda: completed == ["inspected"])
+                    self._wait_for(lambda: manager.get(coordinated_id).status == "finished")
+                    state = manager.get(coordinated_id)
+                    self.assertEqual("Photo Inspector", state.origin)
+                    matching_rows = [row for row in manager.history(500) if row.job_id == coordinated_id]
+                    self.assertEqual(1, len(matching_rows))
+                finally:
+                    inspector.shutdown_jobs(timeout_ms=500)
+                    inspector.close()
+
+    def test_production_settings_jobs_wait_for_coordinator_resources(self):
+        from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
+        from ui.async_job import AsyncJob
+        from ui.job_manager import JobManager
+        from ui.work_coordinator import JobSpec, WorkCoordinator
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionCoordinatedSettingsTest")
+                manager = JobManager()
+                coordinator = WorkCoordinator(manager)
+                blocker = coordinator.submit(
+                    JobSpec("Data Home writer", data_home_write=True),
+                    lambda _job_id, _fallback: None,
+                )
+                store = QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+                dialog = ProductionSettingsDialog(
+                    store,
+                    RuntimeCapabilityService(),
+                    runtime_layout=layout,
+                    support_metadata_provider=lambda: {},
+                    job_manager=manager,
+                    work_coordinator=coordinator,
+                    auto_refresh=False,
+                )
+                completed = []
+                worker = AsyncJob(lambda _progress, _cancel: "scanned")
+                dialog._cache_usage_job = worker
+                worker.completed.connect(completed.append)
+                try:
+                    dialog._start_settings_job(
+                        worker,
+                        role="cache_usage",
+                        thread_attribute="_cache_usage_thread",
+                    )
+                    coordinated_id = dialog._settings_job_ids[worker]
+                    self.assertEqual("queued", manager.get(coordinated_id).status)
+                    self.assertIsNone(dialog._cache_usage_thread)
+                    self.assertTrue(dialog.cancel_settings_tasks_button.isEnabled())
+
+                    coordinator.finish(blocker)
+                    self._wait_for(lambda: completed == ["scanned"])
+                    self._wait_for(lambda: manager.get(coordinated_id).status == "finished")
+                    state = manager.get(coordinated_id)
+                    self.assertEqual("Settings", state.origin)
+                    matching_rows = [row for row in manager.history(500) if row.job_id == coordinated_id]
+                    self.assertEqual(1, len(matching_rows))
+                    self._wait_for(lambda: dialog._cache_usage_job is None)
+
+                    blocker = coordinator.submit(
+                        JobSpec("Second Data Home writer", data_home_write=True),
+                        lambda _job_id, _fallback: None,
+                    )
+                    started = []
+                    queued_worker = AsyncJob(lambda _progress, _cancel: started.append(True))
+                    dialog._cache_usage_job = queued_worker
+                    dialog._start_settings_job(
+                        queued_worker,
+                        role="cache_usage",
+                        thread_attribute="_cache_usage_thread",
+                    )
+                    queued_id = dialog._settings_job_ids[queued_worker]
+                    self.assertEqual("queued", manager.get(queued_id).status)
+                    dialog._cancel_active_settings_tasks()
+                    self.assertEqual("cancelled", manager.get(queued_id).status)
+                    self.assertIsNone(dialog._cache_usage_thread)
+                    self.assertIsNone(dialog._cache_usage_job)
+                    self.assertFalse(dialog.cancel_settings_tasks_button.isEnabled())
+                    coordinator.finish(blocker)
+                    APP.processEvents()
+                    self.assertEqual([], started)
+                finally:
+                    dialog.shutdown_jobs(timeout_ms=500)
+                    dialog.close()
+
+    def test_library_navigation_snapshot_initializes_and_reads_catalog_off_qt(self):
+        from app.path_scope import PathScope
+        from app.services.library_catalog import LibraryCatalogService
+        from ui.library_pane import LibraryPane
+
+        with TemporaryDirectory() as tmp:
+            database = Path(tmp) / "catalog.sqlite3"
+            catalog = LibraryCatalogService(db_path=database)
+            self.assertFalse(database.exists())
+            entered = Event()
+            release = Event()
+            read_threads: list[object] = []
+            qt_acknowledged: list[bool] = []
+            original_list_roots = catalog.list_roots
+
+            def _blocked_list_roots(*args, **kwargs):
+                read_threads.append(QThread.currentThread())
+                entered.set()
+                self.assertTrue(release.wait(timeout=3.0))
+                return original_list_roots(*args, **kwargs)
+
+            with patch.object(catalog, "list_roots", side_effect=_blocked_list_roots):
+                pane = LibraryPane(
+                    lambda: PathScope.from_paths((tmp,)),
+                    lambda: None,
+                    catalog=catalog,
+                )
+                try:
+                    QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                    self._wait_for(entered.is_set, timeout_s=3.0)
+                    self._wait_for(lambda: bool(qt_acknowledged), timeout_s=3.0)
+                    self.assertTrue(read_threads)
+                    self.assertIsNot(read_threads[0], APP.thread())
+                    release.set()
+                    self._wait_for(lambda: pane._catalog_snapshot_job is None, timeout_s=3.0)
+                    self.assertTrue(database.exists())
+                finally:
+                    release.set()
+                    pane.shutdown_jobs(timeout_ms=3000)
+                    pane.close()
+
+    def test_empty_active_scope_uses_one_shared_edit_roots_surface(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionEmptyScopeTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    window.source_pane.set_active_roots(())
+                    APP.processEvents()
+
+                    self.assertIs(window.workspace_stack.currentWidget(), window.empty_scope_panel)
+                    self.assertFalse(window.empty_scope_edit_roots_button.isHidden())
+                    self.assertTrue(window.edit_roots_button.isHidden())
+                    self.assertTrue(window.workspace_subnav.isHidden())
+                    self.assertEqual("primary", window.empty_scope_edit_roots_button.property("kind"))
+                    self.assertIn("same active roots", window.empty_scope_panel.findChild(type(window.scope_summary_label), "noActiveRootsDetail").text())
+                    active_job_ids = {job.job_id for job in window.job_manager.active_jobs()}
+
+                    for workspace_id in ("clustering", "faces", "tags", "library"):
+                        window.set_active_workspace(workspace_id)
+                        APP.processEvents()
+                        self.assertIs(window.workspace_stack.currentWidget(), window.empty_scope_panel)
+                        # A pre-existing asynchronous Library navigation snapshot may
+                        # finish while routes change; switching an empty scope must not
+                        # create any additional work.
+                        self.assertTrue(
+                            {job.job_id for job in window.job_manager.active_jobs()}.issubset(active_job_ids)
+                        )
+                    self.assertIsNone(window.faces_pane)
+                finally:
+                    window.close()
+
     def test_production_window_switches_to_faces_workspace(self):
         from apps.pyqt_production.app import ProductionClusterApp
 
@@ -261,6 +937,7 @@ class ProductionSupportTests(unittest.TestCase):
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
                 self.assertIsNone(window.faces_pane)
+                window.source_pane.set_active_roots((tmp,))
 
                 window.set_active_workspace("faces")
                 self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
@@ -311,9 +988,11 @@ class ProductionSupportTests(unittest.TestCase):
 
         started = Event()
         release = Event()
+        constructor_on_ui_thread: list[bool] = []
 
         class _SlowFaceIndexService:
             def __init__(self, **_kwargs):
+                constructor_on_ui_thread.append(QThread.currentThread() is APP.thread())
                 if not started.is_set():
                     started.set()
                     release.wait(timeout=5.0)
@@ -334,6 +1013,7 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionFacesWorkspaceSwitchTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                window.source_pane.set_active_roots((tmp,))
                 with (
                     patch("apps.pyqt_production.app._face_search_api", return_value=fake_face_search),
                     patch.object(window.runtime_service, "select_policy", return_value=policy),
@@ -346,6 +1026,8 @@ class ProductionSupportTests(unittest.TestCase):
                     window.set_active_workspace("clustering")
 
                     self.assertIsNotNone(init_job)
+                    self.assertTrue(constructor_on_ui_thread)
+                    self.assertFalse(any(constructor_on_ui_thread))
                     self.assertTrue(init_job._cancel_requested)
                     self.assertEqual("clustering", window._active_workspace)
                     self.assertIs(window.workspace_stack.currentWidget(), window.clustering_workspace)
@@ -356,6 +1038,100 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertEqual("clustering", window._active_workspace)
                 self.assertIs(window.workspace_stack.currentWidget(), window.clustering_workspace)
                 window.close()
+
+    def test_settings_face_service_reload_constructs_services_off_qt(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        entered = Event()
+        release = Event()
+        constructor_on_ui_thread: list[bool] = []
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                window = ProductionClusterApp(activate_runtime_root("ProductionFaceReloadThreadTest"))
+                try:
+                    self._wait_for_storage_idle(window)
+                    window.source_pane.set_active_roots((tmp,))
+                    window.set_active_workspace("faces")
+                    self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
+                    original_global = window.face_service_global
+                    original_session = window.face_service_session
+
+                    def _service_factory(**kwargs):
+                        constructor_on_ui_thread.append(QThread.currentThread() is APP.thread())
+                        if not entered.is_set():
+                            entered.set()
+                            self.assertTrue(release.wait(timeout=5.0))
+                        return original_session if "session" in str(kwargs.get("db_path", "")) else original_global
+
+                    fake_face_search = SimpleNamespace(
+                        DEFAULT_HUMAN_FACE_DETECTOR_ID="builtin-detector",
+                        DEFAULT_HUMAN_FACE_EMBEDDER_ID="builtin-embedder",
+                        BUILTIN_HUMAN_DETECTOR_ID="builtin-detector",
+                        BUILTIN_HUMAN_EMBEDDER_ID="builtin-embedder",
+                        resolve_ready_face_pipeline_ids=lambda *_args: ("builtin-detector", "builtin-embedder"),
+                        FaceIndexService=_service_factory,
+                    )
+                    qt_acknowledged: list[bool] = []
+                    with patch("apps.pyqt_production.app._face_search_api", return_value=fake_face_search):
+                        window._reload_face_services_from_settings()
+                        self._wait_for(entered.is_set, timeout_s=5.0)
+                        QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                        self._wait_for(lambda: bool(qt_acknowledged), timeout_s=3.0)
+                        self.assertFalse(any(constructor_on_ui_thread))
+                        self.assertFalse(window.faces_pane.isEnabled())
+                        release.set()
+                        self._wait_for(lambda: window._faces_init_job is None, timeout_s=5.0)
+                        self.assertTrue(window.faces_pane.isEnabled())
+                finally:
+                    release.set()
+                    window.close()
+
+    def test_gallery_result_partitioning_keeps_qt_responsive(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.path_scope import PathScope
+        from app.services.discovery import ImageDiscoveryService
+
+        entered = Event()
+        release = Event()
+        partition_threads: list[object] = []
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                window = ProductionClusterApp(activate_runtime_root("ProductionGalleryPartitionThreadTest"))
+                try:
+                    self._wait_for_storage_idle(window)
+                    root = str(Path(tmp) / "photos")
+                    paths = tuple(f"{root}/{index:05d}.jpg" for index in range(5_000))
+                    result = SimpleNamespace(paths=paths, snapshot_key="fixed", filtered_count=0)
+                    original_contains = PathScope.contains
+
+                    def _blocked_contains(scope, candidate):
+                        partition_threads.append(QThread.currentThread())
+                        if not entered.is_set():
+                            entered.set()
+                            self.assertTrue(release.wait(timeout=5.0))
+                        return original_contains(scope, candidate)
+
+                    qt_acknowledged: list[bool] = []
+                    with (
+                        patch.object(ImageDiscoveryService, "discover_roots_result", return_value=result),
+                        patch.object(PathScope, "contains", _blocked_contains),
+                    ):
+                        window._load_gallery_scope(PathScope((root,)))
+                        self._wait_for(entered.is_set, timeout_s=5.0)
+                        QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                        self._wait_for(lambda: bool(qt_acknowledged), timeout_s=3.0)
+                        self.assertTrue(partition_threads)
+                        self.assertTrue(all(thread is not APP.thread() for thread in partition_threads))
+                        release.set()
+                        self._wait_for(lambda: window._gallery_discovery_job is None, timeout_s=5.0)
+                    self.assertEqual(5_000, len(window._gallery_paths))
+                finally:
+                    release.set()
+                    window.close()
 
     def test_startup_readiness_gate_controls_model_bound_actions(self):
         from apps.pyqt_production.app import ProductionClusterApp
@@ -392,6 +1168,93 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertTrue(window.clustering_pane.cluster_button.isEnabled())
                 window.close()
 
+    def test_startup_readiness_replacement_discards_late_result_and_cancel_is_explicit(self):
+        from app.services.startup_readiness import StartupReadinessReport
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        first_started = Event()
+        third_started = Event()
+        release_first = Event()
+        release_third = Event()
+        calls = 0
+        readiness_on_ui_thread: list[bool] = []
+        report = StartupReadinessReport(
+            execution_policy=ExecutionPolicy(
+                preferred_mode="cpu",
+                effective_mode="cpu",
+                reason="Fixture CPU runtime is ready.",
+            ),
+            capabilities=RuntimeCapabilities(torch_version="fixture", onnx_version="fixture"),
+            clustering_models=("fixture",),
+            clustering_ready=True,
+            clustering_message="Fixture clustering is ready.",
+            face_detector_id="fixture-detector",
+            face_embedder_id="fixture-embedder",
+            face_ready=True,
+            face_message="Fixture faces are ready.",
+        )
+
+        def _readiness_fixture(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            readiness_on_ui_thread.append(QThread.currentThread() is APP.thread())
+            if calls == 1:
+                first_started.set()
+                release_first.wait(timeout=5.0)
+            elif calls == 3:
+                third_started.set()
+                release_third.wait(timeout=5.0)
+            return report
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionStartupReadinessReplacementTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self._wait_for_storage_idle(window)
+                    self._wait_for(
+                        lambda: not window._thread_is_running(window._startup_readiness_thread),
+                        timeout_s=5.0,
+                    )
+                    with patch("apps.pyqt_production.app.inspect_startup_readiness", side_effect=_readiness_fixture):
+                        window._begin_startup_readiness_check()
+                        self._wait_for(first_started.is_set, timeout_s=5.0)
+                        first_thread = window._startup_readiness_thread
+                        self.assertFalse(any(readiness_on_ui_thread))
+                        self.assertEqual("Runtime checking… · Checking", window.runtime_badge.text())
+
+                        # The second generation is current. Releasing the old
+                        # worker after it completes must not overwrite Ready.
+                        window._begin_startup_readiness_check()
+                        self._wait_for(
+                            lambda: window._startup_readiness_report is report
+                            and window.runtime_badge.text().endswith("· Ready"),
+                            timeout_s=5.0,
+                        )
+                        release_first.set()
+                        self._wait_for(
+                            lambda: first_thread is None or not first_thread.isRunning(),
+                            timeout_s=5.0,
+                        )
+                        self.assertTrue(window.runtime_badge.text().endswith("· Ready"))
+
+                        window._begin_startup_readiness_check()
+                        self._wait_for(third_started.is_set, timeout_s=5.0)
+                        current_job = window._startup_readiness_job
+                        self.assertIsNotNone(current_job)
+                        current_job.cancel()
+                        release_third.set()
+                        self._wait_for(
+                            lambda: window.runtime_badge.text() == "Runtime failed · Failed",
+                            timeout_s=5.0,
+                        )
+                        self.assertIn("Rescan GPU Resources", window.runtime_badge.toolTip())
+                finally:
+                    release_first.set()
+                    release_third.set()
+                    window.close()
+
     def test_production_window_switches_to_names_workspace_without_opening_faces(self):
         from apps.pyqt_production.app import ProductionClusterApp
 
@@ -401,10 +1264,11 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionNamesWorkspaceTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                window.source_pane.set_active_roots((str(Path(__file__).parent),))
                 window.show()
                 APP.processEvents()
 
-                self.assertTrue(window.names_workspace_button.isVisible())
+                self.assertTrue(window.people_workspace_button.isVisible())
                 self.assertIsNone(window.faces_pane)
                 window.set_active_workspace("names")
                 self._wait_for(lambda: window.names_pane is not None, timeout_s=5.0)
@@ -415,8 +1279,7 @@ class ProductionSupportTests(unittest.TestCase):
 
                 self.assertEqual("names", window._active_workspace)
                 self.assertIs(window.workspace_stack.currentWidget(), window.names_pane)
-                self.assertTrue(window.names_workspace_button.isChecked())
-                self.assertFalse(window.faces_workspace_button.isChecked())
+                self.assertTrue(window.people_workspace_button.isChecked())
                 self.assertFalse(window._source_pane_visible())
                 self.assertIsNone(window.faces_pane)
                 self.assertTrue(callable(window.names_pane.gallery.context_menu_action_provider))
@@ -439,6 +1302,9 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionFaceProviderFallbackTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                window.source_pane.set_active_roots((tmp,))
+                window.set_active_workspace("faces")
+                self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
 
                 service = window._face_service_for_pipeline(
                     "global",
@@ -482,6 +1348,92 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertFalse(staging.exists())
                 window.close()
 
+    def test_production_ui_refreshes_recovery_history_after_actual_killed_move(self):
+        with TemporaryDirectory() as tmp:
+            fixture_root = Path(tmp) / "fixture"
+            fixture_root.mkdir()
+            source = fixture_root / "source.jpg"
+            source.write_bytes(b"source-photo")
+            destination = fixture_root / "destination"
+            runtime_root = Path(tmp) / "runtime"
+            with patch.dict(
+                os.environ,
+                {"CLUSTERLENS_RUNTIME_ROOT": str(runtime_root), "IMAGE_CLUSTERING_APP_DIR": str(runtime_root)},
+                clear=False,
+            ):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionKilledMoveRecoveryTest")
+                from apps.pyqt_production.app import ProductionClusterApp
+                from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
+
+                app_settings = settings_mod.get_settings()
+                config = {
+                    "audit_log_path": str(app_settings.log_dir / "file_operations.jsonl"),
+                    "journal_path": str(app_settings.log_dir / "file_operations.sqlite3"),
+                    "temp_dir": str(app_settings.cache_dir / "tmp" / "file_ops"),
+                    "source_path": str(source),
+                    "destination": str(destination),
+                }
+                (fixture_root / "gallery_paths.json").write_text(json.dumps(config), encoding="utf-8")
+                environment = dict(os.environ)
+                source_root = str(Path(__file__).resolve().parents[1] / "src")
+                environment["PYTHONPATH"] = source_root + (
+                    os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+                )
+                child = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve().parent / "durable_kill_worker.py"),
+                        "gallery_move",
+                        "after_filesystem_mutation",
+                        str(fixture_root),
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    env=environment,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(-signal.SIGKILL, child.returncode, child.stderr)
+                self.assertFalse(source.exists())
+                moved = destination / source.name
+                self.assertEqual(b"source-photo", moved.read_bytes())
+
+                window = ProductionClusterApp(layout)
+                dialog = None
+                try:
+                    self._wait_for_storage_idle(window)
+                    entries = window.gallery_pane.action_service.read_audit_entries(limit=10)
+                    self.assertEqual(1, len(entries))
+                    self.assertTrue(entries[0]["completed"])
+                    self.assertEqual("restorable", entries[0]["recovery_status"])
+                    self.assertEqual([[str(source), str(moved)]], entries[0]["changed_paths"])
+
+                    dialog = ProductionSettingsDialog(
+                        window.settings_store,
+                        RuntimeCapabilityService(),
+                        runtime_layout=layout,
+                        support_metadata_provider=lambda: {},
+                        auto_refresh=False,
+                        parent=window,
+                    )
+                    dialog.refresh_operation_journal()
+                    self._wait_for(
+                        lambda: dialog._journal_refresh_job is None and dialog._journal_refresh_thread is None,
+                        timeout_s=5.0,
+                    )
+                    self.assertEqual(1, dialog.operation_journal_model.rowCount())
+                    shown = dialog.operation_journal_model.entry_at(0)
+                    self.assertTrue(shown["completed"])
+                    self.assertEqual("restorable", shown["recovery_status"])
+                    self.assertIn("Showing 1 of 1 recovery operations", dialog.journal_status_label.text())
+                finally:
+                    if dialog is not None:
+                        dialog.close()
+                    window.close()
+
     def test_production_face_results_open_in_top_level_gallery_route(self):
         from apps.pyqt_production.app import ProductionClusterApp
 
@@ -491,6 +1443,7 @@ class ProductionSupportTests(unittest.TestCase):
                 layout = activate_runtime_root("ProductionFaceResultsGalleryTest")
                 window = ProductionClusterApp(layout)
                 self._wait_for_storage_idle(window)
+                window.source_pane.set_active_roots((str(Path(__file__).parent),))
                 window.set_active_workspace("faces")
                 self._wait_for(lambda: window.faces_pane is not None, timeout_s=5.0)
                 image_a = str(Path(tmp) / "a.jpg")
@@ -500,13 +1453,32 @@ class ProductionSupportTests(unittest.TestCase):
                 window._open_face_results_in_main_gallery([image_a, image_b])
                 self._wait_for(lambda: window._photo_set_route is not None, timeout_s=2.0)
 
-                self.assertEqual("gallery", window._active_workspace)
+                self.assertEqual("clustering", window._active_workspace)
+                self.assertIs(window.clustering_gallery_stack.currentWidget(), window.photo_gallery)
                 self.assertEqual([image_a, image_b], list(window.photo_gallery._model.all_paths()))
                 self.assertEqual("faces", window._photo_gallery_context_for_path(image_a)["origin"])
                 self.assertEqual("faces", window._photo_set_route.return_workspace)
                 self.assertFalse(window.photo_gallery.review_faces_button.isHidden())
                 self.assertFalse(window.photo_gallery.back_to_folder_button.isHidden())
                 window.close()
+
+    def test_production_migrates_saved_gallery_to_library_but_keeps_explicit_gallery_routes(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionLibraryFirstMigrationTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self._wait_for_storage_idle(window)
+                    window.settings_store.setValue("workspace/default_view", "gallery")
+                    self.assertEqual("library", window._preferred_workspace())
+                    window.set_active_workspace("gallery")
+                    self.assertEqual("clustering", window._active_workspace)
+                    self.assertIs(window.clustering_gallery_stack.currentWidget(), window.photo_gallery)
+                finally:
+                    window.close()
 
     def test_production_clustering_job_records_exact_cpu_fallback_reason(self):
         from apps.pyqt_production.app import ProductionClusterApp
@@ -672,6 +1644,129 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertEqual(logging.ERROR, error_level)
         self.assertIn("boom", error_message)
 
+    def test_worker_progress_protocol_preserves_zero_and_normalizes_invalid_values(self):
+        cases = (
+            ({"value": 0, "status": "Starting"}, (0, "Starting")),
+            ({"value": 1, "status": "Preparing"}, (1, "Preparing")),
+            ({"value": 100, "status": "Done"}, (100, "Done")),
+            ({"value": -1, "status": "Discovering"}, (-1, "Discovering")),
+            ({"value": None, "status": "Waiting"}, (-1, "Waiting")),
+            ({"status": "Waiting"}, (-1, "Waiting")),
+            ({"value": "bad", "status": "Waiting"}, (-1, "Waiting")),
+            ({"value": float("nan"), "status": "Waiting"}, (-1, "Waiting")),
+            ({"value": float("inf"), "status": "Waiting"}, (-1, "Waiting")),
+            ({"value": True, "status": "Waiting"}, (-1, "Waiting")),
+            ({"value": -2, "status": "Below range"}, (0, "Below range")),
+            ({"value": 125, "status": "Finishing"}, (100, "Finishing")),
+            ({"completed": 1, "total": 4, "phase": "Embedding", "unit": "photos"}, (25, "Embedding — 1/4 photos")),
+            ({"completed": 0, "total": 0, "phase": "Empty"}, (-1, "Empty — 0/0")),
+            ({"completed": 9, "total": 4, "phase": "Verify"}, (100, "Verify — 9/4")),
+            ({"completed": 1.5, "total": 4, "phase": "Invalid count"}, (-1, "Invalid count")),
+            ({"completed": 1, "total": 4, "unit": ["photos"]}, (25, "1/4")),
+            (
+                {"value": 80, "phase": "Import", "processed": 8, "skipped": 1, "failed": 1},
+                (80, "Import — 8 processed, 1 skipped, 1 failed"),
+            ),
+            ({"value": 4, "status": {"bad": "status"}, "phase": ["bad"]}, (4, "")),
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionProgressProtocolTest")
+                clustering = ClusteringSessionController(layout)
+                downloads = ModelDownloadController(layout)
+                clustering_seen: list[tuple[int, str]] = []
+                download_seen: list[tuple[int, str]] = []
+                clustering.progress.connect(lambda value, status: clustering_seen.append((value, status)))
+                downloads.progress.connect(lambda value, status: download_seen.append((value, status)))
+
+                for body, expected in cases:
+                    with self.subTest(body=body):
+                        clustering_seen.clear()
+                        download_seen.clear()
+                        line = json.dumps({"type": "progress", "payload": body}) + "\n"
+                        clustering._stdout_buffer = line
+                        clustering._drain_stdout_lines()
+                        downloads._handle_stdout_line(line)
+                        self.assertEqual([expected], clustering_seen)
+                        self.assertEqual([expected], download_seen)
+
+    def test_worker_progress_protocol_allows_a_new_phase_to_restart_at_zero(self):
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionProgressPhaseTest")
+                for controller in (ClusteringSessionController(layout), ModelDownloadController(layout)):
+                    with self.subTest(controller=type(controller).__name__):
+                        seen: list[tuple[int, str]] = []
+                        controller.progress.connect(lambda value, status: seen.append((value, status)))
+                        lines = (
+                            json.dumps({"type": "progress", "payload": {"value": 100, "phase": "Download"}})
+                            + "\n"
+                            + json.dumps({"type": "progress", "payload": {"value": 0, "phase": "Verify"}})
+                            + "\n"
+                        )
+                        if isinstance(controller, ClusteringSessionController):
+                            controller._stdout_buffer = lines
+                            controller._drain_stdout_lines()
+                        else:
+                            for line in lines.splitlines():
+                                controller._handle_stdout_line(line)
+
+                        self.assertEqual([(100, "Download"), (0, "Verify")], seen)
+                        self.assertIsNone(controller._result_payload)
+
+    def test_process_controllers_emit_one_terminal_event_and_no_late_progress(self):
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionTerminalProtocolTest")
+                for controller_kind in ("clustering", "download"):
+                    for first_terminal in ("completed", "failed", "cancelled"):
+                        with self.subTest(controller=controller_kind, first=first_terminal):
+                            controller = (
+                                ClusteringSessionController(layout)
+                                if controller_kind == "clustering"
+                                else ModelDownloadController(layout)
+                            )
+                            events: list[tuple[str, object]] = []
+                            progress: list[tuple[int, str]] = []
+                            controller.completed.connect(lambda payload: events.append(("completed", dict(payload))))
+                            controller.failed.connect(lambda message: events.append(("failed", str(message))))
+                            controller.cancelled.connect(lambda: events.append(("cancelled", None)))
+                            controller.progress.connect(lambda value, text: progress.append((value, text)))
+                            controller._pending_progress = (37, "Preparing 3/8")
+
+                            def _complete() -> None:
+                                if controller_kind == "clustering":
+                                    controller._result_payload = {"ok": True}
+                                    controller._emit_completed_payload()
+                                else:
+                                    controller._emit_completed_once({"ok": True})
+
+                            terminal_calls = {
+                                "completed": _complete,
+                                "failed": lambda: controller._emit_failed_once("fixture failure"),
+                                "cancelled": controller._emit_cancelled_once,
+                            }
+                            terminal_calls[first_terminal]()
+                            for name in ("completed", "failed", "cancelled"):
+                                terminal_calls[name]()
+                            controller._publish_progress(99, "late progress")
+
+                            self.assertEqual([(37, "Preparing 3/8")], progress)
+                            self.assertEqual(1, len(events))
+                            self.assertEqual(first_terminal, events[0][0])
+
+    def test_late_qt_diagnostic_does_not_recreate_a_removed_runtime(self):
+        with TemporaryDirectory() as tmp:
+            removed_runtime = Path(tmp) / "removed-runtime"
+            log_file = removed_runtime / "logs" / "app.log"
+            with patch(
+                "infra.qt_diagnostics.get_settings",
+                return_value=SimpleNamespace(log_file=str(log_file)),
+            ):
+                append_qt_diagnostic("[LateCallback] fixture")
+
+            self.assertFalse(removed_runtime.exists())
+
     def test_session_controller_uses_frozen_worker_entrypoint_for_packaged_builds(self):
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
@@ -729,6 +1824,8 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertIsNone(controller._request_file)
                 self.assertEqual([True, False], running_states)
                 self.assertFalse(list((layout.cache_dir / "tmp").glob("cluster_request_*.json")))
+                if controller._diagnostic_future is not None:
+                    controller._diagnostic_future.result(timeout=3.0)
 
     def test_warm_session_controller_failed_start_emits_failure(self):
         from apps.pyqt_production.worker_protocol import ProductionClusterRequest
@@ -762,6 +1859,139 @@ class ProductionSupportTests(unittest.TestCase):
 
                 self.assertFalse(controller.is_running())
                 self.assertEqual([False], running_states)
+                if controller._diagnostic_future is not None:
+                    controller._diagnostic_future.result(timeout=3.0)
+
+    def test_disabling_warm_worker_stops_idle_process_and_blocks_restart_until_exit(self):
+        class _FakeProcess:
+            def __init__(self):
+                self.writes: list[bytes] = []
+                self.closed = False
+
+            def state(self):
+                return QProcess.ProcessState.Running
+
+            def write(self, payload):
+                self.writes.append(bytes(payload))
+
+            def closeWriteChannel(self):
+                self.closed = True
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                controller = ClusteringSessionController(
+                    activate_runtime_root("ProductionWarmWorkerDisableTest")
+                )
+                process = _FakeProcess()
+                controller._process = process
+                controller._daemon_process = True
+                controller._keep_worker_warm = True
+                self.assertTrue(controller.is_worker_warm())
+
+                controller.set_keep_worker_warm(False)
+
+                self.assertFalse(controller.is_worker_warm())
+                self.assertTrue(controller.is_running())
+                self.assertEqual(
+                    [{"type": "shutdown", "payload": {}}],
+                    [json.loads(payload.decode("utf-8")) for payload in process.writes],
+                )
+                self.assertTrue(process.closed)
+
+    def test_disabling_warm_worker_during_work_stops_it_after_completion(self):
+        class _FakeProcess:
+            def __init__(self):
+                self.writes: list[bytes] = []
+                self.closed = False
+
+            def state(self):
+                return QProcess.ProcessState.Running
+
+            def write(self, payload):
+                self.writes.append(bytes(payload))
+
+            def closeWriteChannel(self):
+                self.closed = True
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                controller = ClusteringSessionController(
+                    activate_runtime_root("ProductionWarmWorkerBusyDisableTest")
+                )
+                process = _FakeProcess()
+                controller._process = process
+                controller._daemon_process = True
+                controller._keep_worker_warm = True
+                controller._running_request = True
+                controller._result_payload = {"clusters_by_key": {}}
+
+                controller.set_keep_worker_warm(False)
+                self.assertFalse(process.writes)
+
+                controller._complete_daemon_result()
+
+                self.assertEqual(1, len(process.writes))
+                self.assertTrue(process.closed)
+                self.assertTrue(controller.is_running())
+
+    def test_real_warm_worker_exits_restarts_and_leaves_no_child(self):
+        from apps.pyqt_production.worker_protocol import ProductionClusterRequest
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                layout = activate_runtime_root("ProductionRealWarmWorkerLifecycleTest")
+                empty_source = Path(tmp) / "empty-source"
+                empty_source.mkdir()
+                request = ProductionClusterRequest(
+                    directory=str(empty_source),
+                    embedding_models=["fast_preview"],
+                    num_clusters=2,
+                    clustering_backends=["cosine-kmeans"],
+                    recursive=False,
+                    similarity_mode="semantic",
+                    outlier_policy="assign",
+                    use_onnx=False,
+                    reuse_result_cache=False,
+                    use_embedding_cache_lookup=False,
+                    preferred_execution_mode="cpu",
+                    allow_model_downloads=False,
+                )
+                controller = ClusteringSessionController(layout)
+                failures: list[str] = []
+                controller.failed.connect(failures.append)
+
+                def run_until_idle_failure() -> tuple[int, QProcess]:
+                    failure_count = len(failures)
+                    controller.set_keep_worker_warm(True)
+                    self.assertTrue(controller.start(request))
+                    self._wait_for(
+                        lambda: len(failures) > failure_count and controller.is_worker_warm(),
+                        timeout_s=10.0,
+                    )
+                    process = controller._process
+                    self.assertIsNotNone(process)
+                    pid = int(process.processId())
+                    self.assertGreater(pid, 0)
+                    self.assertTrue(Path(f"/proc/{pid}").exists())
+                    if controller._diagnostic_future is not None:
+                        controller._diagnostic_future.result(timeout=3.0)
+                    return pid, process
+
+                first_pid, first_process = run_until_idle_failure()
+                controller.set_keep_worker_warm(False)
+                self._wait_for(lambda: controller._process is None, timeout_s=5.0)
+                self.assertFalse(Path(f"/proc/{first_pid}").exists())
+
+                second_pid, second_process = run_until_idle_failure()
+                self.assertNotEqual(first_pid, second_pid)
+                controller.set_keep_worker_warm(False)
+                self._wait_for(lambda: controller._process is None, timeout_s=5.0)
+                self.assertFalse(Path(f"/proc/{second_pid}").exists())
+                for process in (first_process, second_process):
+                    try:
+                        self.assertEqual(QProcess.ProcessState.NotRunning, process.state())
+                    except RuntimeError:
+                        pass
 
     def test_model_download_failed_start_is_terminal_and_removes_request(self):
         from app.services.model_downloads import ModelDownloadItem
@@ -784,6 +2014,8 @@ class ProductionSupportTests(unittest.TestCase):
                 self.assertIsNone(controller._request_file)
                 self.assertEqual([True, False], running_states)
                 self.assertFalse(list((layout.cache_dir / "tmp").glob("model_download_request_*.json")))
+                if controller._diagnostic_future is not None:
+                    controller._diagnostic_future.result(timeout=3.0)
 
     def test_production_entrypoint_routes_worker_mode_without_starting_gui(self):
         from apps.pyqt_production import __main__ as production_main
@@ -792,6 +2024,14 @@ class ProductionSupportTests(unittest.TestCase):
             self.assertEqual(12, production_main.main(["--worker", "--request-json", "request.json"]))
 
         worker_main.assert_called_once_with(["--request-json", "request.json"])
+
+    def test_production_entrypoint_allows_explicit_new_instance(self):
+        from apps.pyqt_production import __main__ as production_main
+
+        with patch("apps.pyqt_production.app.run", return_value=7) as run:
+            self.assertEqual(7, production_main.main(["--new-instance"]))
+
+        run.assert_called_once_with(new_instance=True)
 
     def test_production_request_normalizes_legacy_similarity_mode(self):
         from apps.pyqt_production.worker_protocol import ProductionClusterRequest
@@ -1152,16 +2392,15 @@ class ProductionSupportTests(unittest.TestCase):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
         window = ProductionClusterApp(RUNTIME_LAYOUT)
+        window.source_pane.set_active_roots((str(Path(__file__).parent),))
         window.show()
         APP.processEvents()
 
         self.assertEqual("basic", window._clustering_mode)
         self.assertEqual("basic", window.gallery_pane.inspector_display_mode)
-        self.assertTrue(window.gallery_pane.open_folder_button.isVisible())
-        self.assertTrue(window.gallery_pane.actions_menu_button.isVisible())
-        self.assertTrue(window.gallery_pane.file_ops_menu.menuAction().isVisible())
-        self.assertFalse(window.gallery_pane.metadata_menu.menuAction().isVisible())
-        self.assertFalse(window.gallery_pane.selected_tags_button.isVisible())
+        self.assertFalse(hasattr(window, "gallery_workspace_button"))
+        self.assertIs(window.clustering_gallery_stack.currentWidget(), window.photo_gallery)
+        self.assertTrue(window.photo_gallery.isVisible())
         for legacy_name in (
             "copy_paths_button", "export_paths_button", "copy_button", "move_button",
             "delete_button", "exif_button", "tags_button", "retry_failed_button",
@@ -1177,6 +2416,7 @@ class ProductionSupportTests(unittest.TestCase):
         window.set_clustering_mode("advanced")
         APP.processEvents()
 
+        self.assertIs(window.clustering_gallery_stack.currentWidget(), window.gallery_pane)
         self.assertTrue(window.gallery_pane.selected_tags_button.isVisible())
         self.assertTrue(window.gallery_pane.actions_menu_button.isVisible())
         self.assertTrue(window.gallery_pane.metadata_menu.menuAction().isVisible())
@@ -1198,6 +2438,7 @@ class ProductionSupportTests(unittest.TestCase):
 
                 window = ProductionClusterApp(layout)
                 window.show()
+                window.source_pane.set_active_roots((tmp,))
                 window.set_active_workspace("library")
                 APP.processEvents()
 
@@ -1230,8 +2471,15 @@ class ProductionSupportTests(unittest.TestCase):
             pane.show()
             APP.processEvents()
 
-            self.assertIn("Start here:", pane.start_here_label.text())
-            self.assertEqual(pane._TAB_HEIGHTS["Timeline"], pane.tabs.height())
+            self.assertFalse(hasattr(pane, "start_here_label"))
+            self.assertTrue(pane.library_help_button.isVisible())
+            self.assertIn("explicitly registered roots", pane.library_help_button.toolTip())
+            self.assertFalse(pane.status_label.isVisible())
+            self.assertEqual(
+                pane._timeline_layout_for_width(pane._timeline_usable_width()),
+                pane._timeline_layout_mode,
+            )
+            self.assertEqual(pane._timeline_tab_height(), pane.tabs.height())
             for button in (
                 pane.add_current_root_button,
                 pane.add_root_button,
@@ -1239,6 +2487,7 @@ class ProductionSupportTests(unittest.TestCase):
                 pane.save_album_button,
                 pane.delete_album_button,
                 pane.timeline_reload_button,
+                pane.timeline_refresh_dates_button,
             ):
                 self.assertGreaterEqual(
                     button.contentsRect().width(),
@@ -1249,12 +2498,216 @@ class ProductionSupportTests(unittest.TestCase):
             self.assertGreaterEqual(pane.timeline_end.width(), pane.timeline_end.minimumWidth())
             self.assertGreaterEqual(pane.timeline_camera.width(), pane.timeline_camera.minimumWidth())
 
+            pane.status_label.setText("Loading the full Library timeline…")
+            self.assertTrue(pane.status_label.isVisible())
+            pane.status_label.setText("Library timeline ready.")
+            self.assertFalse(pane.status_label.isVisible())
+
             pane.tabs.setCurrentIndex(pane.tabs.indexOf(pane.duplicate_list.parentWidget()))
             APP.processEvents()
-            self.assertEqual(pane._TAB_HEIGHTS["Cleanup"], pane.tabs.height())
+            self.assertGreaterEqual(pane.tabs.height(), pane._TAB_HEIGHTS["Cleanup"])
             pane.close()
 
-    def test_library_timeline_uses_nested_virtual_sections_while_search_stays_paged(self):
+    def test_library_timeline_controls_reflow_without_losing_values(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import LibraryCatalogService
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            pane.timeline_start.setText("2024-01-01")
+            pane.timeline_end.setText("2024-12-31")
+            pane.timeline_camera.setText("Test camera")
+            pane.timeline_date_source.setCurrentIndex(pane.timeline_date_source.findData("filename_only"))
+            pane.timeline_grouping.setCurrentIndex(pane.timeline_grouping.findData("year_month_day"))
+            pane.timeline_filename_patterns.setPlainText("CAM_%Y%m%d_%H%M%S")
+            pane.timeline_epoch_heuristic.setChecked(True)
+            pane.show()
+
+            def cell_position(key: str) -> tuple[int, int, int, int]:
+                for index in range(pane.timeline_form_layout.count()):
+                    if pane.timeline_form_layout.itemAt(index).widget() is pane._timeline_cells[key]:
+                        return pane.timeline_form_layout.getItemPosition(index)
+                self.fail(f"Timeline cell {key} is missing")
+
+            primary_widths = pane._timeline_primary_widths()
+            primary_spacing = pane.timeline_form_layout.horizontalSpacing()
+            one_row_width = pane._layout_required_width(
+                tuple(primary_widths[key] for key in pane._TIMELINE_PRIMARY_KEYS), primary_spacing
+            )
+            two_row_width = max(
+                pane._layout_required_width(
+                    tuple(primary_widths[key] for key in pane._TIMELINE_TWO_ROW_FILTER_KEYS), primary_spacing
+                ),
+                pane._layout_required_width(
+                    tuple(primary_widths[key] for key in pane._TIMELINE_TWO_ROW_POLICY_KEYS), primary_spacing
+                ),
+            )
+
+            # The breakpoints are derived from the visible controls, not a
+            # hard-coded screen width. Keep the outer pane wide while giving
+            # the scroll viewport an exact, deterministic allocation.
+            for scroll_width, mode in (
+                (one_row_width + 48, "wide"),
+                (two_row_width + 24, "medium"),
+            ):
+                pane.resize(one_row_width + 200, 900)
+                pane.timeline_scroll.setFixedWidth(scroll_width)
+                APP.processEvents()
+                pane._update_timeline_layout()
+                APP.processEvents()
+                self.assertEqual(mode, pane._timeline_layout_mode)
+                usable_width = pane._timeline_usable_width()
+                if mode == "wide":
+                    self.assertGreaterEqual(usable_width, one_row_width)
+                else:
+                    self.assertGreaterEqual(usable_width, two_row_width)
+                    self.assertLess(usable_width, one_row_width)
+                self.assertEqual(pane._timeline_tab_height(), pane.tabs.height())
+                expected_positions = (
+                    {
+                        "start": (0, 0, 1, 1),
+                        "end": (0, 1, 1, 1),
+                        "camera": (0, 2, 1, 1),
+                        "date_source": (0, 3, 1, 1),
+                        "grouping": (0, 4, 1, 1),
+                        "show": (0, 5, 1, 1),
+                        "advanced": (1, 0, 1, 6),
+                    }
+                    if mode == "wide"
+                    else {
+                        "start": (0, 0, 1, 1),
+                        "end": (0, 1, 1, 1),
+                        "camera": (0, 2, 1, 4),
+                        "date_source": (1, 0, 1, 3),
+                        "grouping": (1, 3, 1, 1),
+                        "show": (1, 4, 1, 2),
+                        "advanced": (2, 0, 1, 6),
+                    }
+                )
+                for key, position in expected_positions.items():
+                    self.assertEqual(position, cell_position(key), key)
+                if mode == "wide":
+                    self.assertEqual(0, pane.timeline_scroll.verticalScrollBar().maximum())
+                    self.assertEqual(primary_widths["start"], pane._timeline_cells["start"].width())
+                    self.assertEqual(primary_widths["end"], pane._timeline_cells["end"].width())
+                    self.assertGreater(pane._timeline_cells["camera"].width(), primary_widths["camera"])
+                    self.assertGreater(pane._timeline_cells["date_source"].width(), primary_widths["date_source"])
+                self.assertEqual(7, pane.timeline_form_layout.count())
+                self.assertTrue(pane.timeline_advanced_body.isHidden())
+                self.assertEqual(3, pane.timeline_advanced_body.layout().count())
+                for key in ("start", "end", "camera", "date_source", "grouping", "show", "advanced"):
+                    self.assertTrue(pane._timeline_cells[key].isVisible())
+                for key in ("patterns", "epoch", "refresh"):
+                    self.assertFalse(pane._timeline_cells[key].isVisible())
+
+            pane.timeline_scroll.setFixedWidth(max(1, two_row_width - 24))
+            APP.processEvents()
+            pane._update_timeline_layout()
+            APP.processEvents()
+            self.assertEqual("narrow", pane._timeline_layout_mode)
+            self.assertLess(pane._timeline_usable_width(), two_row_width)
+            self.assertEqual(
+                {
+                    "start": (0, 0, 1, 1),
+                    "end": (1, 0, 1, 1),
+                    "camera": (2, 0, 1, 1),
+                    "date_source": (3, 0, 1, 1),
+                    "grouping": (4, 0, 1, 1),
+                    "show": (5, 0, 1, 1),
+                    "advanced": (6, 0, 1, 1),
+                },
+                {key: cell_position(key) for key in ("start", "end", "camera", "date_source", "grouping", "show", "advanced")},
+            )
+            self.assertEqual(7, pane.timeline_form_layout.count())
+
+            self.assertEqual("2024-01-01", pane.timeline_start.text())
+            self.assertEqual("2024-12-31", pane.timeline_end.text())
+            self.assertEqual("Test camera", pane.timeline_camera.text())
+            self.assertEqual("filename_only", pane.timeline_date_source.currentData())
+            self.assertEqual("year_month_day", pane.timeline_grouping.currentData())
+            self.assertEqual("CAM_%Y%m%d_%H%M%S", pane.timeline_filename_patterns.toPlainText())
+            self.assertTrue(pane.timeline_epoch_heuristic.isChecked())
+            self.assertGreater(pane.timeline_scroll.verticalScrollBar().maximum(), 0)
+            pane.close()
+
+    def test_library_search_hides_empty_generated_context_panel(self):
+        with TemporaryDirectory() as tmp:
+            from PyQt6.QtWidgets import QListWidgetItem
+
+            from app.services.library_catalog import LibraryCatalogService
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            pane.resize(1200, 900)
+            pane.show()
+            pane.tabs.setCurrentIndex(pane.tabs.indexOf(pane.search_field.parentWidget()))
+            APP.processEvents()
+
+            self.assertFalse(pane.context_results_panel.isVisible())
+            self.assertFalse(pane.open_context_button.isEnabled())
+            self.assertEqual(pane._TAB_HEIGHTS["Search"], pane.tabs.height())
+
+            pane.context_results.addItem(QListWidgetItem("A generated context"))
+            pane._set_context_results_panel_visible(True)
+            APP.processEvents()
+            self.assertTrue(pane.context_results_panel.isVisible())
+            self.assertEqual(pane._SEARCH_CONTEXT_TAB_HEIGHT, pane.tabs.height())
+            pane.context_results.setCurrentRow(0)
+            self.assertTrue(pane.open_context_button.isEnabled())
+
+            pane.context_results.clear()
+            pane._set_context_results_panel_visible(False)
+            APP.processEvents()
+            self.assertFalse(pane.context_results_panel.isVisible())
+            self.assertFalse(pane.open_context_button.isEnabled())
+            self.assertEqual(pane._TAB_HEIGHTS["Search"], pane.tabs.height())
+            pane.close()
+
+    def test_library_timeline_filename_patterns_are_visible_persisted_and_refreshable(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import LibraryCatalogService
+            from ui.library_pane import LibraryPane, TimelineDatePreferences
+
+            saved: list[TimelineDatePreferences] = []
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+                timeline_date_preferences_provider=lambda: TimelineDatePreferences(
+                    "filename_only", ("CAM_%Y%m%d_%H%M%S",), True, "year_month_day"
+                ),
+                timeline_date_preferences_changed=saved.append,
+            )
+            pane.show()
+            self._wait_for(lambda: pane._catalog_snapshot_job is None)
+
+            self.assertEqual("filename_only", pane.timeline_date_source.currentData())
+            self.assertEqual("year_month_day", pane.timeline_grouping.currentData())
+            self.assertEqual("CAM_%Y%m%d_%H%M%S", pane.timeline_filename_patterns.toPlainText())
+            self.assertTrue(pane.timeline_epoch_heuristic.isChecked())
+            self.assertTrue(pane.timeline_filename_patterns.tabChangesFocus())
+            self.assertIn("named rule", pane.timeline_date_help_button.toolTip())
+
+            pane.timeline_filename_patterns.setPlainText("ARCHIVE_%Y.%m.%d-%H.%M.%S")
+            pane.timeline_epoch_heuristic.setChecked(False)
+            pane.refresh_timeline_dates()
+            self.assertEqual(("ARCHIVE_%Y.%m.%d-%H.%M.%S",), pane.catalog.filename_date_patterns)
+            self.assertEqual(
+                TimelineDatePreferences("filename_only", ("ARCHIVE_%Y.%m.%d-%H.%M.%S",), False, "year_month_day"),
+                saved[-1],
+            )
+            self.assertIn("No registered active roots", pane.status_label.text())
+            pane.close()
+
+    def test_library_timeline_uses_nested_virtual_sections_while_search_progressively_pages(self):
         with TemporaryDirectory() as tmp:
             from app.services.library_catalog import CatalogTimeline, LibraryCatalogService, TimelineMonth, TimelineYear
             from ui.library_pane import LibraryPane
@@ -1290,7 +2743,384 @@ class ProductionSupportTests(unittest.TestCase):
             APP.processEvents()
             self.assertIs(pane.gallery_stack.currentWidget(), pane.gallery)
             self.assertFalse(pane.load_more_button.isHidden())
-            self.assertEqual(240, pane.PAGE_SIZE)
+            self.assertEqual(500, pane.PAGE_SIZE)
+            pane.shutdown_jobs(timeout_ms=1_000)
+            pane.close()
+
+    def test_library_timeline_photo_total_stays_separate_from_thumbnail_tasks(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import CatalogTimeline, LibraryCatalogService, TimelineMonth, TimelineYear
+            from ui.job_manager import JobManager
+            from ui.library_pane import LibraryPane
+
+            paths = tuple(f"/fixture/{index:02d}.jpg" for index in range(36))
+            timeline = CatalogTimeline(
+                years=(TimelineYear(2026, (TimelineMonth(2026, 9, paths),)),),
+                total_count=36,
+            )
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            manager = JobManager()
+            pane.timeline_gallery.set_job_manager(manager, origin="Library")
+            try:
+                with patch.object(pane.timeline_gallery, "_queue_visible_loads_after_layout"):
+                    pane._publish_timeline(timeline)
+                self.assertEqual("Showing 36 photos in 1 year", pane.timeline_count.text())
+
+                for index in range(3):
+                    pane.timeline_gallery._begin_viewport_task(1, paths[index], "thumbnail")
+                self.assertEqual("Loading thumbnails 0/3 visible", pane.timeline_gallery.status_label.text())
+                self.assertEqual("Showing 36 photos in 1 year", pane.timeline_count.text())
+                job = manager.get(pane.timeline_gallery._viewport_job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual("Library", job.origin)
+            finally:
+                pane.shutdown_jobs(timeout_ms=1_000)
+                pane.close()
+
+    def test_library_search_progressively_publishes_every_page_after_the_first_viewport_batch(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import CatalogAsset, CatalogPage, LibraryCatalogService
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            assets = tuple(
+                CatalogAsset(f"/fixture/{index:04d}.jpg", "root", "", "unparsed", "", "", 1, 1, 1, ".jpg")
+                for index in range(1_001)
+            )
+            offsets: list[int] = []
+
+            def query(query):
+                offsets.append(query.offset)
+                start = int(query.offset)
+                end = min(len(assets), start + int(query.limit))
+                return CatalogPage(assets[start:end], len(assets), end if end < len(assets) else None)
+
+            def publish(paths):
+                pane.gallery.images = list(paths)
+
+            pane.gallery.update_gallery = publish
+            try:
+                pane.tabs.setCurrentIndex(pane.tabs.indexOf(pane.search_field.parentWidget()))
+                with patch.object(pane.catalog, "query_assets", side_effect=query):
+                    pane.run_search()
+                    self._wait_for(lambda: len(pane.gallery.images) == len(assets), timeout_s=5.0)
+                self.assertEqual([0, 500, 1_000], offsets)
+                self.assertFalse(pane._asset_auto_loading)
+                self.assertEqual("Showing 1,001 of 1,001 matching photos", pane.timeline_count.text())
+            finally:
+                pane.shutdown_jobs(timeout_ms=1_000)
+                pane.close()
+
+    def test_library_duplicate_trash_preview_requires_explicit_candidate_checks(self):
+        from PyQt6.QtWidgets import QDialogButtonBox
+
+        from ui.library_pane import _DuplicateTrashPreviewDialog
+
+        dialog = _DuplicateTrashPreviewDialog("Hash duplicate", ["/fixture/a.jpg", "/fixture/b.jpg"])
+        try:
+            accept = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+            self.assertEqual([], dialog.selected_paths())
+            self.assertFalse(accept.isEnabled())
+            dialog._set_all_checked(True)
+            self.assertEqual(["/fixture/a.jpg", "/fixture/b.jpg"], dialog.selected_paths())
+            self.assertTrue(accept.isEnabled())
+            dialog._set_all_checked(False)
+            self.assertEqual([], dialog.selected_paths())
+            self.assertFalse(accept.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_production_process_jobs_do_not_spawn_when_cancelled_while_queued(self):
+        from app.services.model_downloads import ModelDownloadItem
+        from apps.pyqt_production.app import ProductionClusterApp
+        from apps.pyqt_production.worker_protocol import ProductionClusterRequest
+        from ui.work_coordinator import JobSpec
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionQueuedProcessCoordinationTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self._wait_for_storage_idle(window)
+
+                    model_blocker = window.work_coordinator.submit(
+                        JobSpec("Model cache writer", model_cache_write=True),
+                        lambda _job_id, _fallback: None,
+                    )
+                    with patch.object(window.model_download_controller, "start", return_value=True) as start_download:
+                        self.assertTrue(window._queue_model_download([ModelDownloadItem("fast_preview")]))
+                        model_job_id = window._model_download_job_id
+                        self.assertEqual("queued", window.job_manager.get(model_job_id).status)
+                        start_download.assert_not_called()
+                        window.work_coordinator.cancel(model_job_id)
+                        self.assertIsNone(window._model_download_job_id)
+                        window.work_coordinator.finish(model_blocker)
+                        APP.processEvents()
+                        start_download.assert_not_called()
+
+                    source_blocker = window.work_coordinator.submit(
+                        JobSpec("Source writer", source_writes=(tmp,)),
+                        lambda _job_id, _fallback: None,
+                    )
+                    request = ProductionClusterRequest(
+                        directory=tmp,
+                        source_roots=[tmp],
+                        embedding_models=["fast_preview"],
+                        num_clusters=2,
+                        clustering_backends=["cosine-kmeans"],
+                        recursive=False,
+                        similarity_mode="semantic",
+                        outlier_policy="assign",
+                        use_onnx=False,
+                        reuse_result_cache=True,
+                        use_embedding_cache_lookup=True,
+                        preferred_execution_mode="cpu",
+                    )
+                    with patch.object(window.session_controller, "start", return_value=True) as start_session:
+                        self.assertTrue(window._start_request(request, run_origin="test"))
+                        session_job_id = window._active_job_id
+                        self.assertEqual("queued", window.job_manager.get(session_job_id).status)
+                        start_session.assert_not_called()
+                        window.cancel_clustering()
+                        self.assertIsNone(window._active_job_id)
+                        window.work_coordinator.finish(source_blocker)
+                        APP.processEvents()
+                        start_session.assert_not_called()
+                finally:
+                    window.close()
+
+    def test_clustering_launch_uses_background_readiness_snapshot_without_qt_probe(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from apps.pyqt_production.worker_protocol import ProductionClusterRequest
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionReadinessSnapshotLaunchTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self._wait_for_storage_idle(window)
+                    policy = ExecutionPolicy(
+                        preferred_mode="cpu",
+                        effective_mode="cpu",
+                        reason="Fixture readiness snapshot.",
+                    )
+                    window._startup_readiness_report = SimpleNamespace(
+                        execution_policy=policy,
+                        clustering_ready=True,
+                        clustering_message="Fixture clustering is ready.",
+                        face_ready=False,
+                        face_message="Not used by this test.",
+                    )
+                    request = ProductionClusterRequest(
+                        directory=tmp,
+                        source_roots=[tmp],
+                        embedding_models=["fast_preview"],
+                        num_clusters=2,
+                        clustering_backends=["cosine-kmeans"],
+                        recursive=False,
+                        similarity_mode="semantic",
+                        outlier_policy="assign",
+                        use_onnx=False,
+                        reuse_result_cache=True,
+                        use_embedding_cache_lookup=True,
+                        preferred_execution_mode="cpu",
+                    )
+                    with (
+                        patch.object(
+                            window.runtime_service,
+                            "select_policy",
+                            side_effect=AssertionError("Qt launch probed runtime policy"),
+                        ),
+                        patch.object(
+                            window.runtime_service,
+                            "detect",
+                            side_effect=AssertionError("Qt launch probed runtime capabilities"),
+                        ),
+                        patch.object(window.session_controller, "start", return_value=True) as start_session,
+                    ):
+                        self.assertTrue(window._start_request(request, run_origin="test"))
+                        start_session.assert_called_once()
+                    active_job_id = window._active_job_id
+                    self.assertIsNotNone(active_job_id)
+                    window.work_coordinator.finish(active_job_id, status="cancelled")
+                    APP.processEvents()
+
+                    window._startup_readiness_report = SimpleNamespace(
+                        execution_policy=policy,
+                        clustering_ready=True,
+                    )
+                    stale_request = replace(request, preferred_execution_mode="cuda")
+                    with (
+                        patch.object(window, "_begin_startup_readiness_check") as begin_readiness,
+                        patch.object(window.session_controller, "start") as stale_start,
+                    ):
+                        self.assertFalse(window._start_request(stale_request, run_origin="test"))
+                        begin_readiness.assert_called_once_with()
+                        stale_start.assert_not_called()
+
+                    unavailable_policy = ExecutionPolicy(
+                        preferred_mode="cuda",
+                        effective_mode="cpu",
+                        reason="CUDA provider unavailable.",
+                        error="CUDA provider unavailable.",
+                    )
+                    window._startup_readiness_report = SimpleNamespace(
+                        execution_policy=unavailable_policy,
+                        clustering_ready=False,
+                    )
+                    with (
+                        patch("apps.pyqt_production.app.errorBox") as error_box,
+                        patch.object(window.session_controller, "start") as unavailable_start,
+                    ):
+                        self.assertFalse(window._start_request(stale_request, run_origin="test"))
+                        unavailable_start.assert_not_called()
+                        error_box.assert_called_once_with(
+                            "CUDA unavailable",
+                            "CUDA provider unavailable.",
+                        )
+                finally:
+                    window.close()
+
+    def test_cuda_oom_is_terminal_and_never_silently_retries_on_cpu(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from ui.work_coordinator import JobSpec
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                window = ProductionClusterApp(
+                    activate_runtime_root("ProductionCudaOomTerminalTest")
+                )
+                try:
+                    self._wait_for_storage_idle(window)
+                    job_id = window.work_coordinator.submit(
+                        JobSpec("Explicit CUDA run", uses_gpu=True),
+                        lambda _job_id, _fallback: None,
+                    )
+                    window._coordinated_process_job_ids.add(job_id)
+                    window._active_job_id = job_id
+                    with (
+                        patch("apps.pyqt_production.app.errorBox") as error_box,
+                        patch.object(window.session_controller, "start") as restart,
+                    ):
+                        window._on_clustering_failed("CUDA out of memory while loading the model")
+                    state = window.job_manager.get(job_id)
+                    self.assertEqual("failed", state.status)
+                    self.assertIn("out of memory", state.error.lower())
+                    restart.assert_not_called()
+                    error_box.assert_called_once()
+                    self.assertEqual("Failed", window.footer_bar.status_label.text())
+                finally:
+                    window.close()
+
+    def test_settings_runtime_apply_only_invalidates_for_background_readiness(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"IMAGE_CLUSTERING_APP_DIR": tmp}, clear=False):
+                settings_mod._RUNTIME_BASE_DIR = None
+                layout = activate_runtime_root("ProductionSettingsRuntimeInvalidationTest")
+                window = ProductionClusterApp(layout)
+                try:
+                    self._wait_for_storage_idle(window)
+                    window._startup_readiness_report = object()
+                    with (
+                        patch.object(
+                            window.runtime_service,
+                            "select_policy",
+                            side_effect=AssertionError("Settings apply probed runtime policy"),
+                        ),
+                        patch.object(
+                            window.runtime_service,
+                            "detect",
+                            side_effect=AssertionError("Settings apply probed runtime capabilities"),
+                        ),
+                    ):
+                        window._apply_runtime_status()
+                    self.assertIsNone(window._startup_readiness_report)
+                    self.assertEqual("cpu", window.execution_policy.preferred_mode)
+                    self.assertIn("background", window.execution_policy.reason.lower())
+                    self.assertEqual("Runtime checking… · Checking", window.runtime_badge.text())
+                finally:
+                    window.close()
+
+    def test_library_timeline_grouping_drop_down_builds_year_month_week_and_day_views(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import CatalogTimeline, LibraryCatalogService, TimelineDay, TimelineMonth, TimelineYear
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            timeline = CatalogTimeline(
+                years=(
+                    TimelineYear(
+                        2024,
+                        (
+                            TimelineMonth(
+                                2024,
+                                5,
+                                ("/may-20.jpg", "/may-19.jpg", "/may-01.jpg"),
+                                (
+                                    TimelineDay(2024, 5, 20, 21, ("/may-20.jpg",)),
+                                    TimelineDay(2024, 5, 19, 20, ("/may-19.jpg",)),
+                                    TimelineDay(2024, 5, 1, 18, ("/may-01.jpg",)),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                total_count=3,
+            )
+
+            pane.timeline_grouping.setCurrentIndex(pane.timeline_grouping.findData("year"))
+            year_sections, _collapsed = pane._timeline_sections(timeline)
+            self.assertEqual(("/may-20.jpg", "/may-19.jpg", "/may-01.jpg"), year_sections[0].paths)
+            self.assertEqual((), year_sections[0].children)
+
+            pane.timeline_grouping.setCurrentIndex(pane.timeline_grouping.findData("year_month_week"))
+            week_sections, _collapsed = pane._timeline_sections(timeline)
+            week_children = week_sections[0].children[0].children
+            self.assertEqual(["Week 21", "Week 20", "Week 18"], [section.title for section in week_children])
+            self.assertEqual(("/may-20.jpg",), week_children[0].paths)
+
+            pane.timeline_grouping.setCurrentIndex(pane.timeline_grouping.findData("year_month_day"))
+            day_sections, _collapsed = pane._timeline_sections(timeline)
+            day_children = day_sections[0].children[0].children
+            self.assertEqual(["May 20, 2024", "May 19, 2024", "May 1, 2024"], [section.title for section in day_children])
+            pane.close()
+
+    def test_library_timeline_labels_unparsed_filename_time_explicitly(self):
+        with TemporaryDirectory() as tmp:
+            from app.services.library_catalog import CatalogTimeline, LibraryCatalogService, TimelineMonth, TimelineYear
+            from ui.library_pane import LibraryPane
+
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            sections, _collapsed = pane._timeline_sections(
+                CatalogTimeline(
+                    years=(TimelineYear(0, (TimelineMonth(0, 0, ("/unparsed.jpg",)),)),),
+                    total_count=1,
+                )
+            )
+
+            self.assertEqual("Unparsed", sections[0].title)
+            self.assertEqual("Unparsed filename time", sections[0].children[0].title)
             pane.close()
 
     def test_production_clustering_controls_use_curated_model_and_backend_surface(self):
@@ -1342,6 +3172,7 @@ class ProductionSupportTests(unittest.TestCase):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
         window = ProductionClusterApp(RUNTIME_LAYOUT)
+        window.source_pane.set_active_roots((str(Path(__file__).parent),))
         window.show()
         window.set_clustering_mode("advanced")
         APP.processEvents()
@@ -1351,7 +3182,11 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertTrue(pane.technical_panel.isVisible())
         self.assertTrue(pane.backend_checkboxes["hdbscan"].isVisible())
 
-        for preset in ("fast_preview", "high_quality"):
+        self.assertEqual(
+            ["Quick groups", "Similar scenes", "Events", "Documents", "People-heavy", "Detailed groups", "Custom"],
+            [pane.preset_combo.itemText(index) for index in range(pane.preset_combo.count())],
+        )
+        for preset in ("fast_preview", "events", "documents", "people_heavy", "high_quality"):
             pane.preset_combo.setCurrentIndex(pane.preset_combo.findData(preset))
             APP.processEvents()
             self.assertTrue(pane.technical_panel.isVisible())
@@ -1424,11 +3259,13 @@ class ProductionSupportTests(unittest.TestCase):
         window.close()
 
     def test_production_settings_dialog_uses_production_owned_copy(self):
-        from apps.pyqt_production.app import RUNTIME_LAYOUT
+        from apps.pyqt_production.app import RUNTIME_LAYOUT, _select_settings_storage_section
         from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
         from app.services.cache_maintenance import CacheClearResult, CacheUsageSummary, GeneratedStorageSummary
 
         store = QSettings("ClusterLensTests", "ProductionSettingsDialog")
+        store.clear()
+        store.sync()
         dialog = ProductionSettingsDialog(
             store,
             RuntimeCapabilityService(),
@@ -1471,6 +3308,7 @@ class ProductionSupportTests(unittest.TestCase):
             support_metadata_provider=lambda: {},
         )
         self._wait_for(lambda: dialog._cache_usage_thread is None, timeout_s=5.0)
+        self.assertTrue(_select_settings_storage_section(dialog))
         combined_text = "\n".join(
             [
                 dialog.runtime_text.toPlainText(),
@@ -1493,11 +3331,75 @@ class ProductionSupportTests(unittest.TestCase):
         self.assertEqual("Clear Installed Model Assets", dialog.clear_model_assets_button.text())
         self.assertTrue(dialog.clear_runtime_temp_button.isEnabled())
         self.assertTrue(dialog.clear_library_catalog_button.isEnabled())
+
         self.assertTrue(dialog.clear_runtime_reports_button.isEnabled())
         self.assertTrue(dialog.clear_model_assets_button.isEnabled())
         self.assertNotIn("face/search", combined_text)
         self.assertNotIn("convnext", combined_text)
+        self.assertEqual("Disabled", dialog.minimum_image_width.text())
+        self.assertIn("Thumbnail-name matching: off", dialog.source_filter_summary.text())
+        dialog.ignore_thumbnail_like.setChecked(True)
+        dialog.minimum_image_width.setValue(640)
+        dialog.minimum_image_height.setValue(480)
+        dialog.minimum_file_size_kib.setValue(128)
+        values = dialog.values()
+        self.assertTrue(values["source_filters/ignore_thumbnail_like"])
+        self.assertEqual(640, values["source_filters/min_width"])
+        self.assertEqual(480, values["source_filters/min_height"])
+        self.assertEqual(128 * 1024, values["source_filters/min_file_size_bytes"])
+        self.assertIn("Thumbnail-name matching: on", dialog.source_filter_summary.text())
+        self.assertIn("width ≥ 640 px", dialog.source_filter_summary.text())
+        from app.services.source_admission import SourceAdmissionPolicy
+
+        for key in (
+            "source_filters/ignore_thumbnail_like",
+            "source_filters/min_width",
+            "source_filters/min_height",
+            "source_filters/min_file_size_bytes",
+        ):
+            dialog.settings_registry.set(store, key, values[key])
+        restored_policy = SourceAdmissionPolicy.from_settings_store(store)
+        self.assertEqual(
+            SourceAdmissionPolicy(True, minimum_width=640, minimum_height=480, minimum_file_size_bytes=128 * 1024),
+            restored_policy,
+        )
         dialog.close()
+
+    def test_production_cache_clear_reports_late_cancel_as_committed_retryable_state(self):
+        from apps.pyqt_production.app import ProductionClusterApp
+        from app.services.cache_maintenance import CacheUsageSummary
+        from infra.cancel import Cancelled
+
+        class FakeCacheMaintenance:
+            def __init__(self) -> None:
+                self.describe_calls = 0
+
+            def describe_rebuildable_caches(self, *, cancel_check=None):
+                self.describe_calls += 1
+                total = 8192 if self.describe_calls == 1 else 0
+                return CacheUsageSummary("/cache", {"embeddings.sqlite3": total}, total)
+
+            def clear_rebuildable_disk_targets(self, **_kwargs):
+                raise Cancelled()
+
+            @staticmethod
+            def pending_rebuildable_cleanup_targets():
+                return ("cluster_results/",)
+
+        fake = SimpleNamespace(
+            cache_maintenance_service=FakeCacheMaintenance(),
+            _clear_embedding_cache=lambda **_kwargs: (["embeddings.sqlite3"], []),
+        )
+
+        result = ProductionClusterApp._clear_rebuildable_caches(
+            fake,
+            cancel_check=lambda: False,
+        )
+
+        self.assertEqual(("embeddings.sqlite3",), result.cleared_targets)
+        self.assertEqual(("cluster_results/",), result.retry_targets)
+        self.assertTrue(result.completion_survives_cancellation)
+        self.assertTrue(any("after a cache target committed" in failure for failure in result.failures))
 
     def test_production_settings_resource_rescan_forces_background_runtime_refresh(self):
         from apps.pyqt_production.app import RUNTIME_LAYOUT
@@ -1558,6 +3460,7 @@ class ProductionSupportTests(unittest.TestCase):
         from apps.pyqt_production.app import ProductionClusterApp, RUNTIME_LAYOUT
 
         window = ProductionClusterApp(RUNTIME_LAYOUT)
+        window.source_pane.set_active_roots((str(Path(__file__).parent),))
         window.show()
         window.set_clustering_mode("advanced")
         APP.processEvents()
@@ -1808,11 +3711,15 @@ class ProductionSupportTests(unittest.TestCase):
 
                 discovery_thread_flags: list[bool] = []
                 captured_requests: list[object] = []
+                discovery_entered = Event()
+                release_discovery = Event()
                 original_discover = ImageDiscoveryService.discover_result
 
                 def _discover(service, directory, recursive=None, progress_callback=None, cancel_check=None):
                     discovery_thread_flags.append(QThread.currentThread() is APP.thread())
-                    time.sleep(0.05)
+                    discovery_entered.set()
+                    if not release_discovery.wait(timeout=5.0):
+                        raise AssertionError("test did not release blocked discovery")
                     return original_discover(
                         service,
                         directory,
@@ -1832,11 +3739,15 @@ class ProductionSupportTests(unittest.TestCase):
                     "_prepare_request_model_downloads",
                     side_effect=lambda request: replace(request, allow_model_downloads=False),
                 ), patch.object(window.session_controller, "start", side_effect=_start):
-                    window.run_clustering()
-                    APP.processEvents()
-                    self.assertIsNotNone(window._preflight_thread)
-                    self.assertFalse(window.footer_bar.clear_storage_button.isEnabled())
-                    self._wait_for(lambda: bool(captured_requests), timeout_s=5.0)
+                    try:
+                        window.run_clustering()
+                        self._wait_for(discovery_entered.is_set, timeout_s=5.0)
+                        self.assertIsNotNone(window._preflight_thread)
+                        self.assertFalse(window.footer_bar.clear_storage_button.isEnabled())
+                        release_discovery.set()
+                        self._wait_for(lambda: bool(captured_requests), timeout_s=5.0)
+                    finally:
+                        release_discovery.set()
 
                 self.assertTrue(discovery_thread_flags)
                 self.assertFalse(any(discovery_thread_flags))

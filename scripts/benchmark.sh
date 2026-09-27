@@ -14,6 +14,7 @@ fi
 
 export CLUSTERLENS_RUNTIME_ROOT="$benchmark_runtime"
 export PYTHONPYCACHEPREFIX="$benchmark_runtime/pycache"
+export XDG_CONFIG_HOME="$benchmark_runtime/settings"
 export PYTHONPATH="$repo_root/src:$repo_root"
 cd "$repo_root"
 if [[ "${1:-}" == "--thumbnail-index-only" ]]; then
@@ -46,6 +47,21 @@ if [[ "${1:-}" == "--face-review-paging-only" ]]; then
     "$benchmark_python" scripts/benchmark_face_review_paging.py "$@"
     exit 0
 fi
+if [[ "${1:-}" == "--people-detect-workflow-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_people_detect_workflow.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--sectioned-gallery-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_sectioned_gallery_publication.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--people-faces-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_people_faces.py "$@"
+    exit 0
+fi
 if [[ "${1:-}" == "--library-catalog-only" ]]; then
     shift
     "$benchmark_python" scripts/benchmark_library_catalog.py "$@"
@@ -54,6 +70,11 @@ fi
 if [[ "${1:-}" == "--library-timeline-only" ]]; then
     shift
     "$benchmark_python" scripts/benchmark_library_catalog.py --timeline-only "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--duplicate-review-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_duplicate_review.py "$@"
     exit 0
 fi
 if [[ "${1:-}" == "--multi-root-discovery-only" ]]; then
@@ -71,6 +92,21 @@ if [[ "${1:-}" == "--ux-workflow-only" ]]; then
     "$benchmark_python" scripts/benchmark_ux_workflows.py "$@"
     exit 0
 fi
+if [[ "${1:-}" == "--theme-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_theme.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--jobs-history-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_jobs_history.py "$@"
+    exit 0
+fi
+if [[ "${1:-}" == "--production-workloads-only" ]]; then
+    shift
+    "$benchmark_python" scripts/benchmark_production_workloads.py "$@"
+    exit 0
+fi
 "$benchmark_python" scripts/benchmark_acceleration.py "$@"
 "$benchmark_python" scripts/benchmark_face_region_metadata.py
 "$benchmark_python" scripts/benchmark_thumbnail_index.py
@@ -79,6 +115,11 @@ fi
 "$benchmark_python" scripts/benchmark_face_tile_arrangement.py
 "$benchmark_python" scripts/benchmark_face_indexing.py
 "$benchmark_python" scripts/benchmark_face_review_paging.py
+"$benchmark_python" scripts/benchmark_people_detect_workflow.py
+"$benchmark_python" scripts/benchmark_sectioned_gallery_publication.py
 "$benchmark_python" scripts/benchmark_library_catalog.py
 "$benchmark_python" scripts/benchmark_entity_picker.py
 "$benchmark_python" scripts/benchmark_ux_workflows.py
+"$benchmark_python" scripts/benchmark_theme.py
+"$benchmark_python" scripts/benchmark_jobs_history.py
+"$benchmark_python" scripts/benchmark_production_workloads.py

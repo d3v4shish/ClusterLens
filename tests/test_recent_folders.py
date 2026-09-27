@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from src.ui.recent_folders import RecentFolderHistory
 
@@ -54,6 +55,17 @@ class RecentFolderHistoryTests(unittest.TestCase):
             self.assertTrue(history.remove(str(folder)))
             self.assertEqual([], history.paths())
             self.assertFalse(history.clear())
+
+    def test_restore_is_lexical_and_never_probes_saved_directories(self) -> None:
+        store = _Store()
+        store.values["workspace/recent_folders_v1"] = json.dumps(
+            {"version": 1, "paths": ["/disconnected/archive", "/disconnected/archive"]}
+        )
+
+        with patch("src.ui.recent_folders.Path.is_dir", side_effect=AssertionError("unexpected filesystem probe")):
+            history = RecentFolderHistory(store)
+
+        self.assertEqual(["/disconnected/archive"], history.paths())
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import QApplication
 
 from ui.sectioned_gallery import GallerySection, SectionedGalleryModel
@@ -166,6 +166,108 @@ def test_sectioned_gallery_requests_lazy_face_tools_before_opening_editor() -> N
     app.processEvents()
 
 
+def test_large_section_preparation_discards_stale_worker_result() -> None:
+    app = QApplication.instance() or QApplication([])
+    from threading import Event
+    from time import monotonic, sleep
+    from unittest.mock import patch
+
+    from ui.sectioned_gallery import SectionedGallery
+
+    gallery = SectionedGallery()
+    gallery.ASYNC_PREPARE_PATH_THRESHOLD = 1
+    gallery._queue_visible_loads = lambda: None  # type: ignore[method-assign]
+    first_started = Event()
+    release_first = Event()
+    original_prepare = SectionedGalleryModel.prepare_sections
+    calls = 0
+
+    def _delayed_prepare(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            release_first.wait(timeout=5.0)
+        return original_prepare(*args, **kwargs)
+
+    def _wait_for(predicate) -> None:
+        deadline = monotonic() + 5.0
+        while monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            sleep(0.01)
+        assert predicate()
+
+    try:
+        with patch.object(SectionedGalleryModel, "prepare_sections", side_effect=_delayed_prepare):
+            gallery.set_sections([GallerySection("old", ("/old.jpg",))])
+            _wait_for(first_started.is_set)
+            gallery.set_sections([GallerySection("new", ("/new.jpg",))])
+            _wait_for(lambda: gallery._model.all_paths() == ["/new.jpg"])
+            release_first.set()
+            _wait_for(lambda: gallery._section_prepare_thread is None)
+            assert gallery._model.all_paths() == ["/new.jpg"]
+    finally:
+        release_first.set()
+        gallery.close()
+        app.processEvents()
+
+
+def test_large_section_resize_prepares_reflow_off_the_ui_thread() -> None:
+    app = QApplication.instance() or QApplication([])
+    from time import monotonic, sleep
+
+    from ui.sectioned_gallery import SectionedGallery
+
+    gallery = SectionedGallery()
+    gallery.ASYNC_PREPARE_PATH_THRESHOLD = 1
+    gallery._queue_visible_loads = lambda: None  # type: ignore[method-assign]
+    paths = tuple(f"/photo-{index}.jpg" for index in range(2_200))
+
+    def _wait_for(predicate) -> None:
+        deadline = monotonic() + 5.0
+        while monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            sleep(0.01)
+        assert predicate()
+
+    try:
+        gallery.resize(1_120, 700)
+        gallery.show()
+        app.processEvents()
+        gallery.set_sections([GallerySection("large", paths)])
+        _wait_for(lambda: gallery._model.all_paths() == list(paths))
+
+        selected_path = paths[100]
+        row, column = gallery._model._path_locations[selected_path]  # noqa: SLF001 - model owns stable path locations
+        gallery.table.selectionModel().select(
+            gallery._model.index(row, column),
+            QItemSelectionModel.SelectionFlag.Select,
+        )
+        old_columns = gallery._model.columnCount()
+
+        gallery.resize(500, 700)
+        app.processEvents()
+        expected_columns = max(1, gallery.table.viewport().width() // max(120, gallery._tile_size + 18))
+        assert expected_columns != old_columns
+        assert gallery._section_prepare_job is not None
+        _wait_for(lambda: gallery._model.columnCount() == expected_columns)
+        _wait_for(
+            lambda: selected_path
+            in {
+                gallery._model.path_at(index)
+                for index in gallery.table.selectionModel().selectedIndexes()
+            }
+        )
+        assert gallery._model.all_paths() == list(paths)
+    finally:
+        gallery.close()
+        app.processEvents()
+
+
 def test_group_header_hover_opens_a_photo_first_preview() -> None:
     app = QApplication.instance() or QApplication([])
     from ui.sectioned_gallery import SectionedGallery
@@ -214,3 +316,34 @@ def test_photos_gallery_opens_inspector_with_face_region_editing_when_index_is_r
     assert callback_paths == ["/a.jpg"]
     gallery.close()
     app.processEvents()
+
+
+def test_viewport_thumbnail_progress_uses_distinct_units_and_workspace_owner() -> None:
+    app = QApplication.instance() or QApplication([])
+    from ui.job_manager import JobManager
+    from ui.sectioned_gallery import SectionedGallery
+
+    manager = JobManager()
+    gallery = SectionedGallery()
+    gallery.set_job_manager(manager, origin="Library")
+    try:
+        gallery._begin_viewport_task(1, "/photos/a.jpg", "thumbnail")
+        gallery._begin_viewport_task(1, "/photos/b.jpg", "thumbnail")
+        job_id = gallery._viewport_job_id
+        assert job_id is not None
+        assert manager.get(job_id).origin == "Library"
+        assert gallery.status_label.text() == "Loading thumbnails 0/2 visible"
+
+        gallery._complete_viewport_task(1, "/photos/a.jpg", "thumbnail")
+        gallery._complete_viewport_task(1, "/photos/b.jpg", "thumbnail")
+
+        assert gallery.status_label.text() == "Thumbnails ready 2/2."
+        assert "Loaded" not in gallery.status_label.text()
+        assert manager.get(job_id).status == "finished"
+
+        gallery._begin_viewport_task(1, "/photos/a.jpg", "label")
+        assert gallery._viewport_job_id is None
+        assert gallery._viewport_tasks == set()
+    finally:
+        gallery.close()
+        app.processEvents()

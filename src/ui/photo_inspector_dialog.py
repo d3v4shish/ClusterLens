@@ -9,16 +9,20 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, pyqtSlot
 from PyQt6.QtGui import QIcon, QImage, QImageReader, QKeyEvent, QKeySequence, QPainter, QPixmap, QShortcut
-from PyQt6.QtWidgets import QAbstractItemView, QDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListView, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QAbstractItemView, QComboBox, QDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 
 from app.services.face_types import EditableFaceInput
-from app.services.photo_metadata import PhotoMetadata, PhotoMetadataService
+from app.services.photo_metadata import PhotoEditDraft, PhotoEditService, PhotoMetadata, PhotoMetadataService
 from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
 from ui.error_mbox import confirmBox, errorBox
 from ui.entity_picker import EntityPicker, EntityPickerDialog
+from ui.common import HelpIconButton, KeyboardTabBar, ResponsiveFlowLayout
 from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel
-from ui.zoomable_image import ZoomableImageView
+from ui.icons import apply_icon
+from ui.theme import get_theme_manager
+from ui.work_coordinator import JobSpec, WorkCoordinator
+from ui.zoomable_image import ZoomableImageView, adaptive_neutral_backdrop
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 
@@ -52,18 +56,31 @@ class PhotoInspectorDialog(QDialog):
         face_draft_updated_callback: Callable[[str, list[EditableFaceDraft], bool], None] | None = None,
         face_edit_saved_callback: Callable[[str], None] | None = None,
         face_auto_clean_callback: Callable[[str, list[EditableFaceDraft]], tuple[list[EditableFaceDraft], dict[str, int]]] | None = None,
+        allow_metadata_edit: bool = True,
+        allow_file_rename: bool = True,
+        rename_current_callback: Callable[[str], None] | None = None,
         job_manager: JobManager | None = None,
+        work_coordinator: WorkCoordinator | None = None,
         parent=None,
     ):
         super().__init__(parent)
         self.metadata_service = metadata_service or PhotoMetadataService()
+        self.photo_edit_service = PhotoEditService()
         self.face_service = face_service
         self.face_draft_provider = face_draft_provider
         self.face_draft_updated_callback = face_draft_updated_callback
         self.face_edit_saved_callback = face_edit_saved_callback
         self.face_auto_clean_callback = face_auto_clean_callback
+        self._allow_metadata_edit = bool(allow_metadata_edit)
+        self._allow_file_rename = bool(allow_file_rename)
+        self.rename_current_callback = rename_current_callback
         self.job_manager = job_manager
-        self._allow_face_edit = bool(allow_face_edit and face_service is not None)
+        self.work_coordinator = work_coordinator
+        self._coordinated_job_ids: dict[AsyncJob, int] = {}
+        # Keep the Faces surface visible in every inspector route.  A missing
+        # service explains its readiness state instead of making face regions
+        # appear to be unsupported by that workspace.
+        self._allow_face_edit = bool(allow_face_edit)
         self._active_thread = None
         self._active_job = None
         self._preview_thread = None
@@ -80,6 +97,8 @@ class PhotoInspectorDialog(QDialog):
         self._face_edit_job = None
         self._face_name_suggestion_thread = None
         self._face_name_suggestion_job = None
+        self._metadata_edit_thread = None
+        self._metadata_edit_job = None
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
         self._thread_jobs: dict[object, object | None] = {}
         self._progress_jobs: dict[int, dict[str, object]] = {}
@@ -98,6 +117,8 @@ class PhotoInspectorDialog(QDialog):
         self._face_redo_by_path: dict[str, list[list[EditableFaceDraft]]] = {}
         self._current_context: dict[str, object] = {}
         self._current_image_path = ""
+        self._metadata_baseline_draft = PhotoEditDraft()
+        self._metadata_populating = False
         self.setWindowTitle("Photo Inspector")
         self.resize(1200, 800)
         self.main_layout = QVBoxLayout(self)
@@ -119,15 +140,43 @@ class PhotoInspectorDialog(QDialog):
         self.preview_view.zoom_changed.connect(self._on_zoom_changed)
         image_layout.addWidget(self.preview_view, stretch=1)
 
-        nav = QHBoxLayout()
-        nav.setContentsMargins(0, 0, 0, 0)
+        self.viewer_actions = QWidget(self.image_panel)
+        nav = ResponsiveFlowLayout(self.viewer_actions, spacing=6)
         self.prev_button = QPushButton("Previous")
         self.next_button = QPushButton("Next")
         self.fit_button = QPushButton("Fit")
         self.actual_size_button = QPushButton("1:1")
         self.zoom_out_button = QPushButton("−")
         self.zoom_in_button = QPushButton("+")
+        self.viewer_background_combo = QComboBox()
+        self.viewer_background_combo.addItem("Adaptive", "adaptive_neutral")
+        self.viewer_background_combo.addItem("Theme", "theme")
+        self.viewer_background_combo.addItem("Black", "black")
+        self.viewer_background_combo.addItem("Middle gray", "middle_gray")
+        self.viewer_background_combo.addItem("Light gray", "light_gray")
+        self.viewer_background_combo.setAccessibleName("Photo viewer background")
+        self.viewer_background_combo.setToolTip(
+            "Choose only the photo canvas background. Adaptive samples the loaded preview border; app chrome is unchanged."
+        )
+        theme_manager = get_theme_manager()
+        viewer_backdrop = theme_manager.viewer_backdrop if theme_manager is not None else "adaptive_neutral"
+        backdrop_index = self.viewer_background_combo.findData(viewer_backdrop)
+        self.viewer_background_combo.setCurrentIndex(max(0, backdrop_index))
+        self.viewer_background_combo.currentIndexChanged.connect(self._viewer_background_changed)
+        if theme_manager is not None:
+            theme_manager.viewer_backdrop_changed.connect(self._sync_viewer_background_combo)
         self.full_screen_button = QPushButton("Full screen")
+        self.face_regions_button = QPushButton("Face regions")
+        self.capture_time_button = QPushButton("Set capture time…")
+        self.fit_button.setAccessibleName("Fit image to viewer")
+        self.actual_size_button.setAccessibleName("Show image at actual size")
+        self.zoom_out_button.setAccessibleName("Zoom out")
+        self.zoom_in_button.setAccessibleName("Zoom in")
+        self.full_screen_button.setAccessibleName("Toggle full-screen viewer")
+        self.face_regions_button.setAccessibleName("Show or hide face regions")
+        self.capture_time_button.setAccessibleName("Set photo capture time")
+        self.face_regions_button.setCheckable(True)
+        self.face_regions_button.setChecked(True)
         self.zoom_label = QLabel("Fit")
         self.prev_button.setToolTip("Previous photo (Left or A)")
         self.next_button.setToolTip("Next photo (Right or D)")
@@ -136,6 +185,13 @@ class PhotoInspectorDialog(QDialog):
         self.zoom_out_button.setToolTip("Zoom out (−)")
         self.zoom_in_button.setToolTip("Zoom in (+)")
         self.full_screen_button.setToolTip("Toggle full-screen viewer (F11)")
+        self.face_regions_button.setToolTip("Show or hide detected and saved face-region boxes on this photo.")
+        self.capture_time_button.setToolTip(
+            "Enter a capture date and time for this photo, then Save sidecar. "
+            "Timeline treats a valid saved value as your explicit correction after Refresh dates."
+        )
+        apply_icon(self.face_regions_button, "faces")
+        apply_icon(self.capture_time_button, "metadata")
         self.zoom_label.setToolTip("Mouse-wheel zoom is centered on the pointer. Middle-drag pans a zoomed photo.")
         self.index_label = QLabel("")
         self.index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -146,13 +202,29 @@ class PhotoInspectorDialog(QDialog):
         nav.addWidget(self.zoom_out_button)
         nav.addWidget(self.zoom_in_button)
         nav.addWidget(self.zoom_label)
-        nav.addWidget(self.index_label, stretch=1)
+        nav.addWidget(self.viewer_background_combo)
+        nav.addWidget(self.index_label)
+        nav.addWidget(self.face_regions_button)
+        nav.addWidget(self.capture_time_button)
         nav.addWidget(self.full_screen_button)
-        image_layout.addLayout(nav)
+        image_layout.addWidget(self.viewer_actions)
 
         self.details_panel = QWidget(self.content_splitter)
-        self.details_panel.setMinimumWidth(380)
-        self.details_panel.setMaximumWidth(520)
+        text_scale = int(getattr(theme_manager, "text_scale", 100)) if theme_manager is not None else 100
+        if text_scale >= 200:
+            details_minimum_width = 600
+            details_maximum_width = 660
+        elif text_scale >= 150:
+            details_minimum_width = 480
+            details_maximum_width = 580
+        elif text_scale >= 125:
+            details_minimum_width = 420
+            details_maximum_width = 540
+        else:
+            details_minimum_width = 380
+            details_maximum_width = 520
+        self.details_panel.setMinimumWidth(details_minimum_width)
+        self.details_panel.setMaximumWidth(details_maximum_width)
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(12, 0, 0, 0)
         details_layout.setSpacing(8)
@@ -169,6 +241,7 @@ class PhotoInspectorDialog(QDialog):
             title_label.setMinimumWidth(54)
 
         self.name_label = QLabel("")
+        self.name_label.setProperty("role", "section")
         name_font = self.name_label.font()
         name_font.setBold(True)
         name_font.setPointSize(max(name_font.pointSize(), 11))
@@ -206,13 +279,12 @@ class PhotoInspectorDialog(QDialog):
         face_editor_layout.setSpacing(6)
 
         self.face_editor_summary_label = QLabel("Face regions are available when face indexing is ready for this photo.")
+        self.face_editor_summary_label.setProperty("role", "helper")
         self.face_editor_summary_label.setWordWrap(True)
         face_editor_layout.addWidget(self.face_editor_summary_label)
 
-        face_action_grid = QGridLayout()
-        face_action_grid.setContentsMargins(0, 0, 0, 0)
-        face_action_grid.setHorizontalSpacing(6)
-        face_action_grid.setVerticalSpacing(6)
+        self.face_actions = QWidget(self.face_editor_panel)
+        face_action_grid = ResponsiveFlowLayout(self.face_actions, spacing=6)
         self.face_rescan_button = QPushButton("Auto-Scan This Image")
         self.face_draw_button = QPushButton("Draw Face Box")
         self.face_remove_button = QPushButton("Remove Selected Faces")
@@ -224,26 +296,46 @@ class PhotoInspectorDialog(QDialog):
         self.face_auto_clean_button = QPushButton("Auto-Clean This Image")
         self.face_reset_button = QPushButton("Reset")
         self.face_save_button = QPushButton("Save Face Edits")
+        self.face_remove_button.setToolTip("Remove only the selected staged face regions.")
+        self.face_duplicate_button.setToolTip("Duplicate one selected region so two nearby faces can be mapped separately.")
+        self.face_split_button.setToolTip("Split one selected region into two staged face boxes.")
+        self.face_auto_clean_button.setToolTip("Remove obvious low-quality detections from the staged draft.")
+        self.face_reset_button.setToolTip("Discard staged face-region changes and restore the saved index.")
+        self.face_remove_all_button.setToolTip("Stage removal of every face region from this photo.")
         face_action_buttons = [
             self.face_rescan_button,
             self.face_draw_button,
-            self.face_remove_button,
-            self.face_duplicate_button,
-            self.face_split_button,
             self.face_undo_button,
             self.face_redo_button,
-            self.face_remove_all_button,
-            self.face_auto_clean_button,
-            self.face_reset_button,
         ]
-        for button_index, button in enumerate(face_action_buttons):
+        for button in face_action_buttons:
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            face_action_grid.addWidget(button, button_index // 2, button_index % 2)
-        face_action_grid.setColumnStretch(0, 1)
-        face_action_grid.setColumnStretch(1, 1)
+            face_action_grid.addWidget(button)
         self.face_save_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        face_action_grid.addWidget(self.face_save_button, len(face_action_buttons) // 2, 0, 1, 2)
-        face_editor_layout.addLayout(face_action_grid)
+        face_action_grid.addWidget(self.face_save_button)
+        self.face_more_button = QToolButton(self.face_editor_panel)
+        self.face_more_button.setText("More face actions")
+        self.face_more_button.setAccessibleName("Open additional face-region actions")
+        self.face_more_button.setToolTip("Duplicate, split, clean, reset, or remove face regions.")
+        self.face_more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.face_more_menu = QMenu(self.face_more_button)
+        self.face_more_actions = {
+            self.face_remove_button: self.face_more_menu.addAction("Remove selected faces"),
+            self.face_duplicate_button: self.face_more_menu.addAction("Duplicate selected face"),
+            self.face_split_button: self.face_more_menu.addAction("Split selected face"),
+            self.face_auto_clean_button: self.face_more_menu.addAction("Auto-clean this image"),
+            self.face_reset_button: self.face_more_menu.addAction("Discard face draft"),
+            self.face_remove_all_button: self.face_more_menu.addAction("Remove all face regions"),
+        }
+        self.face_more_menu.insertSeparator(self.face_more_actions[self.face_remove_all_button])
+        for button, action in self.face_more_actions.items():
+            button.hide()
+            action.setToolTip(button.toolTip())
+            action.triggered.connect(button.click)
+        self.face_more_menu.aboutToShow.connect(self._sync_face_overflow_actions)
+        self.face_more_button.setMenu(self.face_more_menu)
+        face_action_grid.addWidget(self.face_more_button)
+        face_editor_layout.addWidget(self.face_actions)
 
         self.face_name_group = QGroupBox("Selected face regions", self.face_editor_panel)
         self.face_name_group.setToolTip(
@@ -279,18 +371,16 @@ class PhotoInspectorDialog(QDialog):
         self.face_name_selected_button.setToolTip("Write the entered name to every selected saved face region and its XMP/EXIF metadata.")
         self.face_rename_selected_button.setToolTip("Choose a current name from the selected regions, then rename only those regions.")
         self.face_unlabel_selected_button.setToolTip("Choose a current name from the selected regions, then remove it only from those regions.")
-        face_name_actions = QGridLayout()
-        face_name_actions.setContentsMargins(0, 0, 0, 0)
-        face_name_actions.setHorizontalSpacing(6)
-        for column in range(3):
-            face_name_actions.setColumnStretch(column, 1)
-        for column, button in enumerate(
+        self.face_name_actions = QWidget(self.face_name_group)
+        face_name_actions = ResponsiveFlowLayout(self.face_name_actions, spacing=6)
+        for button in (
             (self.face_name_selected_button, self.face_rename_selected_button, self.face_unlabel_selected_button)
         ):
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setMinimumWidth(100)
             button.setMinimumHeight(32)
-            face_name_actions.addWidget(button, 0, column)
-        face_name_layout.addLayout(face_name_actions)
+            face_name_actions.addWidget(button)
+        face_name_layout.addWidget(self.face_name_actions)
         face_editor_layout.addWidget(self.face_name_group)
 
         self.face_editor_helper_label = QLabel(
@@ -321,14 +411,107 @@ class PhotoInspectorDialog(QDialog):
         details_layout.addWidget(self.face_editor_panel)
 
         self.metadata_summary_label = QLabel("")
+        self.metadata_summary_label.setProperty("role", "helper")
         self.metadata_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.metadata_summary_label.setWordWrap(True)
         self.metadata_summary_label.setTextFormat(Qt.TextFormat.RichText)
         self.metadata_summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         details_layout.addWidget(self.metadata_summary_label)
 
+        self.metadata_editor_group = QGroupBox("Edit photo metadata", self.details_panel)
+        self.metadata_editor_group.setToolTip(
+            "Save keeps these curated values in a reversible ClusterLens sidecar. "
+            "Embed into original is a separate, journaled action for supported JPEG and TIFF files."
+        )
+        metadata_form = QFormLayout(self.metadata_editor_group)
+        metadata_form.setContentsMargins(8, 6, 8, 8)
+        metadata_form.setSpacing(6)
+        self.metadata_title_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_description_input = QPlainTextEdit(self.metadata_editor_group)
+        self.metadata_description_input.setTabChangesFocus(True)
+        self.metadata_description_input.setMaximumHeight(62)
+        self.metadata_rating_input = QSpinBox(self.metadata_editor_group)
+        self.metadata_rating_input.setRange(0, 5)
+        self.metadata_tags_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_creator_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_copyright_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_captured_at_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_location_input = QLineEdit(self.metadata_editor_group)
+        self.metadata_custom_input = QPlainTextEdit(self.metadata_editor_group)
+        self.metadata_custom_input.setTabChangesFocus(True)
+        self.metadata_custom_input.setMaximumHeight(56)
+        self.metadata_tags_input.setPlaceholderText("family, travel, portrait")
+        self.metadata_captured_at_input.setPlaceholderText("YYYY-MM-DD HH:MM:SS")
+        self.metadata_custom_input.setPlaceholderText("key: value (one per line)")
+        for widget, accessible_name in (
+            (self.metadata_title_input, "Photo title"),
+            (self.metadata_description_input, "Photo description"),
+            (self.metadata_rating_input, "Photo rating"),
+            (self.metadata_tags_input, "Photo keywords"),
+            (self.metadata_creator_input, "Photo creator"),
+            (self.metadata_copyright_input, "Photo copyright"),
+            (self.metadata_captured_at_input, "Photo capture date and time"),
+            (self.metadata_location_input, "Photo location"),
+            (self.metadata_custom_input, "Advanced photo metadata"),
+        ):
+            widget.setAccessibleName(accessible_name)
+        for widget, tooltip in (
+            (self.metadata_title_input, "A short photo title."),
+            (self.metadata_description_input, "A longer caption or description."),
+            (self.metadata_rating_input, "Your 0–5 rating, saved safely in the sidecar."),
+            (self.metadata_tags_input, "Comma-separated keywords; existing tags remain unchanged until a dedicated tag action is used."),
+            (self.metadata_creator_input, "Creator/artist credit."),
+            (self.metadata_copyright_input, "Copyright notice."),
+            (
+                self.metadata_captured_at_input,
+                "Capture date and time. Use ISO format, for example 2026-09-16 14:30:00. "
+                "A valid value from 1991 through the current year is a manual Timeline correction after Refresh dates.",
+            ),
+            (self.metadata_location_input, "A human-readable location."),
+            (self.metadata_custom_input, "Advanced textual fields. Unsafe binary and maker-note EXIF fields are intentionally read-only."),
+        ):
+            widget.setToolTip(tooltip)
+        metadata_form.addRow("Title", self.metadata_title_input)
+        metadata_form.addRow("Description", self.metadata_description_input)
+        metadata_form.addRow("Rating", self.metadata_rating_input)
+        metadata_form.addRow("Keywords", self.metadata_tags_input)
+        metadata_form.addRow("Creator", self.metadata_creator_input)
+        metadata_form.addRow("Copyright", self.metadata_copyright_input)
+        metadata_form.addRow("Capture time", self.metadata_captured_at_input)
+        metadata_form.addRow("Location", self.metadata_location_input)
+        metadata_form.addRow("Advanced", self.metadata_custom_input)
+        self.metadata_actions = QWidget(self.metadata_editor_group)
+        metadata_actions = ResponsiveFlowLayout(self.metadata_actions, spacing=6)
+        self.metadata_save_button = QPushButton("Save sidecar", self.metadata_editor_group)
+        self.metadata_discard_button = QPushButton("Discard changes", self.metadata_editor_group)
+        self.metadata_embed_button = QPushButton("Embed into original", self.metadata_editor_group)
+        self.rename_file_button = QPushButton("Rename file…", self.metadata_editor_group)
+        self.metadata_help_button = HelpIconButton(
+            "Save sidecar is reversible and leaves the source photo untouched. "
+            "Embed into original writes only supported textual fields to JPEG/TIFF after confirmation. "
+            "Raw maker-note EXIF values remain read-only for safety.",
+            self.metadata_editor_group,
+            help_key="photo_metadata",
+        )
+        self.metadata_save_button.setToolTip("Save a reversible metadata sidecar without modifying the photo.")
+        self.metadata_discard_button.setToolTip("Restore every staged field to its last loaded or saved value.")
+        self.metadata_embed_button.setToolTip("Explicitly embed supported fields into this JPEG/TIFF original. The operation is journaled and cancellable before the atomic write.")
+        self.rename_file_button.setToolTip("Preview a collision-safe rename for this photo. No filename changes until confirmation.")
+        apply_icon(self.metadata_save_button, "metadata")
+        apply_icon(self.metadata_embed_button, "metadata")
+        apply_icon(self.rename_file_button, "rename")
+        metadata_actions.addWidget(self.metadata_save_button)
+        metadata_actions.addWidget(self.metadata_discard_button)
+        metadata_actions.addWidget(self.metadata_embed_button)
+        metadata_actions.addWidget(self.rename_file_button)
+        metadata_actions.addWidget(self.metadata_help_button)
+        metadata_form.addRow(self.metadata_actions)
+        details_layout.addWidget(self.metadata_editor_group)
+
         self.info_text = QTextBrowser()
         self.info_text.setReadOnly(True)
+        self.info_text.setTabChangesFocus(True)
+        self.info_text.setAccessibleName("Photo EXIF metadata")
         self.info_text.installEventFilter(self)
         self.info_text.document().setDefaultStyleSheet(
             """
@@ -348,6 +531,98 @@ class PhotoInspectorDialog(QDialog):
         self.info_text.setMinimumHeight(220)
         details_layout.addWidget(self.info_text, stretch=1)
 
+        # The inspector used to stack every editor into one tall rail. Keep
+        # the image dominant and make each kind of information predictable.
+        for widget in (
+            self.identity_panel,
+            self.face_editor_panel,
+            self.metadata_summary_label,
+            self.metadata_editor_group,
+            self.info_text,
+        ):
+            details_layout.removeWidget(widget)
+        self.inspector_tabs = QTabWidget(self.details_panel)
+        self.inspector_tabs.setTabBar(KeyboardTabBar(self.inspector_tabs))
+        self.inspector_tabs.setAccessibleName("Photo inspector panels")
+        self.inspector_tabs.tabBar().setAccessibleName("Photo inspector panels")
+        self.info_page = QWidget(self.inspector_tabs)
+        info_layout = QVBoxLayout(self.info_page)
+        info_layout.setContentsMargins(0, 8, 0, 0)
+        info_layout.addWidget(self.identity_panel)
+        info_layout.addWidget(self.metadata_summary_label)
+        info_layout.addStretch(1)
+        self.inspector_tabs.addTab(self.info_page, "Info")
+
+        self.people_page = QScrollArea(self.inspector_tabs)
+        self.people_page.setWidgetResizable(True)
+        self.people_page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        people_content = QWidget(self.people_page)
+        people_layout = QVBoxLayout(people_content)
+        people_layout.setContentsMargins(0, 8, 0, 0)
+        self.people_unavailable_label = QLabel(
+            "Face regions will appear here when face tools are ready for this photo.",
+            people_content,
+        )
+        self.people_unavailable_label.setWordWrap(True)
+        people_layout.addWidget(self.people_unavailable_label)
+        people_layout.addWidget(self.face_editor_panel, stretch=1)
+        self.people_page.setWidget(people_content)
+        self.inspector_tabs.addTab(self.people_page, "People")
+
+        self.metadata_page = QScrollArea(self.inspector_tabs)
+        self.metadata_page.setWidgetResizable(True)
+        self.metadata_page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        metadata_content = QWidget(self.metadata_page)
+        metadata_layout = QVBoxLayout(metadata_content)
+        metadata_layout.setContentsMargins(0, 8, 0, 0)
+        metadata_layout.addWidget(self.metadata_editor_group)
+        metadata_layout.addStretch(1)
+        self.metadata_page.setWidget(metadata_content)
+        self.inspector_tabs.addTab(self.metadata_page, "Metadata")
+
+        self.exif_page = QWidget(self.inspector_tabs)
+        exif_layout = QVBoxLayout(self.exif_page)
+        exif_layout.setContentsMargins(0, 8, 0, 0)
+        exif_search_row = QHBoxLayout()
+        self.exif_search_field = QLineEdit(self.exif_page)
+        self.exif_search_field.setPlaceholderText("Find an EXIF or metadata field")
+        self.exif_search_field.setAccessibleName("Search complete EXIF metadata")
+        self.exif_find_button = QPushButton("Find next", self.exif_page)
+        self.exif_find_button.setToolTip("Find the next matching field or value in the complete metadata table.")
+        self.exif_search_field.returnPressed.connect(self._find_next_exif_value)
+        self.exif_find_button.clicked.connect(self._find_next_exif_value)
+        exif_search_row.addWidget(self.exif_search_field, stretch=1)
+        exif_search_row.addWidget(self.exif_find_button)
+        exif_layout.addLayout(exif_search_row)
+        exif_layout.addWidget(self.info_text, stretch=1)
+        self.inspector_tabs.addTab(self.exif_page, "EXIF")
+        details_layout.addWidget(self.inspector_tabs, stretch=1)
+        inspector_focus_order = (
+            self.inspector_tabs.tabBar(),
+            self.prev_button,
+            self.next_button,
+            self.fit_button,
+            self.actual_size_button,
+            self.zoom_out_button,
+            self.zoom_in_button,
+            self.viewer_background_combo,
+            self.face_regions_button,
+            self.capture_time_button,
+            self.full_screen_button,
+        )
+        for current, following in zip(inspector_focus_order, inspector_focus_order[1:]):
+            QWidget.setTabOrder(current, following)
+        metadata_focus_order = (
+            self.metadata_custom_input,
+            self.metadata_save_button,
+            self.metadata_discard_button,
+            self.metadata_embed_button,
+            self.rename_file_button,
+            self.metadata_help_button,
+        )
+        for current, following in zip(metadata_focus_order, metadata_focus_order[1:]):
+            QWidget.setTabOrder(current, following)
+
         self.content_splitter.addWidget(self.image_panel)
         self.content_splitter.addWidget(self.details_panel)
         self.content_splitter.setStretchFactor(0, 1)
@@ -362,6 +637,8 @@ class PhotoInspectorDialog(QDialog):
         self.zoom_out_button.clicked.connect(self.preview_view.zoom_out)
         self.zoom_in_button.clicked.connect(self.preview_view.zoom_in)
         self.full_screen_button.clicked.connect(self._toggle_full_screen)
+        self.face_regions_button.toggled.connect(self.preview_view.set_face_boxes_visible)
+        self.capture_time_button.clicked.connect(self._focus_capture_time_editor)
         self.face_rescan_button.clicked.connect(self._auto_scan_current_image_faces)
         self.face_draw_button.clicked.connect(self._toggle_draw_face_box)
         self.face_remove_button.clicked.connect(self._remove_selected_faces)
@@ -376,6 +653,22 @@ class PhotoInspectorDialog(QDialog):
         self.face_name_selected_button.clicked.connect(self._name_selected_faces)
         self.face_rename_selected_button.clicked.connect(self._rename_selected_faces)
         self.face_unlabel_selected_button.clicked.connect(self._unlabel_selected_faces)
+        self.metadata_save_button.clicked.connect(self._save_metadata_sidecar)
+        self.metadata_discard_button.clicked.connect(self._discard_metadata_changes)
+        self.metadata_embed_button.clicked.connect(self._embed_metadata_into_original)
+        self.rename_file_button.clicked.connect(self._rename_current_file)
+        for field in (
+            self.metadata_title_input,
+            self.metadata_tags_input,
+            self.metadata_creator_input,
+            self.metadata_copyright_input,
+            self.metadata_captured_at_input,
+            self.metadata_location_input,
+        ):
+            field.textChanged.connect(self._metadata_inputs_changed)
+        self.metadata_description_input.textChanged.connect(self._metadata_inputs_changed)
+        self.metadata_custom_input.textChanged.connect(self._metadata_inputs_changed)
+        self.metadata_rating_input.valueChanged.connect(self._metadata_inputs_changed)
         selection_model = self.image_faces_list.selectionModel()
         if selection_model is not None:
             selection_model.selectionChanged.connect(lambda *_args: self._on_face_draft_selection_changed())
@@ -402,28 +695,28 @@ class PhotoInspectorDialog(QDialog):
 
         if self._active_job is not None:
             self._retain_async_refs(self._active_job, self._active_thread)
-            self._active_job.cancel()
+            self._cancel_operation_job(self._active_job)
             self._active_job = None
             self._active_thread = None
         if self._preview_job is not None:
             self._retain_async_refs(self._preview_job, self._preview_thread)
-            self._preview_job.cancel()
+            self._cancel_operation_job(self._preview_job)
             self._preview_job = None
             self._preview_thread = None
         if self._face_draft_job is not None:
             self._retain_async_refs(self._face_draft_job, self._face_draft_thread)
-            self._face_draft_job.cancel()
+            self._cancel_operation_job(self._face_draft_job)
             self._face_draft_job = None
             self._face_draft_thread = None
         if self._face_thumbnail_job is not None:
             self._retain_async_refs(self._face_thumbnail_job, self._face_thumbnail_thread)
-            self._face_thumbnail_job.cancel()
+            self._cancel_operation_job(self._face_thumbnail_job)
             self._face_thumbnail_job = None
             self._face_thumbnail_thread = None
         self._face_thumbnail_request_signature = None
         if self._prefetch_job is not None:
             self._retain_async_refs(self._prefetch_job, self._prefetch_thread)
-            self._prefetch_job.cancel()
+            self._cancel_operation_job(self._prefetch_job)
             self._prefetch_job = None
             self._prefetch_thread = None
 
@@ -439,13 +732,15 @@ class PhotoInspectorDialog(QDialog):
         self.preview_view.set_face_boxes(self._context_face_boxes(context), normalized=False, dirty=False)
         self.preview_view.set_selected_face_indexes(())
         self.preview_view.set_draw_mode(False)
+        self.preview_view.set_adaptive_backdrop(None)
         self.preview_view.set_pixmap(None)
         self._set_loading_state(face_message=self._context_face_message(context))
         self._load_face_editor_state(image_path, self._current_context)
 
         self._load_preview(image_path, request_id=request_id, full_res=False)
-        if self._display_mode == "advanced":
-            self._load_metadata_async(image_path, context, request_id=request_id)
+        # Curated metadata is available in every inspector.  Advanced mode
+        # only controls the raw diagnostic table below it.
+        self._load_metadata_async(image_path, context, request_id=request_id)
         self._prefetch_neighbors()
 
     def _load_metadata_async(self, image_path: str, context: dict[str, object], request_id: int) -> None:
@@ -458,16 +753,19 @@ class PhotoInspectorDialog(QDialog):
                 include_face_boxes=False,
             )
             raise_if_cancelled(cancel_check)
-            return metadata
+            draft = self.photo_edit_service.load_draft(image_path)
+            raise_if_cancelled(cancel_check)
+            return metadata, draft
 
         job = AsyncJob(_run)
-        self._track_operation_job(job, "Loading photo metadata", foreground=False)
 
-        def _on_completed(metadata: PhotoMetadata) -> None:
+        def _on_completed(result) -> None:
             if request_id != self._request_id:
                 return
-            self.metadata_summary_label.setText(self._render_metadata_summary(metadata))
+            metadata, draft = result
+            self.metadata_summary_label.setText(self._render_metadata_summary(metadata, draft))
             self.info_text.setHtml(self._render_metadata(metadata))
+            self._populate_metadata_editor(draft)
             self._set_state_text(self._context_face_message(metadata.context))
 
         def _on_failed(message: str) -> None:
@@ -488,14 +786,263 @@ class PhotoInspectorDialog(QDialog):
         job.completed.connect(_on_completed)
         job.failed.connect(_on_failed)
         job.cancelled.connect(_on_cancelled)
-        self._active_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            "Loading photo metadata",
+            foreground=False,
+            job_attribute="_active_job",
+            thread_attribute="_active_thread",
+            source_reads=(image_path, str(self.photo_edit_service._sidecar_path(image_path))),
         )
-        self._active_thread = thread
+
+    def _populate_metadata_editor(self, draft: PhotoEditDraft, *, update_baseline: bool = True) -> None:
+        self._metadata_populating = True
+        try:
+            self.metadata_title_input.setText(draft.title)
+            self.metadata_description_input.setPlainText(draft.description)
+            self.metadata_rating_input.setValue(int(draft.rating))
+            self.metadata_tags_input.setText(", ".join(draft.tags))
+            self.metadata_creator_input.setText(draft.creator)
+            self.metadata_copyright_input.setText(draft.copyright)
+            self.metadata_captured_at_input.setText(draft.captured_at)
+            self.metadata_location_input.setText(draft.location)
+            self.metadata_custom_input.setPlainText(
+                "\n".join(f"{key}: {value}" for key, value in sorted(draft.custom_fields.items()))
+            )
+        finally:
+            self._metadata_populating = False
+        if update_baseline:
+            self._metadata_baseline_draft = draft
+        path = self._current_editable_path()
+        editable = bool(self._allow_metadata_edit and path)
+        self.metadata_editor_group.setEnabled(editable)
+        self.capture_time_button.setEnabled(editable)
+        self.metadata_embed_button.setEnabled(editable and self.photo_edit_service.can_embed(path))
+        self.rename_file_button.setEnabled(bool(self._allow_file_rename and callable(self.rename_current_callback) and path))
+        self._metadata_inputs_changed()
+
+    def _metadata_inputs_changed(self, *_args) -> None:
+        if self._metadata_populating:
+            return
+        dirty = self._metadata_draft_from_inputs() != self._metadata_baseline_draft
+        self.metadata_save_button.setVisible(dirty)
+        self.metadata_discard_button.setVisible(dirty)
+
+    def _metadata_is_dirty(self) -> bool:
+        return self._metadata_draft_from_inputs() != self._metadata_baseline_draft
+
+    def _discard_metadata_changes(self) -> None:
+        self._populate_metadata_editor(self._metadata_baseline_draft, update_baseline=False)
+        self._set_state_text("Discarded staged metadata changes. No source or sidecar file was changed.")
+
+    def _confirm_leave_metadata_changes(self) -> bool:
+        if not self._metadata_is_dirty():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unsaved metadata changes")
+        box.setText("This photo has staged metadata changes.")
+        box.setInformativeText(
+            "Save them to the reversible sidecar, discard them, or stay on this photo."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        choice = box.exec()
+        if choice == QMessageBox.StandardButton.Discard:
+            self._discard_metadata_changes()
+            return True
+        if choice == QMessageBox.StandardButton.Save:
+            self._save_metadata_sidecar()
+            self._set_state_text("Saving metadata. Navigate or close again after the Job completes.")
+        return False
+
+    def _discard_face_changes(self) -> None:
+        image_path = self._current_editable_path()
+        if not image_path:
+            return
+        self._face_drafts_by_path[image_path] = self._clone_face_drafts(
+            self._face_original_drafts_by_path.get(image_path, [])
+        )
+        self._face_editor_dirty_paths.discard(image_path)
+        self._face_undo_by_path[image_path] = []
+        self._face_redo_by_path[image_path] = []
+        self.preview_view.set_draw_mode(False)
+        self._publish_face_drafts(image_path)
+        self._refresh_face_editor_ui(image_path)
+        self._set_state_text("Discarded staged face-region changes. The saved face index was not changed.")
+
+    def _confirm_leave_face_changes(self) -> bool:
+        image_path = self._current_editable_path()
+        if not image_path or image_path not in self._face_editor_dirty_paths:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unsaved face-region changes")
+        box.setText("This photo has staged face-region changes.")
+        box.setInformativeText("Save them to the face index, discard them, or stay on this photo.")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        choice = box.exec()
+        if choice == QMessageBox.StandardButton.Discard:
+            self._discard_face_changes()
+            return True
+        if choice == QMessageBox.StandardButton.Save:
+            self._save_face_edits()
+            self._set_state_text("Saving face regions. Navigate or close again after the Job completes.")
+        return False
+
+    def _confirm_leave_changes(self) -> bool:
+        return self._confirm_leave_metadata_changes() and self._confirm_leave_face_changes()
+
+    def _metadata_draft_from_inputs(self) -> PhotoEditDraft:
+        custom: dict[str, str] = {}
+        for line in self.metadata_custom_input.toPlainText().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            normalized_key = key.strip()
+            normalized_value = value.strip()
+            if normalized_key and normalized_value:
+                custom[normalized_key] = normalized_value
+        tags = tuple(
+            dict.fromkeys(
+                value.strip()
+                for value in self.metadata_tags_input.text().split(",")
+                if value.strip()
+            )
+        )
+        return PhotoEditDraft(
+            title=self.metadata_title_input.text().strip(),
+            description=self.metadata_description_input.toPlainText().strip(),
+            rating=int(self.metadata_rating_input.value()),
+            tags=tags,
+            creator=self.metadata_creator_input.text().strip(),
+            copyright=self.metadata_copyright_input.text().strip(),
+            captured_at=self.metadata_captured_at_input.text().strip(),
+            location=self.metadata_location_input.text().strip(),
+            custom_fields=custom,
+        )
+
+    def _start_metadata_edit_job(self, label: str, fn, on_completed) -> None:
+        if self._metadata_edit_job is not None:
+            return
+
+        def _run(progress, cancel_check):
+            raise_if_cancelled(cancel_check)
+            result = fn(progress, cancel_check)
+            raise_if_cancelled(cancel_check)
+            return result
+
+        job = AsyncJob(_run)
+        self.metadata_editor_group.setEnabled(False)
+
+        def _done(result) -> None:
+            self._metadata_edit_job = None
+            self._metadata_edit_thread = None
+            self._populate_metadata_editor(self._metadata_draft_from_inputs())
+            on_completed(result)
+
+        def _failed(message: str) -> None:
+            self._metadata_edit_job = None
+            self._metadata_edit_thread = None
+            self._populate_metadata_editor(self._metadata_draft_from_inputs(), update_baseline=False)
+            self._set_state_text(f"Metadata operation failed: {message}")
+
+        def _cancelled() -> None:
+            self._metadata_edit_job = None
+            self._metadata_edit_thread = None
+            self._populate_metadata_editor(self._metadata_draft_from_inputs(), update_baseline=False)
+            self._set_state_text("Metadata operation cancelled. No unfinished write was applied.")
+
+        job.completed.connect(_done)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+        path = self._current_editable_path()
+        sidecar = str(self.photo_edit_service._sidecar_path(path)) if path else ""
+        source_writes = (path,) if label == "Embedding photo metadata" else (sidecar,)
+        self._start_operation_worker(
+            job,
+            label,
+            foreground=True,
+            job_attribute="_metadata_edit_job",
+            thread_attribute="_metadata_edit_thread",
+            source_writes=tuple(value for value in source_writes if value),
+        )
+
+    def _save_metadata_sidecar(self) -> None:
+        path = self._current_editable_path()
+        if not path or not self._allow_metadata_edit:
+            return
+        draft = self._metadata_draft_from_inputs()
+
+        def _run(progress, cancel_check):
+            progress(-1, "Saving reversible metadata sidecar…")
+            raise_if_cancelled(cancel_check)
+            return self.photo_edit_service.save_draft(path, draft)
+
+        self._start_metadata_edit_job(
+            "Saving photo metadata sidecar",
+            _run,
+            lambda sidecar: self._set_state_text(
+                f"Saved reversible metadata sidecar: {Path(str(sidecar)).name}"
+                + (
+                    ". Refresh Timeline dates to use this capture-time correction."
+                    if draft.captured_at
+                    else ""
+                )
+            ),
+        )
+
+    def _focus_capture_time_editor(self) -> None:
+        """Make the common manual Timeline correction direct in every viewer route."""
+
+        if not self.capture_time_button.isEnabled():
+            self._set_state_text("Capture time cannot be changed while this photo is read-only.")
+            return
+        self.inspector_tabs.setCurrentWidget(self.metadata_page)
+        self.metadata_captured_at_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.metadata_captured_at_input.selectAll()
+        self._set_state_text(
+            "Enter YYYY-MM-DD HH:MM:SS, then choose Save sidecar. "
+            "In Timeline, Refresh dates applies a valid 1991–current-year value."
+        )
+
+    def _embed_metadata_into_original(self) -> None:
+        path = self._current_editable_path()
+        if not path or not self._allow_metadata_edit or not self.photo_edit_service.can_embed(path):
+            return
+        if not confirmBox(
+            "Embed metadata into original?",
+            "This writes supported textual fields into the original image. Your sidecar remains available, and the operation is recorded in Safety & Recovery.",
+            parent=self,
+        ):
+            return
+        draft = self._metadata_draft_from_inputs()
+
+        def _run(progress, cancel_check):
+            return self.photo_edit_service.embed_draft(path, draft, progress_callback=progress, cancel_check=cancel_check)
+
+        self._start_metadata_edit_job(
+            "Embedding photo metadata",
+            _run,
+            lambda result: self._set_state_text(
+                f"Embedded metadata for {len(getattr(result, 'affected_paths', []) or [])} photo(s)."
+            ),
+        )
+
+    def _rename_current_file(self) -> None:
+        path = self._current_editable_path()
+        if not path or not self._allow_file_rename or not callable(self.rename_current_callback):
+            return
+        self.rename_current_callback(path)
 
     def _request_face_name_suggestions(self) -> None:
         """Populate the shared name picker without reading SQLite on the UI thread."""
@@ -514,20 +1061,19 @@ class PhotoInspectorDialog(QDialog):
             return [str(name or "").strip() for name in list(names or ())]
 
         job = AsyncJob(_run)
-        self._track_operation_job(job, "Loading saved person names", foreground=False)
 
         def _completed(names) -> None:
             self.face_name_input.set_choices(names)
 
         job.completed.connect(_completed)
-        self._face_name_suggestion_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            "Loading saved person names",
+            foreground=False,
+            job_attribute="_face_name_suggestion_job",
+            thread_attribute="_face_name_suggestion_thread",
+            data_home_read=True,
         )
-        self._face_name_suggestion_thread = thread
 
     def _load_preview(self, image_path: str, *, request_id: int, full_res: bool) -> None:
         target_size = self.preview_view.viewport().size()
@@ -554,18 +1100,18 @@ class PhotoInspectorDialog(QDialog):
             if image.isNull():
                 raise ValueError(reader.errorString() or "Could not decode image")
             raise_if_cancelled(cancel_check)
-            return image
+            backdrop = None if full_res else adaptive_neutral_backdrop(image)
+            return image, backdrop
 
         job = AsyncJob(_run)
-        self._track_operation_job(
-            job,
-            "Loading full-resolution preview" if full_res else "Loading photo preview",
-            foreground=False,
-        )
+        label = "Loading full-resolution preview" if full_res else "Loading photo preview"
 
-        def _on_completed(image) -> None:
+        def _on_completed(result) -> None:
             if request_id != self._request_id:
                 return
+            image, backdrop = result
+            if not full_res:
+                self.preview_view.set_adaptive_backdrop(backdrop)
             pixmap = QPixmap.fromImage(image)
             self.preview_view.set_pixmap(pixmap if not pixmap.isNull() else None, preserve_zoom=full_res)
             if full_res:
@@ -581,14 +1127,14 @@ class PhotoInspectorDialog(QDialog):
 
         job.completed.connect(_on_completed)
         job.failed.connect(_on_failed)
-        self._preview_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            label,
+            foreground=False,
+            job_attribute="_preview_job",
+            thread_attribute="_preview_thread",
+            source_reads=(image_path,),
         )
-        self._preview_thread = thread
 
     @staticmethod
     def _thread_is_running(thread) -> bool:
@@ -641,6 +1187,10 @@ class PhotoInspectorDialog(QDialog):
             self._face_name_suggestion_thread = None
             if self._face_name_suggestion_job is job:
                 self._face_name_suggestion_job = None
+        if self._metadata_edit_thread is thread:
+            self._metadata_edit_thread = None
+            if self._metadata_edit_job is job:
+                self._metadata_edit_job = None
 
     def _handle_finished_thread(self, thread) -> None:
         if thread is None:
@@ -662,10 +1212,50 @@ class PhotoInspectorDialog(QDialog):
     def _load_face_editor_state(self, image_path: str, context: dict[str, object]) -> None:
         enabled = self._face_edit_enabled_for_context(context)
         self.face_editor_panel.setVisible(enabled)
+        self.people_unavailable_label.setVisible(not enabled)
         if not enabled:
             self.preview_view.set_selected_face_indexes(())
             self.preview_view.set_draw_mode(False)
             return
+        if self.face_service is None:
+            self.face_editor_summary_label.setText(
+                "Face-region tools are not ready for this workspace yet. Existing regions remain visible on the photo."
+            )
+            for button in (
+                self.face_rescan_button,
+                self.face_draw_button,
+                self.face_remove_button,
+                self.face_duplicate_button,
+                self.face_split_button,
+                self.face_undo_button,
+                self.face_redo_button,
+                self.face_remove_all_button,
+                self.face_auto_clean_button,
+                self.face_reset_button,
+                self.face_save_button,
+                self.face_name_selected_button,
+                self.face_rename_selected_button,
+                self.face_unlabel_selected_button,
+            ):
+                button.setEnabled(False)
+            return
+        for button in (
+            self.face_rescan_button,
+            self.face_draw_button,
+            self.face_remove_button,
+            self.face_duplicate_button,
+            self.face_split_button,
+            self.face_undo_button,
+            self.face_redo_button,
+            self.face_remove_all_button,
+            self.face_auto_clean_button,
+            self.face_reset_button,
+            self.face_save_button,
+            self.face_name_selected_button,
+            self.face_rename_selected_button,
+            self.face_unlabel_selected_button,
+        ):
+            button.setEnabled(True)
         path = str(image_path or "")
         self._face_undo_by_path.setdefault(path, [])
         self._face_redo_by_path.setdefault(path, [])
@@ -732,7 +1322,6 @@ class PhotoInspectorDialog(QDialog):
             return drafts
 
         job = AsyncJob(_run)
-        self._track_operation_job(job, "Reading saved face regions", foreground=False)
 
         def _completed(drafts: object) -> None:
             if request_id != self._request_id or image_path != self._current_editable_path():
@@ -753,14 +1342,15 @@ class PhotoInspectorDialog(QDialog):
 
         job.completed.connect(_completed)
         job.failed.connect(_failed)
-        self._face_draft_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            "Reading saved face regions",
+            foreground=False,
+            job_attribute="_face_draft_job",
+            thread_attribute="_face_draft_thread",
+            source_reads=(image_path,),
+            data_home_read=True,
         )
-        self._face_draft_thread = thread
 
     def _load_indexed_face_drafts(self, image_path: str, context: dict[str, object]) -> list[EditableFaceDraft]:
         records: list[IndexedFaceRecord] = []
@@ -1324,7 +1914,7 @@ class PhotoInspectorDialog(QDialog):
             return
         if self._face_thumbnail_job is not None:
             self._retain_async_refs(self._face_thumbnail_job, self._face_thumbnail_thread)
-            self._face_thumbnail_job.cancel()
+            self._cancel_operation_job(self._face_thumbnail_job)
         self._face_thumbnail_request_signature = signature
 
         def _run(progress, cancel_check):
@@ -1364,7 +1954,6 @@ class PhotoInspectorDialog(QDialog):
             return results
 
         job = AsyncJob(_run)
-        self._track_operation_job(job, "Loading face-region previews", foreground=False)
 
         def _completed(payload: object) -> None:
             if request_id != self._request_id or image_path != self._current_editable_path():
@@ -1378,14 +1967,14 @@ class PhotoInspectorDialog(QDialog):
                     self.image_faces_model.set_item_icon(row, icon)
 
         job.completed.connect(_completed)
-        self._face_thumbnail_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            "Loading face-region previews",
+            foreground=False,
+            job_attribute="_face_thumbnail_job",
+            thread_attribute="_face_thumbnail_thread",
+            source_reads=(image_path,),
         )
-        self._face_thumbnail_thread = thread
 
     def _set_face_edit_busy(self, busy: bool, message: str = "") -> None:
         for control in [
@@ -1404,6 +1993,7 @@ class PhotoInspectorDialog(QDialog):
             self.face_name_selected_button,
             self.face_rename_selected_button,
             self.face_unlabel_selected_button,
+            self.face_more_button,
         ]:
             control.setEnabled(not busy)
         if not busy:
@@ -1411,17 +2001,20 @@ class PhotoInspectorDialog(QDialog):
         if message:
             self.face_editor_summary_label.setText(message)
 
+    def _sync_face_overflow_actions(self) -> None:
+        for button, action in self.face_more_actions.items():
+            action.setEnabled(button.isEnabled())
+
     def _start_face_edit_job(self, label: str, fn, on_completed) -> None:
-        if self._face_edit_thread is not None:
+        if self._face_edit_job is not None:
             try:
-                if self._face_edit_thread.isRunning():
+                if self._face_edit_thread is None or self._face_edit_thread.isRunning():
                     errorBox("Busy", "Another face edit operation is already running for this image.")
                     return
             except RuntimeError:
                 self._face_edit_thread = None
                 self._face_edit_job = None
         job = AsyncJob(fn)
-        self._track_operation_job(job, label, foreground=True)
 
         def _on_completed(result) -> None:
             self._set_face_edit_busy(False)
@@ -1437,14 +2030,19 @@ class PhotoInspectorDialog(QDialog):
         job.completed.connect(_on_completed)
         job.failed.connect(_on_failed)
         job.cancelled.connect(_on_cancelled)
-        self._face_edit_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        image_path = self._current_editable_path()
+        mutating = label != "Auto-scan current image"
+        self._start_operation_worker(
+            job,
+            label,
+            foreground=True,
+            job_attribute="_face_edit_job",
+            thread_attribute="_face_edit_thread",
+            source_reads=(image_path,) if not mutating else (),
+            source_writes=(image_path,) if mutating else (),
+            data_home_write=mutating,
+            model_cache_read=not mutating,
         )
-        self._face_edit_thread = thread
         self._set_face_edit_busy(True, f"{label} running...")
 
     def _set_face_drafts_for_path(self, image_path: str, drafts: list[EditableFaceDraft]) -> None:
@@ -1708,14 +2306,13 @@ class PhotoInspectorDialog(QDialog):
             (self._prefetch_job, self._prefetch_thread),
             (self._face_edit_job, self._face_edit_thread),
             (self._face_name_suggestion_job, self._face_name_suggestion_thread),
+            (self._metadata_edit_job, self._metadata_edit_thread),
             *self._retained_async_refs,
+            *[(job, thread) for thread, job in list(self._thread_jobs.items())],
         ]
         for job, thread in active_pairs:
             if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    pass
+                self._cancel_operation_job(job)
             thread_finished = True
             if thread is not None:
                 try:
@@ -1723,6 +2320,27 @@ class PhotoInspectorDialog(QDialog):
                 except RuntimeError:
                     thread_finished = True
             ready_to_close = bool(thread_finished) and ready_to_close
+        if ready_to_close:
+            if self.work_coordinator is not None:
+                for coordinated_job_id in tuple(self._coordinated_job_ids.values()):
+                    self.work_coordinator.finish(coordinated_job_id, status="cancelled")
+            self._coordinated_job_ids.clear()
+            # Threads can finish before their queued terminal relay reaches the
+            # GUI event loop. Disconnect inspector observers while the dialog
+            # is still alive so those callbacks cannot touch deleted controls.
+            disconnected_jobs: set[int] = set()
+            for job, _thread in active_pairs:
+                if job is None or id(job) in disconnected_jobs:
+                    continue
+                disconnected_jobs.add(id(job))
+                for signal_name in ("started", "progress", "completed", "failed", "cancelled"):
+                    signal = getattr(job, signal_name, None)
+                    if signal is None:
+                        continue
+                    try:
+                        signal.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
         self._active_job = None
         self._active_thread = None
         self._preview_job = None
@@ -1738,10 +2356,29 @@ class PhotoInspectorDialog(QDialog):
         self._face_edit_thread = None
         self._face_name_suggestion_job = None
         self._face_name_suggestion_thread = None
+        self._metadata_edit_job = None
+        self._metadata_edit_thread = None
         if ready_to_close:
             self._retained_async_refs = []
             self._thread_jobs = {}
+            self._progress_jobs = {}
         return ready_to_close
+
+    def _viewer_background_changed(self, _index: int) -> None:
+        mode = str(self.viewer_background_combo.currentData() or "adaptive_neutral")
+        manager = get_theme_manager()
+        if manager is not None:
+            manager.set_viewer_backdrop(mode, persist=True)
+        else:
+            self.preview_view.set_backdrop_mode(mode)
+
+    def _sync_viewer_background_combo(self, mode: str) -> None:
+        index = self.viewer_background_combo.findData(str(mode))
+        if index < 0 or index == self.viewer_background_combo.currentIndex():
+            return
+        self.viewer_background_combo.blockSignals(True)
+        self.viewer_background_combo.setCurrentIndex(index)
+        self.viewer_background_combo.blockSignals(False)
 
     def _on_zoom_changed(self, zoom: float) -> None:
         self.zoom_label.setText(f"{int(round(float(zoom) * 100.0))}%")
@@ -1779,17 +2416,19 @@ class PhotoInspectorDialog(QDialog):
             return None
 
         job = AsyncJob(_run)
-        self._track_operation_job(job, "Prefetching adjacent photos", foreground=False)
-        self._prefetch_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        self._start_operation_worker(
+            job,
+            "Prefetching adjacent photos",
+            foreground=False,
+            job_attribute="_prefetch_job",
+            thread_attribute="_prefetch_thread",
+            source_reads=tuple(paths),
         )
-        self._prefetch_thread = thread
 
     def closeEvent(self, event) -> None:
+        if not self._confirm_leave_changes():
+            event.ignore()
+            return
         if not self.shutdown_jobs():
             event.ignore()
             return
@@ -1823,8 +2462,19 @@ class PhotoInspectorDialog(QDialog):
 
     def _apply_display_mode(self) -> None:
         advanced = self._display_mode == "advanced"
-        self.metadata_summary_label.setVisible(advanced)
-        self.info_text.setVisible(advanced)
+        self.metadata_summary_label.setVisible(True)
+        self.metadata_editor_group.setVisible(True)
+        self.inspector_tabs.setTabVisible(self.inspector_tabs.indexOf(self.exif_page), advanced)
+
+    def _find_next_exif_value(self) -> None:
+        text = self.exif_search_field.text().strip()
+        if not text:
+            return
+        if not self.info_text.find(text):
+            cursor = self.info_text.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            self.info_text.setTextCursor(cursor)
+            self.info_text.find(text)
 
     def _update_identity(self, image_path: str) -> None:
         path = Path(image_path)
@@ -1846,7 +2496,7 @@ class PhotoInspectorDialog(QDialog):
 
     def _track_operation_job(self, job: AsyncJob, label: str, *, foreground: bool) -> None:
         """Expose every inspector worker locally and in the shared Jobs panel."""
-        if self.job_manager is not None:
+        if self.job_manager is not None and self.work_coordinator is None:
             self.job_manager.bind_async_job(
                 job,
                 label,
@@ -1867,6 +2517,78 @@ class PhotoInspectorDialog(QDialog):
         job.failed.connect(lambda _message, key=key: self._finish_operation_progress(key))
         job.cancelled.connect(lambda key=key: self._finish_operation_progress(key))
         self._refresh_operation_progress()
+
+    def _cancel_operation_job(self, job: AsyncJob | None) -> None:
+        if job is None:
+            return
+        coordinated_job_id = self._coordinated_job_ids.get(job)
+        if coordinated_job_id is not None and self.work_coordinator is not None:
+            self.work_coordinator.cancel(coordinated_job_id)
+            return
+        try:
+            job.cancel()
+        except Exception:
+            pass
+
+    def _start_operation_worker(
+        self,
+        job: AsyncJob,
+        label: str,
+        *,
+        foreground: bool,
+        job_attribute: str,
+        thread_attribute: str,
+        source_reads: tuple[str, ...] = (),
+        source_writes: tuple[str, ...] = (),
+        data_home_read: bool = False,
+        data_home_write: bool = False,
+        model_cache_read: bool = False,
+    ) -> None:
+        """Start one Inspector worker only after shared resource admission."""
+
+        self._track_operation_job(job, label, foreground=foreground)
+        setattr(self, job_attribute, job)
+
+        def _terminal_cleanup(*_args) -> None:
+            self._coordinated_job_ids.pop(job, None)
+            if getattr(self, thread_attribute, None) is None and getattr(self, job_attribute, None) is job:
+                setattr(self, job_attribute, None)
+
+        job.completed.connect(_terminal_cleanup)
+        job.failed.connect(_terminal_cleanup)
+        job.cancelled.connect(_terminal_cleanup)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_async_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            setattr(self, thread_attribute, thread)
+
+        if self.work_coordinator is None:
+            _launch()
+            return
+        coordinated_job_id = self.work_coordinator.submit_async_job(
+            JobSpec(
+                label,
+                origin="Photo Inspector",
+                foreground=foreground,
+                io_bound=True,
+                source_reads=source_reads,
+                source_writes=source_writes,
+                data_home_read=data_home_read,
+                data_home_write=data_home_write,
+                model_cache_read=model_cache_read,
+            ),
+            job,
+            _launch,
+        )
+        manager = self.job_manager or self.work_coordinator.job_manager
+        state = manager.get(coordinated_job_id)
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._coordinated_job_ids[job] = coordinated_job_id
 
     def _update_operation_progress(self, key: int, value: int, text: str) -> None:
         state = self._progress_jobs.get(int(key))
@@ -1933,6 +2655,8 @@ class PhotoInspectorDialog(QDialog):
             return
         new_index = self._index + int(delta)
         if new_index < 0 or new_index >= len(self._image_paths):
+            return
+        if not self._confirm_leave_changes():
             return
         self._index = new_index
         self.load_metadata(self._image_paths[self._index], dict(self._base_context))
@@ -2015,19 +2739,66 @@ class PhotoInspectorDialog(QDialog):
         return f"Showing {len(boxes)} detected face(s) on the full photo."
 
     @classmethod
-    def _render_metadata_summary(cls, metadata: PhotoMetadata) -> str:
+    def _render_metadata_summary(
+        cls,
+        metadata: PhotoMetadata,
+        draft: PhotoEditDraft | None = None,
+    ) -> str:
         camera = html.escape(metadata.camera or "Unknown")
         tags = metadata.context.get("tags") if isinstance(metadata.context, dict) else None
         tags_line = ""
         if isinstance(tags, (list, tuple)) and tags:
             tags_line = f"<br><b>Tags</b> {html.escape(', '.join(str(tag) for tag in tags))}"
+        date_fields = cls._date_related_exif_fields(metadata.exif)
+        date_lines = [
+            f"<br><b>{html.escape(key)}</b> {html.escape(value)}"
+            for key, value in date_fields
+        ]
+        if not date_lines:
+            date_lines.append("<br><span>No EXIF date/time fields found.</span>")
+        sidecar_captured_at = str(getattr(draft, "captured_at", "") or "").strip()
+        if sidecar_captured_at:
+            date_lines.append(
+                "<br><b>Timeline correction (sidecar)</b> "
+                f"{html.escape(sidecar_captured_at)}"
+            )
         return (
             "<b>Important Details</b><br>"
             f"<b>Dimensions</b> {metadata.width} x {metadata.height}"
             f" &nbsp; | &nbsp; <b>Size</b> {cls._format_file_size(metadata.file_size)}"
-            f" &nbsp; | &nbsp; <b>Modified</b> {html.escape(metadata.modified_at)}"
+            f" &nbsp; | &nbsp; <b>File modified</b> {html.escape(metadata.modified_at)}"
             f"<br><b>Camera</b> {camera}"
+            "<br><b>Photo dates</b>"
+            f"{''.join(date_lines)}"
             f"{tags_line}"
+        )
+
+    @staticmethod
+    def _date_related_exif_fields(exif: dict[str, str]) -> list[tuple[str, str]]:
+        """Return every scalar EXIF field whose name represents date/time data."""
+
+        priority = {
+            "datetimeoriginal": 0,
+            "datetimedigitized": 1,
+            "datetime": 2,
+            "gpsdatestamp": 3,
+            "gpstimestamp": 4,
+            "offsettimeoriginal": 5,
+            "offsettimedigitized": 6,
+            "offsettime": 7,
+            "subsectimeoriginal": 8,
+            "subsectimedigitized": 9,
+            "subsectime": 10,
+        }
+        fields = [
+            (str(key), str(value))
+            for key, value in dict(exif or {}).items()
+            if str(value or "").strip()
+            and any(token in str(key).casefold() for token in ("date", "time", "timestamp"))
+        ]
+        return sorted(
+            fields,
+            key=lambda item: (priority.get(item[0].casefold(), len(priority)), item[0].casefold()),
         )
 
     @classmethod

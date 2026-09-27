@@ -73,7 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     _write_image(sources / "restore_conflict.png", "#f4d03f")
     skipped = restarted_service.restore_changed_paths(list(conflict_move.changed_paths), conflict_policy="skip")
     _require(len(skipped.failures) == 1 and "already exists" in skipped.failures[0], "skip policy did not preserve replacement")
-    _require(Path(conflict_move.changed_paths[0][1]).is_file(), "skip policy removed the recoverable original")
+    skipped_preserves_both = Path(conflict_move.changed_paths[0][1]).is_file()
+    _require(skipped_preserves_both, "skip policy removed the recoverable original")
     unique = restarted_service.restore_changed_paths(list(conflict_move.changed_paths), conflict_policy="unique_name")
     _require(len(unique.changed_paths) == 1 and not unique.failures, "unique-name restore did not succeed")
     unique_target = Path(unique.changed_paths[0][1])
@@ -98,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             "trash_collision_uses_unique_name": str(collision_target.relative_to(trash_dir)),
             "partial_failure_preserves_success": len(partial.changed_paths) == 1 and len(partial.failures) == 1,
             "restart_recovery_restores_original": current_manifest["restart.png"] == source_manifest_before["restart.png"],
-            "skip_policy_preserves_both": Path(conflict_move.changed_paths[0][1]).is_file(),
+            "skip_policy_preserves_both": skipped_preserves_both,
             "unique_policy_preserves_both": unique_target != sources / "restore_conflict.png",
             "journal_operation_count": len(journal_entries),
         },

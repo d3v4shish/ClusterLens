@@ -12,6 +12,7 @@ from threading import Event, Lock
 from time import perf_counter
 from uuid import uuid4
 
+from PyQt6 import sip
 from PyQt6.QtCore import QAbstractListModel, QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QImageReader, QPainter, QPixmap
 from PyQt6.QtWidgets import (
@@ -47,7 +48,6 @@ from PyQt6.QtWidgets import (
     QTableView,
     QTableWidget,
     QTableWidgetItem,
-    QTabBar,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -58,6 +58,7 @@ from PIL.ImageQt import ImageQt
 
 from app.path_scope import folder_scope_sql, path_is_within_scope
 from app.services.discovery import ImageDiscoveryService
+from app.services.face_storage_recovery import FaceStorageRemovalService
 from app.services.face_search import (
     BUILTIN_HUMAN_DETECTOR_ID,
     BUILTIN_HUMAN_EMBEDDER_ID,
@@ -65,6 +66,7 @@ from app.services.face_search import (
     DEFAULT_FACE_SCORE_THRESHOLD,
     FaceAlbumGroupPage,
     FaceAlbumGroupSummary,
+    FaceAlbumInitialPage,
     FaceAlbumMemberPage,
     FaceAlbumRecord,
     FaceClusterMember,
@@ -110,19 +112,24 @@ from infra.cancel import raise_if_cancelled
 from infra.logging_config import get_logger
 from infra.qt_diagnostics import append_qt_diagnostic
 from infra.settings import get_settings
-from ui.common import HelpIconButton, build_help_inline
+from ui.common import HelpIconButton, KeyboardTabBar, ResponsiveFlowLayout, build_help_inline
+from ui.count_copy import counted, loaded_and_showing, loading, showing
 from ui.entity_picker import EntityPicker
 from ui.error_mbox import confirmBox, errorBox, infoBox
-from ui.async_job import AsyncJob, Cancelled, detach_running_async_job, start_job_in_thread, wait_for_thread_shutdown
+from ui.async_job import AsyncJob, Cancelled, defer_async_job_dispose, start_job_in_thread, wait_for_thread_shutdown
 from ui.gallery_pane import GalleryPane
+from ui.icons import apply_icon
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
 from ui.photo_inspector_dialog import EditableFaceDraft
-from ui.theme import COLORS
+from ui.theme import COLORS, apply_field_size, get_theme_manager, theme_revision
 
 try:
     from ui.job_manager import JobManager
+    from ui.work_coordinator import JobSpec, WorkCoordinator
 except Exception:  # pragma: no cover
     JobManager = None  # type: ignore[assignment]
+    JobSpec = None  # type: ignore[assignment]
+    WorkCoordinator = None  # type: ignore[assignment]
 
 
 LOGGER = get_logger(__name__)
@@ -314,6 +321,16 @@ class FaceReviewPublishSnapshot:
     status_text: str = ""
     streaming: bool = False
     append_detected_faces: bool = False
+
+
+@dataclass(frozen=True)
+class FaceReviewCachedPage:
+    """One fully prepared review page that has not necessarily reached the UI."""
+
+    offset: int
+    snapshot: FaceReviewPublishSnapshot
+    migrated_image_paths: tuple[str, ...] = ()
+    is_final_page: bool = False
 
 
 @dataclass(frozen=True)
@@ -539,6 +556,20 @@ class FaceResultHoverPreviewPopup(QFrame):
         layout.addWidget(self.note_label)
 
         self.setFixedWidth(320)
+        manager = get_theme_manager()
+        if manager is not None:
+            manager.theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, *_args) -> None:
+        self.setStyleSheet(
+            f"QFrame#faceResultHoverPreviewPopup {{ background: {COLORS['surface_raised']}; "
+            f"border: 1px solid {COLORS['border_strong']}; border-radius: 8px; }} "
+            f"QLabel {{ color: {COLORS['text']}; }}"
+        )
+        self.image_label.setStyleSheet(
+            f"background: {COLORS['surface_sunken']}; border: 1px solid {COLORS['border']};"
+        )
+        self.note_label.setStyleSheet(f"color: {COLORS['text_muted']};")
 
     def set_group_details(self, group: FaceResultGroup, *, more_count: int, loading: bool) -> None:
         self.title_label.setText(str(group.title or "Face cluster"))
@@ -1047,16 +1078,21 @@ class SectionedFaceTileModel(QAbstractTableModel):
 
 
 class FaceTileItemDelegate(QStyledItemDelegate):
-    _background = QColor(COLORS["surface"])
-    _placeholder_background = QColor(COLORS["surface_sunken"])
-    _border = QColor(COLORS["border"])
-    _selected_background = QColor(COLORS["surface_selected"])
-    _selected_border = QColor(COLORS["info"])
-    _review_border = QColor(COLORS["warning"])
-    _draft_border = QColor(COLORS["danger_hover"])
-    _pending_border = QColor(COLORS["identity_pending"])
-    _text = QColor(COLORS["text"])
-    _muted = QColor(COLORS["text_muted"])
+    def _sync_theme_colors(self) -> None:
+        revision = theme_revision()
+        if revision == getattr(self, "_theme_revision", -1):
+            return
+        self._theme_revision = revision
+        self._background = QColor(COLORS["surface"])
+        self._placeholder_background = QColor(COLORS["surface_sunken"])
+        self._border = QColor(COLORS["border"])
+        self._selected_background = QColor(COLORS["surface_selected"])
+        self._selected_border = QColor(COLORS["info"])
+        self._review_border = QColor(COLORS["warning"])
+        self._draft_border = QColor(COLORS["danger_hover"])
+        self._pending_border = QColor(COLORS["identity_pending"])
+        self._text = QColor(COLORS["text"])
+        self._muted = QColor(COLORS["text_muted"])
 
     def sizeHint(self, option, index):  # type: ignore[override]
         model = index.model()
@@ -1064,6 +1100,7 @@ class FaceTileItemDelegate(QStyledItemDelegate):
         return QSize(max(96, int(requested_size.width()) + 30), int(requested_size.height()) + 46)
 
     def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
+        self._sync_theme_colors()
         model = index.model()
         requested_size = model.requested_icon_size() if hasattr(model, "requested_icon_size") else QSize(72, 72)
         content_rect = option.rect.adjusted(4, 4, -4, -4)
@@ -1378,6 +1415,35 @@ FACE_QUALITY_POLICY_FIELDS: tuple[tuple[str, str], ...] = (
     ("alignment_policy", "Alignment"),
 )
 
+PEOPLE_FACE_ROUTE_IDS = frozenset({"all_faces", "unnamed", "detect", "review_name", "find", "identities"})
+PEOPLE_FACE_ROUTE_ALIASES = {
+    "faces": "all_faces",
+    "all": "all_faces",
+    "all faces": "all_faces",
+    "people": "all_faces",
+    "review": "unnamed",
+    "unlabelled": "unnamed",
+    "unlabeled": "unnamed",
+    "folder review": "detect",
+    "folder_review": "detect",
+    "face library": "detect",
+    "face_library": "detect",
+    "review & name": "review_name",
+    "review && name": "review_name",
+    "review_and_name": "review_name",
+    "search": "find",
+    "manage": "identities",
+    "names": "identities",
+}
+
+
+def normalize_people_face_route(section: object) -> str:
+    """Return one stable Faces route ID, or an empty string for unknown input."""
+
+    route = str(section or "").strip().lower().replace("-", "_")
+    route = PEOPLE_FACE_ROUTE_ALIASES.get(route, route)
+    return route if route in PEOPLE_FACE_ROUTE_IDS else ""
+
 
 class _LazyServiceProxy:
     def __init__(self, factory):
@@ -1412,11 +1478,13 @@ class SearchPane(QWidget):
     install_face_model_requested = pyqtSignal(str)
     result_selected = pyqtSignal(str, list, int, object)
     active_tab_changed = pyqtSignal(int)
+    people_section_changed = pyqtSignal(str)
     results_ready = pyqtSignal(list, object, object, object, str)
     source_folder_changed = pyqtSignal(str)
     recent_folder_remove_requested = pyqtSignal(str)
     recent_folders_clear_requested = pyqtSignal()
     face_labels_changed = pyqtSignal()
+    face_index_batch_committed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -1432,16 +1500,27 @@ class SearchPane(QWidget):
         external_results: bool = False,
         saved_search_service: SavedSearchService | None = None,
         supported_face_modes: list[str] | tuple[str, ...] | None = None,
+        initial_people_section: str = "",
     ):
         super().__init__(parent)
         self.settings = get_settings()
         self.current_directory_provider = None
         self.current_scope_roots_provider = None
         self.current_scope_paths_provider = None
+        # The production shell already knows which People task was selected.
+        # Select it before connecting tab-change loading so constructing the
+        # pane never starts an unrelated All Faces query first.
+        self._initial_people_section = normalize_people_face_route(initial_people_section)
         self._explicit_review_scope_paths: tuple[str, ...] = ()
         self.use_onnx_provider = None  # injected callable() -> bool
         self.job_manager: JobManager | None = None  # injected by main window
+        self.work_coordinator: WorkCoordinator | None = None  # injected by main window
         self.saved_search_service = saved_search_service or SavedSearchService()
+        self._saved_search_records: dict[str, SavedSearch] = {}
+        self._saved_search_request_id = 0
+        self._saved_search_job = None
+        self._saved_search_thread = None
+        self._retained_saved_search_refs: list[tuple[object | None, object | None]] = []
         self.clustering_filter_state_provider = None
         self.search_service_global = search_service_global or _LazyServiceProxy(SimilaritySearchService)
         self.search_service_session = search_service_session or _LazyServiceProxy(SimilaritySearchService)
@@ -1537,7 +1616,12 @@ class SearchPane(QWidget):
         self._active_job = None
         self._active_job_id: int | None = None
         self._active_completion_callback = False
+        # Generic People workers capture this value when submitted.  Context
+        # changes invalidate only their UI publication; the worker and its
+        # Jobs history still reach a normal terminal state.
+        self._worker_context_generation = 0
         self._thread_jobs: dict[object, object | None] = {}
+        self._coordinated_job_ids: dict[AsyncJob, int] = {}
         self._is_shutting_down = False
         self._face_db_usage_job = None
         self._face_db_usage_thread = None
@@ -1572,6 +1656,7 @@ class SearchPane(QWidget):
         self._face_results_context_menu: QMenu | None = None
         self._results_kind = "none"  # similarity|faces|faces_review|face_clusters|labels|none
         self._face_review_by_path: dict[str, FaceFolderReviewImage] = {}
+        self._face_review_stale = False
         self._face_review_selected_path = ""
         self._face_review_folder = ""
         self._face_review_all_images: list[FaceFolderReviewImage] = []
@@ -1580,12 +1665,26 @@ class SearchPane(QWidget):
         self._face_review_stream_generation = 0
         self._face_review_stream_in_progress = False
         self._face_review_stream_paths: list[str] = []
+        self._face_review_stream_candidate_snapshot: object | None = None
         self._face_review_stream_next_offset: int | None = None
         self._face_review_stream_folder = ""
         self._face_review_stream_scope_roots: tuple[str, ...] = ()
         self._face_review_stream_include_tiny_faces = True
         self._face_review_stream_source: FaceReviewSource | None = None
         self._face_review_stream_summary_notice = ""
+        # The stream reads database pages in the background, but only the
+        # viewport/tail path is permitted to add a cached page to the gallery.
+        # These values deliberately contain metadata only; thumbnail and crop
+        # caches remain owned by the existing viewport loaders.
+        self._face_review_cache_generation = 0
+        self._face_review_cache_in_progress = False
+        self._face_review_cache_complete = False
+        self._face_review_cached_pages: list[FaceReviewCachedPage] = []
+        self._face_review_cached_page_index = 0
+        self._face_review_tail_waiting_for_cache = False
+        self._face_review_live_scan_generation = 0
+        self._face_review_live_scan_active = False
+        self._face_review_live_scan_folder = ""
         self._face_review_stream_job = None
         self._face_review_stream_thread = None
         self._retained_face_review_stream_refs: list[tuple[object | None, object | None]] = []
@@ -1621,6 +1720,8 @@ class SearchPane(QWidget):
         self._face_detected_publish_target_image_count = 0
         self._face_detected_publish_in_progress = False
         self._face_detected_publish_append = False
+        self._face_detected_publish_paused = False
+        self._face_detected_faces_cache_generation = -1
         self._face_detected_arrangement_request_id = 0
         self._face_detected_arrangement_active = False
         self._face_detected_arrangement_group_count = 0
@@ -1665,6 +1766,13 @@ class SearchPane(QWidget):
         self._face_album_member_stream_group_id = ""
         self._face_album_member_stream_in_progress = False
         self._face_album_loaded = False
+        # These keys make tab revisits cheap.  They intentionally describe
+        # only the data query; selection, paging, and visible tile state stay
+        # in the live model until the query itself changes.
+        self._face_data_generation = 0
+        self._face_album_loaded_key: tuple[object, ...] | None = None
+        self._face_album_refresh_key: tuple[object, ...] | None = None
+        self._face_album_published_key: tuple[object, ...] | None = None
         self._face_album_refresh_job = None
         self._face_album_refresh_thread = None
         self._face_album_refresh_job_id: int | None = None
@@ -1679,6 +1787,9 @@ class SearchPane(QWidget):
         self._last_pending_acceptance_count = 0
         self._face_hidden_rejected_refs: set[tuple[str, int]] = set()
         self._face_query_detected_faces: list[object] = []
+        self._face_query_request_id = 0
+        self._face_similarity_request_id = 0
+        self._face_walkthrough_dismissed = False
         self._enabled_tabs = {str(name).strip().lower() for name in (enabled_tabs or []) if str(name).strip()}
         self._all_faces_tab_label = "All Faces"
         self._face_folder_tab_label = (
@@ -1729,12 +1840,21 @@ class SearchPane(QWidget):
         self._folder_photo_restore_path = ""
         self._folder_photo_restore_scroll = 0
         self._face_splitter_default_sizes = [360, 1240]
+        self._face_splitter_user_sizes = list(self._face_splitter_default_sizes)
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(8)
         self._face_result_filter_timer = QTimer(self)
         self._face_result_filter_timer.setSingleShot(True)
         self._face_result_filter_timer.timeout.connect(self._start_face_result_filter_job)
+        self._query_find_visibility_timer = QTimer(self)
+        self._query_find_visibility_timer.setSingleShot(True)
+        self._query_find_visibility_timer.timeout.connect(self._ensure_query_find_visible)
+        self._face_worker_release_queue: list[tuple[str, object, str, str]] = []
+        self._async_thread_release_queue: list[object] = []
+        self._face_worker_release_timer = QTimer(self)
+        self._face_worker_release_timer.setSingleShot(True)
+        self._face_worker_release_timer.timeout.connect(self._flush_face_worker_releases)
         self._face_tile_refresh_timer = QTimer(self)
         self._face_tile_refresh_timer.setSingleShot(True)
         self._face_tile_refresh_timer.timeout.connect(self._flush_face_tile_refresh)
@@ -1744,6 +1864,7 @@ class SearchPane(QWidget):
         self._face_review_stream_timer = QTimer(self)
         self._face_review_stream_timer.setSingleShot(True)
         self._face_review_stream_timer.timeout.connect(self._request_next_face_review_stream_page)
+        self.face_index_batch_committed.connect(self._on_face_index_batch_committed)
         self._face_album_member_stream_timer = QTimer(self)
         self._face_album_member_stream_timer.setSingleShot(True)
         self._face_album_member_stream_timer.timeout.connect(self._request_next_face_album_member_stream_page)
@@ -1789,24 +1910,29 @@ class SearchPane(QWidget):
             "Faces shows every visible face in the active folder review."
         )
         self.face_detected_faces_summary.setWordWrap(True)
+        self.face_detected_faces_summary.setProperty("role", "helper")
         detected_layout.addWidget(self.face_detected_faces_summary)
+        # The filter and state already establish the context; retain the label
+        # for accessibility/status updates without spending vertical space.
+        self.face_detected_faces_summary.hide()
         detected_filter_row = QHBoxLayout()
         detected_filter_row.setContentsMargins(0, 0, 0, 0)
         detected_filter_row.setSpacing(6)
-        detected_filter_row.addWidget(QLabel("Show"))
         self.face_detected_label_filter_combo = QComboBox(self.face_detected_faces_panel)
+        self.face_detected_label_filter_combo.setAccessibleName("Show detected faces")
         self.face_detected_label_filter_combo.addItem("All faces", "all")
         self.face_detected_label_filter_combo.addItem("Labelled faces", "named")
         self.face_detected_label_filter_combo.addItem("Unlabelled faces", "unlabeled")
         self.face_detected_label_filter_combo.addItem("Ignored faces", "ignored")
         self.face_detected_label_filter_combo.setToolTip(
             "Filter the current folder review by name or reversible ignore state. Unsaved manually named drafts "
-            "count as labelled; automatic pending proposals remain unlabelled. Ignored faces stay out of normal "
+            "count as labelled; automatic pending proposals are reviewed in Review. Ignored faces stay out of normal "
             "search and clustering until restored."
         )
         self.face_detected_label_filter_combo.currentIndexChanged.connect(
             self._on_detected_face_label_filter_changed
         )
+        apply_field_size(self.face_detected_label_filter_combo, "short")
         detected_filter_row.addWidget(self.face_detected_label_filter_combo)
         detected_filter_row.addStretch(1)
         detected_layout.addLayout(detected_filter_row)
@@ -1824,6 +1950,15 @@ class SearchPane(QWidget):
         self.face_detected_remove_button = QPushButton("Remove Selected Faces")
         self.face_detected_jump_button = QPushButton("Show Photo")
         self.face_detected_edit_button = QPushButton("Open Inspector")
+        apply_icon(self.face_detected_find_button, "similar")
+        apply_icon(self.face_detected_cluster_selected_button, "organize")
+        apply_icon(self.face_detected_cluster_visible_button, "organize")
+        apply_icon(self.face_detected_arrange_button, "organize")
+        apply_icon(self.face_detected_name_button, "faces")
+        apply_icon(self.face_detected_ignore_button, "ignore")
+        apply_icon(self.face_detected_restore_button, "restore")
+        apply_icon(self.face_detected_jump_button, "reveal")
+        apply_icon(self.face_detected_edit_button, "inspect")
         for button in (
             self.face_detected_find_button,
             self.face_detected_cluster_selected_button,
@@ -1873,8 +2008,6 @@ class SearchPane(QWidget):
             ]
         )
         detected_actions.addWidget(self.face_detected_find_button)
-        detected_actions.addWidget(self.face_detected_cluster_selected_button)
-        detected_actions.addWidget(self.face_detected_cluster_visible_button)
         self.face_detected_arrange_button.setToolTip(
             "Temporarily keep similar unlabelled faces together in this tab. "
             "Uses the current face-clustering settings and does not save names."
@@ -1883,7 +2016,6 @@ class SearchPane(QWidget):
             "Return the Faces tab to the current folder-review ordering."
         )
         detected_actions.addWidget(self.face_detected_arrange_button)
-        detected_actions.addWidget(self.face_detected_reset_arrangement_button)
         detected_actions.addWidget(self.face_detected_name_button)
         self.face_detected_ignore_button.setToolTip(
             "Hide selected saved faces from normal Faces, search, and clustering. This is reversible."
@@ -1891,11 +2023,30 @@ class SearchPane(QWidget):
         self.face_detected_restore_button.setToolTip(
             "Restore selected ignored faces to normal Faces, search, and clustering."
         )
-        detected_actions.addWidget(self.face_detected_ignore_button)
-        detected_actions.addWidget(self.face_detected_restore_button)
-        detected_actions.addWidget(self.face_detected_remove_button)
-        detected_actions.addWidget(self.face_detected_jump_button)
-        detected_actions.addWidget(self.face_detected_edit_button)
+        self.face_detected_actions_menu_button = QToolButton(self.face_detected_faces_panel)
+        self.face_detected_actions_menu_button.setProperty("iconOnly", True)
+        self.face_detected_actions_menu_button.setAccessibleName("More selected-face actions")
+        self.face_detected_actions_menu_button.setToolTip("More actions for the selected face or faces.")
+        apply_icon(self.face_detected_actions_menu_button, "more")
+        self.face_detected_actions_menu = QMenu(self.face_detected_actions_menu_button)
+        self._detected_more_actions = []
+        for button in (
+            self.face_detected_cluster_selected_button,
+            self.face_detected_cluster_visible_button,
+            self.face_detected_reset_arrangement_button,
+            self.face_detected_ignore_button,
+            self.face_detected_restore_button,
+            self.face_detected_remove_button,
+            self.face_detected_jump_button,
+            self.face_detected_edit_button,
+        ):
+            action = self.face_detected_actions_menu.addAction(button.text())
+            action.setToolTip(button.toolTip())
+            action.triggered.connect(button.click)
+            self._detected_more_actions.append((action, button))
+        self.face_detected_actions_menu_button.setMenu(self.face_detected_actions_menu)
+        self.face_detected_actions_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        detected_actions.addWidget(self.face_detected_actions_menu_button)
         detected_layout.addLayout(detected_actions)
         self.face_detected_faces_model = FaceTileListModel(
             self._image_for_face_tile,
@@ -1904,6 +2055,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_detected_faces_list = QListView()
+        self.face_detected_faces_list.setAccessibleName("Detected faces")
         self.face_detected_faces_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_detected_faces_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_detected_faces_list.setMovement(QListView.Movement.Static)
@@ -1940,6 +2092,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_detected_grouped_table = QTableView(self.face_detected_faces_panel)
+        self.face_detected_grouped_table.setAccessibleName("Detected face groups")
         self.face_detected_grouped_table.setModel(self.face_detected_grouped_model)
         self.face_detected_grouped_table.setItemDelegate(SectionedFaceTileDelegate(self.face_detected_grouped_table))
         self.face_detected_grouped_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -2177,7 +2330,7 @@ class SearchPane(QWidget):
             )
         )
         face_results_layout.addLayout(face_results_actions)
-        self.face_result_view_tabs = QTabBar(self.face_results_panel)
+        self.face_result_view_tabs = KeyboardTabBar(self.face_results_panel)
         self.face_result_view_tabs.setObjectName("faceResultViewTabs")
         self.face_result_view_tabs.setDocumentMode(True)
         self.face_result_view_tabs.setDrawBase(False)
@@ -2198,6 +2351,7 @@ class SearchPane(QWidget):
         face_results_body_layout.setSpacing(8)
         self.face_results_groups_model = ListEntryModel(self)
         self.face_results_groups_list = QListView()
+        self.face_results_groups_list.setAccessibleName("Face result groups")
         self.face_results_groups_list.setProperty("sidebarList", True)
         self.face_results_groups_list.setMaximumWidth(260)
         self.face_results_groups_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -2218,6 +2372,7 @@ class SearchPane(QWidget):
         raw_groups_layout.addWidget(self.face_results_groups_list, stretch=1)
         self.face_results_merged_groups_model = ListEntryModel(self)
         self.face_results_merged_groups_list = QListView()
+        self.face_results_merged_groups_list.setAccessibleName("Merged face result groups")
         self.face_results_merged_groups_list.setProperty("sidebarList", True)
         self.face_results_merged_groups_list.setMaximumWidth(260)
         self.face_results_merged_groups_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -2247,6 +2402,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_results_list = QListView()
+        self.face_results_list.setAccessibleName("Face search results")
         self.face_results_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_results_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_results_list.setMovement(QListView.Movement.Static)
@@ -2284,6 +2440,7 @@ class SearchPane(QWidget):
         face_results_layout.addWidget(self.face_results_cluster_explanation)
         face_results_layout.addWidget(self.face_results_cluster_suggestion)
         self.face_results_membership_table = QTableWidget(0, 6, self.face_results_panel)
+        self.face_results_membership_table.setAccessibleName("Face result membership")
         self.face_results_membership_table.setHorizontalHeaderLabels(
             ["Backend", "Cluster", "Size", "Rank", "Outlier", "Quality"]
         )
@@ -2292,10 +2449,15 @@ class SearchPane(QWidget):
         self.face_results_membership_table.setMaximumHeight(180)
         face_results_layout.addWidget(self.face_results_membership_table)
         self.results_list = QListWidget()
+        self.results_list.setAccessibleName("Search results")
         self.status_label = QLabel("Search index idle.")
+        self.status_label.setAccessibleName("People workspace status")
+        self.status_label.setAccessibleDescription(
+            "Current People selection, progress, completion, cancellation, or error status."
+        )
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setAccessibleName("Faces workspace operation progress")
+        self.progress_bar.setAccessibleName("People workspace operation progress")
         self.progress_bar.hide()
         if self._tab_enabled("image search"):
             self._build_image_tab()
@@ -2311,7 +2473,7 @@ class SearchPane(QWidget):
             self._build_face_tab()
         if self._tab_enabled("identities"):
             self._build_face_identities_tab()
-        self.task_navigation = QTabBar(self.sidebar_content_panel)
+        self.task_navigation = KeyboardTabBar(self.sidebar_content_panel)
         self.task_navigation.setObjectName("facesTaskNavigation")
         self.task_navigation.setAccessibleName("Faces task selector")
         self.task_navigation.setToolTip("Choose what you want to do with faces.")
@@ -2327,14 +2489,13 @@ class SearchPane(QWidget):
             "folder review": ("Detect", "Detect or review faces for the selected folder."),
             "face library": ("Detect", "Detect or review faces for the selected folder."),
             "face search": ("Find", "Find a person from a photo or a saved name."),
+            "identities": ("Manage", "Browse, maintain, import, or export saved identities."),
         }
         self._task_navigation_tab_indexes: list[int] = []
         for tab_index in range(self.tabs.count()):
             internal_label = str(self.tabs.tabText(tab_index) or "")
             task = task_labels.get(internal_label.strip().lower())
             if task is None:
-                # Identity management remains available to retained workflows and
-                # automation, but it is intentionally not a primary Faces task.
                 continue
             display_label, tooltip = task
             navigation_index = self.task_navigation.addTab(display_label)
@@ -2345,6 +2506,11 @@ class SearchPane(QWidget):
         self.task_navigation.currentChanged.connect(self._select_task_from_navigation)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBar().hide()
+        initial_tab_index = self._people_section_tab_index(self._initial_people_section)
+        if initial_tab_index >= 0 and self.tabs.currentIndex() != initial_tab_index:
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(initial_tab_index)
+            self.tabs.blockSignals(False)
         initial_task_index = next(
             (
                 navigation_index
@@ -2358,12 +2524,14 @@ class SearchPane(QWidget):
         self.sidebar_content_layout.addWidget(self.tabs)
         self.sidebar_content_layout.addStretch(1)
         self.status_label.setWordWrap(True)
+        self.status_label.setProperty("role", "helper")
         self.task_panel_toggle = QToolButton(self.gallery_panel)
-        self.task_panel_toggle.setText("Hide task panel")
+        self.task_panel_toggle.setProperty("iconOnly", True)
         self.task_panel_toggle.setCheckable(True)
         self.task_panel_toggle.setChecked(True)
         self.task_panel_toggle.setAccessibleName("Show or hide the Faces task panel")
         self.task_panel_toggle.setToolTip("Collapse the task panel to give results more room.")
+        apply_icon(self.task_panel_toggle, "collapse")
         self.task_panel_toggle.toggled.connect(self._set_task_panel_visible)
         self.gallery_layout.addWidget(self.task_panel_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
         self.gallery_layout.addWidget(self.status_label)
@@ -2426,7 +2594,11 @@ class SearchPane(QWidget):
 
     def _set_task_panel_visible(self, visible: bool) -> None:
         self.sidebar_panel.setVisible(bool(visible))
-        self.task_panel_toggle.setText("Hide task panel" if visible else "Show task panel")
+        self.task_panel_toggle.setToolTip(
+            "Collapse the task panel to give results more room."
+            if visible
+            else "Show the task panel."
+        )
         if visible:
             sizes = list(getattr(self.workspace_splitter, "requested_sizes", []) or self._face_splitter_default_sizes)
             self.workspace_splitter.setSizes([max(280, int(sizes[0])), max(1, int(sizes[1]))])
@@ -2546,7 +2718,10 @@ class SearchPane(QWidget):
         return service
 
     def _active_face_service(self) -> FaceIndexService:
-        if self._should_use_resolved_face_review_source():
+        # A Find request must never inherit the database of whatever result
+        # happened to be visible previously.  Folder Review is the only tab
+        # whose operations intentionally use its resolved review source.
+        if self.is_face_folder_tab_active():
             source = self._resolve_face_review_source()
             if source is not None:
                 return source.service
@@ -2883,6 +3058,15 @@ class SearchPane(QWidget):
             )
 
     def _resolve_face_review_source(self, *, folder: str | None = None) -> FaceReviewSource | None:
+        """Return a safe active-service fallback without probing storage on Qt.
+
+        The definitive cross-runtime database selection performs filesystem and
+        SQLite work in :meth:`_resolve_face_review_source_background`, owned by
+        the explicit folder-review refresh.  Callers such as action-state
+        refreshes only need a scoped service immediately; they must never turn
+        a paint, selection, or button update into a disk scan.
+        """
+
         cache_key = self._face_review_source_cache_key_for_folder(folder)
         if cache_key is None:
             if self._face_review_source is not None or self._face_review_source_key is not None:
@@ -2894,114 +3078,18 @@ class SearchPane(QWidget):
         folder_value = str(folder if folder is not None else self._effective_face_folder()).strip()
         scope_key = str(cache_key[1])
         active_service = self._face_service_for_scope(scope_key)
-        default_candidate_resolver = getattr(self._iter_face_review_db_candidates, "__func__", None) is SearchPane._iter_face_review_db_candidates
-        if not isinstance(active_service, FaceIndexService) and default_candidate_resolver:
-            source = FaceReviewSource(
-                service=active_service,
-                folder=folder_value,
-                scope_key=scope_key,
-                mode=self.current_face_mode(),
-                db_path=str(getattr(active_service, "db_path", "") or ""),
-                runtime_root="",
-                indexed_image_count=0,
-                face_image_count=0,
-                face_count=0,
-                selection_reason="Using the injected review service.",
-            )
-            previous_db_path = str(self._face_review_source.db_path) if self._face_review_source is not None else ""
-            self._face_review_source = source
-            self._face_review_source_key = cache_key
-            if previous_db_path != source.db_path:
-                self._log_face_event(
-                    "review_source_resolved",
-                    db_path=source.db_path,
-                    runtime_root=source.runtime_root,
-                    indexed_images=0,
-                    face_images=0,
-                    faces=0,
-                    reason=source.selection_reason,
-                )
-            return source
-        active_db_path = Path(str(getattr(active_service, "db_path", "") or ""))
-        selected_entry: dict[str, object] | None = None
-        best_score: tuple[int, int, int, int, int, int] | None = None
-        for candidate in self._iter_face_review_db_candidates(scope_key=scope_key, active_db_path=active_db_path):
-            metrics = self._face_review_db_metrics(Path(candidate["db_path"]), folder_value)
-            entry = dict(candidate)
-            entry.update(metrics)
-            has_data = int(
-                max(
-                    int(entry.get("indexed_image_count", 0) or 0),
-                    int(entry.get("face_image_count", 0) or 0),
-                    int(entry.get("face_count", 0) or 0),
-                )
-                > 0
-            )
-            rank_value = entry.get("rank", 99)
-            rank = 99 if rank_value is None else int(rank_value)
-            score = (
-                has_data,
-                -rank,
-                int(entry.get("indexed_image_count", 0) or 0),
-                int(entry.get("face_image_count", 0) or 0),
-                int(entry.get("face_count", 0) or 0),
-                int(entry.get("db_mtime_ns", 0) or 0),
-            )
-            if best_score is None or score > best_score:
-                best_score = score
-                selected_entry = entry
-
-        if selected_entry is None:
-            return None
-
-        selected_db_path = Path(str(selected_entry.get("db_path", "") or ""))
-        service = (
-            active_service
-            if str(selected_db_path) == str(active_db_path)
-            else self._face_review_service_for_db(selected_db_path, active_service=active_service)
-        )
-        selected_rank_value = selected_entry.get("rank", 99)
-        rank = 99 if selected_rank_value is None else int(selected_rank_value)
-        indexed_image_count = int(selected_entry.get("indexed_image_count", 0) or 0)
-        face_image_count = int(selected_entry.get("face_image_count", 0) or 0)
-        face_count = int(selected_entry.get("face_count", 0) or 0)
-        if max(indexed_image_count, face_image_count, face_count) <= 0:
-            selection_reason = "No indexed faces found yet; using the active review DB."
-        elif rank == 0:
-            selection_reason = "Using the active review DB."
-        elif rank == 1:
-            selection_reason = "Reusing a populated review DB from the current runtime."
-        elif rank == 2:
-            selection_reason = "Reusing the current pipeline DB from another runtime root."
-        else:
-            selection_reason = "Reusing a populated review DB from another runtime root."
-
-        source = FaceReviewSource(
-            service=service,
+        return FaceReviewSource(
+            service=active_service,
             folder=folder_value,
             scope_key=scope_key,
             mode=self.current_face_mode(),
-            db_path=str(selected_db_path),
-            runtime_root=str(selected_entry.get("runtime_root", "") or ""),
-            indexed_image_count=indexed_image_count,
-            face_image_count=face_image_count,
-            face_count=face_count,
-            selection_reason=selection_reason,
+            db_path=str(getattr(active_service, "db_path", "") or ""),
+            runtime_root="",
+            indexed_image_count=0,
+            face_image_count=0,
+            face_count=0,
+            selection_reason="Resolving the saved review DB in the background.",
         )
-        previous_db_path = str(self._face_review_source.db_path) if self._face_review_source is not None else ""
-        self._face_review_source = source
-        self._face_review_source_key = cache_key
-        if previous_db_path != source.db_path:
-            self._log_face_event(
-                "review_source_resolved",
-                db_path=source.db_path,
-                runtime_root=source.runtime_root,
-                indexed_images=source.indexed_image_count,
-                face_images=source.face_image_count,
-                faces=source.face_count,
-                reason=source.selection_reason,
-            )
-        return source
 
     def current_face_mode(self) -> str:
         combo = getattr(self, "face_mode_combo", None)
@@ -3138,6 +3226,7 @@ class SearchPane(QWidget):
             self._update_face_result_actions()
         if hasattr(self, "face_identity_remove_button"):
             self._update_face_identity_prototype_actions()
+        self._update_query_and_saved_search_actions()
 
     def _set_guarded_action_enabled(self, action, enabled: bool) -> None:
         if action is None:
@@ -3180,6 +3269,7 @@ class SearchPane(QWidget):
         face_services_session: dict[str, FaceIndexService] | None = None,
         refresh: bool = True,
     ) -> None:
+        self._invalidate_worker_context()
         if face_services_global:
             self.face_services_global_by_mode = {
                 normalize_face_mode(mode): service
@@ -3229,11 +3319,11 @@ class SearchPane(QWidget):
         previous_job = self._face_name_suggestions_job
         previous_thread = self._face_name_suggestions_thread
         if previous_job is not None:
-            try:
-                previous_job.cancel()
-            except Exception:
-                pass
-        if previous_thread is not None:
+            self._cancel_job(previous_job)
+        if previous_thread is not None and not any(
+            retained_thread is previous_thread
+            for _retained_job, retained_thread in self._retained_face_name_suggestions_refs
+        ):
             self._retained_face_name_suggestions_refs.append((previous_job, previous_thread))
         try:
             services = self._face_name_suggestion_services()
@@ -3265,22 +3355,33 @@ class SearchPane(QWidget):
                 self._apply_face_name_suggestions(list(names or []))
 
         def _finished(thread) -> None:
-            self._retained_face_name_suggestions_refs = [
-                (retained_job, retained_thread)
-                for retained_job, retained_thread in self._retained_face_name_suggestions_refs
-                if retained_thread is not thread
-            ]
-            if thread is self._face_name_suggestions_thread:
-                self._face_name_suggestions_thread = None
-                self._face_name_suggestions_job = None
+            self._defer_face_worker_release(
+                "_retained_face_name_suggestions_refs",
+                thread,
+                "_face_name_suggestions_job",
+                "_face_name_suggestions_thread",
+            )
 
         job.completed.connect(_completed)
         self._face_name_suggestions_job = job
-        thread = start_job_in_thread(job)
-        self._face_name_suggestions_thread = thread
-        thread.finished.connect(lambda thread=thread: _finished(thread), Qt.ConnectionType.QueuedConnection)
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._face_name_suggestions_thread = thread
+            self._retained_face_name_suggestions_refs.append((job, thread))
+            thread.finished.connect(lambda thread=thread: _finished(thread), Qt.ConnectionType.QueuedConnection)
+
+        job.cancelled.connect(
+            lambda: setattr(self, "_face_name_suggestions_job", None)
+            if thread_holder["thread"] is None and self._face_name_suggestions_job is job
+            else None
+        )
+        self._submit_job(job, "Loading face name suggestions", _launch, foreground=False)
 
     def set_face_service_provider(self, provider) -> None:
+        self._invalidate_worker_context()
         self.face_service_provider = provider
 
     def configure_face_pipeline_options(
@@ -3290,6 +3391,7 @@ class SearchPane(QWidget):
         *,
         refresh: bool = True,
     ) -> None:
+        self._invalidate_worker_context()
         self.face_model_root = str(model_root or "").strip()
         for mode in self.supported_face_modes:
             prefs = self._face_pipeline_prefs_by_mode.setdefault(mode, {})
@@ -3856,7 +3958,7 @@ class SearchPane(QWidget):
             text = text.replace(" Glint360K", "")
             return text
 
-        label.setText(f"{_compact_name(detector_name)} — {_compact_name(embedder_name)} — {face_runtime}")
+        label.setText(f"{_compact_name(detector_name)} — {face_runtime}")
         folder_detail = f"\nFolder: {folder}" if folder else ""
         label.setToolTip(
             f"Scope: {scope_text}{folder_detail}\nRuntime: {runtime_text}\nTorch device: {torch_device}\n"
@@ -4038,6 +4140,7 @@ class SearchPane(QWidget):
             return False
         self._face_pipeline_applied_by_mode[mode] = self._clone_face_pipeline_prefs(prefs)
         self._face_pipeline_dirty_modes.discard(mode)
+        self._invalidate_worker_context()
         self._clear_face_tile_caches()
         self._invalidate_face_review_source()
         self._face_profiles_by_name = {}
@@ -4052,9 +4155,12 @@ class SearchPane(QWidget):
             score_threshold=self.current_face_detector_score_threshold(),
             max_detections=self.current_face_max_detections(),
         )
-        self.refresh_face_library(reason="face settings applied")
-        self.refresh_face_album(reason="face settings applied", force_refresh=True)
         self.face_pipeline_applied.emit({mode: self._clone_face_pipeline_prefs(prefs)})
+        if callable(getattr(self, "face_service_provider", None)):
+            self.status_label.setText("Preparing the selected face pipeline in the background…")
+        else:
+            self.refresh_face_library(reason="face settings applied")
+            self.refresh_face_album(reason="face settings applied", force_refresh=True)
         return True
 
     def _reset_pending_face_settings(self) -> None:
@@ -4150,17 +4256,22 @@ class SearchPane(QWidget):
         for button in self._mode_required_buttons:
             can_open_setup = self._startup_face_ready is not False and button in setup_actions
             self._set_guarded_action_enabled(button, (not busy) and (ready or can_open_setup))
-            if not can_open_setup:
-                continue
-            base_tooltip = button.property("faceReadinessBaseToolTip")
-            if base_tooltip is None:
-                base_tooltip = button.toolTip() or ""
-                button.setProperty("faceReadinessBaseToolTip", base_tooltip)
-            if ready:
-                button.setToolTip(str(base_tooltip or ""))
-            else:
-                setup_note = f"Model setup required: {message}\nClick to open Settings > Face Models."
-                button.setToolTip(f"{base_tooltip}\n\n{setup_note}" if base_tooltip else setup_note)
+        for widget_name, action in (
+            ("face_scan_button", "detect"),
+            ("face_index_button", "index"),
+            ("face_reindex_button", "reindex"),
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                self._apply_face_action_eligibility(widget, action)
+        if not ready and self._startup_face_ready is not False:
+            setup_note = f"Model setup required: {message}\nClick to open Settings > Face Models."
+            for button in setup_actions:
+                tooltip = str(button.toolTip() or "")
+                button.setToolTip(f"{tooltip}\n\n{setup_note}" if tooltip else setup_note)
+        if hasattr(self, "face_detected_find_button"):
+            self._update_detected_face_actions()
+        self._update_query_and_saved_search_actions()
 
     def set_startup_readiness(self, ready: bool, message: str) -> None:
         """Apply the shell's local-only face readiness gate to face actions."""
@@ -4182,12 +4293,17 @@ class SearchPane(QWidget):
             getattr(self, "face_choose_pipeline_button", None),
             getattr(self, "face_model_settings_button", None),
         }
-        for button in self._action_buttons:
+        # Read-only saved searches and other non-inference actions remain
+        # useful while the shell is checking or repairing face models.
+        for button in self._mode_required_buttons:
             if button not in allowed:
                 self._set_guarded_action_enabled(button, False)
                 base_tooltip = button.property("faceReadinessBaseToolTip") or button.toolTip() or ""
                 button.setToolTip(
                     f"{base_tooltip}\n\nFace model setup required: {self._startup_face_message}".strip()
+                )
+                button.setAccessibleDescription(
+                    self._startup_face_message or "Face model setup is required."
                 )
     def _build_global_controls(self) -> None:
         self.sidebar_scroll = QScrollArea(self.sidebar_panel)
@@ -4208,7 +4324,7 @@ class SearchPane(QWidget):
         self.sidebar_scroll.setWidget(self.sidebar_content_panel)
         self.sidebar_layout.addWidget(self.sidebar_scroll, stretch=1)
 
-        workspace_group, workspace_layout = self._group_box("Status", tooltip=FACE_HELP["face_mode"])
+        workspace_group, workspace_layout = self._group_box("Face tools", tooltip=FACE_HELP["face_mode"])
         self.face_workspace_scope_group = workspace_group
         row = QVBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -4227,7 +4343,8 @@ class SearchPane(QWidget):
         row.addWidget(self.face_mode_combo)
         workspace_layout.addLayout(row)
 
-        self.search_only_current_folder = QCheckBox("Limit search to current folder")
+        self.search_only_current_folder = QCheckBox("Current folder only")
+        self.search_only_current_folder.setAccessibleName("Limit search to current folder")
         self.search_only_current_folder.setChecked(True)
         self.search_only_current_folder.setToolTip(FACE_HELP["current_folder_toggle"])
         self.search_only_current_folder.toggled.connect(lambda _checked: self._update_face_status_strip())
@@ -4246,36 +4363,39 @@ class SearchPane(QWidget):
         self.face_model_summary_label.setAccessibleName("Active detector, embedder, and runtime")
         self.face_model_summary_label.setToolTip("Open Advanced Face Pipeline")
         self.face_model_summary_label.setFlat(True)
-        self.face_model_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.face_model_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.face_model_summary_label.setMinimumWidth(0)
         self.face_model_summary_label.setProperty("role", "section")
         self.face_model_summary_label.clicked.connect(self.face_pipeline_controls_requested.emit)
         workspace_layout.addWidget(self.face_model_summary_label)
-        self.global_controls_layout.addWidget(workspace_group)
-
-        summary_group, summary_layout = self._group_box("Active Pipeline", tooltip=FACE_HELP["face_detector"])
-        self.face_pipeline_summary_group = summary_group
-        pipeline_actions = QHBoxLayout()
-        pipeline_actions.setContentsMargins(0, 0, 0, 0)
-        pipeline_actions.setSpacing(6)
-        self.face_choose_pipeline_button = QPushButton("Advanced Pipeline…")
+        # Keep pipeline controls with their live runtime summary. A separate
+        # second card repeated the same context and consumed valuable task-rail
+        # height without exposing another capability.
+        self.face_pipeline_summary_group = workspace_group
+        pipeline_actions_widget = QWidget(workspace_group)
+        pipeline_actions = ResponsiveFlowLayout(pipeline_actions_widget, spacing=6)
+        self.face_choose_pipeline_button = QPushButton("Pipeline…")
         self.face_choose_pipeline_button.setProperty("kind", "secondary")
         self.face_choose_pipeline_button.setToolTip(
             "Choose detector, embedder, quality, cascade, and recognition settings."
         )
         self.face_choose_pipeline_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.face_choose_pipeline_button.setMinimumWidth(0)
+        apply_icon(self.face_choose_pipeline_button, "settings")
         self.face_choose_pipeline_button.clicked.connect(self.face_pipeline_controls_requested.emit)
-        pipeline_actions.addWidget(self.face_choose_pipeline_button, stretch=1)
+        pipeline_actions.addWidget(self.face_choose_pipeline_button)
         self._action_buttons.append(self.face_choose_pipeline_button)
-        self.face_model_settings_button = QPushButton("Install / Manage Face Models")
+        self.face_model_settings_button = QPushButton("Models…")
         self.face_model_settings_button.setProperty("kind", "secondary")
         self.face_model_settings_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.face_model_settings_button.setMinimumWidth(0)
+        self.face_model_settings_button.setToolTip("Install or manage local face detector and embedder models.")
+        apply_icon(self.face_model_settings_button, "metadata")
         self.face_model_settings_button.clicked.connect(self.open_face_model_settings_requested.emit)
-        pipeline_actions.addWidget(self.face_model_settings_button, stretch=1)
+        pipeline_actions.addWidget(self.face_model_settings_button)
         self._action_buttons.append(self.face_model_settings_button)
-        summary_layout.addLayout(pipeline_actions)
-        self.global_controls_layout.addWidget(summary_group)
+        workspace_layout.addWidget(pipeline_actions_widget)
+        self.global_controls_layout.addWidget(workspace_group)
 
         actions_group, actions_layout = self._group_box("Face Settings", tooltip=FACE_HELP["face_detector"])
         self.face_settings_group = actions_group
@@ -4312,7 +4432,7 @@ class SearchPane(QWidget):
         self.global_controls_layout.addWidget(advanced_group)
 
         model_page = QWidget()
-        model_layout = QVBoxLayout(model_page)
+        model_layout = QGridLayout(model_page)
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.setSpacing(8)
         self.face_model_profile_combo = QComboBox()
@@ -4330,22 +4450,33 @@ class SearchPane(QWidget):
         self.face_max_detections_spin = QSpinBox()
         self.face_max_detections_spin.setRange(1, 500)
         self.face_max_detections_spin.setToolTip(FACE_HELP["face_max_detections"])
-        for title, widget, tooltip in (
+        for widget in (
+            self.face_model_profile_combo,
+            self.face_detector_combo,
+            self.face_embedder_combo,
+            self.face_fallback_detector_combo,
+        ):
+            apply_field_size(widget, "medium")
+        apply_field_size(self.face_detector_score_spin, "numeric")
+        apply_field_size(self.face_max_detections_spin, "numeric")
+        for index, (title, widget, tooltip) in enumerate((
             ("Model profile", self.face_model_profile_combo, FACE_HELP["face_model_profile"]),
             ("Detector", self.face_detector_combo, FACE_HELP["face_detector"]),
             ("Embedder", self.face_embedder_combo, FACE_HELP["face_embedder"]),
             ("Fallback detector", self.face_fallback_detector_combo, FACE_HELP["face_fallback_detector"]),
             ("Score threshold", self.face_detector_score_spin, FACE_HELP["face_detector_score_threshold"]),
             ("Max detections", self.face_max_detections_spin, FACE_HELP["face_max_detections"]),
-        ):
-            model_layout.addWidget(self._field_widget(title, widget, tooltip=tooltip))
+        )):
+            model_layout.addWidget(self._field_widget(title, widget, tooltip=tooltip), index // 2, index % 2)
         self.face_model_profile_combo.currentIndexChanged.connect(lambda _index: self._on_face_model_profile_changed())
         self.face_detector_combo.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
         self.face_embedder_combo.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
         self.face_fallback_detector_combo.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
         self.face_detector_score_spin.valueChanged.connect(lambda _value: self._on_face_pipeline_changed())
         self.face_max_detections_spin.valueChanged.connect(lambda _value: self._on_face_pipeline_changed())
-        model_layout.addStretch(1)
+        model_layout.setColumnStretch(0, 1)
+        model_layout.setColumnStretch(1, 1)
+        model_layout.setRowStretch(3, 1)
         self.face_advanced_tabs.addTab(model_page, "Models")
 
         quality_page = QWidget()
@@ -4355,6 +4486,7 @@ class SearchPane(QWidget):
         self.face_quality_page_layout = quality_layout
         self.face_quality_profile_combo = QComboBox()
         self.face_quality_profile_combo.setToolTip(FACE_HELP["face_quality_profile"])
+        apply_field_size(self.face_quality_profile_combo, "medium")
         quality_layout.addWidget(self._field_widget("Quality profile", self.face_quality_profile_combo, tooltip=FACE_HELP["face_quality_profile"]))
         self.face_quality_summary_label = self._helper_label("", tooltip=FACE_HELP["face_quality_profile"])
         self.face_quality_manual_toggle = self._expander_button("Manual Thresholds", checked=False, tooltip=FACE_HELP["face_quality_profile"])
@@ -4368,6 +4500,7 @@ class SearchPane(QWidget):
             widget.setRange(float(minimum), float(maximum))
             widget.setSingleStep(float(step))
             widget.setDecimals(0 if step >= 1.0 else 2)
+            apply_field_size(widget, "numeric")
             widget.valueChanged.connect(lambda _value, _key=key: self._on_face_quality_changed())
             setattr(self, f"face_quality_{key}_spin", widget)
             manual_quality_layout.addWidget(self._field_widget(label, widget, tooltip=FACE_HELP["face_quality_profile"]))
@@ -4376,6 +4509,7 @@ class SearchPane(QWidget):
             combo.addItem("Off", "off")
             combo.addItem("Prefer", "prefer")
             combo.addItem("Require", "require")
+            apply_field_size(combo, "short")
             combo.currentIndexChanged.connect(lambda _index, _key=key: self._on_face_quality_changed())
             setattr(self, f"face_quality_{key}_combo", combo)
             manual_quality_layout.addWidget(self._field_widget(label, combo, tooltip=FACE_HELP["face_quality_profile"]))
@@ -4389,7 +4523,7 @@ class SearchPane(QWidget):
         self.face_advanced_tabs.addTab(quality_page, "Quality")
 
         cascade_page = QWidget()
-        cascade_layout = QVBoxLayout(cascade_page)
+        cascade_layout = QGridLayout(cascade_page)
         cascade_layout.setContentsMargins(0, 0, 0, 0)
         cascade_layout.setSpacing(8)
         self.face_detector_policy_combo = QComboBox()
@@ -4398,15 +4532,19 @@ class SearchPane(QWidget):
         self.face_verifier_mode_combo = QComboBox()
         for item_id, label in face_verifier_mode_choices():
             self.face_verifier_mode_combo.addItem(label, item_id)
+        apply_field_size(self.face_detector_policy_combo, "medium")
+        apply_field_size(self.face_verifier_mode_combo, "medium")
         self.face_detector_policy_combo.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
         self.face_verifier_mode_combo.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
-        cascade_layout.addWidget(self._field_widget("Detector policy", self.face_detector_policy_combo, tooltip=FACE_HELP["face_detector_policy"]))
-        cascade_layout.addWidget(self._field_widget("Verifier", self.face_verifier_mode_combo, tooltip=FACE_HELP["face_verifier_mode"]))
-        cascade_layout.addStretch(1)
-        self.face_advanced_tabs.addTab(cascade_page, "Cascade")
+        cascade_layout.addWidget(self._field_widget("Detector policy", self.face_detector_policy_combo, tooltip=FACE_HELP["face_detector_policy"]), 0, 0)
+        cascade_layout.addWidget(self._field_widget("Verifier", self.face_verifier_mode_combo, tooltip=FACE_HELP["face_verifier_mode"]), 0, 1)
+        cascade_layout.setColumnStretch(0, 1)
+        cascade_layout.setColumnStretch(1, 1)
+        cascade_layout.setRowStretch(1, 1)
+        self.face_advanced_tabs.addTab(cascade_page, "Detection")
 
         recognition_page = QWidget()
-        recognition_layout = QVBoxLayout(recognition_page)
+        recognition_layout = QGridLayout(recognition_page)
         recognition_layout.setContentsMargins(0, 0, 0, 0)
         recognition_layout.setSpacing(8)
         self.face_search_quality_min_combo = QComboBox()
@@ -4433,6 +4571,19 @@ class SearchPane(QWidget):
             self.face_prototype_quality_min_combo,
             self.face_rerank_policy_combo,
         ):
+            apply_field_size(widget, "short")
+        for widget in (
+            self.face_recognition_min_score_spin,
+            self.face_auto_label_min_score_spin,
+            self.face_rerank_top_n_spin,
+        ):
+            apply_field_size(widget, "numeric")
+        for widget in (
+            self.face_search_quality_min_combo,
+            self.face_cluster_quality_min_combo,
+            self.face_prototype_quality_min_combo,
+            self.face_rerank_policy_combo,
+        ):
             widget.currentIndexChanged.connect(lambda _index: self._on_face_pipeline_changed())
         for widget in (
             self.face_recognition_min_score_spin,
@@ -4440,7 +4591,7 @@ class SearchPane(QWidget):
             self.face_rerank_top_n_spin,
         ):
             widget.valueChanged.connect(lambda _value: self._on_face_pipeline_changed())
-        for title, widget, tooltip in (
+        for index, (title, widget, tooltip) in enumerate((
             ("Search quality", self.face_search_quality_min_combo, FACE_HELP["face_search_quality_min"]),
             ("Cluster quality", self.face_cluster_quality_min_combo, FACE_HELP["face_cluster_quality_min"]),
             ("Prototype quality", self.face_prototype_quality_min_combo, FACE_HELP["face_prototype_quality_min"]),
@@ -4448,9 +4599,11 @@ class SearchPane(QWidget):
             ("Auto-label min score", self.face_auto_label_min_score_spin, FACE_HELP["face_auto_label_min_score"]),
             ("Rerank policy", self.face_rerank_policy_combo, FACE_HELP["face_rerank_policy"]),
             ("Rerank top-N", self.face_rerank_top_n_spin, FACE_HELP["face_rerank_top_n"]),
-        ):
-            recognition_layout.addWidget(self._field_widget(title, widget, tooltip=tooltip))
-        recognition_layout.addStretch(1)
+        )):
+            recognition_layout.addWidget(self._field_widget(title, widget, tooltip=tooltip), index // 2, index % 2)
+        recognition_layout.setColumnStretch(0, 1)
+        recognition_layout.setColumnStretch(1, 1)
+        recognition_layout.setRowStretch(4, 1)
         self.face_advanced_tabs.addTab(recognition_page, "Recognition")
 
         self._update_face_mode_status()
@@ -4467,6 +4620,7 @@ class SearchPane(QWidget):
         self.refresh_face_album(reason="tiny detections toggled", force_refresh=True)
 
     def _on_face_mode_changed(self) -> None:
+        self._invalidate_worker_context()
         self._save_face_pipeline_editor_for_mode(self._last_face_mode)
         self._cancel_face_review_stream(replaced=True)
         self._clear_face_tile_caches()
@@ -4488,6 +4642,7 @@ class SearchPane(QWidget):
         self._request_face_name_suggestions()
 
     def _on_face_pipeline_changed(self) -> None:
+        self._invalidate_worker_context()
         self._save_face_pipeline_editor_for_mode(self.current_face_mode())
         self._populate_profile_combo(self.current_face_mode())
         self._update_face_model_details()
@@ -4527,8 +4682,8 @@ class SearchPane(QWidget):
         widget = QWidget(self)
         widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         bar = FlowLayout(widget)
-        self.results_open_btn = QPushButton("Open In Main Gallery")
-        self.results_append_btn = QPushButton("Append To Main Gallery")
+        self.results_open_btn = QPushButton("Open photos")
+        self.results_append_btn = QPushButton("Add to current photo set")
         self.results_export_btn = QPushButton("Export Paths")
         bar.addWidget(self.results_open_btn)
         bar.addWidget(self.results_append_btn)
@@ -4662,8 +4817,8 @@ class SearchPane(QWidget):
         if tabs is None or label is None:
             return
         photo_count = len(list(getattr(self.results_gallery, "images", []) or []))
-        review_images = list(getattr(self, "_face_review_images", []) or [])
-        face_count = sum(len(self._review_faces_for_item(item)) for item in review_images)
+        filtered_review_images = list(getattr(self, "_face_review_images", []) or [])
+        face_count = sum(len(self._review_faces_for_item(item)) for item in filtered_review_images)
         group_count = len(list(getattr(self, "_face_result_groups", []) or []))
         tabs.setTabText(0, f"Photos ({photo_count})")
         tabs.setTabText(1, f"Faces ({face_count})")
@@ -4673,20 +4828,21 @@ class SearchPane(QWidget):
             folder = str(self._effective_face_folder() or "").strip()
         folder_label = Path(folder).name or folder or "No folder selected"
         if self._face_photo_context_kind == "derived":
-            label.setText(f"{self._face_photo_context_title} | {photo_count} photo(s) | Source: {folder_label}")
+            label.setText(f"{self._face_photo_context_title} | {showing(photo_count, 'photo')} | Source: {folder_label}")
             self.face_photo_filter.hide()
             self.face_photos_back_button.show()
             return
+        loaded_review_images = list(getattr(self, "_face_review_all_images", []) or [])
         scanned_count = sum(
             1
-            for item in list(getattr(self, "_face_review_all_images", []) or [])
+            for item in loaded_review_images
             if str(getattr(item, "review_status", "") or "").strip().lower() != "not_scanned"
         )
-        total_count = len(list(getattr(self, "_face_review_all_images", []) or []))
+        loaded_count = len(loaded_review_images)
         filter_label = str(self.face_photo_filter.currentText() or "With Faces")
         label.setText(
-            f"{folder_label} | {photo_count} {filter_label.lower()} photo(s) | "
-            f"{face_count} visible face(s) | {scanned_count}/{total_count} scanned"
+            f"{folder_label} | {loaded_and_showing(loaded_count, photo_count, 'photo')} ({filter_label}) | "
+            f"{counted(face_count, 'visible face')} | {scanned_count}/{loaded_count} photos scanned"
         )
         self.face_photo_filter.show()
         self.face_photos_back_button.hide()
@@ -4753,6 +4909,7 @@ class SearchPane(QWidget):
         QTimer.singleShot(0, lambda value=restore_scroll: self.results_gallery.list_view.verticalScrollBar().setValue(value))
 
     def _on_tab_changed(self, index: int) -> None:
+        self._invalidate_worker_context()
         navigation = getattr(self, "task_navigation", None)
         navigation_indexes = list(getattr(self, "_task_navigation_tab_indexes", []) or [])
         navigation_index = next(
@@ -4769,6 +4926,9 @@ class SearchPane(QWidget):
         except Exception:
             label = ""
         self._log_face_event("tab_changed", tab=label or index)
+        if label != "face search":
+            self._face_query_request_id += 1
+            self._face_similarity_request_id += 1
         if not self._is_face_folder_tab_label(label):
             self._cancel_face_review_stream(replaced=True)
         if not self._is_all_faces_tab_label(label):
@@ -4786,8 +4946,32 @@ class SearchPane(QWidget):
             QTimer.singleShot(0, self._refresh_face_action_audit)
         if label == "face search":
             self._update_face_selected_context_label()
+            self._query_find_visibility_timer.start(0)
         self._update_search_scope_control_visibility(label)
         self._update_face_status_strip()
+        self._emit_people_section_changed()
+
+    def _current_people_section(self) -> str:
+        """Return the stable shell route represented by the current controls."""
+
+        try:
+            label = str(self.tabs.tabText(self.tabs.currentIndex()) or "").strip().lower()
+        except Exception:
+            return ""
+        if self._is_all_faces_tab_label(label):
+            return "unnamed" if self._current_face_album_label_filter() == "unlabeled" else "all_faces"
+        if self._is_face_folder_tab_label(label):
+            return "review_name" if getattr(self, "face_library_tabs", None) is not None and self.face_library_tabs.currentIndex() == 1 else "detect"
+        if label == "face search":
+            return "find"
+        if label == "identities":
+            return "identities"
+        return ""
+
+    def _emit_people_section_changed(self) -> None:
+        section = self._current_people_section()
+        if section:
+            self.people_section_changed.emit(section)
 
     def _select_task_from_navigation(self, index: int) -> None:
         navigation_indexes = list(getattr(self, "_task_navigation_tab_indexes", []) or [])
@@ -4843,17 +5027,20 @@ class SearchPane(QWidget):
         index_value = int(index)
         if index_value == 1:
             tab_name = "detected_faces"
-            self._refresh_detected_faces_review(force=True)
+            self._refresh_detected_faces_review(force=False)
             self._schedule_detected_face_tile_loads()
         elif index_value == 2:
             self._reset_detected_face_arrangement()
-            self._cancel_detected_faces_publish()
+            self._pause_detected_faces_publish()
             tab_name = "face_results"
-            self._sync_face_review_result_groups(force=True)
-            self._schedule_face_result_tile_loads()
+            if self._face_review_cache_complete:
+                self._sync_face_review_result_groups(force=True)
+                self._schedule_face_result_tile_loads()
+            else:
+                self.face_results_summary.setText("Preparing review data in the background. Face Groups will be available when it is ready.")
         else:
             self._reset_detected_face_arrangement()
-            self._cancel_detected_faces_publish()
+            self._pause_detected_faces_publish()
             tab_name = "photos"
         self._log_face_event("review_results_tab_changed", tab=tab_name)
 
@@ -4893,6 +5080,7 @@ class SearchPane(QWidget):
         self.results_gallery.face_auto_clean_callback = self._auto_clean_face_review_drafts
 
     def _set_busy(self, busy: bool, status: str = "") -> None:
+        self._primary_busy = bool(busy)
         for button in self._action_buttons:
             self._set_guarded_action_enabled(button, not busy)
         self._update_face_mode_status()
@@ -4900,12 +5088,21 @@ class SearchPane(QWidget):
             self._update_face_selected_context_label()
             self._update_detected_face_actions()
             self._update_face_result_actions()
+        if hasattr(self, "face_identity_remove_button"):
+            self._update_face_identity_prototype_actions()
+        self._update_query_and_saved_search_actions()
         if status:
             self.status_label.setText(status)
         if busy:
             self.progress_bar.setRange(0, 0)
+            self.progress_bar.setAccessibleDescription(
+                f"In progress; completion total is not known yet. {status}".strip()
+            )
             self.progress_bar.show()
         else:
+            self.progress_bar.setAccessibleDescription(
+                f"Operation is no longer running. {status}".strip()
+            )
             self.progress_bar.hide()
 
     def _on_job_progress(self, value: int, text: str) -> None:
@@ -4914,15 +5111,124 @@ class SearchPane(QWidget):
         else:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(max(0, min(100, int(value))))
+        if int(value) < 0:
+            description = "In progress; completion total is not known yet."
+        else:
+            description = f"{max(0, min(100, int(value)))} percent complete."
+        if text:
+            description += f" {text}"
+        self.progress_bar.setAccessibleDescription(description)
         self.progress_bar.show()
         if text:
             self.status_label.setText(str(text))
 
+    def configure_jobs(self, job_manager, work_coordinator=None) -> None:
+        """Attach the production Jobs surface and resource scheduler."""
+
+        self.job_manager = job_manager
+        self.work_coordinator = work_coordinator
+
+    def _job_spec(self, label: str):
+        if JobSpec is None:
+            return None
+        normalized = str(label or "People work").casefold()
+        roots: tuple[str, ...] = ()
+        provider = self.current_scope_roots_provider
+        if callable(provider):
+            try:
+                roots = tuple(str(path) for path in provider() or () if str(path or "").strip())
+            except Exception:
+                roots = ()
+        if not roots and callable(self.current_directory_provider):
+            try:
+                directory = str(self.current_directory_provider() or "").strip()
+                roots = (directory,) if directory else ()
+            except Exception:
+                roots = ()
+        mutating = any(
+            token in normalized
+            for token in (
+                "saving",
+                "naming",
+                "indexing",
+                "reindexing",
+                "importing",
+                "deleting",
+                "hiding",
+                "ignoring",
+                "applying",
+                "accepting",
+                "rejecting",
+                "undoing",
+                "merging",
+                "clearing person",
+                "auto-propagating",
+                "adding folder",
+                "rescanning",
+                "writing exif",
+            )
+        )
+        model_work = any(
+            token in normalized
+            for token in ("face", "identity prototype", "deep name", "people", "person")
+        )
+        return JobSpec(
+            str(label or "People work"),
+            origin="People",
+            io_bound=not model_work,
+            uses_gpu=model_work,
+            source_reads=roots if "writing exif" not in normalized else (),
+            source_writes=roots if "writing exif" in normalized else (),
+            data_home_write=mutating,
+            data_home_read=not mutating,
+            model_cache_read=model_work,
+        )
+
+    def _submit_job(self, job: AsyncJob, label: str, launcher, *, foreground: bool = True) -> int | None:
+        """Start locally or admit through the production coordinator."""
+
+        if self.work_coordinator is None or JobSpec is None:
+            launcher(False)
+            return None
+
+        def _terminal_cleanup(*_args) -> None:
+            self._coordinated_job_ids.pop(job, None)
+
+        job.completed.connect(_terminal_cleanup)
+        job.failed.connect(_terminal_cleanup)
+        job.cancelled.connect(_terminal_cleanup)
+        spec = replace(self._job_spec(label), foreground=bool(foreground))
+        job_id = self.work_coordinator.submit_async_job(spec, job, launcher)
+        state = self.job_manager.get(job_id) if self.job_manager is not None else None
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._coordinated_job_ids[job] = job_id
+        return job_id
+
+    def _cancel_job(self, job: AsyncJob | None) -> None:
+        if job is None:
+            return
+        job_id = self._coordinated_job_ids.get(job)
+        if job_id is not None and self.work_coordinator is not None:
+            self.work_coordinator.cancel(job_id)
+            return
+        try:
+            job.cancel()
+        except Exception:
+            pass
+
+    def _invalidate_worker_context(self) -> None:
+        """Prevent an older request from publishing into the current view."""
+
+        self._worker_context_generation = int(getattr(self, "_worker_context_generation", 0)) + 1
+
+    def _worker_context_is_current(self, generation: int) -> bool:
+        return not self._is_shutting_down and int(generation) == int(self._worker_context_generation)
+
     def _start_job(self, label: str, fn, on_completed) -> AsyncJob | None:
         # QThread objects are deleted via deleteLater() in the helper; keep our reference safe.
-        if self._active_thread is not None:
+        if self._active_job is not None:
             try:
-                if self._active_thread.isRunning():
+                if self._active_thread is None or self._active_thread.isRunning():
                     if self._active_completion_callback:
                         self._start_job_after_active(label, fn, on_completed)
                         return None
@@ -4932,11 +5238,14 @@ class SearchPane(QWidget):
                 self._active_thread = None
                 self._active_job = None
 
+        context_generation = int(self._worker_context_generation)
         job = AsyncJob(fn)
 
-        job_id: int | None = None
-        if self.job_manager is not None:
-            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin="Faces")
+        job_id_holder: dict[str, int | None] = {"job_id": None}
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
+            job_id = self.job_manager.register_job(label, cancel_fn=job.cancel, origin="People")
+            job_id_holder["job_id"] = job_id
             self._active_job_id = job_id
             job.progress.connect(
                 lambda value, text, job_id=job_id: self.job_manager.update(
@@ -4945,47 +5254,76 @@ class SearchPane(QWidget):
                     text=text,
                 )
             )
-        job.progress.connect(self._on_job_progress)
+        job.progress.connect(
+            lambda value, text, generation=context_generation: self._on_job_progress(value, text)
+            if self._worker_context_is_current(generation)
+            else None
+        )
 
         def _on_failed(message: str) -> None:
-            self._set_busy(False, "Search index idle.")
-            if self.job_manager is not None and job_id is not None:
+            job_id = job_id_holder["job_id"]
+            is_current = self._worker_context_is_current(context_generation)
+            self._set_busy(False, "Search index idle." if is_current else "")
+            if self.job_manager is not None and job_id is not None and not coordinated:
                 self.job_manager.finish(job_id, status="failed", error=message)
             if self._active_job_id == job_id:
                 self._active_job_id = None
-            errorBox(f"{label} failed", message, parent=self)
+            if self._active_thread is None and self._active_job is job:
+                self._active_job = None
+            if is_current:
+                errorBox(f"{label} failed", message, parent=self)
 
         def _on_cancelled() -> None:
-            self._set_busy(False, "Cancelled.")
-            if self.job_manager is not None and job_id is not None:
+            job_id = job_id_holder["job_id"]
+            self._set_busy(
+                False,
+                "Cancelled." if self._worker_context_is_current(context_generation) else "",
+            )
+            if self.job_manager is not None and job_id is not None and not coordinated:
                 self.job_manager.finish(job_id, status="cancelled")
             if self._active_job_id == job_id:
                 self._active_job_id = None
+            if self._active_thread is None and self._active_job is job:
+                self._active_job = None
 
         def _on_completed(result) -> None:
+            job_id = job_id_holder["job_id"]
             self._set_busy(False)
-            if self.job_manager is not None and job_id is not None:
+            if self.job_manager is not None and job_id is not None and not coordinated:
                 self.job_manager.finish(job_id, status="finished")
             if self._active_job_id == job_id:
                 self._active_job_id = None
-            self._active_completion_callback = True
-            try:
-                on_completed(result)
-            finally:
-                self._active_completion_callback = False
+            if self._worker_context_is_current(context_generation):
+                self._active_completion_callback = True
+                try:
+                    on_completed(result)
+                finally:
+                    self._active_completion_callback = False
 
         job.failed.connect(_on_failed)
         job.cancelled.connect(_on_cancelled)
         job.completed.connect(_on_completed)
         self._active_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
-        self._active_thread = thread
-        self._set_busy(True, f"{label} running...")
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_async_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._active_thread = thread
+
+        if coordinated:
+            self._set_busy(True, f"{label} running...")
+            job_id = self._submit_job(job, label, _launch)
+            job_id_holder["job_id"] = job_id
+            state = self.job_manager.get(job_id) if self.job_manager is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._active_job_id = job_id
+        else:
+            _launch(False)
+            self._set_busy(True, f"{label} running...")
         if self.job_manager is not None and self._active_job_id is not None:
             self.job_manager.update(self._active_job_id, progress=None, text="Running")
         return job
@@ -5014,6 +5352,8 @@ class SearchPane(QWidget):
         if thread is None:
             return
         job = self._thread_jobs.pop(thread, None)
+        defer_async_job_dispose(job)
+        released_active = self._active_thread is thread
         if self._active_thread is thread:
             self._active_thread = None
             if self._active_job is job:
@@ -5026,17 +5366,67 @@ class SearchPane(QWidget):
             self._face_action_audit_thread = None
             if self._face_action_audit_job is job:
                 self._face_action_audit_job = None
+        if released_active and not self._is_shutting_down:
+            self._set_busy(False)
 
     def _on_async_thread_finished(self, thread=None) -> None:
-        self._release_finished_thread(thread)
+        if thread is None or sip.isdeleted(self):
+            return
+        if thread not in self._async_thread_release_queue:
+            self._async_thread_release_queue.append(thread)
+        try:
+            self._face_worker_release_timer.start(0)
+        except RuntimeError:
+            return
+
+    def _defer_face_worker_release(
+        self,
+        refs_attr: str,
+        thread,
+        active_job_attr: str,
+        active_thread_attr: str,
+    ) -> None:
+        if sip.isdeleted(self):
+            return
+        spec = (str(refs_attr), thread, str(active_job_attr), str(active_thread_attr))
+        if spec not in self._face_worker_release_queue:
+            self._face_worker_release_queue.append(spec)
+        try:
+            self._face_worker_release_timer.start(0)
+        except RuntimeError:
+            return
+
+    def _flush_face_worker_releases(self) -> None:
+        generic_threads = list(self._async_thread_release_queue)
+        self._async_thread_release_queue = []
+        for thread in generic_threads:
+            self._release_finished_thread(thread)
+        pending = list(self._face_worker_release_queue)
+        self._face_worker_release_queue = []
+        for refs_attr, thread, active_job_attr, active_thread_attr in pending:
+            retained = list(getattr(self, refs_attr, []) or [])
+            for job, retained_thread in retained:
+                if retained_thread is thread:
+                    defer_async_job_dispose(job)
+            setattr(
+                self,
+                refs_attr,
+                [(job, retained_thread) for job, retained_thread in retained if retained_thread is not thread],
+            )
+            if thread is getattr(self, active_thread_attr, None):
+                setattr(self, active_thread_attr, None)
+                setattr(self, active_job_attr, None)
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         self._is_shutting_down = True
+        self._invalidate_worker_context()
         ready_to_close = True
         deadline_s = perf_counter() + (max(0, int(timeout_ms)) / 1000.0)
         self._results_gallery_publish_token += 1
+        self._query_find_visibility_timer.stop()
         self._face_review_stream_timer.stop()
         self._face_album_member_stream_timer.stop()
+        self._face_worker_release_timer.stop()
         self._face_review_stream_generation += 1
         self._face_album_member_stream_generation += 1
         self._face_review_stream_in_progress = False
@@ -5061,8 +5451,6 @@ class SearchPane(QWidget):
 
         def _cancel_and_wait(
             job_thread_pairs: list[tuple[object | None, object | None]],
-            *,
-            detach_on_timeout: bool = False,
         ) -> bool:
             local_ready = True
             cancelled_jobs: set[int] = set()
@@ -5071,7 +5459,7 @@ class SearchPane(QWidget):
                 if job is None or id(job) in cancelled_jobs:
                     continue
                 try:
-                    job.cancel()
+                    self._cancel_job(job)
                     cancelled_jobs.add(id(job))
                 except Exception:
                     pass
@@ -5083,37 +5471,46 @@ class SearchPane(QWidget):
                     if thread.isRunning():
                         wait_timeout_ms = _thread_timeout_ms(thread)
                         thread_ready = wait_for_thread_shutdown(thread, timeout_ms=wait_timeout_ms)
-                        if not thread_ready and detach_on_timeout:
-                            thread_ready = detach_running_async_job(_job, thread)
                         local_ready = thread_ready and local_ready
                 except Exception:
                     local_ready = False
+            if local_ready:
+                # A stopped worker can still have queued relay events waiting
+                # on Qt. Remove UI observers before this pane is deleted so a
+                # late progress/completion signal cannot call a dead widget.
+                for job, _thread in job_thread_pairs:
+                    if job is None:
+                        continue
+                    for signal_name in ("started", "progress", "completed", "failed", "cancelled"):
+                        signal = getattr(job, signal_name, None)
+                        if signal is None:
+                            continue
+                        try:
+                            signal.disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
             return local_ready
 
-        if self._active_job is not None:
-            try:
-                self._active_job.cancel()
-            except Exception:
-                pass
-        if self._active_thread is not None:
-            try:
-                if self._active_thread.isRunning():
-                    wait_timeout_ms = _thread_timeout_ms(self._active_thread)
-                    ready_to_close = wait_for_thread_shutdown(self._active_thread, timeout_ms=wait_timeout_ms) and ready_to_close
-            except Exception:
-                ready_to_close = False
         try:
             self._face_refresh_request_id += 1
+            self._face_result_filter_request_id += 1
+            self._saved_search_request_id += 1
             ready_to_close = _cancel_and_wait([
+                (self._active_job, self._active_thread),
+                *[(job, thread) for thread, job in list(self._thread_jobs.items())],
                 (getattr(self, "_face_refresh_job", None), getattr(self, "_face_refresh_thread", None)),
                 (getattr(self, "_face_review_stream_job", None), getattr(self, "_face_review_stream_thread", None)),
+                (getattr(self, "_face_result_filter_job", None), getattr(self, "_face_result_filter_thread", None)),
                 (self._face_db_usage_job, self._face_db_usage_thread),
                 (self._face_action_audit_job, self._face_action_audit_thread),
                 (self._face_name_suggestions_job, self._face_name_suggestions_thread),
+                (self._saved_search_job, self._saved_search_thread),
                 *list(getattr(self, "_retained_face_refresh_refs", []) or []),
                 *list(getattr(self, "_retained_face_review_stream_refs", []) or []),
+                *list(getattr(self, "_retained_face_result_filter_refs", []) or []),
                 *list(getattr(self, "_retained_face_name_suggestions_refs", []) or []),
-            ], detach_on_timeout=True) and ready_to_close
+                *list(getattr(self, "_retained_saved_search_refs", []) or []),
+            ]) and ready_to_close
         except Exception:
             ready_to_close = False
         try:
@@ -5156,12 +5553,18 @@ class SearchPane(QWidget):
             self._face_name_suggestions_job = None
             self._face_name_suggestions_thread = None
             self._retained_face_name_suggestions_refs = []
+            self._saved_search_job = None
+            self._saved_search_thread = None
+            self._retained_saved_search_refs = []
             self._face_refresh_job = None
             self._face_refresh_thread = None
             self._retained_face_refresh_refs = []
             self._face_review_stream_job = None
             self._face_review_stream_thread = None
             self._retained_face_review_stream_refs = []
+            self._face_result_filter_job = None
+            self._face_result_filter_thread = None
+            self._retained_face_result_filter_refs = []
             self._face_album_refresh_job = None
             self._face_album_refresh_thread = None
             self._retained_face_album_refresh_refs = []
@@ -5176,6 +5579,8 @@ class SearchPane(QWidget):
             self._retained_face_review_hydration_refs = []
             self._face_refresh_in_progress = False
             self._face_tile_loader_threads = []
+            self._face_worker_release_queue = []
+            self._async_thread_release_queue = []
         return ready_to_close
 
     def closeEvent(self, event) -> None:
@@ -5188,6 +5593,11 @@ class SearchPane(QWidget):
         result = super().resizeEvent(event)
         self._refresh_face_grid_layouts()
         self._schedule_face_tile_refresh()
+        return result
+
+    def showEvent(self, event) -> None:
+        result = super().showEvent(event)
+        self.reflow_for_text_scale()
         return result
 
     def _open_results_in_main_gallery(self) -> None:
@@ -5213,11 +5623,21 @@ class SearchPane(QWidget):
         self.result_selected.emit(image_path, paths, paths.index(image_path), self.results_gallery.inspector_context_provider)
 
     def _on_results_gallery_visible_paths_changed(self, paths: list[str]) -> None:
-        if self._results_kind != "faces_review" or not self._face_review_lazy_publish_enabled:
+        if self._results_kind != "faces_review":
             return
         if self.face_review_results_tabs.currentWidget() is not self.results_gallery:
             return
-        self._queue_face_review_path_hydration(paths, replace_existing=True)
+        if self._face_review_lazy_publish_enabled:
+            self._queue_face_review_path_hydration(paths, replace_existing=True)
+        # A review is intentionally viewport-driven: this is the only
+        # automatic request for the next DB page, and only after the user has
+        # reached the tail of the photos already published.
+        gallery_paths = list(getattr(self.results_gallery, "images", []) or [])
+        if not paths or not gallery_paths or not self._face_review_stream_in_progress:
+            return
+        last_visible = max((gallery_paths.index(path) for path in paths if path in gallery_paths), default=-1)
+        if last_visible >= len(gallery_paths) - FACE_DETECTED_FACE_PUBLISH_BATCH_SIZE:
+            self._request_next_face_review_stream_page()
 
     def _on_face_image_edits_saved(self, image_path: str) -> None:
         image_path = str(image_path or "").strip()
@@ -5276,6 +5696,9 @@ class SearchPane(QWidget):
         else:
             self._face_review_draft_dirty_paths.discard(path)
         self._clear_face_tile_caches(path)
+        # A draft changes the tile payload for one photo.  It invalidates the
+        # completed Faces model, but it must not restart review-data loading.
+        self._face_detected_faces_cache_generation = -1
         self._refresh_face_review_gallery_state()
         self._refresh_detected_faces_review()
         if path == self._face_review_selected_path:
@@ -6102,6 +6525,166 @@ class SearchPane(QWidget):
                 refs.append(ref)
         return refs
 
+    def _face_action_eligibility(
+        self,
+        action: str,
+        *,
+        indexed_refs: list[tuple[str, int]] | tuple[tuple[str, int], ...] = (),
+        visible_ref_count: int = 0,
+        ignored_view: bool = False,
+    ) -> tuple[bool, str]:
+        """Return one shared enabled-state contract for People actions.
+
+        This intentionally covers the actions that are exposed in both the
+        Detected Faces toolbar and its context menus, plus Detect/Index/Reindex.
+        Their handlers call the same predicate so a shortcut or queued menu
+        trigger cannot bypass a disabled UI state.
+        """
+
+        action_id = str(action or "").strip().lower()
+        refs = tuple(
+            dict.fromkeys(
+                (str(path), int(face_index))
+                for path, face_index in indexed_refs
+                if str(path or "").strip()
+            )
+        )
+        mutation_actions = {
+            "name", "ignore", "ignore_similar", "restore",
+            "saved_search_rename", "saved_search_delete",
+        }
+        model_actions = {
+            "find_similar", "ignore_similar", "cluster_selected", "cluster_visible",
+            "query_detect",
+        }
+        scope_actions = {"detect", "index", "reindex"}
+
+        selected_saved_search = (
+            self._selected_saved_search()
+            if action_id in {"saved_search_run", "saved_search_rename", "saved_search_delete"}
+            else None
+        )
+        active_thread = getattr(self, "_active_thread", None)
+        primary_job_active = bool(getattr(self, "_primary_busy", False)) or getattr(
+            self, "_active_job", None
+        ) is not None
+        try:
+            if active_thread is not None and active_thread.isRunning():
+                primary_job_active = True
+        except Exception:
+            pass
+
+        independent_saved_search_action = action_id in {"saved_search_rename", "saved_search_delete"} or (
+            action_id == "saved_search_run"
+            and selected_saved_search is not None
+            and str(selected_saved_search.search_type or "") == "clustering_filter"
+        )
+        if action_id in mutation_actions and self._read_only_mode:
+            return False, "Disabled while read-only mode is on. Change it in Settings > Safety & Recovery."
+
+        if action_id in scope_actions:
+            explicit_paths = tuple(getattr(self, "_explicit_review_scope_paths", ()) or ())
+            if not explicit_paths and not self._current_scope_roots():
+                return False, "Choose one or more active Roots before starting this People operation."
+
+        if action_id == "query_detect":
+            query_path = ""
+            if hasattr(self, "face_query_path"):
+                query_path = self.face_query_path.text().strip()
+            if not query_path:
+                return False, "Choose a query photo before detecting faces."
+
+        if action_id in {"saved_search_run", "saved_search_rename", "saved_search_delete"}:
+            if selected_saved_search is None:
+                return False, "Select a saved search first."
+
+        if action_id in {"find_similar", "ignore_similar", "name", "ignore", "restore", "cluster_selected"} and not refs:
+            return False, "Select one or more saved face tiles first."
+        if action_id == "cluster_selected" and len(refs) < 2:
+            return False, "Select at least two saved face tiles before clustering."
+        if action_id == "cluster_visible" and int(visible_ref_count) < 2:
+            return False, "At least two visible saved face tiles are required for clustering."
+        if action_id in {"find_similar", "ignore_similar", "name", "ignore", "cluster_selected", "cluster_visible"} and ignored_view:
+            return False, "Restore ignored faces before using this action."
+        if action_id == "restore" and not ignored_view:
+            return False, "Switch to Ignored faces before restoring selected faces."
+        if action_id in {"find_similar", "ignore_similar"} and not self._face_similarity_scope_available():
+            return False, "Choose an active Root, or enable Search all indexed faces in Find options."
+
+        if primary_job_active and not independent_saved_search_action:
+            return False, "Wait for the active People operation to finish or cancel it in Jobs."
+
+        if action_id in {"saved_search_run", "saved_search_rename", "saved_search_delete"}:
+            if getattr(self, "_saved_search_job", None) is not None:
+                return False, "Wait for the current saved-search operation to finish or cancel it in Jobs."
+
+        if action_id in model_actions:
+            if self._startup_face_ready is False:
+                return False, self._startup_face_message or "Face model readiness is still being checked."
+            ready, message = self._active_face_mode_ready_state()
+            if not ready:
+                return False, f"Face models are not ready: {message}"
+        elif action_id in scope_actions and self._startup_face_ready is False:
+            return False, self._startup_face_message or "Face model readiness is still being checked."
+        return True, ""
+
+    def _apply_face_action_eligibility(self, control, action: str, **kwargs) -> bool:
+        """Apply the shared decision and retain a useful disabled explanation."""
+
+        allowed, reason = self._face_action_eligibility(action, **kwargs)
+        base_tooltip = control.property("faceEligibilityBaseToolTip")
+        if base_tooltip is None:
+            base_tooltip = control.toolTip() or ""
+            control.setProperty("faceEligibilityBaseToolTip", base_tooltip)
+        self._set_guarded_action_enabled(control, allowed)
+        def set_description(message: str) -> None:
+            accessible_setter = getattr(control, "setAccessibleDescription", None)
+            if callable(accessible_setter):
+                accessible_setter(message)
+                return
+            # QAction is not a QWidget and has no accessibility-description
+            # setter in PyQt6. Status/What's This text is exposed by the menu
+            # action and still gives keyboard and assistive users the reason.
+            control.setStatusTip(message)
+            control.setWhatsThis(message)
+
+        if allowed:
+            control.setToolTip(str(base_tooltip))
+            set_description(str(base_tooltip))
+        elif reason:
+            control.setToolTip(f"{base_tooltip}\n\n{reason}".strip())
+            set_description(reason)
+        return allowed
+
+    def _update_query_and_saved_search_actions(self) -> None:
+        """Refresh controls whose eligibility is driven by query/list state."""
+
+        for name, action in (
+            ("face_query_detect_button", "query_detect"),
+            ("saved_search_run_button", "saved_search_run"),
+            ("saved_search_rename_button", "saved_search_rename"),
+            ("saved_search_delete_button", "saved_search_delete"),
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                self._apply_face_action_eligibility(control, action)
+        if self._saved_search_job is not None:
+            for name in (
+                "saved_search_save_button",
+                "saved_search_run_button",
+                "saved_search_rename_button",
+                "saved_search_delete_button",
+            ):
+                control = getattr(self, name, None)
+                if control is not None:
+                    control.setEnabled(False)
+
+    def _require_face_action_eligibility(self, action: str, **kwargs) -> bool:
+        allowed, reason = self._face_action_eligibility(action, **kwargs)
+        if not allowed:
+            self.status_label.setText(reason)
+        return allowed
+
     def _face_result_group_refs(
         self,
         group: FaceResultGroup | None,
@@ -6130,14 +6713,40 @@ class SearchPane(QWidget):
         self._set_guarded_action_enabled(self.face_detected_remove_button, has_selection and not ignored_view)
         self._set_guarded_action_enabled(self.face_detected_jump_button, has_selection)
         self._set_guarded_action_enabled(self.face_detected_edit_button, has_selection)
-        self._set_guarded_action_enabled(self.face_detected_name_button, bool(searchable_selected) and not ignored_view)
-        self._set_guarded_action_enabled(self.face_detected_find_button, len(searchable_selected) == 1 and not ignored_view)
-        self._set_guarded_action_enabled(self.face_detected_cluster_selected_button, len(searchable_selected) >= 2 and not ignored_view)
-        has_visible = bool(
-            int(getattr(self, "_face_detected_visible_scope_ref_count", 0) or 0) > 1
-            or getattr(self.face_detected_faces_model, "rowCount", lambda: 0)() > 1
+        self._apply_face_action_eligibility(
+            self.face_detected_name_button,
+            "name",
+            indexed_refs=searchable_selected,
+            ignored_view=ignored_view,
         )
-        self._set_guarded_action_enabled(self.face_detected_cluster_visible_button, has_visible and not ignored_view)
+        can_find_similar = self._apply_face_action_eligibility(
+            self.face_detected_find_button,
+            "find_similar",
+            indexed_refs=searchable_selected,
+            ignored_view=ignored_view,
+        )
+        self._set_guarded_action_enabled(self.face_detected_find_button, can_find_similar and len(searchable_selected) == 1)
+        if can_find_similar and len(searchable_selected) != 1:
+            base_tooltip = str(self.face_detected_find_button.property("faceEligibilityBaseToolTip") or "")
+            self.face_detected_find_button.setToolTip(
+                f"{base_tooltip}\n\nSelect exactly one saved face for this toolbar action. "
+                "Use the face menu to search from multiple selected faces.".strip()
+            )
+        self._apply_face_action_eligibility(
+            self.face_detected_cluster_selected_button,
+            "cluster_selected",
+            indexed_refs=searchable_selected,
+            ignored_view=ignored_view,
+        )
+        self._apply_face_action_eligibility(
+            self.face_detected_cluster_visible_button,
+            "cluster_visible",
+            visible_ref_count=max(
+                int(getattr(self, "_face_detected_visible_scope_ref_count", 0) or 0),
+                int(getattr(self.face_detected_faces_model, "rowCount", lambda: 0)() or 0),
+            ),
+            ignored_view=ignored_view,
+        )
         candidate_refs = self._detected_unlabelled_arrangement_refs()
         can_arrange = (
             not bool(getattr(self, "_face_detected_publish_in_progress", False))
@@ -6145,11 +6754,27 @@ class SearchPane(QWidget):
             and str(getattr(self, "face_detected_label_filter_combo", None).currentData() or "all") not in {"named", "ignored"}
         )
         self._set_guarded_action_enabled(self.face_detected_arrange_button, can_arrange)
-        self._set_guarded_action_enabled(self.face_detected_ignore_button, bool(searchable_selected) and not ignored_view)
-        self._set_guarded_action_enabled(self.face_detected_restore_button, bool(searchable_selected) and ignored_view)
+        self._apply_face_action_eligibility(
+            self.face_detected_ignore_button,
+            "ignore",
+            indexed_refs=searchable_selected,
+            ignored_view=ignored_view,
+        )
+        self._apply_face_action_eligibility(
+            self.face_detected_restore_button,
+            "restore",
+            indexed_refs=searchable_selected,
+            ignored_view=ignored_view,
+        )
         self.face_detected_reset_arrangement_button.setEnabled(
             bool(getattr(self, "_face_detected_arrangement_active", False))
         )
+        overflow = getattr(self, "_detected_more_actions", ())
+        for action, button in overflow:
+            action.setEnabled(button.isEnabled())
+        menu_button = getattr(self, "face_detected_actions_menu_button", None)
+        if menu_button is not None:
+            menu_button.setEnabled(any(button.isEnabled() for _action, button in overflow))
 
     def _on_detected_face_label_filter_changed(self, _index: int) -> None:
         """Reapply the cached review so each face filter starts from the full scope."""
@@ -6174,11 +6799,11 @@ class SearchPane(QWidget):
             errorBox("No indexed faces selected", "Select one or more saved face tiles first.")
             return
         action_text = "Ignoring" if ignored else "Restoring"
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, f"{action_text} selected faces...")
             raise_if_cancelled(cancel_check)
-            service = self._active_face_service()
             method = getattr(service, "hide_faces" if ignored else "unhide_faces", None)
             if callable(method):
                 return int(method(refs) or 0)
@@ -6197,22 +6822,33 @@ class SearchPane(QWidget):
         self._start_job(f"{action_text} selected faces", _run, _done)
 
     def _ignore_selected_detected_faces(self) -> None:
+        refs = self._selected_detected_face_indexed_refs()
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("ignore", indexed_refs=refs, ignored_view=ignored_view):
+            return
         self._set_face_refs_ignored(
-            self._selected_detected_face_indexed_refs(),
+            refs,
             ignored=True,
             source_label="Detected Faces",
         )
 
     def _restore_selected_detected_faces(self) -> None:
+        refs = self._selected_detected_face_indexed_refs()
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("restore", indexed_refs=refs, ignored_view=ignored_view):
+            return
         self._set_face_refs_ignored(
-            self._selected_detected_face_indexed_refs(),
+            refs,
             ignored=False,
             source_label="Ignored Faces",
         )
 
     def _ignore_selected_face_results(self) -> None:
+        refs = self._selected_face_result_tiles()
+        if not self._require_face_action_eligibility("ignore", indexed_refs=refs):
+            return
         self._set_face_refs_ignored(
-            self._selected_face_result_tiles(),
+            refs,
             ignored=True,
             source_label="Grouped Photos",
         )
@@ -6224,14 +6860,23 @@ class SearchPane(QWidget):
         self._set_face_refs_ignored(refs, ignored=True, source_label="Selected Clusters")
 
     def _ignore_similar_detected_faces(self) -> None:
+        refs = self._selected_detected_face_indexed_refs()
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility(
+            "ignore_similar", indexed_refs=refs, ignored_view=ignored_view
+        ):
+            return
         self._ignore_similar_face_refs(
-            self._selected_detected_face_indexed_refs(),
+            refs,
             source_label="Detected Faces",
         )
 
     def _ignore_similar_face_results(self) -> None:
+        refs = self._selected_face_result_tiles()
+        if not self._require_face_action_eligibility("ignore_similar", indexed_refs=refs):
+            return
         self._ignore_similar_face_refs(
-            self._selected_face_result_tiles(),
+            refs,
             source_label="Grouped Photos",
         )
 
@@ -6373,19 +7018,22 @@ class SearchPane(QWidget):
         backend = str(backends[0] if backends else self._default_face_cluster_backend())
         backend_options = self.current_face_cluster_backend_options()
         outlier_policy = self.current_face_cluster_outlier_policy()
+        backend_label = self._face_cluster_backend_label(backend)
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(5, f"Preparing {len(refs)} unlabelled face(s) for similarity grouping…")
-            progress(-1, f"Grouping {len(refs)} unlabelled face(s) with {self._face_cluster_backend_label(backend)}…")
+            progress(-1, f"Grouping {len(refs)} unlabelled face(s) with {backend_label}…")
             result = _call_with_optional_cancel(
-                self._active_face_service().cluster_faces_compare,
+                service.cluster_faces_compare,
                 num_clusters=num_clusters,
                 min_face_score=configured_min_score,
                 backends=[backend],
                 outlier_policy=outlier_policy,
                 backend_options_by_backend={backend: dict(backend_options)} if backend_options else None,
                 face_refs=refs,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
             return (result, tuple(unlabelled_items), tuple(refs), selected_refs, label_filter, backend)
@@ -6469,6 +7117,7 @@ class SearchPane(QWidget):
         )
 
     def _on_detected_face_selection_changed(self) -> None:
+        self._face_similarity_request_id += 1
         self._update_detected_face_actions()
         if self._face_selection_sync_in_progress:
             return
@@ -6594,8 +7243,8 @@ class SearchPane(QWidget):
 
     def _name_detected_faces_from_context(self) -> None:
         refs = self._selected_detected_face_indexed_refs()
-        if not refs:
-            errorBox("No faces selected", "Select one or more saved face tiles in Detected Faces first.")
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("name", indexed_refs=refs, ignored_view=ignored_view):
             return
         person_name = self._resolve_detected_face_context_name(prompt=True)
         if not person_name:
@@ -6652,12 +7301,17 @@ class SearchPane(QWidget):
             ignore_similar_action.triggered.connect(self._ignore_similar_detected_faces)
             restore_action.triggered.connect(self._restore_selected_detected_faces)
             remove_action.triggered.connect(self._remove_selected_detected_face_tiles)
-            name_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
-            find_similar_action.setEnabled(bool(indexed_refs) and not ignored_view)
-            cluster_action.setEnabled(len(indexed_refs) >= 2 and not ignored_view)
-            ignore_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
-            ignore_similar_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
-            restore_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and ignored_view)
+            self._apply_face_action_eligibility(name_action, "name", indexed_refs=indexed_refs, ignored_view=ignored_view)
+            self._apply_face_action_eligibility(find_similar_action, "find_similar", indexed_refs=indexed_refs, ignored_view=ignored_view)
+            self._apply_face_action_eligibility(cluster_action, "cluster_selected", indexed_refs=indexed_refs, ignored_view=ignored_view)
+            self._apply_face_action_eligibility(ignore_action, "ignore", indexed_refs=indexed_refs, ignored_view=ignored_view)
+            self._apply_face_action_eligibility(
+                ignore_similar_action,
+                "ignore_similar",
+                indexed_refs=indexed_refs,
+                ignored_view=ignored_view,
+            )
+            self._apply_face_action_eligibility(restore_action, "restore", indexed_refs=indexed_refs, ignored_view=ignored_view)
             remove_action.setEnabled(not self._read_only_mode and not ignored_view)
             self._detected_faces_context_actions = {
                 "name": name_action,
@@ -6691,12 +7345,23 @@ class SearchPane(QWidget):
         jump_action.triggered.connect(self._jump_to_selected_detected_face)
         inspector_action.triggered.connect(self._open_selected_detected_face_in_inspector)
         remove_action.triggered.connect(self._remove_selected_detected_face_tiles)
-        find_similar_action.setEnabled(len(indexed_refs) == 1 and not ignored_view)
-        name_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
+        can_find_similar = self._apply_face_action_eligibility(
+            find_similar_action,
+            "find_similar",
+            indexed_refs=indexed_refs,
+            ignored_view=ignored_view,
+        )
+        find_similar_action.setEnabled(can_find_similar and len(indexed_refs) == 1)
+        self._apply_face_action_eligibility(name_action, "name", indexed_refs=indexed_refs, ignored_view=ignored_view)
         find_by_name_action.setEnabled(bool(any_selected) and not ignored_view)
-        ignore_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
-        ignore_similar_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and not ignored_view)
-        restore_action.setEnabled(bool(indexed_refs) and not self._read_only_mode and ignored_view)
+        self._apply_face_action_eligibility(ignore_action, "ignore", indexed_refs=indexed_refs, ignored_view=ignored_view)
+        self._apply_face_action_eligibility(
+            ignore_similar_action,
+            "ignore_similar",
+            indexed_refs=indexed_refs,
+            ignored_view=ignored_view,
+        )
+        self._apply_face_action_eligibility(restore_action, "restore", indexed_refs=indexed_refs, ignored_view=ignored_view)
         jump_action.setEnabled(bool(any_selected))
         inspector_action.setEnabled(bool(any_selected))
         remove_action.setEnabled(bool(any_selected) and not self._read_only_mode and not ignored_view)
@@ -6757,8 +7422,7 @@ class SearchPane(QWidget):
 
     def _name_face_results_from_prompt(self) -> None:
         refs = self._selected_face_result_tiles()
-        if not refs:
-            errorBox("No faces selected", "Select one or more saved face tiles in Grouped Photos first.")
+        if not self._require_face_action_eligibility("name", indexed_refs=refs):
             return
         selected_count = len(refs)
         title = "Name Selected Faces" if selected_count > 1 else "Name Face"
@@ -6783,6 +7447,10 @@ class SearchPane(QWidget):
             getattr(self, "face_results_model", None),
         )
         refs = self._selected_face_result_tiles()
+        similarity_scope_available = self._face_similarity_scope_available()
+        similarity_scope_hint = (
+            "Choose an active Root, or enable Search all indexed faces in Find options."
+        )
         if len(selected_items) > 1:
             name_action = menu.addAction("Name Selected Faces…")
             find_similar_action = menu.addAction("Find Similar to Selected Faces")
@@ -6793,14 +7461,17 @@ class SearchPane(QWidget):
             ignore_similar_action.setToolTip(
                 "Find faces similar to the selected tiles and hide only those matches. The selected tiles stay visible."
             )
+            if not similarity_scope_available:
+                find_similar_action.setToolTip(similarity_scope_hint)
+                ignore_similar_action.setToolTip(similarity_scope_hint)
             name_action.triggered.connect(self._name_face_results_from_prompt)
             find_similar_action.triggered.connect(self._search_selected_face_results)
             ignore_action.triggered.connect(self._ignore_selected_face_results)
             ignore_similar_action.triggered.connect(self._ignore_similar_face_results)
-            name_action.setEnabled(bool(refs) and not self._read_only_mode)
-            find_similar_action.setEnabled(bool(refs))
-            ignore_action.setEnabled(bool(refs) and not self._read_only_mode)
-            ignore_similar_action.setEnabled(bool(refs) and not self._read_only_mode)
+            self._apply_face_action_eligibility(name_action, "name", indexed_refs=refs)
+            self._apply_face_action_eligibility(find_similar_action, "find_similar", indexed_refs=refs)
+            self._apply_face_action_eligibility(ignore_action, "ignore", indexed_refs=refs)
+            self._apply_face_action_eligibility(ignore_similar_action, "ignore_similar", indexed_refs=refs)
             self._face_results_context_actions = {
                 "name": name_action,
                 "find_similar": find_similar_action,
@@ -6822,6 +7493,9 @@ class SearchPane(QWidget):
         ignore_similar_action.setToolTip(
             "Find faces similar to this tile and hide only those matches. This face stays visible."
         )
+        if not similarity_scope_available:
+            find_similar_action.setToolTip(similarity_scope_hint)
+            ignore_similar_action.setToolTip(similarity_scope_hint)
         ignore_similar_action.triggered.connect(self._ignore_similar_face_results)
         show_photo_action = menu.addAction("Show Photo")
         show_photo_action.setToolTip("Open the source photo for this face tile.")
@@ -6829,10 +7503,10 @@ class SearchPane(QWidget):
         inspector_action = menu.addAction("Open Inspector")
         inspector_action.setToolTip("Open the source photo in the inspector.")
         inspector_action.triggered.connect(self._open_selected_face_result_in_inspector)
-        name_action.setEnabled(bool(refs) and not self._read_only_mode)
-        find_similar_action.setEnabled(bool(refs))
-        ignore_action.setEnabled(bool(refs) and not self._read_only_mode)
-        ignore_similar_action.setEnabled(bool(refs) and not self._read_only_mode)
+        self._apply_face_action_eligibility(name_action, "name", indexed_refs=refs)
+        self._apply_face_action_eligibility(find_similar_action, "find_similar", indexed_refs=refs)
+        self._apply_face_action_eligibility(ignore_action, "ignore", indexed_refs=refs)
+        self._apply_face_action_eligibility(ignore_similar_action, "ignore_similar", indexed_refs=refs)
         show_photo_action.setEnabled(bool(refs))
         inspector_action.setEnabled(bool(refs))
         self._face_results_context_actions = {
@@ -7118,10 +7792,10 @@ class SearchPane(QWidget):
             return
         threshold = float(getattr(self, "face_library_label_threshold", self.face_label_threshold).value())
         cluster_count = len(raw_groups)
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Naming face regions in selected clusters..." if cluster_count > 1 else "Naming face regions in cluster...")
-            service = self._active_face_service()
             label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
             if callable(label_with_metadata):
                 return label_with_metadata(
@@ -7173,7 +7847,11 @@ class SearchPane(QWidget):
     def _update_face_result_actions(self) -> None:
         selected = self._selected_face_result_tiles()
         has_selection = bool(selected)
-        self._set_guarded_action_enabled(self.face_results_name_button, has_selection)
+        self._apply_face_action_eligibility(
+            self.face_results_name_button,
+            "name",
+            indexed_refs=selected,
+        )
         deep_refs = set(getattr(self, "_deep_name_review", {}).get("refs", set()) or set())
         deep_selected = any(ref in deep_refs for ref in selected)
         self._set_guarded_action_enabled(self.face_results_apply_deep_button, deep_selected)
@@ -7569,6 +8247,7 @@ class SearchPane(QWidget):
         self._face_detected_publish_target_image_count = 0
         self._face_detected_publish_in_progress = False
         self._face_detected_publish_append = False
+        self._face_detected_publish_paused = False
         if was_in_progress:
             self._log_face_event(
                 "detected_faces_publish_cancelled",
@@ -7576,6 +8255,21 @@ class SearchPane(QWidget):
                 processed_images=processed_images,
                 target_images=target_image_count,
             )
+
+    def _pause_detected_faces_publish(self) -> None:
+        """Pause a visible Faces build without discarding its virtual rows."""
+
+        if not self._face_detected_publish_in_progress:
+            return
+        self._face_detected_publish_timer.stop()
+        self._face_detected_publish_paused = True
+
+    def _invalidate_detected_faces_review(self) -> None:
+        self._cancel_detected_faces_publish()
+        self._face_detected_faces_cache_generation = -1
+        self._face_detected_face_items_by_image = {}
+        if hasattr(self, "face_detected_faces_model"):
+            self.face_detected_faces_model.set_items([])
 
     def _finalize_detected_faces_publish(self) -> None:
         if not hasattr(self, "face_detected_faces_model"):
@@ -7590,6 +8284,8 @@ class SearchPane(QWidget):
         self._face_detected_publish_target_image_count = 0
         self._face_detected_publish_in_progress = False
         self._face_detected_publish_append = False
+        self._face_detected_publish_paused = False
+        self._face_detected_faces_cache_generation = int(self._face_review_cache_generation)
         self._refresh_detected_faces_summary()
         self._update_detected_face_actions()
         self._schedule_detected_face_tile_loads()
@@ -7602,11 +8298,8 @@ class SearchPane(QWidget):
     def _flush_detected_faces_publish_batch(self) -> None:
         if not self._face_detected_publish_in_progress:
             return
-        if (
-            self.face_review_results_tabs.currentWidget() is not self.face_detected_faces_panel
-            and not self._face_review_stream_in_progress
-        ):
-            self._cancel_detected_faces_publish()
+        if self.face_review_results_tabs.currentWidget() is not self.face_detected_faces_panel:
+            self._pause_detected_faces_publish()
             return
         pending_review_images = list(self._face_detected_publish_pending_review_images or [])
         target_image_count = int(self._face_detected_publish_target_image_count or len(pending_review_images))
@@ -7643,7 +8336,6 @@ class SearchPane(QWidget):
             self.face_detected_faces_model.append_items(batch_items)
         self._face_detected_publish_total_faces = int(self.face_detected_faces_model.rowCount())
         self._refresh_detected_faces_summary()
-        self._update_detected_face_actions()
         if batch_items:
             self._schedule_detected_face_tile_loads()
         self._log_face_event(
@@ -7672,6 +8364,39 @@ class SearchPane(QWidget):
         self._face_detected_visible_scope_ref_count = self._count_detected_visible_scope_refs(
             list(self._face_review_images or [])
         )
+        if self._face_review_cache_in_progress:
+            self._pause_detected_faces_publish()
+            self.face_detected_faces_summary.setText(
+                "Preparing review data in the background. Open Faces after it is ready to load face tiles."
+            )
+            self._update_detected_face_actions()
+            return
+        if (
+            self.face_review_results_tabs.currentWidget() is not self.face_detected_faces_panel
+            and len(self._face_review_images) > FACE_REVIEW_LAZY_PUBLISH_THRESHOLD
+        ):
+            self._pause_detected_faces_publish()
+            self.face_detected_faces_summary.setText(
+                "Detected Faces is deferred. Open this tab to load face tiles from the prepared review data."
+            )
+            self._update_detected_face_actions()
+            return
+        if (
+            not force
+            and self._face_detected_publish_in_progress
+            and self._face_detected_publish_paused
+        ):
+            self._face_detected_publish_paused = False
+            self._flush_detected_faces_publish_batch()
+            return
+        if (
+            not force
+            and self._face_detected_faces_cache_generation == int(self._face_review_cache_generation)
+            and not self._face_detected_publish_in_progress
+        ):
+            self._refresh_detected_faces_summary()
+            self._schedule_detected_face_tile_loads()
+            return
         if append_review_images is not None:
             self._cancel_detected_faces_publish()
             pending_review_images = list(append_review_images or [])
@@ -7749,6 +8474,7 @@ class SearchPane(QWidget):
                     range(start_row, start_row + len(image_face_items))
                 )
         self.face_detected_faces_model.set_items(face_items)
+        self._face_detected_faces_cache_generation = int(self._face_review_cache_generation)
         self._refresh_detected_faces_summary()
         self._update_detected_face_actions()
         self._schedule_detected_face_tile_loads()
@@ -7983,6 +8709,66 @@ class SearchPane(QWidget):
                 self.tabs.setCurrentIndex(index)
                 return
 
+    def activate_people_section(self, section: str) -> None:
+        """Activate a shell-level People route without duplicate lazy loads.
+
+        A changed tab delegates loading to ``currentChanged``.  Re-entering
+        the current route explicitly ensures its cached view is available,
+        but does not republish an unchanged album.
+        """
+
+        target_section = normalize_people_face_route(section)
+        if not target_section:
+            return
+        target_index = self._people_section_tab_index(target_section)
+        if target_index < 0:
+            return
+        filter_changed = False
+        if target_section in {"all_faces", "unnamed"} and hasattr(self, "face_album_label_filter_combo"):
+            filter_id = "unlabeled" if target_section == "unnamed" else "all"
+            filter_index = self.face_album_label_filter_combo.findData(filter_id)
+            if filter_index >= 0 and filter_index != self.face_album_label_filter_combo.currentIndex():
+                self.face_album_label_filter_combo.blockSignals(True)
+                self.face_album_label_filter_combo.setCurrentIndex(filter_index)
+                self.face_album_label_filter_combo.blockSignals(False)
+                self._set_face_result_label_filter(filter_id)
+                filter_changed = True
+
+        if target_section in {"detect", "review_name"} and hasattr(self, "face_library_tabs"):
+            library_tab = 1 if target_section == "review_name" else 0
+            if self.face_library_tabs.currentIndex() != library_tab:
+                self.face_library_tabs.setCurrentIndex(library_tab)
+
+        tab_changed = self.tabs.currentIndex() != target_index
+        if tab_changed:
+            self.tabs.setCurrentIndex(target_index)
+        elif filter_changed:
+            self._on_face_album_label_filter_changed()
+        else:
+            self.ensure_current_faces_tab_loaded()
+        self._emit_people_section_changed()
+
+    def _people_section_tab_index(self, section: str) -> int:
+        """Return the internal tab index for a shell-level People route."""
+
+        target_section = normalize_people_face_route(section)
+        if not target_section:
+            return -1
+        target_is_find = target_section == "find"
+        target_is_detect = target_section in {"detect", "review_name"}
+        target_is_identities = target_section == "identities"
+        target_is_album = target_section in {"all_faces", "unnamed"}
+        for index in range(self.tabs.count()):
+            label = str(self.tabs.tabText(index) or "").strip().lower()
+            if (
+                (target_is_find and label == "face search")
+                or (target_is_identities and label == "identities")
+                or (target_is_detect and self._is_face_folder_tab_label(label))
+                or (target_is_album and self._is_all_faces_tab_label(label))
+            ):
+                return index
+        return -1
+
     def _show_all_faces_tab(self) -> None:
         for index in range(self.tabs.count()):
             try:
@@ -8028,27 +8814,21 @@ class SearchPane(QWidget):
         self,
         *,
         profiles: list[PersonProfile] | None = None,
+        duplicate_warnings: dict[str, tuple[tuple[str, float], ...]] | None = None,
         force_reload: bool = False,
     ) -> None:
         if not hasattr(self, "face_identity_list"):
             return
-        service = self._active_face_service()
         if force_reload:
             self._face_identity_prototype_request_id += 1
             self._face_identity_prototype_loading_name = ""
             self._face_identity_prototypes_by_name = {}
             self._face_identity_cover_ages_by_name = {}
-        if profiles is None or force_reload:
-            try:
-                profiles = service.load_person_profiles(limit=max(1, int(self.face_browser_limit.value() or 1)))
-            except Exception:
-                profiles = []
+        if profiles is None:
+            self._request_face_identity_refresh()
+            return
         self._face_profiles_by_name.update({str(profile.person_name): profile for profile in list(profiles or [])})
-        duplicate_warnings = getattr(service, "identity_duplicate_warnings", None)
-        try:
-            self._face_identity_duplicates = dict(duplicate_warnings() if callable(duplicate_warnings) else {})
-        except Exception:
-            self._face_identity_duplicates = {}
+        self._face_identity_duplicates = dict(duplicate_warnings or {})
         current_name = str(self._face_identity_selected_name or "").strip()
         entries: list[ListEntry] = []
         for profile in list(profiles or []):
@@ -8091,12 +8871,24 @@ class SearchPane(QWidget):
             progress(-1, "Loading saved identities...")
             if cancel_check():
                 raise Cancelled()
-            return service.load_person_profiles(limit=limit)
+            profiles = service.load_person_profiles(limit=limit)
+            raise_if_cancelled(cancel_check)
+            duplicate_loader = getattr(service, "identity_duplicate_warnings", None)
+            duplicates = duplicate_loader() if callable(duplicate_loader) else {}
+            raise_if_cancelled(cancel_check)
+            return profiles, duplicates
+
+        def _done(result) -> None:
+            profiles, duplicates = result
+            self._refresh_face_identities(
+                profiles=list(profiles or []),
+                duplicate_warnings=dict(duplicates or {}),
+            )
 
         self._start_job(
             "Loading saved identities",
             _run,
-            lambda profiles: self._refresh_face_identities(profiles=list(profiles or [])),
+            _done,
         )
 
     def _apply_face_identity_filters(self, *, preserve_name: str = "") -> None:
@@ -8138,6 +8930,7 @@ class SearchPane(QWidget):
             self.face_identity_summary.setText("Select a saved identity to inspect its prototype examples.")
             self.face_identity_duplicate_warning.setVisible(False)
             self.face_identity_prototype_model.set_items([])
+            self._update_face_identity_prototype_actions()
             return
         profile = self._face_profiles_by_name.get(person_name)
         if person_name in self._face_identity_prototypes_by_name:
@@ -8233,13 +9026,44 @@ class SearchPane(QWidget):
         faces = list(self._face_identity_prototypes_by_name.get(person_name, []))
         can_open = bool(faces)
         has_selected_faces = bool(self._selected_identity_prototype_refs())
-        self.face_identity_open_photo_button.setEnabled(has_selected_faces or can_open)
-        self.face_identity_open_inspector_button.setEnabled(has_selected_faces or can_open)
-        writable = not bool(self._read_only_mode)
+        primary_job_active = bool(getattr(self, "_primary_busy", False)) or getattr(
+            self, "_active_job", None
+        ) is not None
+        active_thread = getattr(self, "_active_thread", None)
+        try:
+            primary_job_active = primary_job_active or bool(
+                active_thread is not None and active_thread.isRunning()
+            )
+        except RuntimeError:
+            primary_job_active = True
+        self.face_identity_open_photo_button.setEnabled(
+            not primary_job_active and (has_selected_faces or can_open)
+        )
+        self.face_identity_open_inspector_button.setEnabled(
+            not primary_job_active and (has_selected_faces or can_open)
+        )
+        writable = not bool(self._read_only_mode) and not primary_job_active
         self.face_identity_remove_button.setEnabled(writable and has_selected_faces and len(faces) > 1)
         self.face_identity_pin_button.setEnabled(writable and has_selected_faces)
         self.face_identity_merge_button.setEnabled(writable and bool(person_name))
         self.face_identity_clear_button.setEnabled(writable and bool(person_name))
+
+    def _set_face_identity_disclosure_visible(
+        self,
+        toggle: QToolButton,
+        body: QWidget,
+        expanded: bool,
+    ) -> None:
+        self._set_expander_state(toggle, body, expanded)
+        if not expanded:
+            return
+        busy = bool(getattr(self, "_primary_busy", False)) or getattr(
+            self, "_active_job", None
+        ) is not None
+        for button in body.findChildren(QPushButton):
+            mutation_blocked = self._read_only_mode and bool(button.property("mutationAction"))
+            button.setEnabled(not busy and not mutation_blocked)
+        self._update_face_identity_prototype_actions()
 
     def _focus_selected_identity_prototype_photo(self) -> None:
         refs = self._selected_identity_prototype_refs()
@@ -8292,16 +9116,21 @@ class SearchPane(QWidget):
             self.status_label.setText("Example removal cancelled. No face data was changed.")
             return
         service = self._active_face_service()
-        try:
+
+        def _run(progress, cancel_check):
+            progress(-1, "Removing identity prototype examples…")
             for image_path, face_index in refs:
+                raise_if_cancelled(cancel_check)
                 service.remove_person_prototype_face(person_name, image_path, face_index)
-        except Exception as exc:
-            errorBox("Remove failed", str(exc))
-            return
-        self.refresh_face_library(refresh_people=True, reason="prototype face removed")
-        self._maybe_refresh_global_face_album(reason="prototype face removed")
-        self._refresh_face_identities(force_reload=True)
-        self._show_face_identities_tab()
+            return len(refs)
+
+        def _done(_changed: int) -> None:
+            self.refresh_face_library(refresh_people=True, reason="prototype face removed")
+            self._maybe_refresh_global_face_album(reason="prototype face removed")
+            self._refresh_face_identities(force_reload=True)
+            self._show_face_identities_tab()
+
+        self._start_job("Removing identity prototype examples", _run, _done)
 
     def _pin_selected_identity_prototype_face(self) -> None:
         if not self._ensure_writable_face_action("change the pinned identity example"):
@@ -8312,15 +9141,21 @@ class SearchPane(QWidget):
             errorBox("No prototype selected", "Select one prototype face first.")
             return
         image_path, face_index = refs[0]
-        try:
-            self._active_face_service().pin_person_prototype_face(person_name, image_path, face_index)
-        except Exception as exc:
-            errorBox("Pin failed", str(exc))
-            return
-        self.refresh_face_library(refresh_people=True, reason="prototype face pinned")
-        self._maybe_refresh_global_face_album(reason="prototype face pinned")
-        self._refresh_face_identities(force_reload=True)
-        self._show_face_identities_tab()
+        service = self._active_face_service()
+
+        def _run(progress, cancel_check):
+            progress(-1, "Pinning identity prototype example…")
+            raise_if_cancelled(cancel_check)
+            service.pin_person_prototype_face(person_name, image_path, face_index)
+            return None
+
+        def _done(_result) -> None:
+            self.refresh_face_library(refresh_people=True, reason="prototype face pinned")
+            self._maybe_refresh_global_face_album(reason="prototype face pinned")
+            self._refresh_face_identities(force_reload=True)
+            self._show_face_identities_tab()
+
+        self._start_job("Pinning identity prototype example", _run, _done)
 
     def _merge_selected_identity_into_target(self) -> None:
         if not self._ensure_writable_face_action("merge saved identities"):
@@ -8333,31 +9168,45 @@ class SearchPane(QWidget):
         if source == target:
             errorBox("Invalid merge", "The source identity and target identity must be different.")
             return
-        label_counts = getattr(self._active_face_service(), "label_counts", None)
-        affected = int((label_counts() if callable(label_counts) else {}).get(source, 0))
-        if not confirmBox(
-            "Merge saved identities?",
-            (
-                f"Target: {source} → {target}\n"
-                f"Affected face labels: {affected}\n"
-                "Result: the source identity is removed and its labels move to the target.\n"
-                "Recovery: this merge is not automatically recoverable."
-            ),
-            parent=self,
-        ):
-            self.status_label.setText("Identity merge cancelled. No face data was changed.")
-            return
-        try:
-            self._active_face_service().merge_person_identities(source, target)
-        except Exception as exc:
-            errorBox("Merge failed", str(exc))
-            return
-        self.face_identity_merge_target.clear()
-        self.refresh_face_library(refresh_people=True, reason="identities merged from identities tab")
-        self._maybe_refresh_global_face_album(reason="identities merged from identities tab")
-        self._refresh_face_identities(force_reload=True)
-        self.face_labels_changed.emit()
-        self._show_face_identities_tab()
+        service = self._active_face_service()
+
+        def _count(progress, cancel_check):
+            progress(-1, "Counting identity labels…")
+            raise_if_cancelled(cancel_check)
+            label_counts = getattr(service, "label_counts", None)
+            return int((label_counts() if callable(label_counts) else {}).get(source, 0))
+
+        def _count_done(affected: int) -> None:
+            if not confirmBox(
+                "Merge saved identities?",
+                (
+                    f"Target: {source} → {target}\n"
+                    f"Affected face labels: {int(affected)}\n"
+                    "Result: the source identity is removed and its labels move to the target.\n"
+                    "Recovery: this merge is not automatically recoverable."
+                ),
+                parent=self,
+            ):
+                self.status_label.setText("Identity merge cancelled. No face data was changed.")
+                return
+
+            def _write(progress, cancel_check):
+                progress(-1, "Merging saved identities…")
+                raise_if_cancelled(cancel_check)
+                service.merge_person_identities(source, target)
+                return None
+
+            def _done(_result) -> None:
+                self.face_identity_merge_target.clear()
+                self.refresh_face_library(refresh_people=True, reason="identities merged from identities tab")
+                self._maybe_refresh_global_face_album(reason="identities merged from identities tab")
+                self._refresh_face_identities(force_reload=True)
+                self.face_labels_changed.emit()
+                self._show_face_identities_tab()
+
+            self._start_job("Merging saved identities", _write, _done)
+
+        self._start_job("Preparing identity merge", _count, _count_done)
 
     def _clear_selected_identity_labels(self) -> None:
         if not self._ensure_writable_face_action("remove a saved identity name"):
@@ -8366,30 +9215,44 @@ class SearchPane(QWidget):
         if not person_name:
             errorBox("No identity selected", "Select an identity first.")
             return
-        label_counts = getattr(self._active_face_service(), "label_counts", None)
-        affected = int((label_counts() if callable(label_counts) else {}).get(person_name, 0))
-        if not confirmBox(
-            "Remove identity name?",
-            (
-                f"Target: {person_name}\n"
-                f"Affected face labels: {affected}\n"
-                "Result: the faces become unnamed; source photos remain unchanged.\n"
-                "Recovery: this action is not automatically recoverable."
-            ),
-            parent=self,
-        ):
-            self.status_label.setText("Remove name cancelled. No face data was changed.")
-            return
-        try:
-            self._active_face_service().clear_person_labels(person_name)
-        except Exception as exc:
-            errorBox("Clear failed", str(exc))
-            return
-        self.refresh_face_library(refresh_people=True, reason="identity labels cleared from identities tab")
-        self._maybe_refresh_global_face_album(reason="identity labels cleared from identities tab")
-        self._refresh_face_identities(force_reload=True)
-        self.face_labels_changed.emit()
-        self._show_face_identities_tab()
+        service = self._active_face_service()
+
+        def _count(progress, cancel_check):
+            progress(-1, "Counting identity labels…")
+            raise_if_cancelled(cancel_check)
+            label_counts = getattr(service, "label_counts", None)
+            return int((label_counts() if callable(label_counts) else {}).get(person_name, 0))
+
+        def _count_done(affected: int) -> None:
+            if not confirmBox(
+                "Remove identity name?",
+                (
+                    f"Target: {person_name}\n"
+                    f"Affected face labels: {int(affected)}\n"
+                    "Result: the faces become unnamed; source photos remain unchanged.\n"
+                    "Recovery: this action is not automatically recoverable."
+                ),
+                parent=self,
+            ):
+                self.status_label.setText("Remove name cancelled. No face data was changed.")
+                return
+
+            def _write(progress, cancel_check):
+                progress(-1, "Removing identity name…")
+                raise_if_cancelled(cancel_check)
+                service.clear_person_labels(person_name)
+                return None
+
+            def _done(_result) -> None:
+                self.refresh_face_library(refresh_people=True, reason="identity labels cleared from identities tab")
+                self._maybe_refresh_global_face_album(reason="identity labels cleared from identities tab")
+                self._refresh_face_identities(force_reload=True)
+                self.face_labels_changed.emit()
+                self._show_face_identities_tab()
+
+            self._start_job("Removing identity name", _write, _done)
+
+        self._start_job("Preparing identity name removal", _count, _count_done)
 
     def _current_face_identity_name(self) -> str:
         for widget_name in ("face_label_name", "face_find_name_query", "person_name", "face_name_query"):
@@ -8515,11 +9378,11 @@ class SearchPane(QWidget):
             errorBox("Missing name", "Enter the identity name first, then run Name Selected again.")
             return
         threshold = float(getattr(self, "face_library_label_threshold", self.face_label_threshold).value())
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Saving selected face-region label...")
             _ = cancel_check
-            service = self._active_face_service()
             label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
             if callable(label_with_metadata):
                 return label_with_metadata(
@@ -8571,7 +9434,11 @@ class SearchPane(QWidget):
         self._start_job("Saving selected face label", _run, _done)
 
     def _prepare_name_selected_detected_faces(self) -> None:
-        self._save_face_refs_name(self._selected_detected_face_indexed_refs(), source_label="Detected Faces")
+        refs = self._selected_detected_face_indexed_refs()
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("name", indexed_refs=refs, ignored_view=ignored_view):
+            return
+        self._save_face_refs_name(refs, source_label="Detected Faces")
 
     def _prepare_name_selected_face_results(self) -> None:
         self._name_face_results_from_prompt()
@@ -8621,24 +9488,18 @@ class SearchPane(QWidget):
         job = self._face_result_filter_job
         thread = self._face_result_filter_thread
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         self._face_result_filter_job = None
         self._face_result_filter_thread = None
         _ = thread
 
     def _on_face_result_filter_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_result_filter_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_result_filter_refs = retained
-        if thread is self._face_result_filter_thread:
-            self._face_result_filter_thread = None
-            self._face_result_filter_job = None
+        self._defer_face_worker_release(
+            "_retained_face_result_filter_refs",
+            thread,
+            "_face_result_filter_job",
+            "_face_result_filter_thread",
+        )
 
     def _start_face_result_filter_job(self) -> None:
         if self._face_result_filter_timer.isActive():
@@ -8702,13 +9563,24 @@ class SearchPane(QWidget):
         job.failed.connect(_failed)
         job.completed.connect(_completed)
         self._face_result_filter_job = job
-        thread = start_job_in_thread(job)
-        self._face_result_filter_thread = thread
-        self._retained_face_result_filter_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_result_filter_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._face_result_filter_thread = thread
+            self._retained_face_result_filter_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_result_filter_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        job.cancelled.connect(
+            lambda: setattr(self, "_face_result_filter_job", None)
+            if thread_holder["thread"] is None and self._face_result_filter_job is job
+            else None
         )
+        self._submit_job(job, "Filtering face results", _launch, foreground=False)
 
     @staticmethod
     def _face_result_saved_ref_worker(item: FaceTileItem) -> tuple[str, int] | None:
@@ -9667,28 +10539,38 @@ class SearchPane(QWidget):
 
     def _search_face_ref(self, image_path: str, face_index: int, *, source_label: str) -> None:
         folder = self.face_name_folder_filter.text().strip() if hasattr(self, "face_name_folder_filter") else ""
-        scope_roots = self._current_scope_roots()
-        scope_paths = self._current_scope_paths()
-        if not folder and self.search_only_current_folder.isChecked():
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
+        if scope_roots is not None and not folder and self.search_only_current_folder.isChecked():
             folder = self._current_directory()
         effective_min_score = self._effective_face_search_min_score(float(self.face_browser_min_score.value()))
+        service = self._active_face_service()
+        top_k = int(self.face_browser_top_k.value())
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        self._face_similarity_request_id += 1
+        request_id = int(self._face_similarity_request_id)
 
         def _run(progress, cancel_check):
             progress(-1, "Searching selected face...")
             return _call_with_optional_cancel(
-                self._active_face_service().search_similar_face,
+                service.search_similar_face,
                 str(image_path),
                 int(face_index),
-                top_k=int(self.face_browser_top_k.value()),
+                top_k=top_k,
                 min_score=effective_min_score,
                 folder_prefix=folder,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
 
         def _done(results) -> None:
+            if request_id != int(self._face_similarity_request_id):
+                self._log_face_event("selected_face_search_discarded", request_id=request_id)
+                return
             self.status_label.setText(f"Found {len(results)} matches for the selected face.")
             self._show_face_match_results(
                 list(results or []),
@@ -9701,15 +10583,14 @@ class SearchPane(QWidget):
 
     def _search_selected_detected_face(self) -> None:
         refs = self._selected_detected_face_indexed_refs()
-        if not refs:
-            errorBox("No faces selected", "Select one or more saved face tiles in Detected Faces first.")
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("find_similar", indexed_refs=refs, ignored_view=ignored_view):
             return
         self._search_face_refs(refs, source_label="Detected Faces")
 
     def _search_selected_face_results(self) -> None:
         refs = self._selected_face_result_tiles()
-        if not refs:
-            errorBox("No faces selected", "Select one or more saved face tiles in Grouped Photos first.")
+        if not self._require_face_action_eligibility("find_similar", indexed_refs=refs):
             return
         self._search_face_refs(refs, source_label="Grouped Photos")
 
@@ -9724,18 +10605,20 @@ class SearchPane(QWidget):
         backend = str(backends[0] if backends else self._default_face_cluster_backend())
         backend_options = self.current_face_cluster_backend_options()
         outlier_policy = self.current_face_cluster_outlier_policy()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Clustering faces...")
             return _call_with_optional_cancel(
-                self._active_face_service().cluster_faces_compare,
+                service.cluster_faces_compare,
                 num_clusters=num_clusters,
                 min_face_score=min_score,
                 backends=backends,
                 outlier_policy=outlier_policy,
                 backend_options_by_backend={str(item): dict(backend_options) for item in backends if backend_options},
                 face_refs=refs,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
 
@@ -9756,7 +10639,11 @@ class SearchPane(QWidget):
         self._start_job("Clustering faces", _run, _done)
 
     def _cluster_selected_detected_faces(self) -> None:
-        self._cluster_face_refs(self._selected_detected_face_indexed_refs(), source_label="Detected Faces selection")
+        refs = self._selected_detected_face_indexed_refs()
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility("cluster_selected", indexed_refs=refs, ignored_view=ignored_view):
+            return
+        self._cluster_face_refs(refs, source_label="Detected Faces selection")
 
     def _cluster_visible_detected_faces(self) -> None:
         refs: list[tuple[str, int]] = []
@@ -9765,6 +10652,11 @@ class SearchPane(QWidget):
                 continue
             for record in tuple(item.visible_faces or ()):
                 refs.append((str(record.image_path), int(record.face_index)))
+        ignored_view = str(self.face_detected_label_filter_combo.currentData() or "all") == "ignored"
+        if not self._require_face_action_eligibility(
+            "cluster_visible", visible_ref_count=len(refs), ignored_view=ignored_view
+        ):
+            return
         self._cluster_face_refs(refs, source_label="Detected Faces visible scope")
 
     def _jump_to_selected_face_result(self) -> None:
@@ -9819,10 +10711,10 @@ class SearchPane(QWidget):
         if not refs:
             errorBox("No faces selected", "The current merged group does not include saved face regions.")
             return
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             _ = (progress, cancel_check)
-            service = self._active_face_service()
             label_with_metadata = getattr(service, "label_indexed_faces_with_metadata", None)
             if callable(label_with_metadata):
                 return label_with_metadata(resolved_name, refs, source="metadata_region_sync")
@@ -10011,7 +10903,7 @@ class SearchPane(QWidget):
     def _export_face_cluster_results(self) -> None:
         groups = [group for group in list(self._face_result_source_groups or []) if str(group.comparison_key or "").strip() or int(group.cluster_id) >= 0]
         if not groups:
-            errorBox("No cluster results", "Run clustering first, then export the current cluster result set.")
+            errorBox("No organization results", "Organize photos first, then export the current result groups.")
             return
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Face Cluster Results", "", "JSON Files (*.json)")
         if not out_path:
@@ -10054,6 +10946,7 @@ class SearchPane(QWidget):
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Face Identities", "", "JSON Files (*.json)")
         if not out_path:
             return
+        profile_limit = max(1, int(getattr(self, "face_browser_limit", self.face_name_top_k).value()))
 
         def _run(progress, cancel_check):
             progress(-1, "Collecting saved identities…")
@@ -10064,7 +10957,7 @@ class SearchPane(QWidget):
                 raise_if_cancelled(cancel_check)
                 Path(out_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
                 return len(payload.get("identities", []) or [])
-            profiles = list(service.load_person_profiles(limit=max(1, int(getattr(self, "face_browser_limit", self.face_name_top_k).value()))))
+            profiles = list(service.load_person_profiles(limit=profile_limit))
             identities = []
             prototype_loader = getattr(service, "load_person_prototype_faces", lambda *_args, **_kwargs: [])
             for profile in profiles:
@@ -10229,12 +11122,17 @@ class SearchPane(QWidget):
         ):
             self.status_label.setText("Recognition change cancelled. No settings were changed.")
             return
-        try:
+        def _run(progress, cancel_check):
+            progress(-1, "Updating face recognition state…")
+            raise_if_cancelled(cancel_check)
             set_enabled_fn(bool(enabled))
-            state = "enabled" if bool(enabled) else "disabled"
+            return bool(enabled)
+
+        def _done(result) -> None:
+            state = "enabled" if bool(result) else "disabled"
             self.status_label.setText(f"Face recognition {state} for the saved face library.")
-        except Exception as exc:
-            errorBox("Face recognition setting failed", str(exc))
+
+        self._start_job("Updating face recognition", _run, _done)
 
     def _purge_face_data(self) -> None:
         if not self._ensure_writable_face_action("purge face data"):
@@ -10244,40 +11142,48 @@ class SearchPane(QWidget):
         if not callable(purge_fn):
             errorBox("Purge unavailable", "The active face service does not support full face-data purge.")
             return
-        report = {}
         prepare_fn = getattr(service, "prepare_face_data_purge", None)
-        if callable(prepare_fn):
-            try:
-                report = dict(prepare_fn() or {})
-            except Exception:
-                report = {}
-        table_counts = dict(report.get("table_counts", {}) or {})
-        row_count = sum(int(value or 0) for value in table_counts.values())
-        ann_files = list(report.get("ann_files", []) or [])
-        model_targets = list(report.get("model_cache_targets", []) or [])
-        if not confirmBox(
-            "Purge face data?",
-            (
-                "Delete stored face data for the active Faces mode?\n\n"
-                f"Rows: {row_count}\n"
-                f"ANN files: {len(ann_files)}\n"
-                f"Model cache targets: {len(model_targets)}\n\n"
-                "Source image files are not deleted."
-            ),
-            parent=self,
-        ):
-            self.status_label.setText("Face-data purge cancelled. No face data was changed.")
-            return
-        typed, accepted = QInputDialog.getText(
-            self,
-            "Confirm complete face-data purge",
-            "Type PURGE to permanently remove the listed face data:",
-        )
-        if not accepted or str(typed).strip() != "PURGE":
-            self.status_label.setText("Face-data purge cancelled. Type PURGE exactly to continue.")
-            return
-        try:
-            result = dict(purge_fn(confirm=True) or {})
+
+        def _prepare(progress, cancel_check):
+            progress(-1, "Inspecting managed face data…")
+            raise_if_cancelled(cancel_check)
+            return dict(prepare_fn() or {}) if callable(prepare_fn) else {}
+
+        def _confirm_and_start(report) -> None:
+            table_counts = dict(report.get("table_counts", {}) or {})
+            row_count = sum(int(value or 0) for value in table_counts.values())
+            ann_files = list(report.get("ann_files", []) or [])
+            model_targets = list(report.get("model_cache_targets", []) or [])
+            if not confirmBox(
+                "Purge face data?",
+                (
+                    "Delete stored face data for the active Faces mode?\n\n"
+                    f"Rows: {row_count}\n"
+                    f"ANN files: {len(ann_files)}\n"
+                    f"Model cache targets: {len(model_targets)}\n\n"
+                    "Source image files are not deleted."
+                ),
+                parent=self,
+            ):
+                self.status_label.setText("Face-data purge cancelled. No face data was changed.")
+                return
+            typed, accepted = QInputDialog.getText(
+                self,
+                "Confirm complete face-data purge",
+                "Type PURGE to permanently remove the listed face data:",
+            )
+            if not accepted or str(typed).strip() != "PURGE":
+                self.status_label.setText("Face-data purge cancelled. Type PURGE exactly to continue.")
+                return
+
+            def _purge(progress, cancel_check):
+                progress(-1, "Purging managed face data…")
+                raise_if_cancelled(cancel_check)
+                return dict(purge_fn(confirm=True) or {})
+
+            self._start_job("Purging face data", _purge, _purge_done)
+
+        def _purge_done(result) -> None:
             removed_ann = len(list(result.get("removed_ann_files", []) or []))
             removed_models = len(list(result.get("removed_model_cache_targets", []) or []))
             self._face_review_by_path.clear()
@@ -10291,8 +11197,8 @@ class SearchPane(QWidget):
             self.status_label.setText(
                 f"Purged face data. Removed {removed_ann} ANN file(s) and {removed_models} model cache target(s)."
             )
-        except Exception as exc:
-            errorBox("Purge failed", str(exc))
+
+        self._start_job("Inspecting face data purge", _prepare, _confirm_and_start)
 
     def _apply_results_view(self) -> None:
         if getattr(self, "_results_kind", "none") != "similarity":
@@ -10405,6 +11311,10 @@ class SearchPane(QWidget):
         append_qt_diagnostic(f"[FacePane] {message}")
 
     def refresh_face_library(self, *, refresh_people: bool = True, reason: str = "") -> None:
+        if not self.is_face_folder_tab_active():
+            self._face_review_stale = True
+            self._log_face_event("review_refresh_deferred", reason=str(reason or "unspecified"))
+            return
         self._request_face_library_refresh(
             refresh_people=bool(refresh_people),
             reason=str(reason or "unspecified"),
@@ -10412,6 +11322,11 @@ class SearchPane(QWidget):
         )
 
     def refresh_face_album(self, *, reason: str = "", force_refresh: bool = False) -> None:
+        if not self.is_all_faces_tab_active():
+            self._face_album_loaded_key = None
+            self._face_album_published_key = None
+            self._log_face_event("album_refresh_deferred", reason=str(reason or "unspecified"))
+            return
         self._request_face_album_refresh(
             reason=str(reason or "unspecified"),
             force_refresh=bool(force_refresh),
@@ -10422,7 +11337,12 @@ class SearchPane(QWidget):
             return
         if self._current_face_scope_key() != "global":
             return
-        self.refresh_face_album(reason=reason, force_refresh=force_refresh)
+        if self.is_all_faces_tab_active():
+            self.refresh_face_album(reason=reason, force_refresh=force_refresh)
+            return
+        self._face_album_loaded_key = None
+        self._face_album_published_key = None
+        self._log_face_event("album_refresh_deferred", reason=reason)
 
     def _current_face_album_label_filter(self) -> str:
         combo = getattr(self, "face_album_label_filter_combo", None)
@@ -10437,10 +11357,46 @@ class SearchPane(QWidget):
         if mode == "named":
             return ("named",)
         if mode == "unlabeled":
-            # A proposal is not a durable person name yet, so it belongs with
-            # unlabelled faces until the user accepts it.
-            return ("unlabeled", "pending")
-        return None
+            return ("unlabeled",)
+        # Pending proposals and ignored regions are Review work.  Keeping
+        # them out of the album avoids showing the same durable face in two
+        # apparently contradictory People sections.
+        return ("named", "unlabeled")
+
+    def _face_album_cache_key(
+        self,
+        *,
+        include_tiny_faces: bool | None = None,
+        label_filter: str | None = None,
+    ) -> tuple[object, ...]:
+        service = self._global_face_service()
+        return (
+            str(getattr(service, "db_path", "") or id(service)),
+            tuple(self._current_scope_roots()),
+            bool(self._show_tiny_detections_enabled() if include_tiny_faces is None else include_tiny_faces),
+            str(label_filter or self._current_face_album_label_filter()),
+            int(self._face_data_generation),
+        )
+
+    def _invalidate_face_data(self, *, reason: str, refresh_active: bool = True) -> None:
+        """Invalidate cached face views after a durable mutation.
+
+        Only the visible People surface is refreshed now.  The remaining
+        surface stays marked stale and is refreshed when the user opens it.
+        """
+
+        self._face_data_generation += 1
+        self._face_album_loaded_key = None
+        self._face_album_published_key = None
+        self._face_review_stale = True
+        self._invalidate_face_review_source()
+        self._log_face_event("face_data_invalidated", reason=reason, generation=self._face_data_generation)
+        if not refresh_active:
+            return
+        if self.is_all_faces_tab_active():
+            self.refresh_face_album(reason=reason, force_refresh=True)
+        elif self.is_face_folder_tab_active():
+            self.refresh_face_library(reason=reason)
 
     @staticmethod
     def _face_album_label_filter_text(label_filter: str) -> str:
@@ -10463,6 +11419,7 @@ class SearchPane(QWidget):
     def _on_face_album_label_filter_changed(self) -> None:
         label_filter = self._current_face_album_label_filter()
         self._set_face_result_label_filter(label_filter)
+        self._emit_people_section_changed()
         self.refresh_face_album(
             reason=f"All Faces filter: {self._face_album_label_filter_text(label_filter)}",
             force_refresh=True,
@@ -10634,12 +11591,27 @@ class SearchPane(QWidget):
         group_kinds = self._face_album_group_kinds_for_label_filter(label_filter)
         label_filter_text = self._face_album_label_filter_text(label_filter)
         scope_roots = self._current_scope_roots()
+        cache_key = self._face_album_cache_key(
+            include_tiny_faces=include_tiny_faces,
+            label_filter=label_filter,
+        )
+        if self._face_album_refresh_in_progress and self._face_album_refresh_key == cache_key:
+            self._log_face_event("album_refresh_coalesced", reason=pending_reason)
+            return
+        if (
+            not force_refresh
+            and self._face_album_loaded
+            and self._face_album_loaded_key == cache_key
+        ):
+            self._log_face_event("album_refresh_cache_hit", reason=pending_reason)
+            return
         self._cancel_face_album_member_stream(replaced=True)
         self._face_album_request_id += 1
         request_id = int(self._face_album_request_id)
         self._face_album_refresh_in_progress = True
+        self._face_album_refresh_key = cache_key
         self._cancel_face_album_refresh_job(replaced=True)
-        self._log_face_event("album_refresh_requested", reason=pending_reason, request_id=request_id)
+        self._log_face_event("album_refresh_requested", reason=pending_reason, request_id=request_id, cache_key=cache_key)
         service = self._global_face_service()
         recovery_database_key = str(getattr(service, "db_path", "") or id(service))
         recover_manual_labels = recovery_database_key not in self._legacy_manual_label_recovery_db_paths
@@ -10653,8 +11625,36 @@ class SearchPane(QWidget):
                 recovery = recovery_fn()
             if cancel_check():
                 raise Cancelled()
+            initial_page_loader = getattr(service, "load_face_album_initial_page", None)
             group_page_loader = getattr(service, "load_face_album_group_page", None)
             member_page_loader = getattr(service, "load_face_album_member_page", None)
+            if callable(initial_page_loader):
+                initial_page = _call_with_optional_cancel(
+                    initial_page_loader,
+                    group_limit=100,
+                    member_limit=FACE_PROGRESSIVE_PAGE_SIZE,
+                    include_tiny_faces=include_tiny_faces,
+                    scope_roots=scope_roots,
+                    group_kinds=group_kinds,
+                    cancel_check=cancel_check,
+                )
+                if not isinstance(initial_page, FaceAlbumInitialPage):
+                    raise ValueError("Face album initial-page loader returned an invalid result.")
+                group_page = initial_page.groups
+                member_page = initial_page.members
+                if cancel_check():
+                    raise Cancelled()
+                return {
+                    "request_id": request_id,
+                    "reason": pending_reason,
+                    "include_tiny_faces": bool(include_tiny_faces),
+                    "label_filter": label_filter,
+                    "groups": list(group_page.items),
+                    "members": list(member_page.items if member_page is not None else ()),
+                    "group_page": group_page,
+                    "member_page": member_page,
+                    "manual_label_recovery": recovery,
+                }
             if callable(group_page_loader) and callable(member_page_loader):
                 group_page_kwargs = {
                     "offset": 0,
@@ -10728,9 +11728,10 @@ class SearchPane(QWidget):
 
         job = AsyncJob(_run)
         album_job_id: int | None = None
-        if self.job_manager is not None:
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
             album_job_id = self.job_manager.register_job(
-                "All Faces refresh", cancel_fn=job.cancel, origin="Faces", foreground=False
+                "All Faces refresh", cancel_fn=job.cancel, origin="People", foreground=False
             )
             self._face_album_refresh_job_id = album_job_id
             job.progress.connect(
@@ -10743,7 +11744,7 @@ class SearchPane(QWidget):
         job.progress.connect(lambda _value, text: self.status_label.setText(str(text)))
 
         def _finish_job(status: str, error: str = "") -> None:
-            if self.job_manager is not None and album_job_id is not None:
+            if self.job_manager is not None and album_job_id is not None and not coordinated:
                 self.job_manager.finish(album_job_id, status=status, error=error)
             if self._face_album_refresh_job_id == album_job_id:
                 self._face_album_refresh_job_id = None
@@ -10787,13 +11788,25 @@ class SearchPane(QWidget):
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
         self._face_album_refresh_job = job
-        thread = start_job_in_thread(job)
-        self._face_album_refresh_thread = thread
-        self._retained_face_album_refresh_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_album_refresh_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._face_album_refresh_thread = thread
+            self._retained_face_album_refresh_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_album_refresh_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        if coordinated:
+            album_job_id = self._submit_job(job, "All Faces refresh", _launch, foreground=False)
+            state = self.job_manager.get(album_job_id) if self.job_manager is not None and album_job_id is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._face_album_refresh_job_id = album_job_id
+        else:
+            _launch(False)
 
     def _cancel_face_album_refresh_job(self, *, replaced: bool = False) -> None:
         job = self._face_album_refresh_job
@@ -10801,32 +11814,44 @@ class SearchPane(QWidget):
         if job is None and thread is None:
             return
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         if replaced:
             self._log_face_event("album_refresh_replaced", request_id=self._face_album_request_id)
         self._face_album_refresh_job = None
         self._face_album_refresh_thread = None
 
     def _on_face_album_refresh_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_album_refresh_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_album_refresh_refs = retained
-        if thread is self._face_album_refresh_thread:
-            self._face_album_refresh_thread = None
-            self._face_album_refresh_job = None
+        self._defer_face_worker_release(
+            "_retained_face_album_refresh_refs",
+            thread,
+            "_face_album_refresh_job",
+            "_face_album_refresh_thread",
+        )
 
     def _apply_face_album_snapshot(self, snapshot: dict[str, object]) -> None:
-        self._face_album_groups = list(snapshot.get("groups", []) or [])
-        self._face_album_records = list(snapshot.get("members", []) or [])
+        label_filter = str(snapshot.get("label_filter", self._current_face_album_label_filter()) or "all")
+        allowed_kinds = set(self._face_album_group_kinds_for_label_filter(label_filter) or ())
+        raw_groups = list(snapshot.get("groups", []) or [])
+        # Compatibility adapters may predate the Review-only pending policy.
+        # Enforce the visible album contract at the UI boundary as well as in
+        # the SQLite service so stale/pending proposals cannot leak back into
+        # Unnamed/All Faces during a mixed-version session.
+        self._face_album_groups = [
+            group for group in raw_groups
+            if not allowed_kinds or str(getattr(group, "group_kind", "")).strip().lower() in allowed_kinds
+        ]
+        allowed_group_ids = {str(getattr(group, "group_id", "")) for group in self._face_album_groups}
+        self._face_album_records = [
+            record for record in list(snapshot.get("members", []) or [])
+            if (
+                not allowed_kinds
+                or str(getattr(record, "group_kind", "")).strip().lower() in allowed_kinds
+            ) and str(getattr(record, "group_id", "")) in allowed_group_ids
+        ]
         group_page = snapshot.get("group_page")
         member_page = snapshot.get("member_page")
-        if isinstance(group_page, FaceAlbumGroupPage):
+        filtered_legacy_groups = len(self._face_album_groups) != len(raw_groups)
+        if isinstance(group_page, FaceAlbumGroupPage) and not filtered_legacy_groups:
             self._face_album_total_groups = int(group_page.total_count)
             self._face_album_next_group_offset = group_page.next_offset
         else:
@@ -10847,6 +11872,11 @@ class SearchPane(QWidget):
                 self._face_album_member_next_offsets[group_id] = None
                 self._face_album_member_totals[group_id] = int(group.face_count)
         self._face_album_loaded = True
+        self._face_album_loaded_key = self._face_album_cache_key(
+            include_tiny_faces=bool(snapshot.get("include_tiny_faces", self._show_tiny_detections_enabled())),
+            label_filter=str(snapshot.get("label_filter", self._current_face_album_label_filter()) or "all"),
+        )
+        self._face_album_published_key = None
         named_groups = [group for group in self._face_album_groups if str(getattr(group, "group_kind", "")) == "named"]
         total_faces = sum(int(getattr(group, "face_count", 0) or 0) for group in self._face_album_groups)
         total_photos = len({str(record.image_path) for record in self._face_album_records})
@@ -10859,13 +11889,14 @@ class SearchPane(QWidget):
             if str(getattr(group, "group_kind", "")) != "named"
         ]
         summary = (
-            f"Showing {len(self._face_album_groups)} of {self._face_album_total_groups} group(s) for {label_filter_text} "
-            f"from the saved face library ({total_faces} face(s) in the loaded group summaries)."
+            f"{showing(len(self._face_album_groups), 'group', total=self._face_album_total_groups, matching=True)} "
+            f"for {label_filter_text} from the saved face library. "
+            f"Shown group summaries represent {counted(total_faces, 'face')}."
         )
         if named_groups:
-            summary += f" {len(named_groups)} named identity group(s)."
+            summary += f" {counted(len(named_groups), 'named identity group')}."
         if total_photos:
-            summary += f" {total_photos} photo(s) represented."
+            summary += f" {counted(total_photos, 'photo')} represented."
         if bucket_bits:
             summary += f" Buckets: {', '.join(bucket_bits)}."
         self._face_album_summary_text = summary
@@ -10877,12 +11908,15 @@ class SearchPane(QWidget):
                 self._start_face_album_member_stream(str(member_page.group_id or ""))
 
     def _show_face_album_results(self, summary_text: str | None = None) -> None:
-        # Reopening All Faces is an explicit request to replace any current
-        # result view.  A background refresh, by contrast, remains passive.
-        self._request_face_album_publish(
-            str(summary_text or self._face_album_summary_text or "All Faces album"),
-            force=True,
-        )
+        cache_key = self._face_album_loaded_key
+        if (
+            cache_key is not None
+            and cache_key == self._face_album_published_key
+            and str(self._face_result_source_kind or "") == "face_album"
+        ):
+            self._log_face_event("album_publish_cache_hit")
+            return
+        self._request_face_album_publish(str(summary_text or self._face_album_summary_text or "All Faces album"))
 
     def _update_face_album_paging_actions(self) -> None:
         load_groups = getattr(self, "face_album_load_more_groups_button", None)
@@ -10899,7 +11933,7 @@ class SearchPane(QWidget):
                 and selected_group_id
                 and selected_group_id == self._face_album_member_stream_group_id
             )
-            load_faces.setText("Loading selected faces…" if loading_selected_group else "Load more selected faces")
+            load_faces.setText("Loading faces…" if loading_selected_group else "More faces")
             load_faces.setEnabled(
                 next_offset is not None
                 and not self._face_album_refresh_in_progress
@@ -10912,9 +11946,10 @@ class SearchPane(QWidget):
         self._cancel_face_album_refresh_job(replaced=True)
         job = AsyncJob(run)
         album_job_id: int | None = None
-        if self.job_manager is not None:
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
             album_job_id = self.job_manager.register_job(
-                label, cancel_fn=job.cancel, origin="Faces", foreground=False
+                label, cancel_fn=job.cancel, origin="People", foreground=False
             )
             self._face_album_refresh_job_id = album_job_id
             job.progress.connect(
@@ -10928,7 +11963,7 @@ class SearchPane(QWidget):
 
         def _finish(status: str, error: str = "") -> None:
             self._face_album_refresh_in_progress = False
-            if self.job_manager is not None and album_job_id is not None:
+            if self.job_manager is not None and album_job_id is not None and not coordinated:
                 self.job_manager.finish(album_job_id, status=status, error=error)
             if self._face_album_refresh_job_id == album_job_id:
                 self._face_album_refresh_job_id = None
@@ -10951,13 +11986,22 @@ class SearchPane(QWidget):
         job.cancelled.connect(lambda: _finish("cancelled"))
         job.completed.connect(_completed)
         self._face_album_refresh_job = job
-        thread = start_job_in_thread(job)
-        self._face_album_refresh_thread = thread
-        self._retained_face_album_refresh_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_album_refresh_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_album_refresh_thread = thread
+            self._retained_face_album_refresh_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_album_refresh_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        if coordinated:
+            album_job_id = self._submit_job(job, label, _launch, foreground=False)
+            state = self.job_manager.get(album_job_id) if self.job_manager is not None and album_job_id is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._face_album_refresh_job_id = album_job_id
+        else:
+            _launch(False)
         self._update_face_album_paging_actions()
 
     def _load_more_face_album_groups(self) -> None:
@@ -11003,6 +12047,7 @@ class SearchPane(QWidget):
                 "Select a group to load its faces."
             )
             self._face_album_summary_text = summary
+            self._face_album_published_key = None
             self._request_face_album_publish(summary)
 
         self._start_face_album_page_job("Loading more face groups", _run, _apply)
@@ -11063,8 +12108,9 @@ class SearchPane(QWidget):
             self._face_album_member_next_offsets[target_group_id] = page.next_offset
             self._face_album_member_totals[target_group_id] = int(page.total_count)
             loaded_count = sum(1 for record in self._face_album_records if str(record.group_id) == target_group_id)
-            summary = f"Loaded {loaded_count} of {int(page.total_count)} face(s) for the selected group."
+            summary = f"{showing(loaded_count, 'face', total=int(page.total_count), matching=True)} for the selected group."
             self._face_album_summary_text = summary
+            self._face_album_published_key = None
             self._request_face_album_publish(summary)
             if page.next_offset is None:
                 if target_group_id == self._face_album_member_stream_group_id:
@@ -11093,23 +12139,17 @@ class SearchPane(QWidget):
     def _cancel_face_album_publish_job(self) -> None:
         job = self._face_album_publish_job
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         self._face_album_publish_job = None
         self._face_album_publish_thread = None
 
     def _on_face_album_publish_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_album_publish_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_album_publish_refs = retained
-        if thread is self._face_album_publish_thread:
-            self._face_album_publish_thread = None
-            self._face_album_publish_job = None
+        self._defer_face_worker_release(
+            "_retained_face_album_publish_refs",
+            thread,
+            "_face_album_publish_job",
+            "_face_album_publish_thread",
+        )
 
     def _request_face_album_publish(self, summary_text: str, *, force: bool = False) -> None:
         groups = list(self._face_album_groups or [])
@@ -11154,13 +12194,16 @@ class SearchPane(QWidget):
         job.failed.connect(_failed)
         job.completed.connect(_completed)
         self._face_album_publish_job = job
-        thread = start_job_in_thread(job)
-        self._face_album_publish_thread = thread
-        self._retained_face_album_publish_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_album_publish_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_album_publish_thread = thread
+            self._retained_face_album_publish_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_album_publish_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self._submit_job(job, "Preparing All Faces results", _launch, foreground=False)
 
     def _build_face_album_publish_snapshot(
         self,
@@ -11255,6 +12298,7 @@ class SearchPane(QWidget):
             context_by_path=dict(snapshot.context_by_path or {}),
             kind="face_album",
         )
+        self._face_album_published_key = self._face_album_loaded_key
         scope_roots = self._current_scope_roots()
         scope_label = "all indexed faces" if not scope_roots else f"{len(scope_roots)} active root(s)"
         self.status_label.setText(f"Loaded the detected-face album for {scope_label}.")
@@ -11344,6 +12388,16 @@ class SearchPane(QWidget):
             progress(-1, f"Loading indexed face review for {Path(folder).name or folder}...")
             page_loader = getattr(source.service, "load_folder_review_image_page", None)
             if callable(page_loader) and indexed_paths:
+                candidate_snapshot = None
+                prepare_snapshot = getattr(source.service, "prepare_folder_review_candidate_snapshot", None)
+                if callable(prepare_snapshot):
+                    candidate_snapshot = _call_with_optional_cancel(
+                        prepare_snapshot,
+                        folder,
+                        candidate_paths=indexed_paths,
+                        scope_roots=scope_roots,
+                        cancel_check=cancel_check,
+                    )
                 review_page = _call_with_optional_cancel(
                     page_loader,
                     folder,
@@ -11354,9 +12408,12 @@ class SearchPane(QWidget):
                     candidate_paths=indexed_paths,
                     include_tiny_faces=include_tiny_faces,
                     cancel_check=cancel_check,
+                    _candidate_snapshot=candidate_snapshot,
                 )
                 if not isinstance(review_page, FaceFolderReviewPage):
                     raise RuntimeError("Folder-review page loader returned an invalid result.")
+                prepared_paths = getattr(candidate_snapshot, "source_paths", None)
+                progressive_paths = list(prepared_paths) if prepared_paths is not None else list(indexed_paths)
                 migrated_image_paths: list[str] = []
                 consume_migrated = getattr(source.service, "consume_recent_migrated_face_paths", None)
                 if callable(consume_migrated):
@@ -11377,7 +12434,7 @@ class SearchPane(QWidget):
                     "folder": folder,
                     "include_tiny_faces": include_tiny_faces,
                     "refresh_people": bool(refresh_people),
-                    "discovered_paths": list(indexed_paths),
+                    "discovered_paths": progressive_paths,
                     "review_images": list(review_page.items),
                     "migrated_image_paths": migrated_image_paths,
                     "profiles": list(profiles or []),
@@ -11385,7 +12442,8 @@ class SearchPane(QWidget):
                     "summary_notice": summary_notice,
                     "status_text": status_text,
                     "progressive_page": review_page,
-                    "progressive_paths": list(indexed_paths),
+                    "progressive_paths": progressive_paths,
+                    "progressive_candidate_snapshot": candidate_snapshot,
                 }
             else:
                 payload = self._load_face_refresh_result(
@@ -11410,9 +12468,10 @@ class SearchPane(QWidget):
 
         job = AsyncJob(_run)
         refresh_job_id: int | None = None
-        if self.job_manager is not None:
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
             refresh_job_id = self.job_manager.register_job(
-                "Face review refresh", cancel_fn=job.cancel, origin="Faces", foreground=False
+                "Face review refresh", cancel_fn=job.cancel, origin="People", foreground=False
             )
             self._face_refresh_job_id = refresh_job_id
             job.progress.connect(
@@ -11425,7 +12484,7 @@ class SearchPane(QWidget):
         job.progress.connect(lambda _value, text: self.status_label.setText(str(text)))
 
         def _finish_job(status: str, error: str = "") -> None:
-            if self.job_manager is not None and refresh_job_id is not None:
+            if self.job_manager is not None and refresh_job_id is not None and not coordinated:
                 self.job_manager.finish(refresh_job_id, status=status, error=error)
             if self._face_refresh_job_id == refresh_job_id:
                 self._face_refresh_job_id = None
@@ -11482,13 +12541,22 @@ class SearchPane(QWidget):
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
         self._face_refresh_job = job
-        thread = start_job_in_thread(job)
-        self._face_refresh_thread = thread
-        self._retained_face_refresh_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_refresh_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_refresh_thread = thread
+            self._retained_face_refresh_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_refresh_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        if coordinated:
+            refresh_job_id = self._submit_job(job, "Face review refresh", _launch, foreground=False)
+            state = self.job_manager.get(refresh_job_id) if self.job_manager is not None and refresh_job_id is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._face_refresh_job_id = refresh_job_id
+        else:
+            _launch(False)
 
     def _cancel_face_refresh_job(self, *, replaced: bool = False) -> None:
         job = self._face_refresh_job
@@ -11496,25 +12564,19 @@ class SearchPane(QWidget):
         if job is None and thread is None:
             return
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         if replaced:
             self._log_face_event("refresh_replaced", request_id=self._face_refresh_request_id)
         self._face_refresh_job = None
         self._face_refresh_thread = None
 
     def _on_face_refresh_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_refresh_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_refresh_refs = retained
-        if thread is self._face_refresh_thread:
-            self._face_refresh_thread = None
-            self._face_refresh_job = None
+        self._defer_face_worker_release(
+            "_retained_face_refresh_refs",
+            thread,
+            "_face_refresh_job",
+            "_face_refresh_thread",
+        )
 
     def _settle_face_refresh_threads(self, *, timeout_ms: int = 100) -> None:
         retained: list[tuple[object | None, object | None]] = []
@@ -11541,30 +12603,32 @@ class SearchPane(QWidget):
         self._face_review_stream_timer.stop()
         job = getattr(self, "_face_review_stream_job", None)
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         was_in_progress = bool(getattr(self, "_face_review_stream_in_progress", False))
         self._face_review_stream_generation += 1
         self._face_review_stream_in_progress = False
         self._face_review_stream_paths = []
+        self._face_review_stream_candidate_snapshot = None
         self._face_review_stream_next_offset = None
         self._face_review_stream_source = None
         self._face_review_stream_job = None
         self._face_review_stream_thread = None
+        self._face_review_cache_generation += 1
+        self._face_review_cache_in_progress = False
+        self._face_review_cache_complete = False
+        self._face_review_cached_pages = []
+        self._face_review_cached_page_index = 0
+        self._face_review_tail_waiting_for_cache = False
         if was_in_progress and replaced:
             self._log_face_event("review_stream_cancelled", reason="review request replaced")
 
     def _on_face_review_stream_thread_finished(self, thread=None) -> None:
-        self._retained_face_review_stream_refs = [
-            (job, retained_thread)
-            for job, retained_thread in self._retained_face_review_stream_refs
-            if retained_thread is not thread
-        ]
-        if thread is self._face_review_stream_thread:
-            self._face_review_stream_thread = None
-            self._face_review_stream_job = None
+        self._defer_face_worker_release(
+            "_retained_face_review_stream_refs",
+            thread,
+            "_face_review_stream_job",
+            "_face_review_stream_thread",
+        )
 
     def _start_face_review_stream(self, snapshot: dict[str, object]) -> bool:
         page = snapshot.get("progressive_page")
@@ -11577,131 +12641,373 @@ class SearchPane(QWidget):
         self._face_review_stream_generation += 1
         self._face_review_stream_in_progress = True
         self._face_review_stream_paths = list(dict.fromkeys(source_paths))
+        self._face_review_stream_candidate_snapshot = snapshot.get("progressive_candidate_snapshot")
         self._face_review_stream_next_offset = int(page.next_offset)
         self._face_review_stream_folder = str(snapshot.get("folder", "") or "")
         self._face_review_stream_scope_roots = tuple(self._current_scope_roots())
         self._face_review_stream_include_tiny_faces = bool(snapshot.get("include_tiny_faces", True))
         self._face_review_stream_source = source
         self._face_review_stream_summary_notice = str(snapshot.get("summary_notice", "") or "")
+        self._face_review_cache_complete = False
+        self._face_review_cache_in_progress = False
+        self._face_review_cached_pages = []
+        self._face_review_cached_page_index = 0
+        self._face_review_tail_waiting_for_cache = False
         self._log_face_event(
             "review_stream_started",
             total_images=int(page.total_count),
             loaded_images=int(page.next_offset),
         )
+        self._start_face_review_stream_cache()
         return True
 
     def _face_review_stream_progress_notice(self) -> str:
         total = len(self._face_review_stream_paths)
-        loaded = len(self._face_review_all_images)
-        return f"Loading face review: {min(loaded, total)} of {total} image(s)."
+        if self._face_review_cache_complete:
+            return f"Review metadata ready for {counted(total, 'photo')}. Scroll to show more."
+        return "Preparing review data in the background. Scroll to load more when it is ready."
 
     def _schedule_next_face_review_stream_page(self) -> None:
-        if not self._face_review_stream_in_progress or self._face_review_stream_next_offset is None:
-            return
-        if self._face_review_stream_job is not None:
-            return
-        self._face_review_stream_timer.start(FACE_PROGRESSIVE_PAGE_INTERVAL_MS)
+        # Kept as a compatibility seam for existing callers.  Folder review
+        # pages must never advance on a timer: a scroll near the visible tail
+        # explicitly calls _request_next_face_review_stream_page instead.
+        return
 
-    def _request_next_face_review_stream_page(self) -> None:
-        if not self._face_review_stream_in_progress:
-            return
+    def _start_face_review_stream_cache(self) -> None:
+        """Read the remaining review metadata without publishing another UI page.
+
+        The gallery owns a small visible working set.  This worker deliberately
+        prepares the rest of the review independently so database progress
+        cannot reset the gallery, create hidden face tiles, or schedule image
+        decoding for photos the user has not reached.
+        """
+
         source = self._face_review_stream_source
         offset = self._face_review_stream_next_offset
         if source is None or offset is None:
             return
         loader = getattr(source.service, "load_folder_review_image_page", None)
         if not callable(loader):
-            self._cancel_face_review_stream()
             return
-        generation = int(self._face_review_stream_generation)
+        self._face_review_cache_generation += 1
+        cache_generation = int(self._face_review_cache_generation)
+        stream_generation = int(self._face_review_stream_generation)
         folder = str(self._face_review_stream_folder or "")
         scope_roots = tuple(self._face_review_stream_scope_roots)
         include_tiny_faces = bool(self._face_review_stream_include_tiny_faces)
         source_paths = list(self._face_review_stream_paths)
+        candidate_snapshot = self._face_review_stream_candidate_snapshot
+        filter_state = self._face_review_filter_state()
+        # Progressive publication is source ordered.  Applying a global sort
+        # to individual pages would move already reviewed photos beneath the
+        # user's viewport.
+        filter_state["sort_mode"] = "source"
+        hidden_rejected_refs = set(self._face_hidden_rejected_refs)
+        dirty_paths = set(self._face_review_draft_dirty_paths)
+        drafts_by_path = {str(path): list(drafts) for path, drafts in self._face_review_drafts_by_path.items()}
+        scope_label = self._face_db_scope_label()
+        self._face_review_cache_in_progress = True
+        self._face_review_cache_complete = False
 
         def _run(progress, cancel_check):
-            progress(-1, f"Loading face review {min(len(source_paths), int(offset) + FACE_PROGRESSIVE_PAGE_SIZE)}/{len(source_paths)} image(s)...")
-            page = _call_with_optional_cancel(
-                loader,
-                folder,
-                offset=int(offset),
-                limit=FACE_PROGRESSIVE_PAGE_SIZE,
-                recursive=True,
-                scope_roots=scope_roots,
-                candidate_paths=source_paths,
-                include_tiny_faces=include_tiny_faces,
-                cancel_check=cancel_check,
-            )
-            if not isinstance(page, FaceFolderReviewPage):
-                raise RuntimeError("Folder-review page loader returned an invalid result.")
-            migrated_paths: list[str] = []
-            consume_migrated = getattr(source.service, "consume_recent_migrated_face_paths", None)
-            if callable(consume_migrated):
-                migrated_paths = list(consume_migrated() or [])
-            return page, migrated_paths
+            progress(-1, "Preparing review data in the background…")
+            prepared_snapshot = candidate_snapshot
+            if prepared_snapshot is None:
+                prepare_snapshot = getattr(source.service, "prepare_folder_review_candidate_snapshot", None)
+                if callable(prepare_snapshot):
+                    prepared_snapshot = _call_with_optional_cancel(
+                        prepare_snapshot,
+                        folder,
+                        candidate_paths=source_paths,
+                        scope_roots=scope_roots,
+                        cancel_check=cancel_check,
+                    )
+            cached_pages: list[FaceReviewCachedPage] = []
+            next_offset: int | None = int(offset)
+            while next_offset is not None:
+                if cancel_check():
+                    raise Cancelled()
+                page = _call_with_optional_cancel(
+                    loader,
+                    folder,
+                    offset=int(next_offset),
+                    limit=FACE_PROGRESSIVE_PAGE_SIZE,
+                    recursive=True,
+                    scope_roots=scope_roots,
+                    candidate_paths=source_paths,
+                    include_tiny_faces=include_tiny_faces,
+                    cancel_check=cancel_check,
+                    _candidate_snapshot=prepared_snapshot,
+                )
+                if not isinstance(page, FaceFolderReviewPage):
+                    raise RuntimeError("Folder-review page loader returned an invalid result.")
+                migrated_paths: list[str] = []
+                consume_migrated = getattr(source.service, "consume_recent_migrated_face_paths", None)
+                if callable(consume_migrated):
+                    migrated_paths = list(consume_migrated() or [])
+                page_snapshot = self._build_face_review_publish_snapshot(
+                    request_id=0,
+                    folder=folder,
+                    review_images=list(page.items),
+                    filter_state=filter_state,
+                    hidden_rejected_refs=hidden_rejected_refs,
+                    dirty_paths=dirty_paths,
+                    drafts_by_path=drafts_by_path,
+                    scope_label=scope_label,
+                    include_tiny_faces=include_tiny_faces,
+                    service=source.service,
+                    migrated_image_paths=list(migrated_paths or []),
+                    summary_notice="",
+                    status_text="",
+                    cancel_check=cancel_check,
+                )
+                cached_pages.append(
+                    FaceReviewCachedPage(
+                        offset=int(page.offset),
+                        snapshot=page_snapshot,
+                        migrated_image_paths=tuple(str(path) for path in migrated_paths if str(path or "").strip()),
+                        is_final_page=page.next_offset is None,
+                    )
+                )
+                loaded_count = min(
+                    len(source_paths),
+                    max(0, int(page.offset)) + len(tuple(page.items or ())),
+                )
+                total_count = len(source_paths)
+                percent = int((loaded_count * 100) / total_count) if total_count else 100
+                progress(percent, loading(loaded_count, total_count, "photo"))
+                next_offset = page.next_offset
+            return tuple(cached_pages)
 
         job = AsyncJob(_run)
-        job.progress.connect(lambda _value, text: self.status_label.setText(str(text)))
 
         def _failed(message: str) -> None:
-            if generation != int(self._face_review_stream_generation):
+            if stream_generation != int(self._face_review_stream_generation):
                 return
+            if cache_generation != int(self._face_review_cache_generation):
+                return
+            self._face_review_cache_in_progress = False
             text = str(message or "").strip()
             if text.casefold() != "cancelled":
-                self.status_label.setText(f"Face review loading stopped: {text}")
-            self._cancel_face_review_stream()
+                self.status_label.setText(f"Face review background loading stopped: {text}")
 
         def _completed(result) -> None:
-            if generation != int(self._face_review_stream_generation) or not self._face_review_stream_in_progress:
+            if stream_generation != int(self._face_review_stream_generation):
+                return
+            if cache_generation != int(self._face_review_cache_generation):
+                return
+            if not isinstance(result, tuple) or not all(isinstance(page, FaceReviewCachedPage) for page in result):
                 return
             self._face_review_stream_job = None
             self._face_review_stream_thread = None
-            try:
-                page, migrated_paths = result
-            except (TypeError, ValueError):
-                self._cancel_face_review_stream()
-                return
-            if not isinstance(page, FaceFolderReviewPage):
-                self._cancel_face_review_stream()
-                return
-            existing_paths = {str(item.image_path) for item in self._face_review_all_images}
-            self._face_review_all_images.extend(
-                item for item in page.items if str(getattr(item, "image_path", "") or "") not in existing_paths
+            self._face_review_cached_pages = list(result)
+            self._face_review_cached_page_index = 0
+            self._face_review_cache_in_progress = False
+            self._face_review_cache_complete = True
+            self._face_review_stream_next_offset = None
+
+            known_all_paths = {str(item.image_path) for item in self._face_review_all_images}
+            known_filtered_paths = {str(item.image_path) for item in self._face_review_images}
+            for cached_page in self._face_review_cached_pages:
+                page_snapshot = cached_page.snapshot
+                for item in list(page_snapshot.all_review_images or ()):
+                    if str(item.image_path) not in known_all_paths:
+                        self._face_review_all_images.append(item)
+                        known_all_paths.add(str(item.image_path))
+                for item in list(page_snapshot.filtered_review_images or ()):
+                    if str(item.image_path) not in known_filtered_paths:
+                        self._face_review_images.append(item)
+                        known_filtered_paths.add(str(item.image_path))
+                self._face_review_by_path.update(dict(page_snapshot.review_by_path or {}))
+                self._face_review_context_by_path.update(dict(page_snapshot.context_by_path or {}))
+
+            self.face_library_review_summary.setText(
+                self._face_review_summary_text(
+                    self._face_review_images,
+                    folder=folder,
+                    include_tiny_faces=include_tiny_faces,
+                    summary_notice="Review data is ready. Scroll to load more photos.",
+                )
             )
-            self._face_review_stream_next_offset = page.next_offset
-            is_final_page = page.next_offset is None
-            if is_final_page:
-                self._face_review_stream_in_progress = False
-                self._face_review_stream_next_offset = None
-            stream_notice = self._face_review_stream_progress_notice()
-            summary_notice = " ".join(
-                part for part in (self._face_review_stream_summary_notice, stream_notice if not is_final_page else "") if part
+            self._update_face_results_context()
+            self._log_face_event(
+                "review_cache_complete",
+                image_count=len(self._face_review_all_images),
+                cached_pages=len(self._face_review_cached_pages),
             )
-            self._request_face_review_publish(
-                list(self._face_review_all_images),
-                folder=folder,
-                migrated_image_paths=list(migrated_paths or []),
-                summary_notice=summary_notice,
-                status_text=("Loaded face review for " + folder + ".") if is_final_page else stream_notice,
-                streaming=not is_final_page,
-                append_detected_faces=not is_final_page,
-            )
-            if is_final_page:
-                self._log_face_event("review_stream_complete", image_count=len(self._face_review_all_images))
-            else:
-                self._schedule_next_face_review_stream_page()
+            if self.face_review_results_tabs.currentWidget() is self.face_detected_faces_panel:
+                self._refresh_detected_faces_review(force=False)
+            elif self.face_review_results_tabs.currentWidget() is self.face_results_panel:
+                self._sync_face_review_result_groups(force=True)
+            if self._face_review_tail_waiting_for_cache:
+                self._face_review_tail_waiting_for_cache = False
+                self._request_next_face_review_stream_page()
 
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(lambda: None)
         self._face_review_stream_job = job
-        thread = start_job_in_thread(job)
-        self._face_review_stream_thread = thread
-        self._retained_face_review_stream_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_review_stream_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_review_stream_thread = thread
+            self._retained_face_review_stream_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_review_stream_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self._submit_job(job, "Loading face review pages", _launch, foreground=False)
+
+    def _append_cached_face_review_page(self, cached_page: FaceReviewCachedPage) -> int:
+        """Append one already prepared page without republishing the gallery."""
+
+        snapshot = cached_page.snapshot
+        gallery_paths = set(getattr(self.results_gallery, "images", []) or [])
+        append_paths = [path for path in list(snapshot.paths or ()) if path not in gallery_paths]
+        if not append_paths:
+            return 0
+        self.results_gallery.append_images(append_paths)
+        limit_paths = set(append_paths)
+        try:
+            self.results_gallery.model.set_overlays_by_path(
+                dict(snapshot.overlay_by_path or {}),
+                dict(snapshot.subtitle_by_path or {}),
+                limit_paths=limit_paths,
+            )
+            self.results_gallery.model.set_face_boxes_by_path(
+                dict(snapshot.face_boxes_by_path or {}), limit_paths=limit_paths
+            )
+            self.results_gallery.model.set_face_box_states_by_path(
+                dict(snapshot.face_box_states_by_path or {}), limit_paths=limit_paths
+            )
+        except Exception:
+            pass
+        self.results_gallery.inspector_context_provider = lambda path: self._face_review_context_by_path.get(path, {})
+        migrated_paths = list(cached_page.migrated_image_paths or ())
+        if migrated_paths:
+            self.results_gallery.invalidate_image_paths(migrated_paths, reload_visible=True)
+        self._update_face_results_context()
+        self._log_face_event("review_cached_page_appended", offset=cached_page.offset, image_count=len(append_paths))
+        return len(append_paths)
+
+    def _append_face_review_page(
+        self,
+        review_images: list[FaceFolderReviewImage],
+        *,
+        folder: str,
+        migrated_image_paths: list[str],
+        status_text: str,
+        page_snapshot: FaceReviewPublishSnapshot | None = None,
+    ) -> int:
+        """Merge one fetched review page without recreating the photo gallery."""
+
+        existing_paths = set(self._face_review_by_path)
+        page_images = [
+            item
+            for item in list(review_images or [])
+            if str(getattr(item, "image_path", "") or "").strip()
+            and str(getattr(item, "image_path", "") or "") not in existing_paths
+        ]
+        if not page_images:
+            return 0
+        scope_label = self._face_db_scope_label()
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        if page_snapshot is None:
+            # This fallback serves direct callers. Normal viewport paging
+            # prepares its snapshot in the page worker below.
+            filter_state = self._face_review_filter_state()
+            filter_state["sort_mode"] = "source"
+            hidden_rejected_refs = set(self._face_hidden_rejected_refs)
+            dirty_paths = set(self._face_review_draft_dirty_paths)
+            drafts_by_path = {str(path): list(drafts) for path, drafts in self._face_review_drafts_by_path.items()}
+            page_snapshot = self._build_face_review_publish_snapshot(
+                request_id=0,
+                folder=folder,
+                review_images=page_images,
+                filter_state=filter_state,
+                hidden_rejected_refs=hidden_rejected_refs,
+                dirty_paths=dirty_paths,
+                drafts_by_path=drafts_by_path,
+                scope_label=scope_label,
+                include_tiny_faces=include_tiny_faces,
+                service=self._active_face_service(),
+                migrated_image_paths=list(migrated_image_paths or []),
+                summary_notice="",
+                status_text=status_text,
+                cancel_check=lambda: False,
+            )
+        self._face_review_all_images.extend(page_images)
+        self._face_review_images.extend(list(page_snapshot.filtered_review_images or ()))
+        self._face_review_by_path.update(dict(page_snapshot.review_by_path or {}))
+        self._face_review_context_by_path.update(dict(page_snapshot.context_by_path or {}))
+        self._face_review_lazy_publish_enabled = bool(
+            self._face_review_lazy_publish_enabled or getattr(page_snapshot, "lazy_publish", False)
         )
+        gallery_paths = set(getattr(self.results_gallery, "images", []) or [])
+        append_paths = [path for path in list(page_snapshot.paths or ()) if path not in gallery_paths]
+        if append_paths:
+            self.results_gallery.append_images(append_paths)
+            limit_paths = set(append_paths)
+            try:
+                self.results_gallery.model.set_overlays_by_path(
+                    dict(page_snapshot.overlay_by_path or {}),
+                    dict(page_snapshot.subtitle_by_path or {}),
+                    limit_paths=limit_paths,
+                )
+                self.results_gallery.model.set_face_boxes_by_path(
+                    dict(page_snapshot.face_boxes_by_path or {}), limit_paths=limit_paths
+                )
+                self.results_gallery.model.set_face_box_states_by_path(
+                    dict(page_snapshot.face_box_states_by_path or {}), limit_paths=limit_paths
+                )
+            except Exception:
+                pass
+        self.results_gallery.inspector_context_provider = lambda path: self._face_review_context_by_path.get(path, {})
+        # A review-page arrival must never create or extend the hidden Faces
+        # model.  The Faces tab consumes the completed metadata cache only
+        # when the user opens it.
+        self.face_library_review_summary.setText(
+            self._face_review_summary_text(
+                self._face_review_images,
+                folder=folder,
+                include_tiny_faces=include_tiny_faces,
+            )
+        )
+        self._update_face_results_context()
+        return len(append_paths)
+
+    def _request_next_face_review_stream_page(self) -> None:
+        if not self._face_review_stream_in_progress:
+            return
+        if self._face_review_cache_in_progress:
+            # A tail request is remembered, but database work stays entirely
+            # in the cache worker.  Its completion appends exactly one page.
+            self._face_review_tail_waiting_for_cache = True
+            self.status_label.setText("Preparing the next review page in the background…")
+            return
+        if self._face_review_cached_page_index >= len(self._face_review_cached_pages):
+            if self._face_review_cache_complete:
+                self._face_review_stream_in_progress = False
+                self._face_review_stream_next_offset = None
+                self.status_label.setText("All prepared review photos are visible.")
+                self._log_face_event("review_stream_complete", image_count=len(self._face_review_all_images))
+            return
+        cached_page = self._face_review_cached_pages[self._face_review_cached_page_index]
+        self._face_review_cached_page_index += 1
+        appended_paths = self._append_cached_face_review_page(cached_page)
+        if self._face_review_cached_page_index >= len(self._face_review_cached_pages):
+            self._face_review_stream_in_progress = False
+            self._face_review_stream_next_offset = None
+            # Every page is now represented by the live review metadata and
+            # gallery model. Drop the prepared snapshots so a long review does
+            # not retain a second copy of its page dictionaries after the user
+            # has reached the end.
+            self._face_review_cached_pages = []
+            self._face_review_cached_page_index = 0
+        if not appended_paths and self._face_review_stream_in_progress:
+            # Filters may empty an entire source page.  Consume already cached
+            # pages until there is a visible tail item, without another DB job.
+            QTimer.singleShot(0, self._request_next_face_review_stream_page)
 
     def _apply_face_review_snapshot(self, snapshot: dict[str, object]) -> None:
         folder = str(snapshot.get("folder", "") or "")
@@ -11710,12 +13016,14 @@ class SearchPane(QWidget):
         include_tiny_faces = bool(snapshot.get("include_tiny_faces", False))
         refresh_people = bool(snapshot.get("refresh_people", False))
         reason = str(snapshot.get("reason", "background refresh") or "background refresh")
+        self._face_review_stale = False
         summary_notice = str(snapshot.get("summary_notice", "") or "")
         status_text = str(snapshot.get("status_text", "") or "")
         streaming = self._start_face_review_stream(snapshot)
         if streaming:
-            summary_notice = " ".join(part for part in (summary_notice, self._face_review_stream_progress_notice()) if part)
-            status_text = self._face_review_stream_progress_notice()
+            progress_notice = self._face_review_stream_progress_notice()
+            summary_notice = " ".join(part for part in (summary_notice, progress_notice, "Scroll to load more.") if part)
+            status_text = f"{progress_notice} Scroll to load more."
         self._log_face_event("review_loaded_background", folder=folder, image_count=len(review_images), refresh_people=refresh_people)
         self._request_face_review_publish(
             review_images,
@@ -11726,8 +13034,6 @@ class SearchPane(QWidget):
         )
         if refresh_people and hasattr(self, "face_named_people_list"):
             self._apply_face_people_data(profiles, review_images, folder=folder, include_tiny_faces=include_tiny_faces)
-        if streaming:
-            self._schedule_next_face_review_stream_page()
         self._log_face_event("refresh_complete", reason=reason, request_id=int(snapshot.get("request_id", 0) or 0))
 
     def ensure_face_library_loaded(self, *, allow_inactive: bool = False) -> None:
@@ -11744,7 +13050,7 @@ class SearchPane(QWidget):
         if not effective_folder:
             return
         if (
-            (not self._face_review_by_path or self._face_review_folder != effective_folder)
+            (self._face_review_stale or not self._face_review_by_path or self._face_review_folder != effective_folder)
             and not self._face_refresh_in_progress
         ):
             self._request_face_library_refresh(refresh_people=False, reason="ensure library loaded", force_refresh=False)
@@ -11773,7 +13079,8 @@ class SearchPane(QWidget):
             label = ""
         if not allow_inactive and not self._is_all_faces_tab_label(label):
             return
-        if not self._face_album_loaded:
+        cache_key = self._face_album_cache_key()
+        if not self._face_album_loaded or self._face_album_loaded_key != cache_key:
             if not self._face_album_refresh_in_progress:
                 self._request_face_album_refresh(reason="ensure all faces loaded", force_refresh=False)
             return
@@ -11889,6 +13196,7 @@ class SearchPane(QWidget):
         self.duplicate_min_score.setSingleStep(0.05)
         self.duplicate_min_score.setValue(0.1)
         self.duplicate_review_list = QListWidget()
+        self.duplicate_review_list.setAccessibleName("Duplicate review candidates")
         self.duplicate_review_list.setMaximumHeight(180)
         self.duplicate_review_list.itemSelectionChanged.connect(self._update_duplicate_review_selection)
         self.duplicate_review_summary = QLabel("Duplicate review: run a duplicate search to compare candidates.")
@@ -11944,6 +13252,7 @@ class SearchPane(QWidget):
     def _helper_label(text: str, *, tooltip: str = "") -> QLabel:
         label = QLabel(str(text or ""))
         label.setWordWrap(True)
+        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
         if tooltip:
             label.setToolTip(str(tooltip))
         return label
@@ -11951,7 +13260,7 @@ class SearchPane(QWidget):
     @staticmethod
     def _group_box(title: str, *, tooltip: str = "") -> tuple[QGroupBox, QVBoxLayout]:
         group = QGroupBox(title)
-        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         if tooltip:
             group.setToolTip(str(tooltip))
         layout = QVBoxLayout(group)
@@ -11968,7 +13277,23 @@ class SearchPane(QWidget):
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         label = QLabel(title)
+        label.setProperty("role", "helper")
         label.setWordWrap(True)
+        buddy = widget
+        if buddy.focusPolicy() == Qt.FocusPolicy.NoFocus:
+            buddy = next(
+                (
+                    child
+                    for child in widget.findChildren(QWidget)
+                    if child.focusPolicy() != Qt.FocusPolicy.NoFocus
+                ),
+                widget,
+            )
+        label.setBuddy(buddy)
+        if buddy is not widget and not buddy.accessibleName():
+            buddy.setAccessibleName(str(title))
+        elif not widget.accessibleName():
+            widget.setAccessibleName(str(title))
         label_row = QHBoxLayout()
         label_row.setContentsMargins(0, 0, 0, 0)
         label_row.setSpacing(4)
@@ -12049,10 +13374,31 @@ class SearchPane(QWidget):
 
     def _on_face_workspace_splitter_moved(self, *_args) -> None:
         try:
-            self.workspace_splitter.requested_sizes = [int(value) for value in self.workspace_splitter.sizes()]
+            sizes = [int(value) for value in self.workspace_splitter.sizes()]
+            self.workspace_splitter.requested_sizes = sizes
+            self._face_splitter_user_sizes = sizes
         except Exception:
             pass
         self._refresh_face_grid_layouts()
+
+    def reflow_for_text_scale(self) -> None:
+        """Fit the task rail to live font metrics without losing user intent."""
+
+        total_width = max(0, int(self.workspace_splitter.width()))
+        if total_width <= 0 or not self.sidebar_panel.isVisible():
+            return
+        content_hint = max(0, int(self.sidebar_content_panel.minimumSizeHint().width()))
+        scrollbar_width = max(0, int(self.sidebar_scroll.verticalScrollBar().sizeHint().width()))
+        preferred = int((self._face_splitter_user_sizes or self._face_splitter_default_sizes)[0])
+        sidebar_width = min(
+            int(self.sidebar_panel.maximumWidth()),
+            max(int(self.sidebar_panel.minimumWidth()), preferred, content_hint + scrollbar_width),
+        )
+        gallery_width = max(int(self.gallery_panel.minimumWidth()), total_width - sidebar_width)
+        if sidebar_width + gallery_width > total_width:
+            sidebar_width = max(int(self.sidebar_panel.minimumWidth()), total_width - gallery_width)
+        self.workspace_splitter.setSizes([sidebar_width, gallery_width])
+        self._refresh_face_grid_layouts(force=True)
 
     def _refresh_face_grid_layouts(self, *, force: bool = False) -> None:
         self._refresh_face_library_layout(force=force)
@@ -12077,8 +13423,6 @@ class SearchPane(QWidget):
         for widget_name in (
             "show_tiny_detections_checkbox",
             "face_mode_status_label",
-            "face_identity_management_group",
-            "face_identity_danger_group",
             "face_save_profile_button",
             "face_hide_selected_faces_button",
         ):
@@ -12094,15 +13438,19 @@ class SearchPane(QWidget):
         library_tabs = getattr(self, "face_library_tabs", None)
         if library_tabs is not None:
             library_tabs.tabBar().setVisible(True)
-            library_tabs.tabBar().setTabVisible(1, False)
-            if library_tabs.currentIndex() == 1:
-                library_tabs.setCurrentIndex(0)
+            library_tabs.tabBar().setTabVisible(1, True)
         if hasattr(self, "face_search_quick_group"):
-            # Keep the retained walkthrough and saved-search implementation out
-            # of the primary Find task.  The active controls below have their
-            # own tooltips and help affordances, so this long-form panel should
-            # not claim vertical space even in Advanced mode.
-            self.face_search_quick_group.setVisible(False)
+            self.face_search_quick_group.setVisible(True)
+        for widget_name in (
+            "face_identity_management_group",
+            "face_identity_danger_group",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                # The dedicated Manage route makes these capabilities explicit.
+                # Destructive groups remain collapsed by default and retain their
+                # existing read-only and confirmation safeguards.
+                widget.setVisible(True)
         for widget in getattr(self, "face_profile_technical_fields", []):
             widget.setVisible(bool(advanced))
         for widget_name in (
@@ -12118,7 +13466,6 @@ class SearchPane(QWidget):
                 widget.setVisible(bool(advanced))
         self._update_face_scope_summary()
         for widget_name in (
-            "saved_search_group",
             "face_hide_rejected_button",
             "face_restore_rejected_button",
             "face_rescan_selected_button",
@@ -12180,32 +13527,51 @@ class SearchPane(QWidget):
             return
         mode = self._face_search_layout_mode_for_viewport()
         self._refresh_face_search_action_layout(mode)
+        self._refresh_face_find_action_layout(mode)
         if not force and mode == self._face_search_layout_mode:
             return
         self._clear_layout(self.face_search_grid)
         self.face_search_grid.setColumnStretch(0, 1)
         self.face_search_grid.setColumnStretch(1, 1 if mode == "wide" else 0)
-        for row in range(9):
+        for row in range(10):
             self.face_search_grid.setRowStretch(row, 0)
         if mode == "wide":
-            self.face_search_grid.addWidget(self.face_search_selected_group, 0, 0)
-            self.face_search_grid.addWidget(self.face_find_group, 0, 1)
-            self.face_search_grid.addWidget(self.face_find_name_group, 1, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_manage_group, 2, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_save_group, 3, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_pending_group, 4, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_people_query_group, 5, 0, 1, 2)
-            self.face_search_grid.setRowStretch(6, 1)
+            self.face_search_grid.addWidget(self.face_primary_find_widget, 0, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_search_selected_group, 1, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_people_query_group, 2, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_search_quick_group, 3, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_manage_group, 4, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_save_group, 5, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_pending_group, 6, 0, 1, 2)
+            self.face_search_grid.setRowStretch(7, 1)
         else:
-            self.face_search_grid.addWidget(self.face_search_selected_group, 0, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_find_group, 1, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_find_name_group, 2, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_manage_group, 3, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_save_group, 4, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_pending_group, 5, 0, 1, 2)
-            self.face_search_grid.addWidget(self.face_people_query_group, 6, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_primary_find_widget, 0, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_search_selected_group, 1, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_people_query_group, 2, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_search_quick_group, 3, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_manage_group, 4, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_save_group, 5, 0, 1, 2)
+            self.face_search_grid.addWidget(self.face_pending_group, 6, 0, 1, 2)
             self.face_search_grid.setRowStretch(7, 1)
         self._face_search_layout_mode = mode
+
+    def _on_face_find_task_changed(self, index: int) -> None:
+        """Show exactly one primary Find workflow without discarding either query."""
+
+        photo_task = int(index) == 0
+        self.face_find_group.setVisible(photo_task)
+        self.face_find_name_group.setVisible(not photo_task)
+        target = self.face_query_path if photo_task else self.face_find_name_query
+        target.setFocus(Qt.FocusReason.TabFocusReason)
+        self._query_find_visibility_timer.start(0)
+
+    def _activate_photo_find_from_keyboard(self) -> None:
+        """Run the currently meaningful primary photo action from Return."""
+
+        if self._selected_query_face_bboxes():
+            self._search_faces()
+            return
+        self._detect_query_photo_faces()
 
     def _refresh_face_search_action_layout(self, mode: str) -> None:
         """Use a button grid only where the active Find pane has room for it."""
@@ -12222,6 +13588,38 @@ class SearchPane(QWidget):
             return
         selected_actions.addWidget(self.face_search_selected_card_button, 0, 0, 1, 2)
         selected_actions.addWidget(self.face_search_name_selected_card_button, 1, 0, 1, 2)
+
+    def _refresh_face_find_action_layout(self, mode: str) -> None:
+        """Give scan controls their own row when the task rail is narrow."""
+
+        grid = getattr(self, "face_find_fields_grid", None)
+        widgets = (
+            getattr(self, "face_query_photo_cell", None),
+            getattr(self, "face_query_detect_button", None),
+            getattr(self, "face_index_actions_widget", None),
+            getattr(self, "face_query_faces_summary", None),
+            getattr(self, "face_query_faces_list", None),
+            getattr(self, "face_search_button", None),
+        )
+        if grid is None or any(widget is None for widget in widgets):
+            return
+        for widget in widgets:
+            grid.removeWidget(widget)
+        photo_cell, detect_button, index_actions, summary, candidates, search_button = widgets
+        if mode == "wide":
+            grid.addWidget(photo_cell, 0, 0, 1, 2)
+            grid.addWidget(detect_button, 1, 0)
+            grid.addWidget(index_actions, 1, 1)
+            grid.addWidget(summary, 2, 0, 1, 2)
+            grid.addWidget(candidates, 3, 0, 1, 2)
+            grid.addWidget(search_button, 4, 0, 1, 2)
+            return
+        grid.addWidget(photo_cell, 0, 0, 1, 2)
+        grid.addWidget(detect_button, 1, 0, 1, 2)
+        grid.addWidget(index_actions, 2, 0, 1, 2)
+        grid.addWidget(summary, 3, 0, 1, 2)
+        grid.addWidget(candidates, 4, 0, 1, 2)
+        grid.addWidget(search_button, 5, 0, 1, 2)
 
     def _build_face_album_tab(self) -> None:
         tab_body = QWidget()
@@ -12244,7 +13642,7 @@ class SearchPane(QWidget):
         self.face_album_label_filter_combo.addItem("Unlabelled faces", "unlabeled")
         self.face_album_label_filter_combo.setToolTip(
             "Choose all saved faces, only durable face names, or faces without a durable name. "
-            "Unlabelled also includes pending automatic proposals until they are accepted."
+            "Pending automatic proposals are reviewed in People → Review."
         )
         self.face_album_label_filter_combo.currentIndexChanged.connect(
             lambda _index: self._on_face_album_label_filter_changed()
@@ -12258,23 +13656,26 @@ class SearchPane(QWidget):
         self.face_album_refresh_button = QPushButton("Refresh All Faces")
         self.face_album_refresh_button.setToolTip("Reload the saved global face library. This does not rescan folders.")
         self.face_album_refresh_button.clicked.connect(lambda: self.refresh_face_album(reason="manual album refresh", force_refresh=True))
-        album_buttons.addWidget(self.face_album_refresh_button, 0, 0)
+        album_buttons.addWidget(self.face_album_refresh_button, 0, 0, 1, 2)
         self.face_album_load_more_groups_button = QPushButton("Load more groups")
         self.face_album_load_more_groups_button.setToolTip("Load the next page of saved face groups from the global library.")
         self.face_album_load_more_groups_button.setEnabled(False)
         self.face_album_load_more_groups_button.clicked.connect(self._load_more_face_album_groups)
-        album_buttons.addWidget(self.face_album_load_more_groups_button, 0, 1)
-        self.face_album_load_more_faces_button = QPushButton("Load more selected faces")
+        self.face_album_load_more_groups_button.setText("More groups")
+        self.face_album_load_more_groups_button.setAccessibleName("Load more face groups")
+        album_buttons.addWidget(self.face_album_load_more_groups_button, 1, 0, 1, 2)
+        self.face_album_load_more_faces_button = QPushButton("More faces")
+        self.face_album_load_more_faces_button.setAccessibleName("Load more faces in the selected group")
         self.face_album_load_more_faces_button.setToolTip("Load the next page of faces for the currently selected group.")
         self.face_album_load_more_faces_button.setEnabled(False)
         self.face_album_load_more_faces_button.clicked.connect(self._load_more_selected_face_album_members)
-        album_buttons.addWidget(self.face_album_load_more_faces_button, 1, 0)
+        album_buttons.addWidget(self.face_album_load_more_faces_button, 2, 0, 1, 2)
         self.face_album_help_button = HelpIconButton(
             FACE_HELP["people_groups"],
             album_group,
             help_key="all_faces",
         )
-        album_buttons.addWidget(self.face_album_help_button, 1, 1, alignment=Qt.AlignmentFlag.AlignRight)
+        album_filter_row.addWidget(self.face_album_help_button)
         album_layout.addLayout(album_buttons)
         tab_layout.addWidget(album_group)
         tab_layout.addStretch(1)
@@ -12291,6 +13692,8 @@ class SearchPane(QWidget):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.setSpacing(8)
         self.face_library_tabs = QTabWidget(tab_body)
+        self.face_library_tabs.setTabBar(KeyboardTabBar(self.face_library_tabs))
+        self.face_library_tabs.tabBar().setAccessibleName("Detect and review mode")
         self.face_library_tabs.setDocumentMode(True)
         detection_page = QWidget(self.face_library_tabs)
         detection_layout = QGridLayout(detection_page)
@@ -12303,10 +13706,10 @@ class SearchPane(QWidget):
         selection_layout.setSpacing(10)
         self.face_library_selection_grid = selection_layout
         self.face_library_tabs.addTab(detection_page, "Detect Faces")
-        self.face_library_tabs.addTab(selection_page, "Review & Name")
-        # The retained review workflow stays implemented, but is hidden from
-        # the primary Faces navigation until its redesign is ready.
-        self.face_library_tabs.tabBar().setTabVisible(1, False)
+        self.face_library_tabs.addTab(selection_page, "Review && Name")
+        self.face_library_tabs.currentChanged.connect(
+            lambda _index: self._emit_people_section_changed()
+        )
         tab_layout.addWidget(self.face_library_tabs)
 
         self.face_db_scope = QComboBox(detection_page)
@@ -12320,6 +13723,7 @@ class SearchPane(QWidget):
         self.face_folder_path.setToolTip(FACE_HELP["scan_source"])
 
         self.face_named_people_list = QListWidget()
+        self.face_named_people_list.setAccessibleName("Saved identities in the current folder")
         self.face_named_people_list.setProperty("sidebarList", True)
         self.face_named_people_list.setItemDelegate(SidebarListEntryDelegate(self.face_named_people_list))
         self.face_named_people_list.setMinimumHeight(220)
@@ -12328,6 +13732,7 @@ class SearchPane(QWidget):
             "Saved identities for this folder. Click one to load its name and profile fields."
         )
         self.face_unlabeled_groups_list = QListWidget()
+        self.face_unlabeled_groups_list.setAccessibleName("Unlabelled face groups in the current folder")
         self.face_unlabeled_groups_list.setProperty("sidebarList", True)
         self.face_unlabeled_groups_list.setItemDelegate(SidebarListEntryDelegate(self.face_unlabeled_groups_list))
         self.face_unlabeled_groups_list.setMinimumHeight(220)
@@ -12426,6 +13831,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_scanned_list = QListView()
+        self.face_scanned_list.setAccessibleName("Faces in the selected photo")
         self.face_scanned_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_scanned_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_scanned_list.setMovement(QListView.Movement.Static)
@@ -12516,24 +13922,31 @@ class SearchPane(QWidget):
 
         source_layout.addWidget(self._field_widget("Sort", self.face_review_sort, tooltip=FACE_HELP["face_review_sort"]))
 
-        buttons = QGridLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.setSpacing(6)
+        buttons = ResponsiveFlowLayout(spacing=6)
         self.face_scan_actions_grid = buttons
         self.face_scan_button = QPushButton("Detect Faces")
         self.face_scan_button.setProperty("kind", "primary")
         self.face_scan_button.setToolTip(FACE_HELP["scan_folder_button"])
+        self.face_scan_button.setProperty("faceReadinessBaseToolTip", FACE_HELP["scan_folder_button"])
+        self.face_scan_button.setProperty("faceEligibilityBaseToolTip", FACE_HELP["scan_folder_button"])
         self.face_refresh_people_button = QPushButton("Reload People List")
         self.face_refresh_people_button.setToolTip(FACE_HELP["reload_people_button"])
-        self.face_refresh_faces_button = QPushButton("Refresh Folder Review")
+        self.face_refresh_faces_button = QPushButton("Refresh review")
+        self.face_refresh_faces_button.setAccessibleName("Refresh folder review")
         self.face_refresh_faces_button.setToolTip(FACE_HELP["reload_faces_button"])
-        self.face_auto_clean_button = QPushButton("Auto-Clean Folder Review")
+        self.face_auto_clean_button = QPushButton("Auto-clean review")
+        self.face_auto_clean_button.setAccessibleName("Auto-clean folder review")
         self.face_auto_clean_button.setToolTip(FACE_HELP["auto_clean_review"])
         self.face_hide_rejected_button = QPushButton("Hide Rejected Faces")
         self.face_restore_rejected_button = QPushButton("Restore Rejected Faces")
         self.face_rescan_selected_button = QPushButton("Rescan Selected Photos")
         self.face_rescan_suspicious_button = QPushButton("Rescan Review/Rejected Photos")
         self.face_rescan_fallback_button = QPushButton("Rescan With Fallback Detector")
+        self.face_hide_rejected_button.setToolTip("Hide rejected face regions from normal review without deleting source photos.")
+        self.face_restore_rejected_button.setToolTip("Restore previously hidden rejected face regions to review.")
+        self.face_rescan_selected_button.setToolTip("Run face detection again for the selected review photos.")
+        self.face_rescan_suspicious_button.setToolTip("Run face detection again for photos marked Review or Rejected.")
+        self.face_rescan_fallback_button.setToolTip("Run the configured fallback detector for the selected review photos.")
         self.face_scan_button.clicked.connect(self._scan_face_folder)
         self.face_refresh_people_button.clicked.connect(lambda: self._request_face_library_refresh(refresh_people=True, reason="reload people", force_refresh=True))
         self.face_refresh_faces_button.clicked.connect(lambda: self._request_face_library_refresh(refresh_people=False, reason="reload review", force_refresh=True))
@@ -12555,14 +13968,14 @@ class SearchPane(QWidget):
             self.face_rescan_fallback_button,
         ])
         self._mode_required_buttons.append(self.face_scan_button)
-        buttons.addWidget(self.face_scan_button, 0, 0)
-        buttons.addWidget(self.face_refresh_faces_button, 0, 1)
-        buttons.addWidget(self.face_auto_clean_button, 1, 0)
-        buttons.addWidget(self.face_rescan_selected_button, 1, 1)
-        buttons.addWidget(self.face_hide_rejected_button, 2, 0)
-        buttons.addWidget(self.face_restore_rejected_button, 2, 1)
-        buttons.addWidget(self.face_rescan_suspicious_button, 3, 0)
-        buttons.addWidget(self.face_rescan_fallback_button, 3, 1)
+        buttons.addWidget(self.face_scan_button)
+        buttons.addWidget(self.face_refresh_faces_button)
+        buttons.addWidget(self.face_auto_clean_button)
+        buttons.addWidget(self.face_rescan_selected_button)
+        buttons.addWidget(self.face_hide_rejected_button)
+        buttons.addWidget(self.face_restore_rejected_button)
+        buttons.addWidget(self.face_rescan_suspicious_button)
+        buttons.addWidget(self.face_rescan_fallback_button)
         source_layout.addLayout(buttons)
         self.face_source_group = source_group
 
@@ -12642,7 +14055,8 @@ class SearchPane(QWidget):
         name_layout = QVBoxLayout(name_row)
         name_layout.setContentsMargins(0, 0, 0, 0)
         name_layout.setSpacing(6)
-        self.face_search_by_name_button = QPushButton("Find Photos by Saved Name")
+        self.face_search_by_name_button = QPushButton("Find saved person")
+        self.face_search_by_name_button.setAccessibleName("Find photos by saved name")
         self.face_search_by_name_button.setToolTip(FACE_HELP["find_photos_saved_name"])
         self.face_search_by_name_button.clicked.connect(self._search_by_name)
         self._action_buttons.append(self.face_search_by_name_button)
@@ -12654,7 +14068,7 @@ class SearchPane(QWidget):
         profile_fields.setSpacing(8)
         self.face_profile_fields_grid = profile_fields
         profile_fields.addWidget(self._field_widget("Saved identity", name_row, tooltip=FACE_HELP["saved_person_name"]))
-        profile_fields.addWidget(self._field_widget("Name for selected face(s)", self.face_label_name, tooltip=FACE_HELP["selected_face_name"]))
+        profile_fields.addWidget(self._field_widget("Selected face name", self.face_label_name, tooltip=FACE_HELP["selected_face_name"]))
         self.face_profile_technical_fields = []
         for title, widget, tooltip in (
             ("Saved-name maximum results", self.face_name_top_k, FACE_HELP["name_search_top_k"]),
@@ -12678,13 +14092,15 @@ class SearchPane(QWidget):
         face_actions = QVBoxLayout()
         face_actions.setContentsMargins(0, 0, 0, 0)
         face_actions.setSpacing(6)
-        self.face_save_name_button = QPushButton("Name Selected Face(s)")
+        self.face_save_name_button = QPushButton("Name faces")
+        self.face_save_name_button.setAccessibleName("Name selected faces")
         self.face_save_name_button.setToolTip(FACE_HELP["name_selected_faces"])
         self.face_save_profile_button = QPushButton("Save/Update Profile")
         self.face_save_profile_button.setToolTip(FACE_HELP["save_profile"])
         self.face_hide_selected_faces_button = QPushButton("Hide Selected Face(s)")
         self.face_hide_selected_faces_button.setToolTip("Hide selected face tiles without deleting labels or source images.")
-        self.face_search_selected_button = QPushButton("Find Photos of Selected Face")
+        self.face_search_selected_button = QPushButton("Find this face")
+        self.face_search_selected_button.setAccessibleName("Find photos of selected face")
         self.face_search_selected_button.setToolTip(FACE_HELP["find_photos_selected_face"])
         self.face_save_name_button.clicked.connect(self._save_selected_face_name)
         self.face_save_profile_button.clicked.connect(self._save_person_profile)
@@ -12751,7 +14167,7 @@ class SearchPane(QWidget):
 
     def _select_recent_face_folder(self, directory: str) -> None:
         path = str(directory or "").strip()
-        if not path or not Path(path).is_dir():
+        if not path:
             return
         self.face_folder_path.setText(path)
         self.source_folder_changed.emit(path)
@@ -13188,32 +14604,147 @@ class SearchPane(QWidget):
         self._explicit_review_scope_paths = tuple(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
         count = len(self._explicit_review_scope_paths)
         if count:
-            self.face_scan_button.setText(f"Detect Gallery Set ({count})")
+            self.face_scan_button.setText(f"Detect current photo set ({count})")
             self.face_scan_button.setToolTip(
-                f"Detect and index faces only in the {count} photo(s) sent from Gallery. This begins when you click this button."
+                f"Detect and index faces only in the {count} routed photo(s). This begins when you click this button."
             )
-            self.status_label.setText(f"{count} Gallery photo(s) are ready. Click Detect Gallery Set to start face indexing.")
+            self.status_label.setText(f"{count} routed photo(s) are ready. Click Detect current photo set to start face indexing.")
         else:
             self.face_scan_button.setText("Detect Faces")
             self.face_scan_button.setToolTip(FACE_HELP["scan_folder_button"])
+
+    def _on_face_index_batch_committed(self, payload: object) -> None:
+        """Expose newly durable scan rows without reloading the whole review."""
+
+        try:
+            generation, committed_paths = payload
+        except (TypeError, ValueError):
+            return
+        if int(generation) != int(self._face_review_live_scan_generation) or not self._face_review_live_scan_active:
+            return
+        folder = str(self._face_review_live_scan_folder or "")
+        if not folder:
+            return
+        if not self.is_face_folder_tab_active() or self._effective_face_folder() != folder:
+            # The scan can finish after navigation. Keep its durable rows in
+            # storage and let the next explicit Detect activation issue the
+            # normal scoped refresh instead of publishing into a hidden view.
+            self._face_review_stale = True
+            return
+        paths = [str(path) for path in list(committed_paths or []) if str(path or "").strip()]
+        if not paths:
+            return
+        known_paths = set(self._face_review_stream_paths)
+        new_paths = [path for path in paths if path not in known_paths]
+        if not new_paths:
+            return
+        prior_source_count = len(self._face_review_stream_paths)
+        self._face_review_stream_paths.extend(new_paths)
+        # The immutable snapshot belongs to the prior source list.  Rebuild it
+        # in the replacement cache worker so newly committed paths receive the
+        # same canonical scope checks before any page is published.
+        self._face_review_stream_candidate_snapshot = None
+        self._face_review_stream_folder = folder
+        self._face_review_stream_scope_roots = tuple(self._current_scope_roots())
+        self._face_review_stream_include_tiny_faces = self._show_tiny_detections_enabled()
+        self._face_review_stream_in_progress = True
+        if self._face_review_stream_next_offset is None:
+            self._face_review_stream_next_offset = prior_source_count
+        if self._face_review_stream_source is None:
+            service = self._active_face_service()
+            self._face_review_stream_source = FaceReviewSource(
+                service=service,
+                folder=folder,
+                scope_key=self._current_face_scope_key(),
+                mode=self.current_face_mode(),
+                db_path=str(getattr(service, "db_path", "") or ""),
+                runtime_root="",
+                indexed_image_count=0,
+                face_image_count=0,
+                face_count=0,
+                selection_reason="live face index batch",
+            )
+        # Durable batches feed the metadata cache, never the gallery.  A
+        # still-running cache is restarted against the larger immutable path
+        # list; no visible Photos/Faces model is rebuilt.  An empty review
+        # remembers one demand so the first durable page appears when ready.
+        if self._face_review_cache_in_progress:
+            job = self._face_review_stream_job
+            if job is not None:
+                self._cancel_job(job)
+            self._face_review_cache_generation += 1
+            self._face_review_cache_in_progress = False
+            self._face_review_cache_complete = False
+            self._face_review_cached_pages = []
+            self._face_review_cached_page_index = 0
+            self._face_review_stream_next_offset = len(self._face_review_all_images)
+        if not self._face_review_cache_complete:
+            if not list(getattr(self.results_gallery, "images", []) or []):
+                self._face_review_tail_waiting_for_cache = True
+            self._start_face_review_stream_cache()
+        else:
+            # Preserve the review currently being examined.  Newly committed
+            # rows are durable and will join the next scoped refresh rather
+            # than forcing a hidden page rebuild mid-review.
+            self._face_review_stale = True
+
+    def _finish_live_face_scan(self, generation: int, *, directory: str, metrics: dict, explicit_paths: list[str], scope_roots: tuple[str, ...]) -> None:
+        if int(generation) != int(self._face_review_live_scan_generation):
+            return
+        self._face_review_live_scan_active = False
+        faces = int((metrics or {}).get("faces_indexed", 0))
+        done = int((metrics or {}).get("images_done", 0))
+        total = int((metrics or {}).get("images_total", 0))
+        self._log_face_event("scan_completed", directory=directory, images_done=done, images_total=total, faces_indexed=faces)
+        scope_label = "Current photo set" if explicit_paths else f"{len(scope_roots)} active root(s)"
+        self.status_label.setText(f"Indexed {faces} faces from {done}/{total} images in {scope_label}.")
+        self._explicit_review_scope_paths = ()
+        self.face_scan_button.setText("Detect Faces")
+        self.face_scan_button.setToolTip(FACE_HELP["scan_folder_button"])
+        if directory:
+            self._invalidate_face_discovery_cache(directory)
+        # Rows have already been appended from durable batches.  Rebuilding
+        # the review here used to restart every thumbnail and scroll position.
+        self._maybe_refresh_global_face_album(reason="scan complete", force_refresh=True)
 
     def _scan_face_folder(self) -> None:
         directory = self._effective_face_folder()
         scope_roots = self._current_scope_roots()
         explicit_paths = list(self._explicit_review_scope_paths)
-        if not scope_roots and not explicit_paths:
-            errorBox("No active roots", "Choose one or more active roots in the shared Folder pane first.")
+        if not self._require_face_action_eligibility("detect"):
             return
         if not self._ensure_face_models_ready("scan this folder"):
             return
         service = self._active_face_service()
+        self._face_review_live_scan_generation += 1
+        live_generation = int(self._face_review_live_scan_generation)
+        self._face_review_live_scan_active = True
+        self._face_review_live_scan_folder = str(directory or "")
         self._update_face_scope_summary(folder=directory)
         self._log_face_event("scan_requested", directory=directory, active_root_count=len(scope_roots), explicit_path_count=len(explicit_paths))
 
         def _run(progress, cancel_check):
+            def _index_paths(paths: list[str]):
+                kwargs = {
+                    "progress_callback": progress,
+                    "cancel_check": cancel_check,
+                    "on_persisted_batch": lambda committed: self.face_index_batch_committed.emit(
+                        (live_generation, tuple(committed))
+                    ),
+                }
+                try:
+                    return service.index_paths(paths, **kwargs)
+                except TypeError as exc:
+                    # Third-party/test face services predating the durable
+                    # batch notification retain the original contract.
+                    if "on_persisted_batch" not in str(exc):
+                        raise
+                    kwargs.pop("on_persisted_batch", None)
+                    return service.index_paths(paths, **kwargs)
+
             progress(0, "0/0 images, faces=0")
             if explicit_paths:
-                return service.index_paths(explicit_paths, progress_callback=progress, cancel_check=cancel_check)
+                return _index_paths(explicit_paths)
             from app.services.discovery import ImageDiscoveryService
 
             discovered = ImageDiscoveryService().discover_roots_result(
@@ -13224,22 +14755,21 @@ class SearchPane(QWidget):
             )
             if not discovered.paths:
                 return {"images_total": 0, "images_done": 0, "faces_indexed": 0}
-            return service.index_paths(list(discovered.paths), progress_callback=progress, cancel_check=cancel_check)
+            return _index_paths(list(discovered.paths))
 
         def _done(metrics: dict) -> None:
-            faces = int((metrics or {}).get("faces_indexed", 0))
-            done = int((metrics or {}).get("images_done", 0))
-            total = int((metrics or {}).get("images_total", 0))
-            self._log_face_event("scan_completed", directory=directory, images_done=done, images_total=total, faces_indexed=faces)
-            scope_label = "Gallery photo set" if explicit_paths else f"{len(scope_roots)} active root(s)"
-            self.status_label.setText(f"Indexed {faces} faces from {done}/{total} images in {scope_label}.")
-            self._explicit_review_scope_paths = ()
-            self.face_scan_button.setText("Detect Faces")
-            self.face_scan_button.setToolTip(FACE_HELP["scan_folder_button"])
-            if directory:
-                self._invalidate_face_discovery_cache(directory)
-            self._request_face_library_refresh(refresh_people=True, reason="scan complete", force_refresh=True)
-            self._maybe_refresh_global_face_album(reason="scan complete", force_refresh=True)
+            # Persisted-batch signals are queued from the worker. Deferring
+            # completion lets the final durable page join the review first.
+            QTimer.singleShot(
+                0,
+                lambda: self._finish_live_face_scan(
+                    live_generation,
+                    directory=directory,
+                    metrics=dict(metrics or {}),
+                    explicit_paths=list(explicit_paths),
+                    scope_roots=tuple(scope_roots),
+                ),
+            )
 
         self._start_job("Indexing faces", _run, _done)
 
@@ -13439,7 +14969,9 @@ class SearchPane(QWidget):
             faces = int((metrics or {}).get("faces_indexed", 0))
             done = int((metrics or {}).get("images_done", 0))
             total = int((metrics or {}).get("images_total", 0))
-            self.status_label.setText(f"Rescanned {done}/{total} image(s) and indexed {faces} face(s) for {reason}.")
+            self.status_label.setText(
+                f"Rescanned {done:,}/{total:,} photos and indexed {counted(faces, 'face')} for {reason}."
+            )
             self._request_face_library_refresh(refresh_people=True, reason=f"{reason} rescan complete", force_refresh=True)
 
         self._start_job("Rescanning face review images", _run, _done)
@@ -13545,7 +15077,10 @@ class SearchPane(QWidget):
                         "No saved identities or unlabeled groups found for this folder. Scan the folder or name selected faces first."
                     )
             else:
-                summary = f"Loaded {visible_profiles} saved identities and {unlabeled_group_count} unlabeled group(s)."
+                summary = (
+                    f"Showing {counted(visible_profiles, 'saved identity')} and "
+                    f"{counted(unlabeled_group_count, 'unlabeled group')}."
+                )
                 if hidden_face_count and not include_tiny_faces:
                     summary += f" {hidden_face_count} tiny detection(s) hidden."
                 summary += " Click a row to review it."
@@ -13864,7 +15399,7 @@ class SearchPane(QWidget):
             chunk = image_paths[offset : offset + chunk_size]
             if not chunk:
                 self._publish_results(image_paths, provider, overlay_by_path, subtitle_by_path, self._results_kind)
-                self.status_label.setText(f"Loaded {total} photo(s).")
+                self.status_label.setText(f"{showing(total, 'photo')}.")
                 self._update_face_results_context()
                 return
             self.results_gallery.append_images(chunk)
@@ -13886,7 +15421,7 @@ class SearchPane(QWidget):
             except Exception:
                 pass
             loaded = min(total, offset + len(chunk))
-            self.status_label.setText(f"Loading photos {loaded}/{total}...")
+            self.status_label.setText(f"Publishing results {loaded:,}/{total:,} photos…")
             self._update_face_results_context()
             QTimer.singleShot(chunk_delay_ms, lambda next_offset=offset + chunk_size: _step(next_offset))
 
@@ -13958,9 +15493,11 @@ class SearchPane(QWidget):
                 if str(getattr(record, "quality_status", "clean") or "clean").strip().lower() in {"review", "reject"}
             )
         summary_text = (
-            f"Loaded {len(review_images)} image(s) from {folder}. "
-            f"{int(detected_images)} photo(s) with visible faces, {int(no_face_images)} with no faces, "
-            f"{int(not_scanned_images)} not scanned. {int(visible_face_count)} visible face(s)."
+            f"Loaded {counted(len(review_images), 'photo')} from {folder}. "
+            f"{counted(int(detected_images), 'photo')} with visible faces, "
+            f"{counted(int(no_face_images), 'photo')} with no faces, "
+            f"{counted(int(not_scanned_images), 'photo')} not scanned. "
+            f"{counted(int(visible_face_count), 'visible face')}."
         )
         if int(hidden_face_count) and not include_tiny_faces:
             summary_text += f" {int(hidden_face_count)} tiny detection(s) hidden."
@@ -14178,23 +15715,17 @@ class SearchPane(QWidget):
     def _cancel_face_review_hydration_job(self) -> None:
         job = self._face_review_hydration_job
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         self._face_review_hydration_job = None
         self._face_review_hydration_thread = None
 
     def _on_face_review_hydration_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_review_hydration_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_review_hydration_refs = retained
-        if thread is self._face_review_hydration_thread:
-            self._face_review_hydration_thread = None
-            self._face_review_hydration_job = None
+        self._defer_face_worker_release(
+            "_retained_face_review_hydration_refs",
+            thread,
+            "_face_review_hydration_job",
+            "_face_review_hydration_thread",
+        )
 
     def _request_face_review_hydration(self, paths: list[str]) -> None:
         target_paths = [
@@ -14242,13 +15773,16 @@ class SearchPane(QWidget):
 
         job.completed.connect(_completed)
         self._face_review_hydration_job = job
-        thread = start_job_in_thread(job)
-        self._face_review_hydration_thread = thread
-        self._retained_face_review_hydration_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_review_hydration_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_review_hydration_thread = thread
+            self._retained_face_review_hydration_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_review_hydration_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self._submit_job(job, "Preparing visible face review", _launch, foreground=False)
 
     def _queue_face_review_path_hydration(
         self,
@@ -14330,10 +15864,11 @@ class SearchPane(QWidget):
         ) = self._build_face_review_gallery_state(paths)
         self._face_review_context_by_path = dict(ctx_by_path)
         summary = (
-            f"Loaded {len(paths)} image(s) from {self._face_review_folder}. "
-            f"{int(stats['detected_images'])} photo(s) with visible faces, "
-            f"{int(stats['no_face_images'])} with no faces, {int(stats['not_scanned_images'])} not scanned. "
-            f"{int(stats['visible_face_count'])} visible face(s)."
+            f"{showing(len(paths), 'photo')} from {self._face_review_folder}. "
+            f"{counted(int(stats['detected_images']), 'photo')} with visible faces, "
+            f"{counted(int(stats['no_face_images']), 'photo')} with no faces, "
+            f"{counted(int(stats['not_scanned_images']), 'photo')} not scanned. "
+            f"{counted(int(stats['visible_face_count']), 'visible face')}."
         )
         if int(stats["review_face_count"]):
             summary += f" {int(stats['review_face_count'])} face(s) still need manual review."
@@ -14365,23 +15900,17 @@ class SearchPane(QWidget):
     def _cancel_face_review_publish_job(self) -> None:
         job = self._face_review_publish_job
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(job)
         self._face_review_publish_job = None
         self._face_review_publish_thread = None
 
     def _on_face_review_publish_thread_finished(self, thread=None) -> None:
-        retained: list[tuple[object | None, object | None]] = []
-        for job, retained_thread in self._retained_face_review_publish_refs:
-            if retained_thread is thread:
-                continue
-            retained.append((job, retained_thread))
-        self._retained_face_review_publish_refs = retained
-        if thread is self._face_review_publish_thread:
-            self._face_review_publish_thread = None
-            self._face_review_publish_job = None
+        self._defer_face_worker_release(
+            "_retained_face_review_publish_refs",
+            thread,
+            "_face_review_publish_job",
+            "_face_review_publish_thread",
+        )
 
     def _request_face_review_publish(
         self,
@@ -14509,13 +16038,16 @@ class SearchPane(QWidget):
         job.failed.connect(_failed)
         job.completed.connect(_completed)
         self._face_review_publish_job = job
-        thread = start_job_in_thread(job)
-        self._face_review_publish_thread = thread
-        self._retained_face_review_publish_refs.append((job, thread))
-        thread.finished.connect(
-            lambda thread=thread: self._on_face_review_publish_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._face_review_publish_thread = thread
+            self._retained_face_review_publish_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: self._on_face_review_publish_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self._submit_job(job, "Preparing face review results", _launch, foreground=False)
 
     def _build_face_review_publish_snapshot(
         self,
@@ -14752,9 +16284,11 @@ class SearchPane(QWidget):
             }
         if sorted_review_images:
             summary_text = (
-                f"Loaded {len(sorted_review_images)} image(s) from {folder}. "
-                f"{int(stats['detected_images'])} photo(s) with visible faces, {int(stats['no_face_images'])} with no faces, "
-                f"{int(stats['not_scanned_images'])} not scanned. {int(stats['visible_face_count'])} visible face(s)."
+                f"{showing(len(sorted_review_images), 'photo')} from {folder}. "
+                f"{counted(int(stats['detected_images']), 'photo')} with visible faces, "
+                f"{counted(int(stats['no_face_images']), 'photo')} with no faces, "
+                f"{counted(int(stats['not_scanned_images']), 'photo')} not scanned. "
+                f"{counted(int(stats['visible_face_count']), 'visible face')}."
             )
             if int(stats["review_face_count"]):
                 summary_text += f" {int(stats['review_face_count'])} face(s) still need manual review."
@@ -14806,6 +16340,8 @@ class SearchPane(QWidget):
         self._face_review_sorted_mode = str(getattr(snapshot, "sort_mode", "") or "")
         self._face_review_by_path = dict(snapshot.review_by_path or {})
         self._face_review_context_by_path = dict(snapshot.context_by_path or {})
+        if not append_detected_faces:
+            self._invalidate_detected_faces_review()
         self._face_photo_context_kind = "folder"
         self._face_photo_context_title = "Folder photos"
         self._folder_photo_snapshot = FacePhotoViewSnapshot(
@@ -14838,7 +16374,8 @@ class SearchPane(QWidget):
                 "Choose another Photos filter. Faces and Groups remain available in their own views.",
             )
             self._refresh_detected_faces_review()
-            self._sync_face_review_result_groups()
+            if self._face_review_cache_complete:
+                self._sync_face_review_result_groups()
             self._update_face_selected_context_label()
             self._update_face_results_context()
             self._log_face_event("review_publish_complete", folder=folder, image_count=0)
@@ -14882,17 +16419,22 @@ class SearchPane(QWidget):
                     clear_pixmaps=not streaming,
                     reset_scroll=not streaming,
                 )
-            appended_review_images = (
-                [
-                    item
-                    for item in list(snapshot.filtered_review_images or [])
-                    if str(getattr(item, "image_path", "") or "") not in previous_review_paths
-                ]
-                if append_detected_faces
-                else None
+            # First-page publication never starts work for the hidden Faces
+            # or Face Groups tabs.  The cache completion callback performs
+            # their one explicit handoff when the user has selected either.
+            self._refresh_detected_faces_review(
+                append_review_images=(
+                    [
+                        item
+                        for item in list(snapshot.filtered_review_images or [])
+                        if str(getattr(item, "image_path", "") or "") not in previous_review_paths
+                    ]
+                    if append_detected_faces
+                    else None
+                )
             )
-            self._refresh_detected_faces_review(append_review_images=appended_review_images)
-            self._sync_face_review_result_groups()
+            if self._face_review_cache_complete:
+                self._sync_face_review_result_groups()
             self._load_face_review_selection(selected_path)
             if lazy_publish:
                 self._queue_face_review_path_hydration([selected_path], immediate=False)
@@ -15131,6 +16673,7 @@ class SearchPane(QWidget):
     def _on_scanned_face_selection_changed(self) -> None:
         if self._face_selection_sync_in_progress:
             return
+        self._face_similarity_request_id += 1
         items = self._selected_tile_items(self.face_scanned_list, self.face_scanned_model)
         records = self._selected_scanned_faces()
         if not records:
@@ -15184,18 +16727,23 @@ class SearchPane(QWidget):
         records = self._selected_scanned_faces()
         cover_ref = (records[0].image_path, int(records[0].face_index)) if records else None
         tags = [tag.strip() for tag in self.face_profile_tags.text().split(",") if tag.strip()]
+        notes = self.face_profile_notes.text().strip()
+        favorite = bool(self.face_profile_favorite.isChecked()) if hasattr(self, "face_profile_favorite") else None
+        birth_date = self.face_profile_birth_date.text().strip() if hasattr(self, "face_profile_birth_date") else None
+        hidden = bool(self.face_profile_hidden.isChecked()) if hasattr(self, "face_profile_hidden") else None
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Saving profile...")
             _ = cancel_check
-            self._active_face_service().save_person_profile(
+            service.save_person_profile(
                 person_name,
-                notes=self.face_profile_notes.text().strip(),
+                notes=notes,
                 tags=tags,
                 cover_face_ref=cover_ref,
-                favorite=bool(self.face_profile_favorite.isChecked()) if hasattr(self, "face_profile_favorite") else None,
-                birth_date=self.face_profile_birth_date.text().strip() if hasattr(self, "face_profile_birth_date") else None,
-                hidden=bool(self.face_profile_hidden.isChecked()) if hasattr(self, "face_profile_hidden") else None,
+                favorite=favorite,
+                birth_date=birth_date,
+                hidden=hidden,
             )
             return True
 
@@ -15213,11 +16761,11 @@ class SearchPane(QWidget):
             errorBox("No faces selected", "Select one or more saved face tiles in Face Library first.")
             return
         refs = [(str(record.image_path), int(record.face_index)) for record in records]
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Hiding selected faces...")
             raise_if_cancelled(cancel_check)
-            service = self._active_face_service()
             hide_faces = getattr(service, "hide_faces", None)
             if callable(hide_faces):
                 return int(hide_faces(refs) or 0)
@@ -15256,12 +16804,10 @@ class SearchPane(QWidget):
 
     def _on_person_clicked(self, item) -> None:
         profile = item.data(Qt.ItemDataRole.UserRole)
-        if hasattr(self, "face_library_tabs"):
-            self.face_library_tabs.setCurrentIndex(0)
         if isinstance(profile, FaceLibraryUnlabeledGroup):
             if hasattr(self, "face_people_summary"):
                 self.face_people_summary.setText(
-                    f"Loaded unlabeled group from {Path(profile.image_path).name}. The folder review now focuses that photo."
+                    f"Selected unlabeled group from {Path(profile.image_path).name}. The folder review now focuses that photo."
                 )
             self.face_name_query.clear()
             self.face_label_name.clear()
@@ -15286,7 +16832,7 @@ class SearchPane(QWidget):
                 )
             else:
                 self.face_scanned_summary.setText(
-                    f"Loaded {profile.face_count} unlabeled face(s) from {Path(profile.image_path).name}."
+                    f"Selected {counted(profile.face_count, 'unlabeled face')} from {Path(profile.image_path).name}."
                 )
             return
         if profile is not None and hasattr(profile, "person_name"):
@@ -15318,7 +16864,7 @@ class SearchPane(QWidget):
                     pass
             if hasattr(self, "face_people_summary"):
                 self.face_people_summary.setText(
-                    f"Loaded saved identity '{name}'. Use Find Photos by Saved Name or update the profile below."
+                    f"Selected saved identity '{name}'. Use Find Photos by Saved Name or update the profile below."
                 )
             if hasattr(self, "face_identity_list"):
                 row = self.face_identity_model.row_for_payload(name)
@@ -15342,24 +16888,30 @@ class SearchPane(QWidget):
             errorBox("Missing name", "Enter or select a saved identity name first.")
             return
         folder = self.face_name_folder_filter.text().strip()
-        scope_roots = self._current_scope_roots()
-        scope_paths = self._current_scope_paths()
-        if not folder and self.search_only_current_folder.isChecked():
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
+        if scope_roots is not None and not folder and self.search_only_current_folder.isChecked():
             folder = self._current_directory()
         min_score = float(self.face_name_min_score.value())
         min_score_arg = self._effective_face_search_min_score(min_score if min_score > 0.0 else 0.0)
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        top_k = int(self.face_name_top_k.value())
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Searching by name...")
             return _call_with_optional_cancel(
                 service.search_by_person_name,
                 name,
-                top_k=int(self.face_name_top_k.value()),
+                top_k=top_k,
                 min_score=min_score_arg,
                 folder_prefix=folder,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
 
@@ -15390,22 +16942,24 @@ class SearchPane(QWidget):
             errorBox("Missing name", "Enter or select a saved identity name first.")
             return
         folder = self.face_name_folder_filter.text().strip()
-        scope_roots = self._current_scope_roots()
-        scope_paths = self._current_scope_paths()
-        if not folder and self.search_only_current_folder.isChecked():
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
+        if scope_roots is not None and not folder and self.search_only_current_folder.isChecked():
             folder = self._current_directory()
         min_score = float(self.face_name_min_score.value())
         min_score_arg = self._effective_face_search_min_score(min_score if min_score > 0.0 else 0.0)
 
         def _run(progress, cancel_check):
             return _call_with_optional_cancel(
-                self._active_face_service().deep_search_by_person_name,
+                service.deep_search_by_person_name,
                 name,
                 min_score=min_score_arg,
                 folder_prefix=folder,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 progress=progress,
                 cancel_check=cancel_check,
             )
@@ -15469,9 +17023,9 @@ class SearchPane(QWidget):
         ):
             return
         threshold = float(review.get("threshold", 0.72) or 0.72)
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
-            service = self._active_face_service()
             apply_unlabeled = getattr(service, "label_unlabeled_indexed_faces_with_metadata", None)
             if callable(apply_unlabeled):
                 return apply_unlabeled(
@@ -15586,15 +17140,17 @@ class SearchPane(QWidget):
             errorBox("Missing names", "Enter one or more people names first.")
             return
         scope_paths = self._current_scope_paths()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Finding people together...")
             _ = cancel_check
-            return self._active_face_service().find_face_records_by_people(
+            return service.find_face_records_by_people(
                 names,
                 require_all=True,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(records) -> None:
@@ -15609,13 +17165,15 @@ class SearchPane(QWidget):
 
     def _show_photos_with_any_named_people(self) -> None:
         scope_paths = self._current_scope_paths()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Finding named people...")
             _ = cancel_check
-            return self._active_face_service().find_face_records_with_named_people(
+            return service.find_face_records_with_named_people(
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(records) -> None:
@@ -15630,13 +17188,15 @@ class SearchPane(QWidget):
 
     def _show_photos_with_unknown_people(self) -> None:
         scope_paths = self._current_scope_paths()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Finding unknown people...")
             _ = cancel_check
-            return self._active_face_service().find_face_records_with_unknown_people(
+            return service.find_face_records_with_unknown_people(
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(records) -> None:
@@ -15655,14 +17215,16 @@ class SearchPane(QWidget):
             errorBox("Missing name", "Enter the primary person name first.")
             return
         scope_paths = self._current_scope_paths()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Finding primary person photos...")
             _ = cancel_check
-            return self._active_face_service().find_face_records_with_primary_person(
+            return service.find_face_records_with_primary_person(
                 name,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(records) -> None:
@@ -15720,11 +17282,12 @@ class SearchPane(QWidget):
             return
         scope_paths = self._current_scope_paths()
         include_tiny = self._show_tiny_detections_enabled() if include_tiny_faces is None else bool(include_tiny_faces)
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Running face query...")
             _ = cancel_check
-            return self._active_face_service().search_face_query(
+            return service.search_face_query(
                 query,
                 candidate_paths=scope_paths,
                 include_tiny_faces=include_tiny,
@@ -15807,17 +17370,111 @@ class SearchPane(QWidget):
             return {"person_name": name}
         raise ValueError("Choose a saved search type first.")
 
-    def _refresh_saved_searches(self, selected_id: str = "") -> None:
+    def _apply_saved_searches(
+        self,
+        records: list[SavedSearch] | tuple[SavedSearch, ...],
+        selected_id: str = "",
+    ) -> None:
         if not hasattr(self, "saved_searches_list"):
             return
+        normalized_records = list(records or ())
+        self._saved_search_records = {
+            str(record.search_id): record for record in normalized_records
+        }
         self.saved_searches_list.clear()
-        for record in self.saved_search_service.list_searches():
+        for record in normalized_records:
             item = QListWidgetItem(f"{record.name} | {self._saved_search_type_label(record.search_type)}")
             item.setData(Qt.ItemDataRole.UserRole, record.search_id)
             item.setToolTip(json.dumps(record.payload, indent=2, sort_keys=True))
             self.saved_searches_list.addItem(item)
             if selected_id and record.search_id == selected_id:
                 self.saved_searches_list.setCurrentItem(item)
+        self._update_query_and_saved_search_actions()
+
+    def _start_saved_search_job(self, label: str, fn, on_completed) -> AsyncJob | None:
+        """Run saved-search JSON I/O without occupying the primary People worker."""
+
+        if self._saved_search_job is not None:
+            self.status_label.setText("Another saved-search operation is still finishing.")
+            return None
+        self._saved_search_request_id += 1
+        request_id = int(self._saved_search_request_id)
+        job = AsyncJob(fn)
+        self._saved_search_job = job
+        self._update_query_and_saved_search_actions()
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _is_current() -> bool:
+            return request_id == int(self._saved_search_request_id) and not self._is_shutting_down
+
+        def _clear_active() -> None:
+            if self._saved_search_job is job:
+                self._saved_search_job = None
+
+        def _finished(thread) -> None:
+            self._defer_face_worker_release(
+                "_retained_saved_search_refs",
+                thread,
+                "_saved_search_job",
+                "_saved_search_thread",
+            )
+
+        def _completed(result) -> None:
+            if _is_current():
+                on_completed(result)
+            _clear_active()
+            self._update_query_and_saved_search_actions()
+
+        def _failed(message: str) -> None:
+            if _is_current():
+                errorBox(f"{label} failed", str(message), parent=self)
+            _clear_active()
+            self._update_query_and_saved_search_actions()
+
+        def _cancelled() -> None:
+            if _is_current():
+                self.status_label.setText(f"{label} cancelled. No further saved-search changes were made.")
+            _clear_active()
+            self._update_query_and_saved_search_actions()
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_cancelled)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._saved_search_thread = thread
+            self._retained_saved_search_refs.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread: _finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        job.cancelled.connect(
+            lambda: setattr(self, "_saved_search_job", None)
+            if thread_holder["thread"] is None and self._saved_search_job is job
+            else None
+        )
+        self._submit_job(job, label, _launch, foreground=False)
+        return job
+
+    def _refresh_saved_searches(self, selected_id: str = "") -> None:
+        if not hasattr(self, "saved_searches_list") or self._is_shutting_down:
+            return
+        service = self.saved_search_service
+
+        def _run(progress, cancel_check):
+            progress(-1, "Loading saved searches…")
+            raise_if_cancelled(cancel_check)
+            records = service.list_searches()
+            raise_if_cancelled(cancel_check)
+            return records
+
+        def _done(records) -> None:
+            self._apply_saved_searches(list(records or ()), selected_id)
+
+        self._start_saved_search_job("Loading saved searches", _run, _done)
 
     def _selected_saved_search(self) -> SavedSearch | None:
         if not hasattr(self, "saved_searches_list"):
@@ -15828,45 +17485,83 @@ class SearchPane(QWidget):
         search_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
         if not search_id:
             return None
-        return self.saved_search_service.get_search(search_id)
+        return self._saved_search_records.get(search_id)
 
     def _save_current_saved_search(self) -> None:
         name = self.saved_search_name.text().strip() if hasattr(self, "saved_search_name") else ""
         try:
             payload = self._saved_search_payload_from_controls()
-            record = self.saved_search_service.save_search(name, self._saved_search_kind(), payload)
-            self._refresh_saved_searches(record.search_id)
-            self.status_label.setText(f"Saved search '{record.name}'.")
         except Exception as exc:
             errorBox("Save search failed", str(exc))
+            return
+        search_type = self._saved_search_kind()
+        service = self.saved_search_service
+
+        def _run(progress, cancel_check):
+            progress(-1, "Saving search…")
+            raise_if_cancelled(cancel_check)
+            record = service.save_search(name, search_type, payload)
+            raise_if_cancelled(cancel_check)
+            return record, service.list_searches()
+
+        def _done(result) -> None:
+            record, records = result
+            self._apply_saved_searches(list(records or ()), record.search_id)
+            self.status_label.setText(f"Saved search '{record.name}'.")
+
+        self._start_saved_search_job("Saving saved search", _run, _done)
 
     def _rename_selected_saved_search(self) -> None:
+        if not self._require_face_action_eligibility("saved_search_rename"):
+            return
         record = self._selected_saved_search()
-        if record is None:
-            errorBox("No saved search selected", "Select a saved search first.")
+        if record is None:  # Defensive against a selection disappearing after the guard.
             return
         new_name = self.saved_search_name.text().strip() if hasattr(self, "saved_search_name") else ""
-        try:
-            updated = self.saved_search_service.rename_search(record.search_id, new_name)
-            self._refresh_saved_searches(updated.search_id)
+        service = self.saved_search_service
+
+        def _run(progress, cancel_check):
+            progress(-1, "Renaming saved search…")
+            raise_if_cancelled(cancel_check)
+            updated = service.rename_search(record.search_id, new_name)
+            raise_if_cancelled(cancel_check)
+            return updated, service.list_searches()
+
+        def _done(result) -> None:
+            updated, records = result
+            self._apply_saved_searches(list(records or ()), updated.search_id)
             self.status_label.setText(f"Renamed saved search to '{updated.name}'.")
-        except Exception as exc:
-            errorBox("Rename search failed", str(exc))
+
+        self._start_saved_search_job("Renaming saved search", _run, _done)
 
     def _delete_selected_saved_search(self) -> None:
-        record = self._selected_saved_search()
-        if record is None:
-            errorBox("No saved search selected", "Select a saved search first.")
+        if not self._require_face_action_eligibility("saved_search_delete"):
             return
-        deleted = self.saved_search_service.delete_search(record.search_id)
-        self._refresh_saved_searches()
-        if deleted:
-            self.status_label.setText(f"Deleted saved search '{record.name}'.")
+        record = self._selected_saved_search()
+        if record is None:  # Defensive against a selection disappearing after the guard.
+            return
+        service = self.saved_search_service
+
+        def _run(progress, cancel_check):
+            progress(-1, "Deleting saved search…")
+            raise_if_cancelled(cancel_check)
+            deleted = service.delete_search(record.search_id)
+            raise_if_cancelled(cancel_check)
+            return deleted, service.list_searches()
+
+        def _done(result) -> None:
+            deleted, records = result
+            self._apply_saved_searches(list(records or ()))
+            if deleted:
+                self.status_label.setText(f"Deleted saved search '{record.name}'.")
+
+        self._start_saved_search_job("Deleting saved search", _run, _done)
 
     def _run_selected_saved_search(self) -> None:
+        if not self._require_face_action_eligibility("saved_search_run"):
+            return
         record = self._selected_saved_search()
-        if record is None:
-            errorBox("No saved search selected", "Select a saved search first.")
+        if record is None:  # Defensive against a selection disappearing after the guard.
             return
         self._run_saved_search(record)
 
@@ -15910,7 +17605,9 @@ class SearchPane(QWidget):
             return
         errorBox("Unsupported saved search", f"Cannot run saved search type: {search_type}")
 
-    def _set_face_walkthrough_visible(self, visible: bool) -> None:
+    def _set_face_walkthrough_visible(self, visible: bool, *, user_action: bool = True) -> None:
+        if user_action:
+            self._face_walkthrough_dismissed = not bool(visible)
         if hasattr(self, "face_walkthrough_panel"):
             self.face_walkthrough_panel.setVisible(bool(visible))
         if hasattr(self, "face_walkthrough_reopen_button"):
@@ -15920,16 +17617,22 @@ class SearchPane(QWidget):
         if not hasattr(self, "face_db_usage_label"):
             return
         service = self._active_face_service()
-        db_path = Path(str(getattr(service, "db_path", "") or ""))
+        raw_db_path = str(getattr(service, "db_path", "") or "").strip()
+        if not raw_db_path:
+            self.face_db_usage_label.setText(
+                "Face data usage: unavailable until this face library has a managed database path."
+            )
+            return
+        db_path = Path(raw_db_path)
+        if not db_path.name:
+            self.face_db_usage_label.setText("Face data usage: unavailable for an invalid database path.")
+            return
         self._face_db_usage_request_id += 1
         request_id = int(self._face_db_usage_request_id)
         if self._face_db_usage_job is not None:
-            try:
-                self._face_db_usage_job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(self._face_db_usage_job)
         self.face_db_usage_label.setText("Face data usage: scanning saved face-library files…")
-        targets = [db_path, Path(f"{db_path}.faiss"), Path(f"{db_path}.faiss.json")]
+        targets = FaceStorageRemovalService.managed_paths(db_path)
 
         def _run(progress, cancel_check):
             progress(-1, "Scanning face-library storage…")
@@ -15946,11 +17649,12 @@ class SearchPane(QWidget):
             return total_bytes, existing_paths
 
         job = AsyncJob(_run)
-        if self.job_manager is not None:
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
             self.job_manager.bind_async_job(
                 job,
                 "Scanning face-library storage",
-                origin="Faces",
+                origin="People",
                 foreground=False,
             )
 
@@ -15976,13 +17680,16 @@ class SearchPane(QWidget):
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         self._face_db_usage_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
-        self._face_db_usage_thread = thread
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_async_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._face_db_usage_thread = thread
+
+        self._submit_job(job, "Scanning face-library storage", _launch, foreground=False)
 
     @staticmethod
     def _human_size(size_bytes: int) -> str:
@@ -16003,36 +17710,122 @@ class SearchPane(QWidget):
             return
         service = self._active_face_service()
         db_path = Path(str(getattr(service, "db_path", "") or ""))
-        targets = [db_path, Path(f"{db_path}.faiss"), Path(f"{db_path}.faiss.json")]
-        existing = [path for path in targets if path.exists()]
-        if not existing:
-            self._refresh_face_db_usage_label()
-            return
         if not confirmBox(
-            "Delete active face library?",
+            "Remove active face library?",
             (
                 f"Target: {db_path}\n"
-                f"Affected files: {len(existing)}\n"
+                "Affected files: the saved face index, SQLite WAL/SHM files, and matching search sidecars\n"
                 "Result: indexed faces, saved labels, and identity data in this library are removed.\n"
-                "Recovery: this deletion is irreversible unless you have a separate backup."
+                "Recovery: the files are moved to managed recovery storage and can be restored until permanently discarded."
             ),
             parent=self,
         ):
-            self.status_label.setText("Face-library deletion cancelled. No files were changed.")
+            self.status_label.setText("Face-library removal cancelled. No files were changed.")
             return
-        self._record_face_ui_action_audit(
-            "delete_active_face_db",
-            target=str(db_path),
-            details={"deleted_files": [str(path) for path in existing]},
-            reversible=False,
-        )
-        for path in existing:
-            try:
-                path.unlink()
-            except FileNotFoundError:
+
+        related_services: list[object] = []
+        seen_service_ids: set[int] = set()
+        for candidate in (
+            service,
+            *tuple(self.face_services_global_by_mode.values()),
+            *tuple(self.face_services_session_by_mode.values()),
+        ):
+            if candidate is None or id(candidate) in seen_service_ids:
                 continue
-        self._refresh_face_db_usage_label()
-        self.status_label.setText("Deleted the selected face-library data.")
+            candidate_path = Path(str(getattr(candidate, "db_path", "") or "")).resolve(strict=False)
+            if candidate_path != db_path.resolve(strict=False):
+                continue
+            seen_service_ids.add(id(candidate))
+            related_services.append(candidate)
+
+        def _run(progress, cancel_check):
+            progress(-1, "Preparing saved face-library data for safe removal…")
+            for related_service in related_services:
+                prepare = getattr(related_service, "prepare_storage_removal", None)
+                if callable(prepare):
+                    prepare()
+            raise_if_cancelled(cancel_check)
+            removal = FaceStorageRemovalService(db_path.parent).remove(
+                db_path,
+                cancel_check=cancel_check,
+            )
+            self._record_face_ui_action_audit(
+                "delete_active_face_db",
+                target=str(db_path),
+                details={
+                    "staged_files": list(removal.staged_paths),
+                    "operation_id": removal.operation_id,
+                    "recovery_path": removal.recovery_path,
+                },
+                reversible=True,
+            )
+            return removal
+
+        def _done(removal) -> None:
+            self._invalidate_face_storage_views()
+            self._refresh_face_db_usage_label()
+            count = len(list(getattr(removal, "staged_paths", ()) or ()))
+            if count:
+                self.status_label.setText(
+                    f"Removed {count} saved face-library file(s) to managed recovery storage."
+                )
+            else:
+                self.status_label.setText("No saved face-library files were present to remove.")
+
+        self._start_job("Deleting saved face library", _run, _done)
+
+    def _invalidate_face_storage_views(self) -> None:
+        """Drop every published People snapshot backed by the removed DB."""
+
+        self._face_data_generation += 1
+        self._invalidate_face_review_source()
+        self._face_review_images = []
+        self._face_review_drafts_by_path = {}
+        self._pending_face_assignments = []
+        self._face_hidden_rejected_refs = set()
+        self._face_album_groups = []
+        self._face_album_records = []
+        self._face_album_total_groups = 0
+        self._face_album_next_group_offset = None
+        self._face_album_loaded_group_ids = set()
+        self._face_album_member_next_offsets = {}
+        self._face_album_member_totals = {}
+        self._face_album_loaded = False
+        self._face_album_loaded_key = None
+        self._face_album_refresh_key = None
+        self._face_album_published_key = None
+        self._face_identity_entries = []
+        self._face_profiles_by_name = {}
+        self._face_identity_duplicates = {}
+        self._face_identity_prototypes_by_name = {}
+        self._face_identity_cover_ages_by_name = {}
+        self._face_identity_selected_name = ""
+        for model_name in (
+            "face_results_groups_model",
+            "face_results_merged_groups_model",
+            "face_results_exif_groups_model",
+        ):
+            model = getattr(self, model_name, None)
+            if model is not None:
+                model.set_items([])
+        for model_name in (
+            "face_results_model",
+            "face_detected_faces_model",
+            "face_identity_prototype_model",
+        ):
+            model = getattr(self, model_name, None)
+            if model is not None:
+                model.set_items([])
+        grouped_model = getattr(self, "face_detected_grouped_model", None)
+        if grouped_model is not None:
+            grouped_model.clear()
+        identity_model = getattr(self, "face_identity_model", None)
+        if identity_model is not None:
+            identity_model.set_source_items([])
+        gallery = getattr(self, "results_gallery", None)
+        if gallery is not None:
+            gallery.update_gallery([])
+        self.face_labels_changed.emit()
 
     def _refresh_face_label_audit(self, assignments: list[FaceLabelAssignment]) -> None:
         if not hasattr(self, "face_label_audit_label"):
@@ -16103,10 +17896,7 @@ class SearchPane(QWidget):
         self._face_action_audit_request_id += 1
         request_id = int(self._face_action_audit_request_id)
         if self._face_action_audit_job is not None:
-            try:
-                self._face_action_audit_job.cancel()
-            except Exception:
-                pass
+            self._cancel_job(self._face_action_audit_job)
         self.face_action_audit_list.clear()
         self.face_action_audit_list.addItem("Loading recent face actions…")
         service = self._active_face_service()
@@ -16122,11 +17912,12 @@ class SearchPane(QWidget):
             return events
 
         job = AsyncJob(_run)
-        if self.job_manager is not None:
+        coordinated = self.work_coordinator is not None and JobSpec is not None
+        if self.job_manager is not None and not coordinated:
             self.job_manager.bind_async_job(
                 job,
                 "Loading face action audit",
-                origin="Faces",
+                origin="People",
                 foreground=False,
             )
 
@@ -16142,13 +17933,16 @@ class SearchPane(QWidget):
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         self._face_action_audit_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
-        )
-        self._face_action_audit_thread = thread
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_async_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._face_action_audit_thread = thread
+
+        self._submit_job(job, "Loading face action audit", _launch, foreground=False)
 
     def _apply_face_action_audit_events(self, events: list[object]) -> None:
         if not hasattr(self, "face_action_audit_list"):
@@ -16188,6 +17982,11 @@ class SearchPane(QWidget):
         self.face_recognition_mode_combo.addItem("Balanced", "balanced")
         self.face_recognition_mode_combo.addItem("Strict", "strict")
         self.face_recognition_mode_combo.addItem("Loose", "loose")
+        self.face_search_all_indexed_checkbox = QCheckBox("Search all indexed faces (Power-user)")
+        self.face_search_all_indexed_checkbox.setToolTip(
+            "Search outside the active Roots scope. Off by default so People respects the shared library scope."
+        )
+        self.face_search_all_indexed_checkbox.toggled.connect(self._on_face_similarity_scope_changed)
         self.face_label_threshold = QDoubleSpinBox()
         self.face_label_threshold.setRange(0.0, 1.0)
         self.face_label_threshold.setSingleStep(0.01)
@@ -16286,8 +18085,10 @@ class SearchPane(QWidget):
         self.face_query_builder_unknown = QCheckBox("Unknown")
         self.face_query_builder_hidden = QCheckBox("Hidden")
         self.saved_search_name = QLineEdit()
+        self.saved_search_name.setAccessibleName("Saved search name")
         self.saved_search_name.setPlaceholderText("Saved search name")
         self.saved_search_kind = QComboBox()
+        self.saved_search_kind.setAccessibleName("Saved search type")
         for label, value in (
             ("Clustering tag filter", "clustering_filter"),
             ("Face query", "face_query"),
@@ -16299,6 +18100,7 @@ class SearchPane(QWidget):
         ):
             self.saved_search_kind.addItem(label, value)
         self.saved_searches_list = QListWidget()
+        self.saved_searches_list.setAccessibleName("Saved People searches")
         self.saved_searches_list.setMaximumHeight(150)
         self.saved_searches_list.setToolTip("Saved searches persist across app restarts.")
         self.saved_search_save_button = QPushButton("Save Search")
@@ -16323,11 +18125,39 @@ class SearchPane(QWidget):
         self.merge_target_person.setToolTip(FACE_HELP["merge_target"])
         self.face_people_query_names.setToolTip("Comma-separated people names for co-occurrence queries.")
         self.face_primary_person_query.setToolTip("Find photos where this identity is the largest face.")
-        self.face_query_detect_button = QPushButton("Detect Query Faces")
+        for widget in (
+            self.face_top_k,
+            self.face_min_score,
+            self.face_label_threshold,
+            self.face_cluster_count,
+            self.face_hdbscan_min_cluster_size_spin,
+            self.face_hdbscan_min_samples_spin,
+            self.face_hdbscan_cluster_selection_epsilon_spin,
+            self.face_kmeans_n_init_spin,
+            self.face_kmeans_max_iter_spin,
+            self.face_kmeans_seed_spin,
+            self.face_query_builder_face_count,
+        ):
+            apply_field_size(widget, "numeric")
+        for widget in (
+            self.face_recognition_mode_combo,
+            self.face_cluster_backend,
+            self.face_cluster_outlier_policy_combo,
+            self.face_query_builder_faces_state,
+            self.face_query_builder_people_mode,
+            self.saved_search_kind,
+        ):
+            apply_field_size(widget, "short")
+        self.face_query_detect_button = QPushButton("Detect")
+        self.face_query_detect_button.setAccessibleName("Detect faces in query photo")
         self.face_query_detect_button.setToolTip(FACE_HELP["query_face_image"])
+        apply_icon(self.face_query_detect_button, "scan")
         self.face_query_detect_button.clicked.connect(self._detect_query_photo_faces)
+        self._action_buttons.append(self.face_query_detect_button)
+        self._mode_required_buttons.append(self.face_query_detect_button)
         self.face_query_faces_model = ListEntryModel(self)
         self.face_query_faces_list = QListView()
+        self.face_query_faces_list.setAccessibleName("Faces detected in the query photo")
         self.face_query_faces_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_query_faces_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_query_faces_list.setMovement(QListView.Movement.Static)
@@ -16336,11 +18166,24 @@ class SearchPane(QWidget):
         self.face_query_faces_list.setGridSize(QSize(102, 120))
         self.face_query_faces_list.setSpacing(8)
         self.face_query_faces_list.setUniformItemSizes(True)
-        self.face_query_faces_list.setMaximumHeight(210)
+        # An empty icon view previously reserved 210 px and pushed both Find
+        # actions below the supported viewport. One row is enough to choose a
+        # query face; the list remains scrollable when a photo contains more.
+        self.face_query_faces_list.setMaximumHeight(128)
         self.face_query_faces_list.setModel(self.face_query_faces_model)
-        self.face_query_faces_summary = QLabel("Detect faces in the query photo, then pick one or more faces to search.")
+        query_face_selection_model = self.face_query_faces_list.selectionModel()
+        if query_face_selection_model is not None:
+            query_face_selection_model.selectionChanged.connect(
+                lambda *_args: self._on_query_face_selection_changed()
+            )
+        self.face_query_faces_list.hide()
+        self.face_query_faces_summary = QLabel("Detect and select faces to search.")
         self.face_query_faces_summary.setWordWrap(True)
-        self.face_query_path.textChanged.connect(lambda _text: self._populate_query_face_candidates(self.face_query_path.text().strip(), []))
+        self.face_query_faces_summary.setToolTip(
+            "Detect faces in the query photo, then pick one or more faces to search."
+        )
+        self.face_query_path.textChanged.connect(self._on_face_query_path_changed)
+        self.face_query_path.returnPressed.connect(self._activate_photo_find_from_keyboard)
         self.face_people_together_button = QPushButton("Show Photos With These People")
         self.face_people_any_named_button = QPushButton("Show Photos With Any Named People")
         self.face_people_unknown_button = QPushButton("Show Photos With Unknown People")
@@ -16355,6 +18198,7 @@ class SearchPane(QWidget):
         self.saved_search_run_button.clicked.connect(self._run_selected_saved_search)
         self.saved_search_rename_button.clicked.connect(self._rename_selected_saved_search)
         self.saved_search_delete_button.clicked.connect(self._delete_selected_saved_search)
+        self.saved_searches_list.itemSelectionChanged.connect(self._update_query_and_saved_search_actions)
         self._action_buttons.extend(
             [
                 self.face_people_together_button,
@@ -16383,7 +18227,8 @@ class SearchPane(QWidget):
             "Scan or refresh a folder, select a detected face, then search or name it.",
             tooltip=FACE_HELP["search_quick_start"],
         )
-        self.face_walkthrough_dismiss_button = QPushButton("Dismiss Walkthrough")
+        self.face_walkthrough_dismiss_button = QPushButton("Dismiss")
+        self.face_walkthrough_dismiss_button.setAccessibleName("Dismiss Faces walkthrough")
         self.face_walkthrough_reopen_button = QPushButton("Show Faces Walkthrough")
         self.face_walkthrough_dismiss_button.clicked.connect(lambda: self._set_face_walkthrough_visible(False))
         self.face_walkthrough_reopen_button.clicked.connect(lambda: self._set_face_walkthrough_visible(True))
@@ -16415,11 +18260,12 @@ class SearchPane(QWidget):
         saved_layout.addWidget(self.saved_searches_list)
         quick_layout.addWidget(saved_group)
         self.saved_search_group = saved_group
-        self._refresh_saved_searches()
-        self._set_face_walkthrough_visible(True)
+        QTimer.singleShot(0, self._refresh_saved_searches)
+        self._update_query_and_saved_search_actions()
+        self._set_face_walkthrough_visible(True, user_action=False)
         self.face_search_quick_group = quick_group
 
-        selected_group, selected_layout = self._group_box("Selected Face", tooltip=FACE_HELP["find_photos_selected_face"])
+        selected_group, selected_layout = self._group_box("Selection", tooltip=FACE_HELP["find_photos_selected_face"])
         self.face_search_selected_context_label = self._helper_label(
             "No face selected.",
             tooltip=FACE_HELP["find_photos_selected_face"],
@@ -16440,10 +18286,14 @@ class SearchPane(QWidget):
         selected_buttons.setContentsMargins(0, 0, 0, 0)
         selected_buttons.setHorizontalSpacing(6)
         selected_buttons.setVerticalSpacing(6)
-        self.face_search_selected_card_button = QPushButton("Find Similar From Selection")
+        self.face_search_selected_card_button = QPushButton("Similar")
         self.face_search_selected_card_button.setProperty("kind", "primary")
-        self.face_search_name_selected_card_button = QPushButton("Name Selected Faces")
+        self.face_search_selected_card_button.setToolTip("Find photos containing faces similar to the selected face or faces.")
+        self.face_search_name_selected_card_button = QPushButton("Name")
         self.face_search_name_selected_card_button.setProperty("kind", "secondary")
+        self.face_search_name_selected_card_button.setToolTip("Give the selected face or faces a saved identity name.")
+        apply_icon(self.face_search_selected_card_button, "similar")
+        apply_icon(self.face_search_name_selected_card_button, "rename")
         self.face_search_selected_card_button.clicked.connect(self._search_selected_face)
         self.face_search_name_selected_card_button.clicked.connect(self._save_selected_face_name)
         self._action_buttons.extend([self.face_search_selected_card_button, self.face_search_name_selected_card_button])
@@ -16457,7 +18307,7 @@ class SearchPane(QWidget):
         selected_options_layout = QVBoxLayout(self.face_search_selected_options_panel)
         selected_options_layout.setContentsMargins(0, 0, 0, 0)
         selected_options_layout.setSpacing(8)
-        selected_options_layout.addWidget(self._field_widget("Name for selected face(s)", self.face_label_name, tooltip=FACE_HELP["selected_face_name"]))
+        selected_options_layout.addWidget(self._field_widget("Selected face name", self.face_label_name, tooltip=FACE_HELP["selected_face_name"]))
         selected_options_layout.addWidget(self._field_widget("Selected-face Top-K", self.face_browser_top_k, tooltip=FACE_HELP["selected_face_top_k"]))
         selected_options_layout.addWidget(self._field_widget("Selected-face Min score", self.face_browser_min_score, tooltip=FACE_HELP["selected_face_min_score"]))
         selected_options_layout.addWidget(self._field_widget("Label threshold", self.face_library_label_threshold, tooltip=FACE_HELP["label_threshold"]))
@@ -16473,27 +18323,33 @@ class SearchPane(QWidget):
         self._set_expander_state(self.face_search_selected_options_toggle, self.face_search_selected_options_panel, False)
         self.face_search_selected_group = selected_group
 
-        find_group, find_layout = self._group_box("Find by Face", tooltip=FACE_HELP["find_same_person"])
+        find_group, find_layout = self._group_box("Photo search", tooltip=FACE_HELP["find_same_person"])
         find_fields = QGridLayout()
         find_fields.setContentsMargins(0, 0, 0, 0)
         find_fields.setHorizontalSpacing(6)
         find_fields.setVerticalSpacing(8)
         self.face_find_fields_grid = find_fields
-        find_fields.addWidget(
-            self._field_widget("Query face image", self._path_row(self.face_query_path), tooltip=FACE_HELP["query_face_image"]),
-            0,
-            0,
-            1,
-            2,
+        self.face_query_photo_cell = self._field_widget(
+            "Photo",
+            self._path_row(self.face_query_path, responsive=True),
+            tooltip=FACE_HELP["query_face_image"],
         )
-        self.face_index_button = QPushButton("Index Active Roots")
+        find_fields.addWidget(self.face_query_photo_cell, 0, 0, 1, 2)
+        self.face_index_button = QPushButton("Index")
         self.face_index_button.setToolTip(FACE_HELP["index_current_folder"])
+        self.face_index_button.setProperty("faceReadinessBaseToolTip", FACE_HELP["index_current_folder"])
+        self.face_index_button.setProperty("faceEligibilityBaseToolTip", FACE_HELP["index_current_folder"])
         self.face_reindex_button = QPushButton("Reindex")
         self.face_reindex_button.setProperty("kind", "secondary")
         self.face_reindex_button.setToolTip(FACE_HELP["reindex_active_roots"])
-        self.face_search_button = QPushButton("Find by Face")
+        self.face_reindex_button.setProperty("faceReadinessBaseToolTip", FACE_HELP["reindex_active_roots"])
+        self.face_reindex_button.setProperty("faceEligibilityBaseToolTip", FACE_HELP["reindex_active_roots"])
+        self.face_search_button = QPushButton("Find")
         self.face_search_button.setProperty("kind", "primary")
         self.face_search_button.setToolTip(FACE_HELP["find_same_person"])
+        apply_icon(self.face_index_button, "scan")
+        apply_icon(self.face_reindex_button, "retry")
+        apply_icon(self.face_search_button, "search")
         self.face_index_button.clicked.connect(self._index_faces)
         self.face_reindex_button.clicked.connect(self._reindex_faces)
         self.face_search_button.clicked.connect(self._search_faces)
@@ -16505,6 +18361,7 @@ class SearchPane(QWidget):
         face_index_actions_layout.setSpacing(6)
         face_index_actions_layout.addWidget(self.face_index_button, 1)
         face_index_actions_layout.addWidget(self.face_reindex_button)
+        self.face_index_actions_widget = face_index_actions
         find_fields.addWidget(face_index_actions, 1, 1)
         find_fields.addWidget(self.face_query_faces_summary, 2, 0, 1, 2)
         find_fields.addWidget(self.face_query_faces_list, 3, 0, 1, 2)
@@ -16521,6 +18378,7 @@ class SearchPane(QWidget):
         find_options_layout.addWidget(self._field_widget("Recognition mode", self.face_recognition_mode_combo, tooltip=FACE_HELP["face_recognition_min_score"]))
         find_options_layout.addWidget(self._field_widget("Top-K", self.face_top_k, tooltip=FACE_HELP["name_search_top_k"]))
         find_options_layout.addWidget(self._field_widget("Min face score", self.face_min_score, tooltip=FACE_HELP["selected_face_min_score"]))
+        find_options_layout.addWidget(self.face_search_all_indexed_checkbox)
         self.face_find_options_toggle.toggled.connect(
             lambda checked: self._set_expander_state(self.face_find_options_toggle, self.face_find_options_panel, checked)
         )
@@ -16528,22 +18386,22 @@ class SearchPane(QWidget):
         self._set_expander_state(self.face_find_options_toggle, self.face_find_options_panel, False)
         self.face_find_group = find_group
 
-        find_name_group, find_name_layout = self._group_box("Find by Name", tooltip=FACE_HELP["find_photos_saved_name"])
+        find_name_group, find_name_layout = self._group_box("Saved person", tooltip=FACE_HELP["find_photos_saved_name"])
         self.face_find_name_query = FaceNameLineEdit(find_name_group)
         self.face_find_name_query.setPlaceholderText("Saved person name")
         self.face_find_name_query.setToolTip(FACE_HELP["find_photos_saved_name"])
-        self.face_find_name_button = QPushButton("Find by Name + Similar")
+        self.face_find_name_button = QPushButton("Similar")
         self.face_find_name_button.setProperty("kind", "primary")
         self.face_find_name_button.setToolTip(
             "Search from the saved identity embedding. Results include matching faces even when they have not been named yet."
         )
         self.face_find_name_button.clicked.connect(self._search_by_name)
-        self.face_find_deep_name_button = QPushButton("Deep Name + Similar")
+        self.face_find_deep_name_button = QPushButton("Expand")
         self.face_find_deep_name_button.setToolTip(
             "Expand matching unlabeled faces through the whole active scope, then let you review and save them as this name."
         )
         self.face_find_deep_name_button.clicked.connect(self._deep_search_by_name)
-        self.face_find_name_query.returnPressed.connect(self._search_by_name)
+        self.face_find_name_query.returnPressed.connect(lambda: self._search_by_name())
         find_name_fields = QGridLayout()
         find_name_fields.setContentsMargins(0, 0, 0, 0)
         find_name_fields.setHorizontalSpacing(6)
@@ -16561,6 +18419,26 @@ class SearchPane(QWidget):
         self._action_buttons.extend([self.face_find_name_button, self.face_find_deep_name_button])
         self._mode_required_buttons.extend([self.face_find_name_button, self.face_find_deep_name_button])
         self.face_find_name_group = find_name_group
+
+        self.face_primary_find_widget = QWidget(tab_body)
+        primary_find_layout = QVBoxLayout(self.face_primary_find_widget)
+        primary_find_layout.setContentsMargins(0, 0, 0, 0)
+        primary_find_layout.setSpacing(8)
+        self.face_find_task_selector = QComboBox(self.face_primary_find_widget)
+        self.face_find_task_selector.setObjectName("faceFindTaskSelector")
+        self.face_find_task_selector.setAccessibleName("Find query type")
+        self.face_find_task_selector.setToolTip("Choose whether to find a person from a photo or a saved name.")
+        self.face_find_task_selector.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.face_find_task_selector.setMinimumWidth(0)
+        self.face_find_task_selector.addItem("Photo", "photo")
+        self.face_find_task_selector.addItem("Saved person", "saved_person")
+        self.face_find_task_selector.setItemData(0, "Find a person using a query photo.", Qt.ItemDataRole.ToolTipRole)
+        self.face_find_task_selector.setItemData(1, "Find a person using a saved identity name.", Qt.ItemDataRole.ToolTipRole)
+        primary_find_layout.addWidget(self.face_find_task_selector)
+        primary_find_layout.addWidget(self.face_find_group)
+        primary_find_layout.addWidget(self.face_find_name_group)
+        self.face_find_name_group.hide()
+        self.face_find_task_selector.currentIndexChanged.connect(self._on_face_find_task_changed)
 
         save_group, save_layout = self._group_box("4. Name Or Update A Saved Identity", tooltip=FACE_HELP["save_named_examples"])
         save_layout.addWidget(
@@ -16705,6 +18583,7 @@ class SearchPane(QWidget):
         pending_items_layout.setSpacing(8)
         self.face_pending_model = ListEntryModel(self)
         self.face_pending_list = QListView()
+        self.face_pending_list.setAccessibleName("Pending face-name proposals")
         self.face_pending_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.face_pending_list.setMaximumHeight(180)
         self.face_pending_list.setToolTip(FACE_HELP["pending_face_review"])
@@ -16731,6 +18610,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_pending_preview_list = QListView()
+        self.face_pending_preview_list.setAccessibleName("Selected pending proposal face previews")
         self.face_pending_preview_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_pending_preview_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_pending_preview_list.setMovement(QListView.Movement.Static)
@@ -16835,17 +18715,18 @@ class SearchPane(QWidget):
                 tooltip=FACE_HELP["people_groups"],
             )
         )
-        people_actions = QHBoxLayout()
+        people_actions = ResponsiveFlowLayout(spacing=6)
         people_actions.setContentsMargins(0, 0, 0, 0)
-        people_actions.setSpacing(6)
-        self.face_people_browse_groups_button = QPushButton("Browse Face Groups")
+        self.face_people_browse_groups_button = QPushButton("Browse groups")
+        self.face_people_browse_groups_button.setAccessibleName("Browse face groups")
         self.face_people_browse_groups_button.setToolTip("Open All Faces and browse named and unlabeled groups.")
         self.face_people_browse_groups_button.clicked.connect(self._open_all_faces_task)
-        self.face_people_cluster_button = QPushButton("Cluster Unlabeled Faces")
+        self.face_people_cluster_button = QPushButton("Cluster unlabeled")
+        self.face_people_cluster_button.setAccessibleName("Cluster unlabeled faces")
         self.face_people_cluster_button.setToolTip("Group similar unlabeled faces so you can review and name them.")
         self.face_people_cluster_button.clicked.connect(lambda: self._cluster_faces(force_global=True))
-        people_actions.addWidget(self.face_people_browse_groups_button, stretch=1)
-        people_actions.addWidget(self.face_people_cluster_button, stretch=1)
+        people_actions.addWidget(self.face_people_browse_groups_button)
+        people_actions.addWidget(self.face_people_cluster_button)
         layout.addLayout(people_actions)
         self._action_buttons.extend([self.face_people_browse_groups_button, self.face_people_cluster_button])
         self._mode_required_buttons.append(self.face_people_cluster_button)
@@ -16874,6 +18755,7 @@ class SearchPane(QWidget):
 
         self.face_identity_model = PagedListEntryModel(self, page_size=50)
         self.face_identity_list = QListView()
+        self.face_identity_list.setAccessibleName("Saved identities")
         self.face_identity_list.setProperty("sidebarList", True)
         self.face_identity_list.setModel(self.face_identity_model)
         self.face_identity_list.setItemDelegate(SidebarListEntryDelegate(self.face_identity_list))
@@ -16907,6 +18789,7 @@ class SearchPane(QWidget):
             self,
         )
         self.face_identity_prototype_list = QListView()
+        self.face_identity_prototype_list.setAccessibleName("Prototype faces for the selected identity")
         self.face_identity_prototype_list.setViewMode(QListView.ViewMode.IconMode)
         self.face_identity_prototype_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.face_identity_prototype_list.setMovement(QListView.Movement.Static)
@@ -16934,14 +18817,26 @@ class SearchPane(QWidget):
         self.face_identity_open_photo_button = QPushButton("Show Parent Photo")
         self.face_identity_open_photo_button.clicked.connect(self._focus_selected_identity_prototype_photo)
         layout.addWidget(self.face_identity_open_photo_button)
-        self.face_identity_open_inspector_button = QPushButton("Open Parent Photo In Inspector")
+        self.face_identity_open_inspector_button = QPushButton("Open in Inspector")
+        self.face_identity_open_inspector_button.setAccessibleName("Open parent photo in Inspector")
         self.face_identity_open_inspector_button.clicked.connect(self._open_selected_identity_prototype_in_inspector)
         layout.addWidget(self.face_identity_open_inspector_button)
 
-        self.face_identity_management_group = QGroupBox("Management", tab_body)
-        self.face_identity_management_group.setCheckable(True)
-        self.face_identity_management_group.setChecked(False)
-        identity_management_layout = QVBoxLayout(self.face_identity_management_group)
+        self.face_identity_management_group = QGroupBox("", tab_body)
+        self.face_identity_management_group.setAccessibleName("Identity management actions")
+        identity_management_group_layout = QVBoxLayout(self.face_identity_management_group)
+        self.face_identity_management_toggle = self._expander_button(
+            "Management",
+            checked=False,
+        )
+        self.face_identity_management_toggle.setAccessibleName("Show identity management actions")
+        self.face_identity_management_toggle.setToolTip(
+            "Expand maintenance actions for the selected saved identity."
+        )
+        identity_management_group_layout.addWidget(self.face_identity_management_toggle)
+        self.face_identity_management_body = QWidget(self.face_identity_management_group)
+        identity_management_layout = QVBoxLayout(self.face_identity_management_body)
+        identity_management_layout.setContentsMargins(0, 0, 0, 0)
         self.face_identity_remove_button = QPushButton("Remove From Prototype")
         self.face_identity_remove_button.clicked.connect(self._remove_selected_identity_prototype_faces)
         identity_management_layout.addWidget(self.face_identity_remove_button)
@@ -16972,15 +18867,40 @@ class SearchPane(QWidget):
         self.face_action_audit_refresh_button.clicked.connect(self._refresh_face_action_audit)
         identity_management_layout.addWidget(self.face_action_audit_refresh_button)
         self.face_action_audit_list = QListWidget()
+        self.face_action_audit_list.setAccessibleName("Face action history")
         self.face_action_audit_list.setMaximumHeight(180)
         identity_management_layout.addWidget(self.face_action_audit_list)
+        identity_management_group_layout.addWidget(self.face_identity_management_body)
+        self.face_identity_management_toggle.toggled.connect(
+            lambda expanded: self._set_face_identity_disclosure_visible(
+                self.face_identity_management_toggle,
+                self.face_identity_management_body,
+                expanded,
+            )
+        )
+        self._set_expander_state(
+            self.face_identity_management_toggle,
+            self.face_identity_management_body,
+            False,
+        )
         layout.addWidget(self.face_identity_management_group)
 
-        self.face_identity_danger_group = QGroupBox("Danger zone", tab_body)
-        self.face_identity_danger_group.setCheckable(True)
-        self.face_identity_danger_group.setChecked(False)
+        self.face_identity_danger_group = QGroupBox("", tab_body)
+        self.face_identity_danger_group.setAccessibleName("Show destructive face-data actions")
+        identity_danger_group_layout = QVBoxLayout(self.face_identity_danger_group)
+        self.face_identity_danger_toggle = self._expander_button(
+            "Danger zone",
+            checked=False,
+        )
+        self.face_identity_danger_toggle.setAccessibleName("Show destructive face-data actions")
+        self.face_identity_danger_toggle.setToolTip(
+            "Expand destructive face-data actions. Each action still requires its own confirmation."
+        )
         self.face_identity_danger_group.setProperty("role", "danger")
-        identity_danger_layout = QVBoxLayout(self.face_identity_danger_group)
+        identity_danger_group_layout.addWidget(self.face_identity_danger_toggle)
+        self.face_identity_danger_body = QWidget(self.face_identity_danger_group)
+        identity_danger_layout = QVBoxLayout(self.face_identity_danger_body)
+        identity_danger_layout.setContentsMargins(0, 0, 0, 0)
         self.face_disable_recognition_button = QPushButton("Disable Face Recognition")
         self.face_enable_recognition_button = QPushButton("Enable Face Recognition")
         self.face_disable_recognition_button.clicked.connect(lambda: self._set_face_recognition_enabled(False))
@@ -16996,8 +18916,31 @@ class SearchPane(QWidget):
         self.face_purge_data_button.clicked.connect(self._purge_face_data)
         self.face_delete_db_button.setProperty("kind", "danger")
         self.face_purge_data_button.setProperty("kind", "danger")
+        for button in (
+            self.face_identity_remove_button,
+            self.face_identity_merge_button,
+            self.face_identity_clear_button,
+            self.face_disable_recognition_button,
+            self.face_delete_db_button,
+            self.face_purge_data_button,
+        ):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         identity_danger_layout.addWidget(self.face_delete_db_button)
         identity_danger_layout.addWidget(self.face_purge_data_button)
+        identity_danger_group_layout.addWidget(self.face_identity_danger_body)
+        self.face_identity_danger_toggle.toggled.connect(
+            lambda expanded: self._set_face_identity_disclosure_visible(
+                self.face_identity_danger_toggle,
+                self.face_identity_danger_body,
+                expanded,
+            )
+        )
+        self._set_expander_state(
+            self.face_identity_danger_toggle,
+            self.face_identity_danger_body,
+            False,
+        )
         layout.addWidget(self.face_identity_danger_group)
         self._action_buttons.extend(
             [
@@ -17031,10 +18974,17 @@ class SearchPane(QWidget):
         layout.addWidget(browse_button)
         return row
 
-    def _path_row(self, line_edit: QLineEdit, multi_append: bool = False, enable_paste: bool = True) -> QWidget:
+    def _path_row(
+        self,
+        line_edit: QLineEdit,
+        multi_append: bool = False,
+        enable_paste: bool = True,
+        responsive: bool = False,
+    ) -> QWidget:
         row = QWidget()
-        layout = QHBoxLayout(row)
+        layout = FlowLayout(row) if responsive else QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
         browse_button = QPushButton("Browse")
         browse_button.clicked.connect(lambda: self._browse_image(line_edit, multi_append=multi_append))
         paste_button = QPushButton("Paste")
@@ -17136,26 +19086,35 @@ class SearchPane(QWidget):
         if qimage.isNull():
             return False
         out_dir = self.settings.cache_dir / "pasted_queries"
-        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"pasted_{uuid4().hex}.png"
-        if not qimage.save(str(out_path), "PNG"):
-            return False
-        # Track temp file so we can clean up if user pastes repeatedly.
         key = id(line_edit)
         prev = self._temp_query_files.get(key)
-        if prev and prev != str(out_path):
-            try:
-                Path(prev).unlink(missing_ok=True)
-            except Exception:
-                pass
-        self._temp_query_files[key] = str(out_path)
-        if multi_append:
-            current = [path.strip() for path in line_edit.text().split(";") if path.strip()]
-            current.append(str(out_path))
-            line_edit.setText(";".join(dict.fromkeys(current)))
-        else:
-            line_edit.setText(str(out_path))
-        return True
+        existing_text = str(line_edit.text())
+
+        def _run(progress, cancel_check):
+            progress(-1, "Saving pasted query image…")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if not qimage.save(str(out_path), "PNG"):
+                raise RuntimeError("The pasted image could not be encoded as PNG.")
+            if cancel_check():
+                out_path.unlink(missing_ok=True)
+                raise Cancelled()
+            return str(out_path)
+
+        def _done(saved_path: str) -> None:
+            self._temp_query_files[key] = str(saved_path)
+            if multi_append:
+                current = [path.strip() for path in existing_text.split(";") if path.strip()]
+                current.append(str(saved_path))
+                line_edit.setText(";".join(dict.fromkeys(current)))
+            else:
+                line_edit.setText(str(saved_path))
+            if prev and prev != str(saved_path):
+                from apps.pyqt_production.process_transport import cleanup_paths_async
+
+                cleanup_paths_async(Path(prev))
+
+        return self._start_job("Saving pasted query image", _run, _done) is not None
 
     def context_for_path(self, image_path: str) -> dict[str, object]:
         provider = getattr(self.results_gallery, "inspector_context_provider", None)
@@ -17205,6 +19164,8 @@ class SearchPane(QWidget):
                 pass
 
         return {
+            "state_version": 1,
+            "active_route": self._current_people_section(),
             "active_tab": int(self.tabs.currentIndex()),
             "face_mode": str(self.current_face_mode()),
             "face_ui_mode": str(self.current_ui_mode()),
@@ -17248,6 +19209,7 @@ class SearchPane(QWidget):
             "face_kmeans_seed": int(self.face_kmeans_seed_spin.value()) if hasattr(self, "face_kmeans_seed_spin") else 42,
             "search_only_current_folder": bool(self.search_only_current_folder.isChecked()),
             "show_tiny_detections": bool(self._show_tiny_detections_enabled()),
+            "face_search_all_indexed": bool(self.face_search_all_indexed_checkbox.isChecked()),
             "image_model": _combo_id(getattr(self, "image_model", None)),
             "text_model": _combo_id(getattr(self, "text_model", None)),
             "duplicate_model": _combo_id(getattr(self, "duplicate_model", None)),
@@ -17263,8 +19225,99 @@ class SearchPane(QWidget):
             "face_profile_expanded": bool(getattr(self, "face_profile_toggle", None).isChecked()) if hasattr(self, "face_profile_toggle") else False,
             "face_identity_maintenance_expanded": bool(getattr(self, "face_identity_maintenance_toggle", None).isChecked()) if hasattr(self, "face_identity_maintenance_toggle") else False,
             "face_people_query_expanded": bool(getattr(self, "face_people_query_toggle", None).isChecked()) if hasattr(self, "face_people_query_toggle") else False,
-            "face_walkthrough_dismissed": bool(hasattr(self, "face_walkthrough_panel") and not self.face_walkthrough_panel.isVisible()),
+            "face_walkthrough_dismissed": bool(self._face_walkthrough_dismissed),
+            "face_identity_management_expanded": bool(getattr(self, "face_identity_management_toggle", None).isChecked()) if hasattr(self, "face_identity_management_toggle") else False,
+            "face_identity_danger_expanded": bool(getattr(self, "face_identity_danger_toggle", None).isChecked()) if hasattr(self, "face_identity_danger_toggle") else False,
         }
+
+    def export_workspace_state(self) -> dict[str, object]:
+        """Return the versioned, lightweight state safe for production settings."""
+
+        state = self.export_state()
+        keys = (
+            "state_version", "active_route", "splitter_sizes", "face_library_tab",
+            "face_review_sort", "face_photo_filter", "search_only_current_folder",
+            "show_tiny_detections", "face_search_all_indexed",
+            "face_selected_options_expanded", "face_find_options_expanded",
+            "face_save_options_expanded", "face_manage_options_expanded",
+            "face_pending_items_expanded", "face_people_expanded",
+            "face_profile_expanded", "face_people_query_expanded",
+            "face_walkthrough_dismissed", "face_identity_management_expanded",
+            "face_identity_danger_expanded",
+        )
+        return {key: state[key] for key in keys if key in state}
+
+    def apply_workspace_state(self, state: dict[str, object] | None) -> None:
+        """Restore lightweight UI state after lazy pane construction."""
+
+        if not isinstance(state, dict):
+            return
+        try:
+            state_version = int(state.get("state_version", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if state_version != 1:
+            return
+        route = normalize_people_face_route(state.get("active_route", ""))
+        if route:
+            self.activate_people_section(route)
+        splitter_sizes = state.get("splitter_sizes")
+        if isinstance(splitter_sizes, (list, tuple)) and len(splitter_sizes) == 2:
+            try:
+                self.workspace_splitter.setSizes([max(1, int(value)) for value in splitter_sizes])
+            except (TypeError, ValueError):
+                pass
+        for combo_name, key in (
+            ("face_review_sort", "face_review_sort"),
+            ("face_photo_filter", "face_photo_filter"),
+        ):
+            combo = getattr(self, combo_name, None)
+            if combo is None or key not in state:
+                continue
+            combo.blockSignals(True)
+            self._set_combo_to_id(combo, state.get(key))
+            combo.blockSignals(False)
+        for control_name, key in (
+            ("search_only_current_folder", "search_only_current_folder"),
+            ("show_tiny_detections_checkbox", "show_tiny_detections"),
+            ("face_search_all_indexed_checkbox", "face_search_all_indexed"),
+        ):
+            control = getattr(self, control_name, None)
+            if control is not None and key in state:
+                control.blockSignals(True)
+                control.setChecked(bool(state.get(key)))
+                control.blockSignals(False)
+        for button_name, panel_name, state_key in (
+            ("face_search_selected_options_toggle", "face_search_selected_options_panel", "face_selected_options_expanded"),
+            ("face_find_options_toggle", "face_find_options_panel", "face_find_options_expanded"),
+            ("face_save_options_toggle", "face_save_options_panel", "face_save_options_expanded"),
+            ("face_manage_options_toggle", "face_manage_options_panel", "face_manage_options_expanded"),
+            ("face_pending_items_toggle", "face_pending_items_panel", "face_pending_items_expanded"),
+            ("face_people_toggle", "face_people_panel", "face_people_expanded"),
+            ("face_profile_toggle", "face_profile_panel", "face_profile_expanded"),
+            ("face_people_query_toggle", "face_people_query_panel", "face_people_query_expanded"),
+        ):
+            if hasattr(self, button_name) and state_key in state:
+                self._set_expander_state(
+                    getattr(self, button_name),
+                    getattr(self, panel_name, None),
+                    bool(state.get(state_key)),
+                )
+        for toggle_name, body_name, state_key in (
+            ("face_identity_management_toggle", "face_identity_management_body", "face_identity_management_expanded"),
+            ("face_identity_danger_toggle", "face_identity_danger_body", "face_identity_danger_expanded"),
+        ):
+            toggle = getattr(self, toggle_name, None)
+            body = getattr(self, body_name, None)
+            if toggle is not None and body is not None and state_key in state:
+                self._set_face_identity_disclosure_visible(
+                    toggle,
+                    body,
+                    bool(state.get(state_key)),
+                )
+        dismissed = bool(state.get("face_walkthrough_dismissed", False))
+        self._face_walkthrough_dismissed = dismissed
+        self._set_face_walkthrough_visible(not dismissed, user_action=False)
 
     def apply_state(self, state: dict[str, object] | None) -> None:
         if not state:
@@ -17348,10 +19401,6 @@ class SearchPane(QWidget):
         if hasattr(self, "face_library_tabs"):
             try:
                 index = max(0, min(int(state.get("face_library_tab", 0)), self.face_library_tabs.count() - 1))
-                # Review & Name is retained but intentionally hidden in this
-                # pass, so a previous workspace state must not reopen it.
-                if index == 1 and not self.face_library_tabs.tabBar().isTabVisible(1):
-                    index = 0
                 self.face_library_tabs.setCurrentIndex(index)
             except Exception:
                 pass
@@ -17379,6 +19428,7 @@ class SearchPane(QWidget):
         self._set_combo_to_id(getattr(self, "face_cluster_outlier_policy_combo", None), state.get("face_cluster_outlier_policy", "isolate"))
         self.search_only_current_folder.setChecked(bool(state.get("search_only_current_folder", True)))
         self.show_tiny_detections_checkbox.setChecked(bool(state.get("show_tiny_detections", False)))
+        self.face_search_all_indexed_checkbox.setChecked(bool(state.get("face_search_all_indexed", False)))
         self._set_combo_to_id(getattr(self, "image_model", None), state.get("image_model"))
         self._set_combo_to_id(getattr(self, "text_model", None), state.get("text_model"))
         self._set_combo_to_id(getattr(self, "duplicate_model", None), state.get("duplicate_model"))
@@ -17418,7 +19468,21 @@ class SearchPane(QWidget):
                     getattr(self, panel_name, None),
                     bool(state.get(state_key, False)),
                 )
-        self._set_face_walkthrough_visible(not bool(state.get("face_walkthrough_dismissed", False)))
+        dismissed = bool(state.get("face_walkthrough_dismissed", False))
+        self._face_walkthrough_dismissed = dismissed
+        self._set_face_walkthrough_visible(not dismissed, user_action=False)
+        for toggle_name, body_name, state_key in (
+            ("face_identity_management_toggle", "face_identity_management_body", "face_identity_management_expanded"),
+            ("face_identity_danger_toggle", "face_identity_danger_body", "face_identity_danger_expanded"),
+        ):
+            toggle = getattr(self, toggle_name, None)
+            body = getattr(self, body_name, None)
+            if toggle is not None and body is not None and state_key in state:
+                self._set_face_identity_disclosure_visible(
+                    toggle,
+                    body,
+                    bool(state.get(state_key)),
+                )
         self._apply_face_ui_mode()
         self._on_face_mode_changed()
 
@@ -17459,14 +19523,44 @@ class SearchPane(QWidget):
         directory = str(self._current_directory() or "").strip()
         return (directory,) if directory else ()
 
+    def _face_similarity_scope_roots(self) -> tuple[str, ...] | None:
+        checkbox = getattr(self, "face_search_all_indexed_checkbox", None)
+        if checkbox is not None and checkbox.isChecked():
+            return None
+        return self._current_scope_roots()
+
+    def _face_similarity_scope_available(self) -> bool:
+        """Return whether a similarity request has active roots or the global override."""
+        scope_roots = self._face_similarity_scope_roots()
+        return scope_roots is None or bool(scope_roots)
+
+    def _face_similarity_scope_paths(self, scope_roots: tuple[str, ...] | None) -> list[str] | None:
+        """Avoid retaining a selected-photo working set for the all-indexed override."""
+        return None if scope_roots is None else self._current_scope_paths()
+
+    def _on_face_similarity_scope_changed(self, _checked: bool) -> None:
+        # Running jobs may finish after this toggle. The request token prevents
+        # those stale results from replacing results for the new scope.
+        self._face_similarity_request_id += 1
+        self._invalidate_worker_context()
+
+    def _ensure_face_similarity_scope(self, scope_roots: tuple[str, ...] | None) -> bool:
+        if scope_roots is None or scope_roots:
+            return True
+        self.status_label.setText("Choose an active Root, or enable Search all indexed faces in Find options.")
+        return False
+
     def active_scope_changed(self) -> None:
         """Invalidate root-bound review state without starting a face scan."""
 
+        self._invalidate_worker_context()
         self._invalidate_face_review_source()
         self._cancel_face_review_stream(replaced=True)
         self._cancel_face_album_member_stream(replaced=True)
         self._face_refresh_request_id += 1
         self._face_album_request_id += 1
+        self._face_query_request_id += 1
+        self._face_similarity_request_id += 1
         self._cancel_face_album_refresh_job(replaced=True)
         self._cancel_face_album_publish_job()
         if hasattr(self, "face_folder_path"):
@@ -17476,6 +19570,7 @@ class SearchPane(QWidget):
             self.face_folder_path.setText(primary)
             self.face_folder_path.blockSignals(False)
         self._update_face_scope_summary()
+        self._update_face_mode_status()
         if self.is_face_folder_tab_active():
             self.refresh_face_library(reason="active roots changed")
         elif self.is_all_faces_tab_active():
@@ -17487,16 +19582,17 @@ class SearchPane(QWidget):
         if not directory and not scope_paths:
             errorBox("No folder selected", "Choose a folder in the file pane first.")
             return
+        service = self._active_search_service(scope_combo)
+        use_onnx = self._use_onnx()
 
         def _run(progress, cancel_check):
             progress(-1, "Indexing...")
-            service = self._active_search_service(scope_combo)
             if scope_paths:
                 return service.index_paths(
                     scope_paths,
                     embedding_model=embedding_model,
                     directory_hint=directory,
-                    use_onnx=self._use_onnx(),
+                    use_onnx=use_onnx,
                     progress_callback=progress,
                     cancel_check=cancel_check,
                 )
@@ -17504,7 +19600,7 @@ class SearchPane(QWidget):
                 directory,
                 embedding_model=embedding_model,
                 recursive=True,
-                use_onnx=self._use_onnx(),
+                use_onnx=use_onnx,
                 progress_callback=progress,
                 cancel_check=cancel_check,
             )
@@ -17672,19 +19768,22 @@ class SearchPane(QWidget):
         )
 
     def _run_similarity_search(self, request: SimilaritySearchRequest, *, scope_combo=None) -> None:
+        service = self._active_search_service(scope_combo)
+        fallback_directory = str((request.filters or {}).get("folder") or "").strip() or self._current_directory()
+        auto_reindex_key = (request.embedding_model, fallback_directory)
+        auto_reindex_already_used = auto_reindex_key in self._auto_reindexed
+        auto_reindexed: dict[str, tuple[str, str] | None] = {"key": None}
 
         def _run(progress, cancel_check):
             try:
                 progress(-1, "Searching...")
-                service = self._active_search_service(scope_combo)
                 return service.search(request, cancel_check=cancel_check)
             except Exception as exc:
                 message = str(exc)
                 if "incompatible dimensions" not in message:
                     raise
-                directory = str((request.filters or {}).get("folder") or "").strip() or self._current_directory()
+                directory = fallback_directory
                 if request.candidate_paths:
-                    service = self._active_search_service(scope_combo)
                     service.index_paths(
                         request.candidate_paths,
                         embedding_model=request.embedding_model,
@@ -17694,16 +19793,13 @@ class SearchPane(QWidget):
                         cancel_check=cancel_check,
                     )
                     progress(-1, "Retrying search...")
-                    service = self._active_search_service(scope_combo)
                     return service.search(request, cancel_check=cancel_check)
                 if not directory:
                     raise
                 key = (request.embedding_model, directory)
-                if key in self._auto_reindexed:
+                if auto_reindex_already_used:
                     raise
-                self._auto_reindexed.add(key)
                 # Heal old/corrupted indexes by re-indexing once, then retry the search.
-                service = self._active_search_service(scope_combo)
                 service.index_directory(
                     directory,
                     embedding_model=request.embedding_model,
@@ -17713,10 +19809,13 @@ class SearchPane(QWidget):
                     cancel_check=cancel_check,
                 )
                 progress(-1, "Retrying search...")
-                service = self._active_search_service(scope_combo)
-                return service.search(request, cancel_check=cancel_check)
+                results = service.search(request, cancel_check=cancel_check)
+                auto_reindexed["key"] = key
+                return results
 
         def _done(results) -> None:
+            if auto_reindexed["key"] is not None:
+                self._auto_reindexed.add(auto_reindexed["key"])
             self._set_results_kind("similarity")
             self._last_results = list(results or [])
             self.results_list.clear()
@@ -17752,17 +19851,16 @@ class SearchPane(QWidget):
         explicit_route_paths = tuple(getattr(self, "_explicit_review_scope_paths", ()) or ())
         scope_paths = list(explicit_route_paths) if explicit_route_paths else self._current_scope_paths()
         scope_roots = self._current_scope_roots()
-        if not scope_paths and not scope_roots:
-            errorBox("No active roots", "Select one or more Active roots in the Folder pane first.")
+        if not self._require_face_action_eligibility("reindex" if force else "index"):
             return
         action = "reindex faces" if force else "index faces"
         if not self._ensure_face_models_ready(action):
             return
         source_label = "current routed photos" if scope_paths else f"{len(scope_roots)} active root(s)"
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(0, f"Preparing {source_label}…")
-            service = self._active_face_service()
             if scope_paths:
                 return service.index_paths(
                     list(scope_paths),
@@ -17824,11 +19922,14 @@ class SearchPane(QWidget):
     def _populate_query_face_candidates(self, image_path: str, faces: list[object]) -> None:
         self._face_query_detected_faces = list(faces or [])
         self.face_query_faces_model.clear()
+        # A single candidate is selected automatically, so showing an empty
+        # one-item chooser only pushes the primary Find action below the fold.
+        self.face_query_faces_list.setVisible(len(faces or []) > 1)
         if not str(image_path or "").strip():
-            self.face_query_faces_summary.setText("Detect faces in the query photo, then pick one or more faces to search.")
+            self.face_query_faces_summary.setText("Detect and select faces to search.")
             return
         if not faces:
-            self.face_query_faces_summary.setText(f"No detectable faces were found in {Path(image_path).name}.")
+            self.face_query_faces_summary.setText(f"No faces found in {Path(image_path).name}.")
             return
         entries: list[ListEntry] = []
         for index, face in enumerate(list(faces or []), start=1):
@@ -17852,9 +19953,26 @@ class SearchPane(QWidget):
             if selection_model is not None and index.isValid():
                 selection_model.select(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
                 selection_model.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        face_count = self.face_query_faces_model.rowCount()
         self.face_query_faces_summary.setText(
-            f"Detected {self.face_query_faces_model.rowCount()} face(s) in {Path(image_path).name}. Select one or more to search."
+            f"{face_count} face{'s' if face_count != 1 else ''} ready."
         )
+        self.face_query_faces_summary.setToolTip(
+            f"Detected {face_count} face(s) in {Path(image_path).name}. Select one or more to search."
+        )
+        self._query_find_visibility_timer.start(0)
+
+    def _ensure_query_find_visible(self) -> None:
+        if self._is_shutting_down or not hasattr(self, "face_search_button"):
+            return
+        self.sidebar_scroll.ensureWidgetVisible(self.face_primary_find_widget, 0, 12)
+
+    def _on_face_query_path_changed(self, _text: str) -> None:
+        self._face_query_request_id += 1
+        self._face_similarity_request_id += 1
+        self._invalidate_worker_context()
+        self._populate_query_face_candidates(self.face_query_path.text().strip(), [])
+        self._update_query_and_saved_search_actions()
 
     def _selected_query_face_bboxes(self) -> list[tuple[int, int, int, int]]:
         boxes: list[tuple[int, int, int, int]] = []
@@ -17864,29 +19982,59 @@ class SearchPane(QWidget):
                 boxes.append(tuple(int(value) for value in bbox))
         return boxes
 
+    def _on_query_face_selection_changed(self) -> None:
+        self._face_similarity_request_id += 1
+
     def _detect_query_photo_faces(self) -> None:
-        query_face_image = self.face_query_path.text().strip()
-        if not query_face_image:
-            errorBox("Missing query image", "Choose a query face image first.")
+        if not self._require_face_action_eligibility("query_detect"):
             return
+        query_face_image = self.face_query_path.text().strip()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        self._face_query_request_id += 1
+        request_id = int(self._face_query_request_id)
 
         def _run(progress, cancel_check):
+            progress(-1, "Validating query photo...")
+            self._validate_query_image_path(query_face_image)
+            raise_if_cancelled(cancel_check)
             progress(-1, "Detecting query faces...")
-            if cancel_check():
-                raise Cancelled()
-            result = self._active_face_service().detect_faces_for_image(
+            result = service.detect_faces_for_image(
                 query_face_image,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
             if cancel_check():
                 raise Cancelled()
             return result
 
         def _done(faces) -> None:
+            if (
+                request_id != int(self._face_query_request_id)
+                or query_face_image != self.face_query_path.text().strip()
+            ):
+                self._log_face_event("query_face_detection_discarded", request_id=request_id)
+                return
             self._populate_query_face_candidates(query_face_image, list(faces or []))
             self.status_label.setText(f"Detected {len(faces or [])} query face(s).")
 
         self._start_job("Detecting query faces", _run, _done)
+
+    @staticmethod
+    def _validate_query_image_path(image_path: str) -> None:
+        """Decode a query photo on its worker before invoking a face model."""
+
+        path = Path(str(image_path or "").strip())
+        if not path.is_file():
+            raise ValueError(f"Query photo does not exist: {path}")
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        if not reader.canRead():
+            detail = str(reader.errorString() or "unsupported or corrupt image")
+            raise ValueError(f"Query photo cannot be read: {detail}")
+        image = reader.read()
+        if image.isNull():
+            detail = str(reader.errorString() or "corrupt image data")
+            raise ValueError(f"Query photo cannot be decoded: {detail}")
 
     def _search_face_refs(self, face_refs: list[tuple[str, int]], *, source_label: str) -> None:
         refs = list(dict.fromkeys((str(image_path), int(face_index)) for image_path, face_index in (face_refs or []) if str(image_path or "").strip()))
@@ -17896,27 +20044,37 @@ class SearchPane(QWidget):
         if len(refs) == 1:
             return self._search_face_ref(refs[0][0], refs[0][1], source_label=source_label)
         folder = self.face_name_folder_filter.text().strip() if hasattr(self, "face_name_folder_filter") else ""
-        scope_roots = self._current_scope_roots()
-        scope_paths = self._current_scope_paths()
-        if not folder and self.search_only_current_folder.isChecked():
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
+        if scope_roots is not None and not folder and self.search_only_current_folder.isChecked():
             folder = self._current_directory()
         effective_min_score = self._effective_face_search_min_score(float(self.face_browser_min_score.value()))
+        service = self._active_face_service()
+        top_k = int(self.face_browser_top_k.value())
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        self._face_similarity_request_id += 1
+        request_id = int(self._face_similarity_request_id)
 
         def _run(progress, cancel_check):
             progress(-1, "Searching selected faces...")
             return _call_with_optional_cancel(
-                self._active_face_service().search_similar_faces,
+                service.search_similar_faces,
                 refs,
-                top_k=int(self.face_browser_top_k.value()),
+                top_k=top_k,
                 min_score=effective_min_score,
                 folder_prefix=folder,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
 
         def _done(results) -> None:
+            if request_id != int(self._face_similarity_request_id):
+                self._log_face_event("selected_face_search_discarded", request_id=request_id)
+                return
             self.status_label.setText(f"Found {len(results)} matches from {len(refs)} example faces.")
             self._show_face_match_results(
                 list(results or []),
@@ -17940,38 +20098,42 @@ class SearchPane(QWidget):
             errorBox("No faces selected", "Select one or more saved faces first.")
             return
         folder = self.face_name_folder_filter.text().strip() if hasattr(self, "face_name_folder_filter") else ""
-        scope_roots = self._current_scope_roots()
-        scope_paths = self._current_scope_paths()
-        if not folder and self.search_only_current_folder.isChecked():
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
+        if scope_roots is not None and not folder and self.search_only_current_folder.isChecked():
             folder = self._current_directory()
         effective_min_score = self._effective_face_search_min_score(float(self.face_browser_min_score.value()))
+        service = self._active_face_service()
+        top_k = int(self.face_browser_top_k.value())
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Finding similar faces to ignore...")
-            service = self._active_face_service()
             if len(refs) == 1:
                 results = _call_with_optional_cancel(
                     service.search_similar_face,
                     refs[0][0],
                     refs[0][1],
-                    top_k=int(self.face_browser_top_k.value()),
+                    top_k=top_k,
                     min_score=effective_min_score,
                     folder_prefix=folder,
                     scope_roots=scope_roots,
                     candidate_paths=scope_paths,
-                    include_tiny_faces=self._show_tiny_detections_enabled(),
+                    include_tiny_faces=include_tiny_faces,
                     cancel_check=cancel_check,
                 )
             else:
                 results = _call_with_optional_cancel(
                     service.search_similar_faces,
                     refs,
-                    top_k=int(self.face_browser_top_k.value()),
+                    top_k=top_k,
                     min_score=effective_min_score,
                     folder_prefix=folder,
                     scope_roots=scope_roots,
                     candidate_paths=scope_paths,
-                    include_tiny_faces=self._show_tiny_detections_enabled(),
+                    include_tiny_faces=include_tiny_faces,
                     cancel_check=cancel_check,
                 )
             raise_if_cancelled(cancel_check)
@@ -18027,40 +20189,53 @@ class SearchPane(QWidget):
         if not query_face_image:
             errorBox("Missing query image", "Choose a query face image first.")
             return
-        scope_paths = self._current_scope_paths()
-        scope_roots = self._current_scope_roots()
+        scope_roots = self._face_similarity_scope_roots()
+        if not self._ensure_face_similarity_scope(scope_roots):
+            return
+        scope_paths = self._face_similarity_scope_paths(scope_roots)
         selected_bboxes = self._selected_query_face_bboxes()
         effective_min_score = self._effective_face_search_min_score(float(self.face_min_score.value()))
+        service = self._active_face_service()
+        top_k = int(self.face_top_k.value())
+        include_tiny_faces = self._show_tiny_detections_enabled()
+        self._face_similarity_request_id += 1
+        request_id = int(self._face_similarity_request_id)
 
         def _run(progress, cancel_check):
             progress(-1, "Searching faces...")
             if selected_bboxes:
                 return _call_with_optional_cancel(
-                    self._active_face_service().search_query_faces,
+                    service.search_query_faces,
                     query_face_image,
                     selected_bboxes,
-                    top_k=self.face_top_k.value(),
+                    top_k=top_k,
                     min_face_score=effective_min_score,
                     scope_roots=scope_roots,
                     candidate_paths=scope_paths,
-                    include_tiny_faces=self._show_tiny_detections_enabled(),
+                    include_tiny_faces=include_tiny_faces,
                     cancel_check=cancel_check,
                 )
             request = FaceSearchRequest(
                 query_face_image=query_face_image,
-                top_k=self.face_top_k.value(),
+                top_k=top_k,
                 min_face_score=effective_min_score,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
             return _call_with_optional_cancel(
-                self._active_face_service().search_faces,
+                service.search_faces,
                 request,
                 cancel_check=cancel_check,
             )
 
         def _done(results) -> None:
+            if (
+                request_id != int(self._face_similarity_request_id)
+                or query_face_image != self.face_query_path.text().strip()
+            ):
+                self._log_face_event("query_face_search_discarded", request_id=request_id)
+                return
             self.status_label.setText(f"Found {len(results)} face matches.")
             self._show_face_match_results(
                 list(results or []),
@@ -18085,11 +20260,13 @@ class SearchPane(QWidget):
         scope_paths = None if force_global else self._current_scope_paths()
         scope_roots = None if force_global else self._current_scope_roots()
         folder = "" if force_global else (self._current_directory() if self.search_only_current_folder.isChecked() else "")
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Clustering faces...")
             return _call_with_optional_cancel(
-                self._active_face_service().cluster_faces_compare,
+                service.cluster_faces_compare,
                 num_clusters=num_clusters,
                 min_face_score=min_score,
                 backends=backends,
@@ -18098,7 +20275,7 @@ class SearchPane(QWidget):
                 folder_prefix=folder,
                 scope_roots=scope_roots,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
                 cancel_check=cancel_check,
             )
 
@@ -18137,23 +20314,28 @@ class SearchPane(QWidget):
             example_image_paths=examples,
             similarity_threshold=self.face_label_threshold.value(),
         )
+        service = self._active_face_service()
+        profile_tags_widget = getattr(self, "face_profile_tags", None)
+        profile_notes_widget = getattr(self, "face_profile_notes", None)
+        profile_tags = [tag.strip() for tag in profile_tags_widget.text().split(",") if tag.strip()] if profile_tags_widget is not None else []
+        profile_notes = profile_notes_widget.text().strip() if profile_notes_widget is not None else ""
+        profile_favorite = bool(self.face_profile_favorite.isChecked()) if hasattr(self, "face_profile_favorite") else None
+        profile_birth_date = self.face_profile_birth_date.text().strip() if hasattr(self, "face_profile_birth_date") else None
+        profile_hidden = bool(self.face_profile_hidden.isChecked()) if hasattr(self, "face_profile_hidden") else None
 
         def _run(progress, cancel_check):
             progress(-1, "Saving identity prototype...")
             _ = cancel_check
-            return self._active_face_service().label_face_examples(request)
+            return service.label_face_examples(request)
 
         def _done(person) -> None:
-            profile_tags_widget = getattr(self, "face_profile_tags", None)
-            profile_notes_widget = getattr(self, "face_profile_notes", None)
-            tags = [tag.strip() for tag in profile_tags_widget.text().split(",") if tag.strip()] if profile_tags_widget is not None else []
-            self._active_face_service().save_person_profile(
+            service.save_person_profile(
                 person.person_name,
-                notes=profile_notes_widget.text().strip() if profile_notes_widget is not None else "",
-                tags=tags,
-                favorite=bool(self.face_profile_favorite.isChecked()) if hasattr(self, "face_profile_favorite") else None,
-                birth_date=self.face_profile_birth_date.text().strip() if hasattr(self, "face_profile_birth_date") else None,
-                hidden=bool(self.face_profile_hidden.isChecked()) if hasattr(self, "face_profile_hidden") else None,
+                notes=profile_notes,
+                tags=profile_tags,
+                favorite=profile_favorite,
+                birth_date=profile_birth_date,
+                hidden=profile_hidden,
             )
             self.status_label.setText(f"Saved identity prototype for {person.person_name} from {person.example_count} examples.")
             self.refresh_face_library(refresh_people=True, reason="identity prototype saved")
@@ -18162,12 +20344,14 @@ class SearchPane(QWidget):
         self._start_job("Saving face label", _run, _done)
 
     def _auto_propagate_labels(self) -> None:
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Auto-propagating...")
             _ = cancel_check
-            return self._active_face_service().auto_propagate_labels(
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+            return service.auto_propagate_labels(
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(assignments) -> None:
@@ -18218,16 +20402,18 @@ class SearchPane(QWidget):
         self._start_job("Auto-propagating labels", _run, _done)
 
     def _list_face_labels(self) -> None:
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Loading labels...")
             _ = cancel_check
-            return self._active_face_service().list_face_labels(
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+            return service.list_face_labels(
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(labels) -> None:
-            self.status_label.setText(f"Loaded {len(labels)} saved labels.")
+            self.status_label.setText(f"{showing(len(labels), 'saved label')}.")
             groups: dict[str, list[FaceTileItem]] = {}
             photo_paths: list[str] = []
             overlay_by_path: dict[str, str] = {}
@@ -18271,7 +20457,7 @@ class SearchPane(QWidget):
                     )
                     for name, items in sorted(groups.items(), key=lambda item: item[0].lower())
                 ],
-                summary=f"Loaded {len(labels)} labeled face(s).",
+                summary=f"{showing(len(labels), 'labeled face')}.",
                 photo_paths=photo_paths,
                 overlay_by_path=overlay_by_path,
                 context_by_path=context_by_path,
@@ -18367,11 +20553,12 @@ class SearchPane(QWidget):
         if not proposal_ids:
             errorBox("No pending labels selected", "Select one or more pending face-label proposals first.")
             return
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Accepting face-label proposals...")
             _ = cancel_check
-            return self._active_face_service().accept_pending_face_labels_batch(proposal_ids)
+            return service.accept_pending_face_labels_batch(proposal_ids)
 
         def _done(batch) -> None:
             accepted = list(getattr(batch, "accepted", ()) or ())
@@ -18391,11 +20578,12 @@ class SearchPane(QWidget):
         if not proposal_ids:
             errorBox("No pending labels selected", "Select one or more pending face-label proposals first.")
             return
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Rejecting face-label proposals...")
             _ = cancel_check
-            return self._active_face_service().reject_pending_face_labels(proposal_ids)
+            return service.reject_pending_face_labels(proposal_ids)
 
         def _done(count) -> None:
             self.status_label.setText(f"Rejected {int(count or 0)} face-label proposal(s) from {source_label}.")
@@ -18406,19 +20594,21 @@ class SearchPane(QWidget):
     def _refresh_pending_face_labels(self) -> None:
         folder = self._current_directory() if self.search_only_current_folder.isChecked() else ""
         scope_paths = self._current_scope_paths()
+        service = self._active_face_service()
+        include_tiny_faces = self._show_tiny_detections_enabled()
 
         def _run(progress, cancel_check):
             progress(-1, "Loading pending face labels...")
             _ = cancel_check
-            return self._active_face_service().load_pending_face_labels(
+            return service.load_pending_face_labels(
                 folder_prefix=folder,
                 candidate_paths=scope_paths,
-                include_tiny_faces=self._show_tiny_detections_enabled(),
+                include_tiny_faces=include_tiny_faces,
             )
 
         def _done(assignments) -> None:
             self._set_pending_face_assignments(list(assignments or []))
-            self.status_label.setText(f"Loaded {len(assignments or [])} pending face-label proposals.")
+            self.status_label.setText(f"{showing(len(assignments or []), 'pending face-label proposal')}.")
 
         self._start_job("Loading pending face labels", _run, _done)
 
@@ -18455,10 +20645,12 @@ class SearchPane(QWidget):
         self._reject_pending_face_assignments(assignments, source_label="current cluster")
 
     def _undo_last_pending_face_acceptance(self) -> None:
+        service = self._active_face_service()
+
         def _run(progress, cancel_check):
             progress(-1, "Undoing face-label acceptance...")
             _ = cancel_check
-            return self._active_face_service().undo_last_pending_face_acceptance()
+            return service.undo_last_pending_face_acceptance()
 
         def _done(restored) -> None:
             count = len(list(restored or []))
@@ -18489,11 +20681,12 @@ class SearchPane(QWidget):
             parent=self,
         ):
             return
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Merging labels...")
             _ = cancel_check
-            self._active_face_service().merge_person_labels(source, target)
+            service.merge_person_labels(source, target)
             return True
 
         def _done(_ok: bool) -> None:
@@ -18516,11 +20709,12 @@ class SearchPane(QWidget):
             parent=self,
         ):
             return
+        service = self._active_face_service()
 
         def _run(progress, cancel_check):
             progress(-1, "Clearing person...")
             _ = cancel_check
-            self._active_face_service().clear_person_labels(person_name)
+            service.clear_person_labels(person_name)
             return True
 
         def _done(_ok: bool) -> None:

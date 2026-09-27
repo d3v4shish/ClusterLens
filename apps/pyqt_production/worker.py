@@ -11,6 +11,7 @@ from pathlib import Path
 
 from apps.pyqt_production.bootstrap import bootstrap_runtime
 from apps.pyqt_production.worker_protocol import ProductionClusterRequest, json_line
+from apps.pyqt_production.process_transport import write_result_payload
 from apps.shared.runtime_support import configure_rotating_logging, install_crash_handlers
 
 
@@ -46,21 +47,33 @@ def _emit_event(event_type: str, payload: dict[str, object]) -> None:
         LOGGER.exception("Worker stdout fd write failed")
 
 
+def _emit_result(payload: dict[str, object], *, prefix: str) -> None:
+    path = write_result_payload(RUNTIME_LAYOUT.cache_dir / "tmp", prefix, payload)
+    _emit_event("result_ref", {"path": str(path), "bytes": path.stat().st_size})
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Production PyQt clustering worker")
     parser.add_argument("--request-json", help="Path to a JSON request file.")
     parser.add_argument("--model-request-json", help="Path to a model download request file.")
+    parser.add_argument("--request-stdin", action="store_true", help="Read one clustering request line from stdin.")
+    parser.add_argument("--model-request-stdin", action="store_true", help="Read one model request line from stdin.")
     parser.add_argument("--daemon", action="store_true", help="Keep the worker process alive and accept request JSON lines on stdin.")
     args = parser.parse_args(argv)
 
     if args.daemon:
         LOGGER.info("persistent worker startup begin | app_log=%s", RUNTIME_LAYOUT.app_log)
         return _run_daemon()
-    if args.model_request_json:
+    if args.model_request_json or args.model_request_stdin:
         LOGGER.info("model worker startup begin | request_json=%s app_log=%s", args.model_request_json, RUNTIME_LAYOUT.app_log)
+        if args.model_request_stdin:
+            return _run_model_download_payload(_read_stdin_request())
         return _run_model_download_request(Path(args.model_request_json))
+    if args.request_stdin:
+        request = ProductionClusterRequest(**_read_stdin_request())
+        return _run_cluster_request(request)
     if not args.request_json:
-        parser.error("--request-json or --model-request-json is required unless --daemon is used")
+        parser.error("A request JSON source is required unless --daemon is used")
 
     LOGGER.info("worker startup begin | request_json=%s app_log=%s", args.request_json, RUNTIME_LAYOUT.app_log)
     request_payload = json.loads(Path(args.request_json).read_text(encoding="utf-8"))
@@ -69,10 +82,25 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_model_download_request(request_path: Path) -> int:
+    payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    return _run_model_download_payload(payload)
+
+
+def _read_stdin_request() -> dict[str, object]:
+    raw_line = sys.stdin.readline()
+    if not raw_line:
+        raise ValueError("Worker request stream ended before a request was received.")
+    envelope = json.loads(raw_line)
+    payload = envelope.get("payload") if isinstance(envelope, dict) else None
+    if not isinstance(payload, dict):
+        raise ValueError("Worker request payload must be a JSON object.")
+    return payload
+
+
+def _run_model_download_payload(payload: object) -> int:
     from app.services.model_downloads import ModelDownloadItem, ModelDownloadService
 
     try:
-        payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
         raw_items = list(payload.get("items") or []) if isinstance(payload, dict) else []
         items = [
             ModelDownloadItem(
@@ -92,7 +120,7 @@ def _run_model_download_request(request_path: Path) -> int:
                 {"value": int(value), "status": str(status)},
             ),
         )
-        _emit_event("result", result.as_dict())
+        _emit_result(result.as_dict(), prefix="model_download_result")
         return 0
     except Exception as exc:
         LOGGER.exception("Model download worker failed")
@@ -284,7 +312,7 @@ def _run_cluster_request(request: ProductionClusterRequest, *, runtime: Persiste
                 for comparison_key, summaries in cluster_summaries.items()
             },
         }
-        _emit_event("result", payload)
+        _emit_result(payload, prefix="cluster_result")
         return 0
     except Exception as exc:
         LOGGER.exception("Worker clustering failed")

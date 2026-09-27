@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
+from PyQt6.QtCore import QSettings
+
+from apps.pyqt_production import identity as identity_mod
 from apps.pyqt_production.identity import LEGACY_PRODUCTION_APP_ID, PRODUCTION_APP_ID
 from apps.shared.runtime_support import activate_runtime_root, candidate_runtime_roots
 from infra import settings as settings_mod
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_clusterlens_runtime_root_copies_missing_legacy_runtime_files(tmp_path: Path) -> None:
@@ -72,3 +79,52 @@ def test_configured_data_home_is_used_when_no_process_override_exists(tmp_path: 
         clear=False,
     ):
         assert candidate_runtime_roots(PRODUCTION_APP_ID)[0] == configured_root
+
+
+def test_new_and_existing_profiles_get_compatible_appearance_defaults() -> None:
+    cases = (
+        ("FreshAppearanceProfile", False, "system", "adaptive_neutral"),
+        ("ExistingAppearanceProfile", True, "dark", "theme"),
+    )
+    for app_name, existing, expected_theme, expected_backdrop in cases:
+        target = QSettings("ClusterLensIdentityTests", app_name)
+        target.clear()
+        target.sync()
+        legacy = QSettings("ClusterLensIdentityTestsLegacy", app_name)
+        legacy.clear()
+        legacy.sync()
+        if existing:
+            target.setValue("workspace/default_view", "library")
+            target.sync()
+
+        with patch.object(identity_mod, "PRODUCTION_QSETTINGS_ORG", "ClusterLensIdentityTests"), patch.object(
+            identity_mod, "PRODUCTION_QSETTINGS_APP", app_name
+        ), patch.object(
+            identity_mod,
+            "LEGACY_PRODUCTION_QSETTINGS",
+            (("ClusterLensIdentityTestsLegacy", app_name),),
+        ):
+            migrated = identity_mod.production_settings_store()
+
+        assert migrated.value("appearance/theme") == expected_theme
+        assert migrated.value("appearance/viewer_backdrop") == expected_backdrop
+        assert migrated.value("appearance/migration_v1", False, bool) is True
+        target.clear()
+        legacy.clear()
+
+
+def test_source_launchers_resolve_repository_from_outside_working_directory(tmp_path: Path) -> None:
+    for script_name in ("run_app.sh", "run.sh"):
+        completed = subprocess.run(
+            ["bash", str(ROOT / "scripts" / script_name), "--check-launch"],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            f"{script_name} failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+        assert "ClusterLens launcher is ready." in completed.stdout

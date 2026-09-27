@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING
 import uuid
 
 from PyQt6 import sip
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
-from PyQt6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget
 
 from apps.pyqt_production.bootstrap import bootstrap_runtime
 from apps.pyqt_production.first_run import FirstRunSetupDialog
@@ -20,6 +20,7 @@ from apps.pyqt_production.icon_assets import configure_linux_desktop_entry, prod
 from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME, PRODUCTION_QSETTINGS_ORG, production_settings_store
 from apps.pyqt_production.model_download_controller import ModelDownloadController
 from apps.pyqt_production.session_controller import ClusteringSessionController
+from apps.pyqt_production.single_instance import SingleInstanceCoordinator
 from apps.pyqt_production.settings_dialog import ProductionSettingsDialog
 from apps.pyqt_production.worker_protocol import ProductionClusterRequest
 from apps.shared.runtime_migrations import RuntimeMigrationService
@@ -34,48 +35,58 @@ from app.selection import SelectionTarget  # noqa: E402
 from app.path_scope import PathScope  # noqa: E402
 from app.services.cache_maintenance import CacheClearResult, CacheMaintenanceService, RuntimeStorageSummary  # noqa: E402
 from app.services.data_home import DataHomeManager  # noqa: E402
+from app.services.discovery import ImageDiscoveryService  # noqa: E402
 from app.services.cluster_explanations import ClusterExplanation  # noqa: E402
 from app.services.cluster_context import VisionLanguageSettings  # noqa: E402
 from app.services.cluster_meanings import ClusterMeaning  # noqa: E402
 from app.services.clustering_options import model_label, normalize_clustering_backends, normalize_embedding_models  # noqa: E402
 from app.services.face_model_installer import FaceModelInstaller  # noqa: E402
+from app.services.face_storage_recovery import FaceStorageRemovalService  # noqa: E402
 from app.services.model_assets import MODEL_SOURCE_LABELS, TEXT_MODEL_ORDER, ModelAssetService, ModelDownloadPlan  # noqa: E402
 from app.services.model_downloads import ModelDownloadItem, ModelDownloadService, normalize_model_download_items  # noqa: E402
 from app.services.image_tags import ClusterTagSummary, ImageTagService  # noqa: E402
 from app.services.saved_searches import SavedSearchService  # noqa: E402
 from app.services.photo_metadata import PhotoMetadataService  # noqa: E402
+from app.services.library_catalog import LibraryCatalogService  # noqa: E402
+from app.services.source_admission import SourceAdmissionPolicy  # noqa: E402
 from app.services.startup_readiness import StartupReadinessReport, inspect_startup_readiness  # noqa: E402
 from infra.performance import apply_performance_overrides, detect_system_resources, select_performance_profile  # noqa: E402
+from infra.cancel import Cancelled  # noqa: E402
 from infra.qt_diagnostics import install_qt_message_handler  # noqa: E402
 from infra.runtime import ExecutionPolicy, RuntimeCapabilityService  # noqa: E402
 from infra.settings import get_production_settings_registry, get_settings  # noqa: E402
 from ui.cluster_pane import ClusterPane  # noqa: E402
+from ui.common import KeyboardTabBar  # noqa: E402
 from ui.error_mbox import confirmBox, errorBox, infoBox  # noqa: E402
 from ui.footer_bar import WorkspaceFooter  # noqa: E402
 from ui.gallery_pane import GalleryPane  # noqa: E402
 from ui.sectioned_gallery import GallerySection, SectionedGallery  # noqa: E402
-from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
+from ui.async_job import AsyncJob, defer_async_job_dispose, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown  # noqa: E402
 from ui.job_manager import JobManager  # noqa: E402
 from ui.job_presentation import JobPresentationController  # noqa: E402
 from ui.job_widgets import JobIndicatorWidget  # noqa: E402
-from ui.work_coordinator import WorkCoordinator  # noqa: E402
-from ui.library_pane import LibraryPane  # noqa: E402
+from ui.work_coordinator import JobSpec, WorkCoordinator  # noqa: E402
+from ui.library_pane import LibraryPane, TimelineDatePreferences  # noqa: E402
 from ui.mode_panes import ClusteringOptionsPane, SourcePane  # noqa: E402
 from ui.recent_folders import RecentFolderHistory  # noqa: E402
 from ui.runtime_widgets import RuntimeBadge  # noqa: E402
 from ui.tags_pane import TagsPane  # noqa: E402
 from ui.icons import apply_icon  # noqa: E402
-from ui.theme import apply_ultra_dark  # noqa: E402
+from ui.theme import apply_app_density, install_theme_manager  # noqa: E402
 
 
 configure_rotating_logging(RUNTIME_LAYOUT, force=True)
 LOGGER = logging.getLogger(__name__)
-MIN_SUPPORTED_SCREEN_WIDTH = 1920
-MIN_SUPPORTED_SCREEN_HEIGHT = 1080
+MIN_SUPPORTED_SCREEN_WIDTH = 1280
+MIN_SUPPORTED_SCREEN_HEIGHT = 720
 COMPACT_LAYOUT_WIDTH = 1440
+MEDIUM_LAYOUT_WIDTH = 1680
 PACKAGED_LAUNCH_SMOKE_ENV = "CLUSTERLENS_PACKAGED_LAUNCH_SMOKE"
 PACKAGED_LAUNCH_REPORT_ENV = "CLUSTERLENS_PACKAGED_LAUNCH_REPORT"
 PACKAGED_LAUNCH_SMOKE_SCENARIO = "settings-storage"
+PEOPLE_WORKSPACE_STATE_KEY = "workspace/people_state_v1"
+LEGACY_PEOPLE_WORKSPACE_STATE_KEY = "workspace/people_state"
+PEOPLE_WORKSPACE_STATE_VERSION = 1
 # A top-level Qt widget has no QObject parent.  Retain a close-pending window
 # while its event-loop-driven cancellation drain owns live worker signals.
 _CLOSE_PENDING_WINDOWS: list["ProductionClusterApp"] = []
@@ -85,6 +96,110 @@ if TYPE_CHECKING:
 
 
 _FACE_SEARCH_MODULE = None
+
+
+def _settings_object(raw: object) -> dict[str, object] | None:
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        payload = json.loads(str(raw or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _decode_people_workspace_state(raw: object) -> dict[str, object]:
+    payload = _settings_object(raw)
+    if payload is None:
+        return {}
+    try:
+        state_version = int(payload.get("state_version", 0) or 0)
+    except (TypeError, ValueError):
+        return {}
+    return payload if state_version == PEOPLE_WORKSPACE_STATE_VERSION else {}
+
+
+def _migrate_legacy_people_workspace_state(raw: object) -> dict[str, object]:
+    """Migrate the one supported unversioned People workspace schema.
+
+    The predecessor stored lightweight disclosure fields under
+    ``workspace/people_state`` and used the old shell route names. Unknown
+    fields are intentionally dropped so full result sets or source paths can
+    never enter the lightweight settings payload.
+    """
+
+    payload = _settings_object(raw)
+    if payload is None:
+        return {}
+    try:
+        state_version = int(payload.get("state_version", 0) or 0)
+    except (TypeError, ValueError):
+        return {}
+    if state_version != 0:
+        return {}
+
+    route_aliases = {
+        "faces": "all_faces",
+        "all": "all_faces",
+        "all faces": "all_faces",
+        "people": "all_faces",
+        "review": "unnamed",
+        "unlabelled": "unnamed",
+        "unlabeled": "unnamed",
+        "folder review": "detect",
+        "face library": "detect",
+        "review & name": "review_name",
+        "review && name": "review_name",
+        "review_and_name": "review_name",
+        "search": "find",
+        "manage": "identities",
+        "names": "identities",
+    }
+    route = str(payload.get("active_route", payload.get("route", "")) or "").strip().lower()
+    route = route_aliases.get(route, route)
+    migrated: dict[str, object] = {"state_version": PEOPLE_WORKSPACE_STATE_VERSION}
+    if route in {"all_faces", "unnamed", "detect", "review_name", "find", "identities"}:
+        migrated["active_route"] = route
+
+    legacy_aliases = {
+        "walkthrough_dismissed": "face_walkthrough_dismissed",
+        "find_options_expanded": "face_find_options_expanded",
+        "identity_management_expanded": "face_identity_management_expanded",
+        "identity_danger_expanded": "face_identity_danger_expanded",
+    }
+    boolean_keys = {
+        "search_only_current_folder",
+        "show_tiny_detections",
+        "face_search_all_indexed",
+        "face_selected_options_expanded",
+        "face_find_options_expanded",
+        "face_save_options_expanded",
+        "face_manage_options_expanded",
+        "face_pending_items_expanded",
+        "face_people_expanded",
+        "face_profile_expanded",
+        "face_people_query_expanded",
+        "face_walkthrough_dismissed",
+        "face_identity_management_expanded",
+        "face_identity_danger_expanded",
+    }
+    for old_key, new_key in legacy_aliases.items():
+        if old_key in payload and new_key not in payload:
+            payload[new_key] = payload[old_key]
+    for key in boolean_keys:
+        if isinstance(payload.get(key), bool):
+            migrated[key] = payload[key]
+    for key in ("face_review_sort", "face_photo_filter"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            migrated[key] = value.strip()
+    splitter_sizes = payload.get("splitter_sizes")
+    if isinstance(splitter_sizes, (list, tuple)) and len(splitter_sizes) == 2:
+        try:
+            migrated["splitter_sizes"] = [max(1, int(value)) for value in splitter_sizes]
+        except (TypeError, ValueError):
+            pass
+    return migrated
 
 
 def _face_search_api():
@@ -113,8 +228,6 @@ class PreparedRunPayload:
 
 @dataclass(frozen=True)
 class FacesWorkspacePayload:
-    execution_policy: ExecutionPolicy
-    capabilities: object
     service_cache: dict[tuple[str, str, str, str], object]
     services_global: dict[str, object]
     services_session: dict[str, object]
@@ -142,6 +255,8 @@ class PhotoSetRoute:
 
 
 class ProductionClusterApp(QMainWindow):
+    face_storage_cleared = pyqtSignal()
+
     def __init__(self, runtime_layout: RuntimeLayout):
         super().__init__()
         self._is_shutting_down = False
@@ -164,6 +279,9 @@ class ProductionClusterApp(QMainWindow):
         self.settings = get_settings()
         self.settings_registry = get_production_settings_registry()
         self.settings_store = production_settings_store()
+        self.face_storage_cleared.connect(self._on_face_storage_cleared)
+        app_instance = QApplication.instance()
+        self.theme_manager = install_theme_manager(app_instance, self.settings_store) if app_instance is not None else None
         self.recent_folder_history = RecentFolderHistory(self.settings_store)
         self.runtime_service = RuntimeCapabilityService()
         self.job_manager = JobManager(self)
@@ -173,6 +291,7 @@ class ProductionClusterApp(QMainWindow):
             gpu_policy=self._gpu_conflict_policy(),
         )
         self.work_coordinator.gpu_conflict_requested.connect(self._show_gpu_conflict_choice)
+        self.work_coordinator.job_finished.connect(self._on_coordinated_process_finished)
         self._gpu_conflict_menus: list[QMenu] = []
         self.system_resources = detect_system_resources()
         self.performance_profile = self._effective_performance_profile()
@@ -187,6 +306,7 @@ class ProductionClusterApp(QMainWindow):
         self.data_home_manager = DataHomeManager(PRODUCTION_DISPLAY_NAME, runtime_layout.root)
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
         self.session_controller = ClusteringSessionController(runtime_layout, self)
+        self.session_controller.result_transform = _prepare_clustering_result_payload
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
         self.model_download_controller = ModelDownloadController(runtime_layout, self)
         self.cluster_data: dict[str, dict[int, list[str]]] = {}
@@ -202,9 +322,14 @@ class ProductionClusterApp(QMainWindow):
         self.current_tag_filter: tuple[str, ...] = ()
         self.current_tag_match = "Any"
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
+        self._coordinated_async_job_ids: dict[AsyncJob, int] = {}
+        self._coordinated_process_job_ids: set[int] = set()
         self._startup_maintenance_job = None
         self._startup_maintenance_thread = None
         self._startup_maintenance_complete = False
+        self._model_storage_recovery_job = None
+        self._model_storage_recovery_thread = None
+        self._model_storage_recovery_complete = False
         self._preflight_job = None
         self._preflight_thread = None
         self._preflight_generation = 0
@@ -228,6 +353,7 @@ class ProductionClusterApp(QMainWindow):
         self._faces_init_job_id: int | None = None
         self._faces_init_scheduled = False
         self._faces_init_generation = 0
+        self._faces_reload_pending = False
         self._faces_focus_search_pending = False
         self._pending_photo_face_tool_requests: list[tuple[object, object]] = []
         self._pending_post_install_model_name: str | None = None
@@ -236,6 +362,22 @@ class ProductionClusterApp(QMainWindow):
         self._clustering_mode = "basic"
         self._faces_mode = "basic"
         self._active_workspace = "clustering"
+        self._workspace_sections = {
+            "library": "timeline",
+            "organize": "photos",
+            "people": "people",
+            "tools": "duplicates",
+        }
+        self._updating_workspace_subnav = False
+        self._people_workspace_state = self._load_people_workspace_state()
+        restored_people_route = str(self._people_workspace_state.get("active_route", "") or "").strip().lower()
+        self._pending_people_section = (
+            restored_people_route
+            if restored_people_route in {"all_faces", "unnamed", "detect", "review_name", "find", "identities"}
+            else "people"
+        )
+        if self._pending_people_section != "people":
+            self._workspace_sections["people"] = self._pending_people_section
         self._gallery_paths: list[str] = []
         self._gallery_snapshot_key = ""
         self._gallery_discovery_generation = 0
@@ -247,6 +389,7 @@ class ProductionClusterApp(QMainWindow):
         self._active_cluster_directory = ""
         self._active_cluster_scope_signature = ""
         self._scope_editor_pinned = False
+        self._empty_scope_drawer_dismissed = False
         self._pane_visibility = {"source": True, "controls": True, "details": True}
         self._advanced_pane_visibility = {"source": True, "controls": True, "details": True}
         self._pane_restore_widths = {"source": 250, "controls": 420, "details": 440}
@@ -282,9 +425,19 @@ class ProductionClusterApp(QMainWindow):
         self._startup_check_timer = QTimer(self)
         self._startup_check_timer.setSingleShot(True)
         self._startup_check_timer.timeout.connect(self._post_startup_checks)
+        # Own the deferred startup callback so closeEvent can cancel it.  A
+        # bare QTimer.singleShot() retains its bound method after a disposable
+        # test window has closed, which can start maintenance against a
+        # closing/deleted shell on the next event-loop turn.
+        self._startup_maintenance_timer = QTimer(self)
+        self._startup_maintenance_timer.setSingleShot(True)
+        self._startup_maintenance_timer.timeout.connect(self._start_startup_maintenance)
         self._post_install_timer = QTimer(self)
         self._post_install_timer.setSingleShot(True)
         self._post_install_timer.timeout.connect(self._run_pending_post_install_model_download)
+        self._text_scale_reflow_timer = QTimer(self)
+        self._text_scale_reflow_timer.setSingleShot(True)
+        self._text_scale_reflow_timer.timeout.connect(self._apply_text_scale_reflow)
         self._build_ui()
         self._connect_signals()
         self._refresh_recent_folder_menus()
@@ -292,10 +445,8 @@ class ProductionClusterApp(QMainWindow):
         self.source_pane.set_active_roots(restored_roots)
         restored_folder = str(self.settings_store.value("workspace/selected_folder", "") or "").strip()
         browse_root = restored_folder or self.source_pane.active_scope.primary_root
-        if browse_root and Path(browse_root).is_dir():
-            self.source_pane.set_selected_directory(browse_root, activate_scope=False)
-        else:
-            self._update_scope_summary(self.source_pane.active_scope)
+        self._pending_restored_browse_root = browse_root
+        self._update_scope_summary(self.source_pane.active_scope)
         self._apply_workspace_preferences()
         self.runtime_badge.update_runtime(None, None)
         self._apply_safety_state()
@@ -303,7 +454,7 @@ class ProductionClusterApp(QMainWindow):
         self.set_faces_mode(self._preferred_faces_ui_mode())
         self.set_active_workspace(self._preferred_workspace())
         if not self._packaged_launch_smoke:
-            QTimer.singleShot(0, self._start_startup_maintenance)
+            self._startup_maintenance_timer.start(0)
             self._startup_check_timer.start(0)
 
     def _cleanup_runtime_temp_on_startup(self) -> None:
@@ -364,44 +515,66 @@ class ProductionClusterApp(QMainWindow):
             LOGGER.warning("Runtime migration completed with failures: %s", "; ".join(result.failures))
 
     def _start_startup_maintenance(self) -> None:
-        """Recover local runtime state after the window can show its progress."""
+        """Finish the lightweight local-state work needed to open a workspace."""
         if self._is_shutting_down or self._close_pending or self._startup_maintenance_complete:
             return
-        if self._thread_is_running(self._startup_maintenance_thread):
+        if self._startup_maintenance_job is not None:
             return
+        file_operation_recovery = self.gallery_pane.action_service
 
         def _run(progress, cancel_check):
             progress(-1, "Migrating local workspace…")
             raise_if_cancelled(cancel_check)
             self._run_runtime_migrations()
+            progress(-1, "Recovering interrupted face-library changes…")
+            raise_if_cancelled(cancel_check)
+            face_recovery = FaceStorageRemovalService(self.settings.cache_dir).recover_incomplete()
+            if face_recovery.restored_operations:
+                LOGGER.warning(
+                    "Restored interrupted face-library removals: %s",
+                    ", ".join(face_recovery.restored_operations),
+                )
+            if face_recovery.failures:
+                LOGGER.warning(
+                    "Face-library recovery completed with failures: %s",
+                    "; ".join(face_recovery.failures),
+                )
+            progress(-1, "Reconciling interrupted file operations…")
+            raise_if_cancelled(cancel_check)
+            file_recovery = file_operation_recovery.recover_incomplete_operations()
+            if file_recovery.get("recovered_operations"):
+                LOGGER.warning(
+                    "Reconciled interrupted file operations: %s",
+                    ", ".join(file_recovery["recovered_operations"]),
+                )
+            if file_recovery.get("ambiguous_files") or file_recovery.get("failures"):
+                LOGGER.warning(
+                    "File-operation recovery needs review | ambiguous=%s failures=%s",
+                    len(file_recovery.get("ambiguous_files", ())),
+                    "; ".join(file_recovery.get("failures", ())),
+                )
             progress(-1, "Cleaning local temporary files…")
             raise_if_cancelled(cancel_check)
             self._cleanup_runtime_temp_on_startup()
-            progress(-1, "Recovering downloaded model storage…")
-            raise_if_cancelled(cancel_check)
-            self._recover_downloaded_model_storage()
+            restored_browse_root = str(self._pending_restored_browse_root or "").strip()
+            if restored_browse_root and not Path(restored_browse_root).is_dir():
+                restored_browse_root = ""
             progress(100, "Local workspace ready")
-            return None
+            return restored_browse_root
 
         job = AsyncJob(_run)
         self._startup_maintenance_job = job
-        job_id = self.job_manager.register_job(
-            "Preparing local workspace",
-            cancel_fn=job.cancel,
-            origin="Startup",
-        )
-        job.progress.connect(
-            lambda value, text, job_id=job_id: self.job_manager.update(job_id, progress=value, text=text)
-        )
+        thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
+            thread = thread_holder["thread"]
             if self._startup_maintenance_job is job:
                 self._startup_maintenance_job = None
             if self._startup_maintenance_thread is thread:
                 self._startup_maintenance_thread = None
             self._release_async_refs(job, thread)
 
-        def _completed(_result) -> None:
+        def _completed(restored_browse_root) -> None:
             if (
                 self._is_shutting_down
                 or self._close_pending
@@ -411,10 +584,12 @@ class ProductionClusterApp(QMainWindow):
                 _cleanup()
                 return
             self._startup_maintenance_complete = True
+            if str(restored_browse_root or "").strip():
+                self.source_pane.set_selected_directory(str(restored_browse_root), activate_scope=False)
             self.job_manager.finish(job_id, status="finished")
             _cleanup()
             self._refresh_footer_storage_usage()
-            self._begin_startup_readiness_check()
+            self._start_model_storage_recovery()
             if self._active_workspace == "names" and self.names_pane is None:
                 self._start_names_workspace_load()
             elif self._active_workspace == "faces" and self.faces_pane is None:
@@ -435,7 +610,7 @@ class ProductionClusterApp(QMainWindow):
             self.job_manager.finish(job_id, status="failed", error=str(message))
             _cleanup()
             self._refresh_footer_storage_usage()
-            self._begin_startup_readiness_check()
+            self._start_model_storage_recovery()
             if self._can_update_widget(getattr(self, "footer_bar", None)):
                 self.footer_bar.set_status(f"Startup maintenance needs attention: {message}")
             self._finish_pending_photo_face_tool_requests(
@@ -454,14 +629,101 @@ class ProductionClusterApp(QMainWindow):
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._startup_maintenance_thread = thread
-        self._retain_async_refs(job, thread)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._startup_maintenance_thread = thread
+            self._retain_async_refs(job, thread)
+
+        job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Preparing local workspace",
+                origin="Startup",
+                io_bound=True,
+                data_home_write=True,
+            ),
+            _launch,
+        )
+
+    def _start_model_storage_recovery(self) -> None:
+        """Reconcile local model caches without delaying the People shell.
+
+        This work may walk sizable local Hugging Face and face-model trees.
+        It remains a visible cancellable Job, while workspace construction only
+        needs runtime migration and temporary-file cleanup to have completed.
+        Model-dependent actions still wait for the readiness check started at
+        the end of this recovery.
+        """
+
+        if self._is_shutting_down or self._close_pending or self._model_storage_recovery_complete:
+            return
+        if self._model_storage_recovery_job is not None:
+            return
+
+        def _run(progress, cancel_check):
+            progress(-1, "Reconciling local model storage…")
+            raise_if_cancelled(cancel_check)
+            self._recover_downloaded_model_storage()
+            raise_if_cancelled(cancel_check)
+            progress(100, "Local model storage ready")
+            return None
+
+        job = AsyncJob(_run)
+        self._model_storage_recovery_job = job
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _cleanup() -> None:
+            thread = thread_holder["thread"]
+            if self._model_storage_recovery_job is job:
+                self._model_storage_recovery_job = None
+            if self._model_storage_recovery_thread is thread:
+                self._model_storage_recovery_thread = None
+            self._release_async_refs(job, thread)
+
+        def _finish(status: str, error: str = "") -> None:
+            if self._is_shutting_down or self._close_pending:
+                self.job_manager.finish(job_id, status="cancelled")
+                _cleanup()
+                return
+            if status == "cancelled":
+                self.job_manager.finish(job_id, status="cancelled")
+                _cleanup()
+                self._refresh_footer_storage_usage()
+                return
+            self._model_storage_recovery_complete = True
+            self.job_manager.finish(job_id, status=status, error=error)
+            _cleanup()
+            self._refresh_footer_storage_usage()
+            self._begin_startup_readiness_check()
+
+        job.completed.connect(lambda _result: _finish("finished"))
+        job.failed.connect(lambda message: _finish("failed", str(message)))
+        job.cancelled.connect(lambda: _finish("cancelled"))
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._model_storage_recovery_thread = thread
+            self._retain_async_refs(job, thread)
+
+        job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Reconciling local model storage",
+                origin="Startup",
+                io_bound=True,
+                data_home_write=True,
+                model_cache_write=True,
+            ),
+            _launch,
+        )
 
     def _build_ui(self) -> None:
         self.setWindowTitle(PRODUCTION_DISPLAY_NAME)
-        self.resize(1920, 1080)
-        self.setMinimumSize(1440, 900)
+        self.resize(1600, 900)
+        self.setMinimumSize(1280, 720)
         central = QWidget(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -475,7 +737,7 @@ class ProductionClusterApp(QMainWindow):
         scope_layout.setSpacing(8)
         self.scope_summary_label = QLabel("No active roots", self.scope_strip)
         self.scope_summary_label.setObjectName("workspaceScopeSummary")
-        self.scope_summary_label.setToolTip("Shared root scope for Gallery, Clustering, Faces, Names, Tags, and Library. Active roots include all descendants.")
+        self.scope_summary_label.setToolTip("Shared photo-root scope for Library, Organize, People, and Tools. Active roots include all descendants.")
         self.scope_summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.edit_roots_button = QPushButton("Edit roots", self.scope_strip)
         self.edit_roots_button.setToolTip("Show the shared root picker. Selecting roots does not scan, catalog, or modify photos.")
@@ -485,33 +747,54 @@ class ProductionClusterApp(QMainWindow):
         scope_layout.addWidget(self.edit_roots_button)
         layout.addWidget(self.scope_strip)
 
+        self.workspace_subnav = KeyboardTabBar(central)
+        self.workspace_subnav.setObjectName("workspaceSubnavigation")
+        self.workspace_subnav.setAccessibleName("Current workspace sections")
+        self.workspace_subnav.setExpanding(False)
+        self.workspace_subnav.setDrawBase(False)
+        self.workspace_subnav.currentChanged.connect(self._on_workspace_subnav_changed)
+        layout.addWidget(self.workspace_subnav)
+
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setHandleWidth(6)
         layout.addWidget(self.main_splitter, stretch=1)
 
         self.source_pane = SourcePane(self)
-        self.source_pane.setMinimumWidth(220)
-        self.source_pane.setMaximumWidth(280)
+        self.source_pane.setMinimumWidth(240)
+        self.source_pane.setMaximumWidth(360)
         self.source_pane.set_data_home_summary(
             str(self.runtime_layout.root),
             detail="Indexes, previews, models, recovery, backups, and reports",
         )
 
         self.workspace_stack = QStackedWidget(self)
+        self.empty_scope_panel = self._build_empty_scope_panel()
         self.clustering_workspace = QWidget(self.workspace_stack)
-        clustering_layout = QHBoxLayout(self.clustering_workspace)
+        clustering_layout = QVBoxLayout(self.clustering_workspace)
         clustering_layout.setContentsMargins(0, 0, 0, 0)
-        clustering_layout.setSpacing(0)
+        clustering_layout.setSpacing(6)
+
+        self.organize_mode_bar = QWidget(self.clustering_workspace)
+        organize_mode_layout = QHBoxLayout(self.organize_mode_bar)
+        organize_mode_layout.setContentsMargins(8, 0, 8, 0)
+        organize_mode_layout.setSpacing(6)
+        self.mode_selector.setParent(self.organize_mode_bar)
+        self.mode_selector.setToolTip("Basic keeps the photo-first workflow; Advanced reveals clustering controls and comparison details.")
+        organize_mode_layout.addWidget(self.mode_selector)
+        organize_mode_layout.addStretch(1)
+        clustering_layout.addWidget(self.organize_mode_bar)
 
         self.clustering_splitter = QSplitter(Qt.Orientation.Horizontal, self.clustering_workspace)
         self.clustering_splitter.setChildrenCollapsible(False)
         self.clustering_splitter.setHandleWidth(6)
-        clustering_layout.addWidget(self.clustering_splitter)
+        clustering_layout.addWidget(self.clustering_splitter, stretch=1)
 
         self.clustering_pane = ClusteringOptionsPane(self, option_scope="production")
         self.gallery_pane = GalleryPane(self)
+        self.gallery_pane.configure_jobs(self.job_manager, self.work_coordinator, origin="Organize")
         self.cluster_pane = ClusterPane(self)
+        self.cluster_pane.configure_jobs(self.job_manager, self.work_coordinator)
 
         self.gallery_pane.job_manager = self.job_manager
         self.gallery_pane.metadata_service = self.photo_metadata_service
@@ -543,18 +826,22 @@ class ProductionClusterApp(QMainWindow):
         self.cluster_right_splitter.setStretchFactor(0, 1)
 
         self.clustering_splitter.addWidget(self.clustering_pane)
-        self.clustering_splitter.addWidget(self.gallery_pane)
         self.clustering_splitter.addWidget(self.cluster_right_splitter)
         self.clustering_splitter.setStretchFactor(0, 3)
         self.clustering_splitter.setStretchFactor(1, 8)
         self.clustering_splitter.setStretchFactor(2, 3)
 
-        self.photo_gallery_workspace = QWidget(self.workspace_stack)
-        photo_gallery_layout = QHBoxLayout(self.photo_gallery_workspace)
-        photo_gallery_layout.setContentsMargins(0, 0, 0, 0)
-        photo_gallery_layout.setSpacing(6)
-        self.photo_gallery = SectionedGallery(self.photo_gallery_workspace)
-        self.photo_gallery.set_job_manager(self.job_manager)
+        # Basic Clustering owns the photo-first gallery. Advanced Clustering
+        # keeps its comparison-oriented GalleryPane in the same middle slot,
+        # so every photo route has one predictable destination.
+        self.clustering_gallery_stack = QStackedWidget(self.clustering_workspace)
+        self.clustering_gallery_stack.setObjectName("clusteringGalleryStack")
+        self.photo_gallery = SectionedGallery(self.clustering_gallery_stack)
+        self.photo_gallery.set_job_manager(
+            self.job_manager,
+            origin="Organize",
+            work_coordinator=self.work_coordinator,
+        )
         self.photo_gallery._actions.metadata_service = self.photo_metadata_service
         self.photo_gallery._actions.image_tag_service = self.image_tag_service
         self.photo_gallery.face_service_provider = lambda: self.face_service_global
@@ -562,7 +849,9 @@ class ProductionClusterApp(QMainWindow):
         self.photo_gallery.face_edit_request_handler = self._request_photo_face_tools
         self.photo_gallery.face_edit_saved_callback = self._on_main_gallery_face_labels_changed
         self.photo_gallery.set_read_only_mode(self._read_only_mode())
-        photo_gallery_layout.addWidget(self.photo_gallery, stretch=1)
+        self.clustering_gallery_stack.addWidget(self.photo_gallery)
+        self.clustering_gallery_stack.addWidget(self.gallery_pane)
+        self.clustering_splitter.insertWidget(1, self.clustering_gallery_stack)
 
         self.faces_placeholder = self._build_faces_placeholder()
         self.names_placeholder = self._build_names_placeholder()
@@ -571,6 +860,7 @@ class ProductionClusterApp(QMainWindow):
             lambda: self.source_pane.active_scope,
             self.workspace_stack,
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
         )
         self.tags_pane.gallery.metadata_service = self.photo_metadata_service
         self.tags_pane.set_read_only_mode(self._read_only_mode())
@@ -578,9 +868,13 @@ class ProductionClusterApp(QMainWindow):
             lambda: self.source_pane.active_scope,
             lambda: self.face_service_global,
             self.workspace_stack,
+            catalog=LibraryCatalogService(source_admission_policy=self._source_admission_policy()),
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
             context_settings_provider=self._library_context_settings,
             context_settings_changed=self._save_library_context_settings,
+            timeline_date_preferences_provider=self._library_timeline_date_preferences,
+            timeline_date_preferences_changed=self._save_library_timeline_date_preferences,
         )
         self.library_pane.context_auto.setChecked(self._library_auto_context_enabled())
         self.library_pane.configure_photo_tools(
@@ -593,7 +887,7 @@ class ProductionClusterApp(QMainWindow):
         )
         self.library_pane.set_read_only_mode(self._read_only_mode())
 
-        self.workspace_stack.addWidget(self.photo_gallery_workspace)
+        self.workspace_stack.addWidget(self.empty_scope_panel)
         self.workspace_stack.addWidget(self.clustering_workspace)
         self.workspace_stack.addWidget(self.faces_placeholder)
         self.workspace_stack.addWidget(self.names_placeholder)
@@ -612,19 +906,54 @@ class ProductionClusterApp(QMainWindow):
         self.statusBar().hide()
         self.set_clustering_mode("basic")
 
+    def _build_empty_scope_panel(self) -> QWidget:
+        """Build the one safe first-run surface shared by every workspace."""
+
+        panel = QWidget(self.workspace_stack)
+        panel.setObjectName("noActiveRootsPanel")
+        panel.setAccessibleName("No active photo roots")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(32, 32, 32, 32)
+        panel_layout.setSpacing(10)
+        panel_layout.addStretch(1)
+        title = QLabel("Add photo roots to get started", panel)
+        title.setObjectName("noActiveRootsTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detail = QLabel(
+            "Library, Organize, People, and Tools use the same active roots. "
+            "Choose folders first; no photos are scanned or changed until you start a task.",
+            panel,
+        )
+        detail.setObjectName("noActiveRootsDetail")
+        detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detail.setWordWrap(True)
+        self.empty_scope_edit_roots_button = QPushButton("Edit roots", panel)
+        self.empty_scope_edit_roots_button.setObjectName("noActiveRootsEditButton")
+        self.empty_scope_edit_roots_button.setAccessibleName("Edit active photo roots")
+        self.empty_scope_edit_roots_button.setToolTip(
+            "Choose the folders ClusterLens may use. Applying roots does not scan or modify photos."
+        )
+        self.empty_scope_edit_roots_button.setProperty("kind", "primary")
+        self.empty_scope_edit_roots_button.clicked.connect(self._edit_active_roots)
+        panel_layout.addWidget(title)
+        panel_layout.addWidget(detail)
+        panel_layout.addWidget(self.empty_scope_edit_roots_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        panel_layout.addStretch(1)
+        return panel
+
     def _build_faces_placeholder(self) -> QWidget:
         panel = QWidget(self.workspace_stack)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
         layout.addStretch(1)
-        self.faces_placeholder_title = QLabel("Faces workspace")
+        self.faces_placeholder_title = QLabel("People · Unnamed")
         self.faces_placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.faces_placeholder_title.setObjectName("facesLazyTitle")
-        self.faces_placeholder_detail = QLabel("Face indexing, search, review, and identity tools load when opened.")
+        self.faces_placeholder_detail = QLabel("Face review and similarity tools load only when you open this section.")
         self.faces_placeholder_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.faces_placeholder_detail.setWordWrap(True)
-        self.faces_placeholder_button = QPushButton("Load Faces")
+        self.faces_placeholder_button = QPushButton("Load face tools")
         self.faces_placeholder_button.setMinimumWidth(180)
         self.faces_placeholder_button.clicked.connect(self._start_faces_workspace_load)
         layout.addWidget(self.faces_placeholder_title)
@@ -639,13 +968,13 @@ class ProductionClusterApp(QMainWindow):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
         layout.addStretch(1)
-        self.names_placeholder_title = QLabel("Names workspace")
+        self.names_placeholder_title = QLabel("People")
         self.names_placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.names_placeholder_title.setObjectName("namesLazyTitle")
-        self.names_placeholder_detail = QLabel("Opening the saved global face-label database…")
+        self.names_placeholder_detail = QLabel("Opening saved people and their exact photos…")
         self.names_placeholder_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.names_placeholder_detail.setWordWrap(True)
-        self.names_placeholder_button = QPushButton("Open Names")
+        self.names_placeholder_button = QPushButton("Load people")
         self.names_placeholder_button.setMinimumWidth(180)
         self.names_placeholder_button.clicked.connect(self._start_names_workspace_load)
         layout.addWidget(self.names_placeholder_title)
@@ -690,7 +1019,11 @@ class ProductionClusterApp(QMainWindow):
         # Keep the first window construction lightweight even when Faces is
         # the saved workspace.  The placeholder paints first; model/runtime
         # discovery begins on the next event-loop turn and remains cancellable.
-        if not self._faces_init_scheduled and not self._thread_is_running(self._faces_init_thread):
+        if (
+            not self._packaged_launch_smoke
+            and not self._faces_init_scheduled
+            and self._faces_init_job is None
+        ):
             self._faces_init_scheduled = True
             generation = self._faces_init_generation
             QTimer.singleShot(0, lambda: self._start_faces_workspace_load(generation))
@@ -703,10 +1036,7 @@ class ProductionClusterApp(QMainWindow):
         self._faces_init_scheduled = False
         job = self._faces_init_job
         if job is not None:
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_app_async_job(job)
         self._finish_pending_photo_face_tool_requests(error="Face tool preparation was cancelled.")
 
     def _request_photo_face_tools(self, image_path: str, on_ready, on_failed) -> None:
@@ -731,18 +1061,21 @@ class ProductionClusterApp(QMainWindow):
         self._pending_photo_face_tool_requests.append((on_ready, on_failed))
         self.footer_bar.set_status(f"Preparing face tools for {Path(str(image_path)).name}…")
         self._set_activity("Preparing face tools…")
-        if report is None and self._thread_is_running(self._startup_readiness_thread):
+        if report is None and self._startup_readiness_job is not None:
             # The local-only readiness job is already visible in Jobs. Wait
             # for it instead of racing a model/service construction.
             return
         if not self._startup_maintenance_complete:
             self._start_startup_maintenance()
             return
+        if not self._model_storage_recovery_complete:
+            self._start_model_storage_recovery()
+            return
         # Names opens the same durable global face service. Do not construct
         # it twice when that workspace is already loading.
-        if self._thread_is_running(self._names_init_thread):
+        if self._names_init_job is not None:
             return
-        if not self._thread_is_running(self._faces_init_thread):
+        if self._faces_init_job is None:
             self._start_faces_workspace_load()
 
     def _finish_pending_photo_face_tool_requests(self, *, error: str = "") -> None:
@@ -760,7 +1093,11 @@ class ProductionClusterApp(QMainWindow):
     def _ensure_names_workspace(self):
         if self.names_pane is not None:
             return self.names_pane
-        if not self._names_init_scheduled and not self._thread_is_running(self._names_init_thread):
+        if (
+            not self._packaged_launch_smoke
+            and not self._names_init_scheduled
+            and not self._thread_is_running(self._names_init_thread)
+        ):
             self._names_init_scheduled = True
             QTimer.singleShot(0, self._start_names_workspace_load)
         return self.names_placeholder
@@ -795,6 +1132,9 @@ class ProductionClusterApp(QMainWindow):
         )
         cache_dir = Path(self.settings.cache_dir)
         performance_profile = self.performance_profile
+        execution_policy = self.execution_policy
+        runtime_service = self.runtime_service
+        source_admission_policy = self._source_admission_policy()
         if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
             self.names_placeholder_detail.setText("Opening the saved global face-label database…")
         if self._can_update_widget(getattr(self, "names_placeholder_button", None)):
@@ -817,8 +1157,8 @@ class ProductionClusterApp(QMainWindow):
                 db_path = cache_dir / f"face_search_human_{detector}__{embedder}.db"
             service = face_search.FaceIndexService(
                 mode=mode,
-                execution_policy=self.execution_policy,
-                runtime_service=self.runtime_service,
+                execution_policy=execution_policy,
+                runtime_service=runtime_service,
                 model_root=model_root,
                 detector_id=detector,
                 embedder_id=embedder,
@@ -826,6 +1166,7 @@ class ProductionClusterApp(QMainWindow):
                 detector_max_detections=max_detections,
                 performance_profile=performance_profile,
                 db_path=db_path,
+                discovery_service=ImageDiscoveryService(admission_policy=source_admission_policy),
             )
             raise_if_cancelled(cancel_check)
             return NamesWorkspacePayload(
@@ -835,16 +1176,6 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._names_init_job = job
-        self._names_init_job_id = self.job_manager.register_job(
-            "Opening Names", cancel_fn=job.cancel, origin="Names"
-        )
-        job.progress.connect(
-            lambda value, text: self.job_manager.update(
-                self._names_init_job_id or -1,
-                progress=value,
-                text=text,
-            )
-        )
         job.progress.connect(
             lambda _value, text: self.names_placeholder_detail.setText(str(text))
             if self._can_update_widget(getattr(self, "names_placeholder_detail", None))
@@ -876,51 +1207,73 @@ class ProductionClusterApp(QMainWindow):
                     )
                 elif self._startup_readiness_error:
                     self._finish_pending_photo_face_tool_requests(error=self._startup_readiness_error)
-                elif not self._thread_is_running(self._startup_readiness_thread):
+                elif self._startup_readiness_job is None:
                     self._begin_startup_readiness_check()
 
         def _failed(message: str) -> None:
             text = str(message or "").strip()
             _finish("cancelled" if text.casefold() == "cancelled" else "failed", text)
-            if self._pending_photo_face_tool_requests and not self._thread_is_running(self._faces_init_thread):
+            if self._pending_photo_face_tool_requests and self._faces_init_job is None:
                 self._finish_pending_photo_face_tool_requests(
                     error=text or "Face tools could not be prepared."
                 )
             if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
-                self.names_placeholder_detail.setText(f"Names could not open: {text}")
-                self.names_placeholder_button.setText("Retry Names")
+                self.names_placeholder_detail.setText(f"Saved people could not open: {text}")
+                self.names_placeholder_button.setText("Retry People")
                 self.names_placeholder_button.setEnabled(True)
 
         def _cancelled() -> None:
             _finish("cancelled")
-            if self._pending_photo_face_tool_requests and not self._thread_is_running(self._faces_init_thread):
+            if self._pending_photo_face_tool_requests and self._faces_init_job is None:
                 self._finish_pending_photo_face_tool_requests(error="Face tools loading was cancelled.")
             if self._can_update_widget(getattr(self, "names_placeholder_detail", None)):
-                self.names_placeholder_detail.setText("Names loading was cancelled.")
+                self.names_placeholder_detail.setText("Saved people loading was cancelled.")
                 self.names_placeholder_button.setEnabled(True)
 
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._names_init_thread = thread
-        self._retain_async_refs(job, thread)
+        thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
+            thread = thread_holder["thread"]
             self._release_async_refs(job, thread)
             if self._names_init_thread is thread:
                 self._names_init_thread = None
             if self._names_init_job is job:
                 self._names_init_job = None
 
-        thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._names_init_thread = thread
+            self._retain_async_refs(job, thread)
+            thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
 
-    def _start_faces_workspace_load(self, expected_generation: int | None = None) -> None:
+        self._names_init_job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Opening saved people",
+                origin="People",
+                io_bound=True,
+                data_home_write=True,
+                model_cache_read=True,
+            ),
+            _launch,
+        )
+        job.cancelled.connect(lambda: _cleanup() if thread_holder["thread"] is None else None)
+
+    def _start_faces_workspace_load(
+        self,
+        expected_generation: int | None = None,
+        *,
+        reload_existing: bool = False,
+    ) -> None:
         self._faces_init_scheduled = False
         if expected_generation is not None and expected_generation != self._faces_init_generation:
             return
         if (
-            self.faces_pane is not None
+            (self.faces_pane is not None and not reload_existing)
             or self._is_shutting_down
             or self._unsupported_resolution_active
             or (self._active_workspace != "faces" and not self._pending_photo_face_tool_requests)
@@ -928,10 +1281,10 @@ class ProductionClusterApp(QMainWindow):
             return
         if not self._startup_maintenance_complete:
             if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
-                self.faces_placeholder_detail.setText("Preparing local workspace before opening Faces…")
+                self.faces_placeholder_detail.setText("Preparing the local People workspace…")
             self._start_startup_maintenance()
             return
-        if self._thread_is_running(self._faces_init_thread):
+        if self._faces_init_job is not None:
             return
 
         load_generation = self._faces_init_generation
@@ -950,22 +1303,22 @@ class ProductionClusterApp(QMainWindow):
             1,
             int(self.settings_registry.get(self.settings_store, "faces/max_detections/human", 50)),
         )
-        preferred_execution_mode = self._preferred_execution_mode()
+        # Runtime probing can import CUDA providers and take seconds on some
+        # hosts.  The People shell only opens local databases; model-dependent
+        # Detect/Find actions stay disabled until the separate readiness Job
+        # has completed its authoritative runtime probe.
+        execution_policy = self.execution_policy
+        runtime_service = self.runtime_service
         reset_face_session = bool(self._faces_session_reset_pending)
         cache_dir = Path(self.settings.cache_dir)
         performance_profile = self.performance_profile
+        source_admission_policy = self._source_admission_policy()
         if getattr(self, "faces_placeholder_detail", None) is not None:
             self.faces_placeholder_detail.setText("Checking runtime and opening the saved face library…")
         if getattr(self, "faces_placeholder_button", None) is not None:
             self.faces_placeholder_button.setEnabled(False)
 
         def _run(progress, cancel_check):
-            progress(-1, "Checking CPU and CUDA runtime…")
-            policy = self.runtime_service.select_policy(preferred_execution_mode, refresh=True)
-            capabilities = self.runtime_service.detect()
-            if policy.cuda_required_unavailable:
-                raise RuntimeError(policy.error or policy.reason)
-            raise_if_cancelled(cancel_check)
             progress(-1, "Opening face databases…")
             face_search = _face_search_api()
             mode = "human"
@@ -996,8 +1349,8 @@ class ProductionClusterApp(QMainWindow):
                 raise_if_cancelled(cancel_check)
                 service = face_search.FaceIndexService(
                     mode=mode,
-                    execution_policy=policy,
-                    runtime_service=self.runtime_service,
+                    execution_policy=execution_policy,
+                    runtime_service=runtime_service,
                     model_root=model_root,
                     detector_id=detector,
                     embedder_id=embedder,
@@ -1005,12 +1358,11 @@ class ProductionClusterApp(QMainWindow):
                     detector_max_detections=max_detections,
                     performance_profile=performance_profile,
                     db_path=_db_path(scope),
+                    discovery_service=ImageDiscoveryService(admission_policy=source_admission_policy),
                 )
                 service_cache[(scope, mode, detector, embedder)] = service
                 services[scope] = service
             return FacesWorkspacePayload(
-                execution_policy=policy,
-                capabilities=capabilities,
                 service_cache=service_cache,
                 services_global={mode: services["global"]},
                 services_session={mode: services["session"]},
@@ -1018,16 +1370,6 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._faces_init_job = job
-        self._faces_init_job_id = self.job_manager.register_job(
-            "Opening Faces", cancel_fn=job.cancel, origin="Faces"
-        )
-        job.progress.connect(
-            lambda value, text: self.job_manager.update(
-                self._faces_init_job_id or -1,
-                progress=value,
-                text=text,
-            )
-        )
         job.progress.connect(
             lambda _value, text: self.faces_placeholder_detail.setText(str(text))
             if self._can_update_widget(getattr(self, "faces_placeholder_detail", None))
@@ -1044,22 +1386,42 @@ class ProductionClusterApp(QMainWindow):
                 self._is_shutting_down
                 or self._unsupported_resolution_active
                 or load_generation != self._faces_init_generation
-                or (self._active_workspace != "faces" and not self._pending_photo_face_tool_requests)
+                or (
+                    self._active_workspace != "faces"
+                    and not self._pending_photo_face_tool_requests
+                    and not reload_existing
+                )
                 or not isinstance(payload, FacesWorkspacePayload)
             ):
                 _finish("cancelled")
                 self._finish_pending_photo_face_tool_requests(error="Face tools were cancelled before they were ready.")
                 return
-            self.execution_policy = payload.execution_policy
-            self.runtime_badge.update_runtime(payload.capabilities, payload.execution_policy)
             self._face_service_cache = dict(payload.service_cache)
             self.face_services_global = dict(payload.services_global)
             self.face_services_session = dict(payload.services_session)
             self.face_service_global = self.face_services_global["human"]
             self.face_service_session = self.face_services_session["human"]
             self._faces_session_reset_pending = False
-            if self._active_workspace == "faces":
+            if self._active_workspace == "faces" and self.faces_pane is None:
                 self._build_faces_workspace_widget()
+            elif self.faces_pane is not None:
+                self.faces_pane.setEnabled(True)
+                self.faces_pane.face_service_global = self.face_service_global
+                self.faces_pane.face_service_session = self.face_service_session
+                self.faces_pane.set_face_services(
+                    face_services_global=self.face_services_global,
+                    face_services_session=self.face_services_session,
+                    refresh=False,
+                )
+                self.faces_pane.set_face_service_provider(self._face_service_for_pipeline)
+                self.faces_pane.configure_face_pipeline_options(
+                    self._face_model_root(),
+                    self._preferred_face_pipeline_defaults(),
+                    refresh=False,
+                )
+                self.faces_pane.set_active_face_mode("human", refresh=True)
+                if self.names_pane is not None:
+                    self.names_pane.refresh_names()
             _finish("finished")
             self.footer_bar.set_status("Face tools are ready.")
             self._set_activity("Ready")
@@ -1070,30 +1432,39 @@ class ProductionClusterApp(QMainWindow):
             _finish("cancelled" if text.casefold() == "cancelled" else "failed", text)
             self._finish_pending_photo_face_tool_requests(error=text or "Face tools could not be prepared.")
             if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
-                self.faces_placeholder_detail.setText(f"Faces could not open: {text}")
-                self.faces_placeholder_button.setText("Retry Faces")
+                self.faces_placeholder_detail.setText(f"People tools could not open: {text}")
+                self.faces_placeholder_button.setText("Retry People")
                 self.faces_placeholder_button.setEnabled(True)
+            if reload_existing and self._can_update_widget(self.faces_pane):
+                self.faces_pane.setEnabled(True)
+                self.footer_bar.set_status(f"People settings reload failed: {text}")
 
         def _cancelled() -> None:
             _finish("cancelled")
             self._finish_pending_photo_face_tool_requests(error="Face tools loading was cancelled.")
             if self._can_update_widget(getattr(self, "faces_placeholder_detail", None)):
-                self.faces_placeholder_detail.setText("Faces loading was cancelled.")
+                self.faces_placeholder_detail.setText("People tools loading was cancelled.")
                 self.faces_placeholder_button.setEnabled(True)
+            if reload_existing and self._can_update_widget(self.faces_pane):
+                self.faces_pane.setEnabled(True)
+                self.footer_bar.set_status("People settings reload cancelled; previous services remain active.")
 
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._faces_init_thread = thread
-        self._retain_async_refs(job, thread)
+        thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
+            thread = thread_holder["thread"]
             self._release_async_refs(job, thread)
             if self._faces_init_thread is thread:
                 self._faces_init_thread = None
             if self._faces_init_job is job:
                 self._faces_init_job = None
+            if self._faces_reload_pending and self.faces_pane is not None and not self._is_shutting_down:
+                self._faces_reload_pending = False
+                QTimer.singleShot(0, lambda: self._start_faces_workspace_load(reload_existing=True))
+                return
             if (
                 self._active_workspace == "faces"
                 and self.faces_pane is None
@@ -1102,7 +1473,25 @@ class ProductionClusterApp(QMainWindow):
             ):
                 self._ensure_faces_workspace()
 
-        thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._faces_init_thread = thread
+            self._retain_async_refs(job, thread)
+            thread.finished.connect(_cleanup, Qt.ConnectionType.QueuedConnection)
+
+        self._faces_init_job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Reloading People tools" if reload_existing else "Opening People tools",
+                origin="People",
+                io_bound=True,
+                data_home_write=True,
+                model_cache_read=True,
+            ),
+            _launch,
+        )
+        job.cancelled.connect(lambda: _cleanup() if thread_holder["thread"] is None else None)
 
     def _build_faces_workspace_widget(self) -> None:
         if self.faces_pane is not None or self._is_shutting_down or self._unsupported_resolution_active:
@@ -1118,14 +1507,16 @@ class ProductionClusterApp(QMainWindow):
             enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
             saved_search_service=self.saved_search_service,
             supported_face_modes=["human"],
+            initial_people_section=self._pending_people_section,
         )
         pane.set_face_service_provider(self._face_service_for_pipeline)
+        pane.task_navigation.hide()
         pane.current_directory_provider = lambda: self.source_pane.active_scope.primary_root
         pane.current_scope_roots_provider = lambda: self.source_pane.active_scope.roots
         pane.clustering_filter_state_provider = self._current_clustering_filter_state
         pane.use_onnx_provider = lambda: bool(self.clustering_pane.onnx_checkbox.isChecked())
-        pane.job_manager = self.job_manager
-        pane.results_gallery.job_manager = self.job_manager
+        pane.configure_jobs(self.job_manager, self.work_coordinator)
+        pane.results_gallery.configure_jobs(self.job_manager, self.work_coordinator, origin="People")
         pane.results_gallery.metadata_service = self.photo_metadata_service
         pane.results_gallery.image_tag_service = self.image_tag_service
         pane.configure_face_pipeline_options(
@@ -1143,6 +1534,7 @@ class ProductionClusterApp(QMainWindow):
         if self.source_pane.active_scope.primary_root:
             pane.face_folder_path.setText(self.source_pane.active_scope.primary_root)
         pane.setMinimumWidth(self._layout_widths()["faces"])
+        pane.apply_workspace_state(self._people_workspace_state)
         self.faces_pane = pane
         self._connect_faces_signals(pane)
         self._apply_workspace_preferences()
@@ -1159,7 +1551,8 @@ class ProductionClusterApp(QMainWindow):
             self.workspace_stack.addWidget(pane)
         if self._active_workspace == "faces":
             self.workspace_stack.setCurrentWidget(pane)
-            pane.ensure_current_faces_tab_loaded()
+            self._apply_people_section()
+        pane.reflow_for_text_scale()
         if self._faces_focus_search_pending:
             self._faces_focus_search_pending = False
             target = getattr(pane, "face_identity_search", None) or getattr(pane, "face_query_path", None)
@@ -1176,9 +1569,10 @@ class ProductionClusterApp(QMainWindow):
             lambda: self.face_service_global,
             self.workspace_stack,
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
             active_scope_provider=lambda: self.source_pane.active_scope,
         )
-        pane.gallery.job_manager = self.job_manager
+        pane.gallery.configure_jobs(self.job_manager, self.work_coordinator, origin="People")
         pane.gallery.metadata_service = self.photo_metadata_service
         pane.gallery.image_tag_service = self.image_tag_service
         pane.set_read_only_mode(self._read_only_mode())
@@ -1205,12 +1599,15 @@ class ProductionClusterApp(QMainWindow):
             pane.refresh_names()
 
     def _on_names_face_labels_changed(self) -> None:
-        """Refresh already-created Faces views after an exact Names label edit."""
+        """Invalidate Faces after an exact Names label edit.
+
+        The visible People task updates now; inactive tasks stay lazy rather
+        than each opening a full review and album query for the same change.
+        """
 
         if self.faces_pane is None:
             return
-        self.faces_pane.refresh_face_library(reason="labels changed in Names")
-        self.faces_pane.refresh_face_album(reason="labels changed in Names", force_refresh=True)
+        self.faces_pane._invalidate_face_data(reason="labels changed in Names")
 
     def _on_main_gallery_face_labels_changed(self, image_path: str) -> None:
         """Refresh durable-name views after a Photos inspector face edit."""
@@ -1245,15 +1642,35 @@ class ProductionClusterApp(QMainWindow):
         pane.saved_clustering_filter_requested.connect(self._run_saved_clustering_filter)
         pane.open_face_model_settings_requested.connect(lambda: self.open_settings_dialog("Face Models"))
         pane.face_pipeline_controls_requested.connect(self._show_face_pipeline_controls)
-        pane.face_pipeline_applied.connect(self._persist_face_pipeline_defaults)
+        pane.face_pipeline_applied.connect(self._on_face_pipeline_applied)
         pane.install_face_model_requested.connect(self._request_face_model_download)
         pane.source_folder_changed.connect(self._set_shared_source_folder)
         if self.names_pane is not None:
             pane.face_labels_changed.connect(self.names_pane.refresh_names)
         pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
+        pane.people_section_changed.connect(self._sync_people_section_from_pane)
         pane.set_recent_directories(self.recent_folder_history.paths())
         self._apply_pending_photo_face_review(pane)
+
+    def _sync_people_section_from_pane(self, section: str) -> None:
+        """Reflect nested People navigation without replaying its action."""
+
+        route = str(section or "").strip().lower()
+        if route not in {"all_faces", "unnamed", "detect", "review_name", "find", "identities"}:
+            return
+        self._pending_people_section = route
+        self._workspace_sections["people"] = route
+        if self._workspace_group(self._active_workspace) != "people":
+            return
+        for index in range(self.workspace_subnav.count()):
+            if str(self.workspace_subnav.tabData(index) or "") != route:
+                continue
+            if self.workspace_subnav.currentIndex() != index:
+                self.workspace_subnav.blockSignals(True)
+                self.workspace_subnav.setCurrentIndex(index)
+                self.workspace_subnav.blockSignals(False)
+            break
 
     def _show_face_pipeline_controls(self) -> None:
         self.set_active_workspace("faces")
@@ -1263,7 +1680,7 @@ class ProductionClusterApp(QMainWindow):
 
     def _set_shared_source_folder(self, directory: str) -> None:
         directory = str(directory or "").strip()
-        if directory and Path(directory).is_dir():
+        if directory:
             self.source_pane.set_selected_directory(directory, activate_scope=False)
             self.source_pane.set_active_roots([directory])
 
@@ -1292,45 +1709,41 @@ class ProductionClusterApp(QMainWindow):
         self.feature_label = QLabel(PRODUCTION_DISPLAY_NAME)
         self.feature_label.setProperty("role", "section")
         self.feature_label.setAccessibleName("ClusterLens")
-        self.gallery_workspace_button = QPushButton("Gallery")
-        self.gallery_workspace_button.setCheckable(True)
-        self.gallery_workspace_button.setProperty("nav", True)
-        self.gallery_workspace_button.setAccessibleName("Open Gallery workspace")
-        apply_icon(self.gallery_workspace_button, "workspace")
-        self.gallery_workspace_button.clicked.connect(lambda: self.set_active_workspace("gallery"))
-        self.clustering_workspace_button = QPushButton("Clustering")
-        self.clustering_workspace_button.setCheckable(True)
-        self.clustering_workspace_button.setProperty("nav", True)
-        self.clustering_workspace_button.setAccessibleName("Open Clustering workspace")
-        apply_icon(self.clustering_workspace_button, "workspace")
-        self.clustering_workspace_button.clicked.connect(lambda: self.set_active_workspace("clustering"))
-        self.faces_workspace_button = QPushButton("Faces")
-        self.faces_workspace_button.setCheckable(True)
-        self.faces_workspace_button.setProperty("nav", True)
-        self.faces_workspace_button.setAccessibleName("Open Faces workspace")
-        apply_icon(self.faces_workspace_button, "search")
-        self.faces_workspace_button.clicked.connect(lambda: self.set_active_workspace("faces"))
-        self.names_workspace_button = QPushButton("Names")
-        self.names_workspace_button.setCheckable(True)
-        self.names_workspace_button.setProperty("nav", True)
-        self.names_workspace_button.setAccessibleName("Open Names workspace")
-        self.names_workspace_button.setToolTip("Browse durable saved names and the photos containing their labeled faces.")
-        apply_icon(self.names_workspace_button, "search")
-        self.names_workspace_button.clicked.connect(lambda: self.set_active_workspace("names"))
-        self.tags_workspace_button = QPushButton("Tags")
-        self.tags_workspace_button.setCheckable(True)
-        self.tags_workspace_button.setProperty("nav", True)
-        self.tags_workspace_button.setAccessibleName("Open Tags workspace")
-        self.tags_workspace_button.setToolTip("Browse, edit, filter, and cluster durable photo tags.")
-        apply_icon(self.tags_workspace_button, "search")
-        self.tags_workspace_button.clicked.connect(lambda: self.set_active_workspace("tags"))
         self.library_workspace_button = QPushButton("Library")
         self.library_workspace_button.setCheckable(True)
         self.library_workspace_button.setProperty("nav", True)
         self.library_workspace_button.setAccessibleName("Open Library workspace")
-        self.library_workspace_button.setToolTip("Browse registered local photo roots, review duplicates, clean up people, and search generated cluster context.")
-        apply_icon(self.library_workspace_button, "workspace")
+        self.library_workspace_button.setToolTip("Browse the timeline, all photos, search, and saved albums.")
+        apply_icon(self.library_workspace_button, "folder")
         self.library_workspace_button.clicked.connect(lambda: self.set_active_workspace("library"))
+        self.organize_workspace_button = QPushButton("Organize")
+        self.organize_workspace_button.setCheckable(True)
+        self.organize_workspace_button.setProperty("nav", True)
+        self.organize_workspace_button.setAccessibleName("Open Organize workspace")
+        self.organize_workspace_button.setToolTip("Organize photos, tags, and generated cluster context.")
+        apply_icon(self.organize_workspace_button, "scan")
+        self.organize_workspace_button.clicked.connect(lambda: self.set_active_workspace("organize"))
+        self.people_workspace_button = QPushButton("People")
+        self.people_workspace_button.setCheckable(True)
+        self.people_workspace_button.setProperty("nav", True)
+        self.people_workspace_button.setAccessibleName("Open People workspace")
+        self.people_workspace_button.setToolTip("Browse named people, review unnamed faces, and find a face.")
+        apply_icon(self.people_workspace_button, "faces")
+        self.people_workspace_button.clicked.connect(lambda: self.set_active_workspace("people"))
+        self.tools_workspace_button = QPushButton("Tools")
+        self.tools_workspace_button.setCheckable(True)
+        self.tools_workspace_button.setProperty("nav", True)
+        self.tools_workspace_button.setAccessibleName("Open Tools workspace")
+        self.tools_workspace_button.setToolTip("Review duplicates, batch rename or edit metadata, and open recovery controls.")
+        apply_icon(self.tools_workspace_button, "settings")
+        self.tools_workspace_button.clicked.connect(lambda: self.set_active_workspace("tools"))
+        # Stable attribute aliases keep integrations using the old route
+        # names functional while only the four user-facing destinations are
+        # exposed in the header.
+        self.clustering_workspace_button = self.organize_workspace_button
+        self.faces_workspace_button = self.people_workspace_button
+        self.names_workspace_button = self.people_workspace_button
+        self.tags_workspace_button = self.organize_workspace_button
         self.current_folder_label = QLabel("No folder selected")
         self.current_folder_label.setAccessibleName("Current folder")
         self.current_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1395,14 +1808,11 @@ class ProductionClusterApp(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings_dialog)
 
         row.addWidget(self.feature_label)
-        row.addWidget(self.gallery_workspace_button)
-        row.addWidget(self.clustering_workspace_button)
-        row.addWidget(self.faces_workspace_button)
-        row.addWidget(self.names_workspace_button)
-        row.addWidget(self.tags_workspace_button)
         row.addWidget(self.library_workspace_button)
-        row.addWidget(self.current_folder_label, stretch=1)
-        row.addWidget(self.mode_selector)
+        row.addWidget(self.organize_workspace_button)
+        row.addWidget(self.people_workspace_button)
+        row.addWidget(self.tools_workspace_button)
+        row.addStretch(1)
         row.addWidget(self.view_button)
         row.addWidget(self.jobs_widget)
         row.addWidget(self.runtime_badge)
@@ -1415,15 +1825,13 @@ class ProductionClusterApp(QMainWindow):
             self.advanced_mode_button,
         ):
             legacy_widget.hide()
-        QWidget.setTabOrder(self.gallery_workspace_button, self.clustering_workspace_button)
-        QWidget.setTabOrder(self.clustering_workspace_button, self.faces_workspace_button)
-        QWidget.setTabOrder(self.faces_workspace_button, self.names_workspace_button)
-        QWidget.setTabOrder(self.names_workspace_button, self.tags_workspace_button)
-        QWidget.setTabOrder(self.tags_workspace_button, self.library_workspace_button)
-        QWidget.setTabOrder(self.library_workspace_button, self.mode_selector)
-        QWidget.setTabOrder(self.mode_selector, self.view_button)
-        QWidget.setTabOrder(self.view_button, self.jobs_widget)
-        QWidget.setTabOrder(self.jobs_widget, self.runtime_badge)
+        self.current_folder_label.hide()
+        QWidget.setTabOrder(self.library_workspace_button, self.organize_workspace_button)
+        QWidget.setTabOrder(self.organize_workspace_button, self.people_workspace_button)
+        QWidget.setTabOrder(self.people_workspace_button, self.tools_workspace_button)
+        QWidget.setTabOrder(self.tools_workspace_button, self.view_button)
+        QWidget.setTabOrder(self.view_button, self.jobs_widget.jobs_btn)
+        QWidget.setTabOrder(self.jobs_widget.jobs_btn, self.runtime_badge)
         QWidget.setTabOrder(self.runtime_badge, self.settings_button)
         return bar
 
@@ -1432,12 +1840,19 @@ class ProductionClusterApp(QMainWindow):
         self.set_active_workspace_mode(mode)
 
     def _connect_signals(self) -> None:
+        if self.theme_manager is not None:
+            self.theme_manager.text_scale_changed.connect(self._queue_text_scale_reflow)
         self.source_pane.scope_changed.connect(self._on_active_scope_changed)
         self.source_pane.data_home_requested.connect(lambda: self.open_settings_dialog("Storage"))
         self.source_pane.recent_folder_remove_requested.connect(self._remove_recent_folder)
         self.source_pane.recent_folders_clear_requested.connect(self._clear_recent_folders)
         self.source_pane.run_requested.connect(self.run_clustering)
         self.source_pane.cancel_requested.connect(self.cancel_clustering)
+        self.source_pane.close_edit_requested.connect(self._request_close_source_pane)
+        self.source_pane.draft_applied.connect(self._close_applied_source_pane)
+        # Compatibility for older shortcut/action integrations that ask the
+        # pane to hide directly. The visible Close control uses the staged
+        # Apply/Discard review signal above.
         self.source_pane.hide_requested.connect(self._hide_source_pane)
         self.clustering_pane.run_requested.connect(self.run_clustering)
         self.clustering_pane.cancel_requested.connect(self.cancel_clustering)
@@ -1471,6 +1886,15 @@ class ProductionClusterApp(QMainWindow):
         self.library_pane.metadata_changed.connect(self._on_gallery_metadata_changed)
         self.library_pane.paths_renamed.connect(self._on_gallery_paths_renamed)
         self.library_pane.open_in_gallery_requested.connect(self._open_library_photos_in_gallery)
+        self.library_pane.settings_requested.connect(self.open_settings_dialog)
+        self.library_pane.roots_changed.connect(self.source_pane.set_library_root_states)
+        self.library_pane.root_job_state_changed.connect(self.source_pane.set_library_root_job_state)
+        self.source_pane.register_library_root_requested.connect(self.library_pane.register_root_path)
+        self.source_pane.refresh_library_root_requested.connect(self.library_pane.refresh_root_path)
+        self.source_pane.pause_library_root_requested.connect(self.library_pane.cancel_root_scan)
+        self.source_pane.remove_library_root_requested.connect(self.library_pane.remove_root_path)
+        self.source_pane.set_library_root_enabled_requested.connect(self.library_pane.set_root_path_enabled)
+        self.library_pane.refresh_roots()
         self.footer_bar.clear_storage_requested.connect(self._request_runtime_storage_clear)
         self.session_controller.started.connect(self._on_clustering_started)
         self.session_controller.progress.connect(self._on_clustering_progress)
@@ -1488,18 +1912,16 @@ class ProductionClusterApp(QMainWindow):
     def _install_shell_shortcuts(self) -> None:
         self._shell_shortcuts: list[QShortcut] = []
         shortcuts = (
-            ("Ctrl+1", lambda: self.set_active_workspace("gallery")),
-            ("Ctrl+2", lambda: self.set_active_workspace("clustering")),
-            ("Ctrl+3", lambda: self.set_active_workspace("faces")),
-            ("Ctrl+4", lambda: self.set_active_workspace("names")),
-            ("Ctrl+5", lambda: self.set_active_workspace("tags")),
-            ("Ctrl+6", lambda: self.set_active_workspace("library")),
+            ("Ctrl+1", lambda: self.set_active_workspace("library")),
+            ("Ctrl+2", lambda: self.set_active_workspace("organize")),
+            ("Ctrl+3", lambda: self.set_active_workspace("people")),
+            ("Ctrl+4", lambda: self.set_active_workspace("tools")),
             ("Ctrl+J", self._open_jobs_dialog),
             ("Ctrl+,", self.open_settings_dialog),
             ("Ctrl+O", self._focus_folder_picker),
             ("Ctrl+F", self._focus_workspace_search),
             ("Ctrl+R", self.run_clustering),
-            ("Esc", self.cancel_clustering),
+            ("Esc", self.cancel_active_work),
             ("F1", self._show_keyboard_help),
         )
         for sequence, handler in shortcuts:
@@ -1513,18 +1935,10 @@ class ProductionClusterApp(QMainWindow):
         self.source_pane.file_tree.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _focus_workspace_search(self) -> None:
-        if self._active_workspace != "faces":
-            self.set_active_workspace("faces")
-        pane = self._ensure_faces_workspace()
-        if self.faces_pane is None:
-            self._faces_focus_search_pending = True
-            button = getattr(self, "faces_placeholder_button", None)
-            if button is not None:
-                button.setFocus(Qt.FocusReason.ShortcutFocusReason)
-            return
-        target = getattr(pane, "face_identity_search", None) or getattr(pane, "face_query_path", None)
-        if target is not None:
-            target.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._workspace_sections["library"] = "search"
+        self.set_active_workspace("library")
+        self.library_pane.set_surface_group("library", "search")
+        self.library_pane.search_field.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _open_jobs_dialog(self) -> None:
         """Keep the Jobs surface reachable without relying on footer focus."""
@@ -1536,10 +1950,11 @@ class ProductionClusterApp(QMainWindow):
     def _show_keyboard_help(self) -> None:
         infoBox(
             "Keyboard shortcuts",
-            "Ctrl+1 Gallery\nCtrl+2 Clustering\nCtrl+3 Faces\nCtrl+4 Names\nCtrl+5 Tags\nCtrl+6 Library\nCtrl+J Jobs\nCtrl+O Choose folder\nCtrl+F Search\nCtrl+R Run clustering\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
+            "Ctrl+1 Library\nCtrl+2 Organize\nCtrl+3 People\nCtrl+4 Tools\nCtrl+J Jobs\nCtrl+O Choose folder\nCtrl+F Library search\nCtrl+R Organize photos\nEsc Cancel active work\nCtrl+, Settings\nF1 Help",
         )
 
     def _open_runtime_status_details(self) -> None:
+        focus_return = QApplication.focusWidget()
         dialog = ProductionSettingsDialog(
             self.settings_store,
             self.runtime_service,
@@ -1560,20 +1975,26 @@ class ProductionClusterApp(QMainWindow):
             support_metadata_provider=self._support_metadata,
             model_download_controller=self.model_download_controller,
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
             parent=self,
         )
+        appearance_snapshot = self._connect_settings_appearance_preview(dialog)
         dialog.runtime_rescanned.connect(self._begin_startup_readiness_check)
-        support_index = next(
-            (index for index in range(dialog.tabs.count()) if dialog.tabs.tabText(index) in {"Support", "Diagnostics"}),
-            0,
-        )
-        dialog.tabs.setCurrentIndex(support_index)
+        dialog.select_section("Support")
         if dialog.exec() == dialog.DialogCode.Accepted:
             self._apply_settings_values(dialog.values())
+        else:
+            self._restore_settings_appearance(appearance_snapshot)
         self._refresh_workspace_ui()
+        self._restore_focus_after_dialog(focus_return, self.runtime_badge)
 
     def _preferred_execution_mode(self) -> str:
         return str(self.settings_registry.get(self.settings_store, "runtime/preferred_mode", self.settings.preferred_execution_mode))
+
+    def _source_admission_policy(self) -> SourceAdmissionPolicy:
+        """Snapshot global source filters on the Qt thread before starting work."""
+
+        return SourceAdmissionPolicy.from_settings_store(self.settings_store)
 
     def _gpu_conflict_policy(self) -> str:
         return str(self.settings_registry.get(self.settings_store, "runtime/gpu_conflict_policy", "ask") or "ask")
@@ -1628,7 +2049,35 @@ class ProductionClusterApp(QMainWindow):
         )
 
     def _preferred_workspace(self) -> str:
-        return self._normalize_workspace_id(str(self.settings_registry.get(self.settings_store, "workspace/default_view", "gallery")))
+        saved = str(self.settings_registry.get(self.settings_store, "workspace/default_view", "library") or "").strip().lower()
+        # A saved standalone Gallery tab predates the Library-first shell.
+        # Migration is intentionally only at startup: explicit old API routes
+        # still open Basic Clustering's photo surface.
+        if saved in {"gallery", "photos", "photo gallery"}:
+            return "library"
+        return self._normalize_workspace_id(saved)
+
+    def _load_people_workspace_state(self) -> dict[str, object]:
+        raw = self.settings_store.value(PEOPLE_WORKSPACE_STATE_KEY, "")
+        if str(raw or "").strip() or isinstance(raw, dict):
+            return _decode_people_workspace_state(raw)
+
+        legacy_raw = self.settings_store.value(LEGACY_PEOPLE_WORKSPACE_STATE_KEY, "")
+        migrated = _migrate_legacy_people_workspace_state(legacy_raw)
+        if not migrated:
+            return {}
+        try:
+            self.settings_store.setValue(
+                PEOPLE_WORKSPACE_STATE_KEY,
+                json.dumps(migrated, sort_keys=True),
+            )
+            self.settings_store.remove(LEGACY_PEOPLE_WORKSPACE_STATE_KEY)
+            self.settings_store.sync()
+        except (AttributeError, OSError, RuntimeError):
+            # The migrated in-memory state is still safe to use when settings
+            # are temporarily read-only; persistence can be retried at close.
+            pass
+        return migrated
 
     def _preferred_faces_ui_mode(self) -> str:
         return self._normalize_ui_mode(str(self.settings_registry.get(self.settings_store, "workspace/faces_mode", "basic")))
@@ -1752,6 +2201,10 @@ class ProductionClusterApp(QMainWindow):
             )
         self.settings_store.sync()
 
+    def _on_face_pipeline_applied(self, preferences_by_mode: dict[str, object]) -> None:
+        self._persist_face_pipeline_defaults(preferences_by_mode)
+        self._reload_face_services_from_settings()
+
     def _keep_worker_warm(self) -> bool:
         return bool(self.settings_registry.get(self.settings_store, "performance/keep_worker_warm", False))
 
@@ -1795,27 +2248,170 @@ class ProductionClusterApp(QMainWindow):
         self.settings_registry.set(self.settings_store, "library/auto_cluster_context", bool(auto_enabled))
         self.settings_store.sync()
 
-    def _clear_face_session_dbs(self) -> None:
-        for path in self.settings.cache_dir.glob("face_search*_session*.db*"):
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
+    def _library_timeline_date_preferences(self) -> TimelineDatePreferences:
+        policy = str(
+            self.settings_registry.get(self.settings_store, "library/timeline_date_policy", "datetime_original_then_metadata")
+            or "metadata_or_filename"
+        )
+        raw_patterns = str(
+            self.settings_registry.get(self.settings_store, "library/timeline_filename_patterns", "") or ""
+        )
+        raw_epoch_heuristic = bool(
+            self.settings_registry.get(self.settings_store, "library/timeline_raw_epoch_heuristic", False)
+        )
+        grouping = str(
+            self.settings_registry.get(self.settings_store, "library/timeline_grouping", "year_month")
+            or "year_month"
+        )
+        return TimelineDatePreferences(
+            policy,
+            tuple(line.strip() for line in raw_patterns.splitlines() if line.strip()),
+            raw_epoch_heuristic,
+            grouping,
+        )
+
+    def _save_library_timeline_date_preferences(self, preferences: TimelineDatePreferences) -> None:
+        self.settings_registry.set(self.settings_store, "library/timeline_date_policy", str(preferences.date_policy))
+        self.settings_registry.set(self.settings_store, "library/timeline_filename_patterns", "\n".join(preferences.filename_patterns))
+        self.settings_registry.set(self.settings_store, "library/timeline_raw_epoch_heuristic", bool(preferences.raw_epoch_heuristic))
+        self.settings_registry.set(self.settings_store, "library/timeline_grouping", str(preferences.grouping))
+        self.settings_store.sync()
 
     @staticmethod
     def _normalize_workspace_id(value: str) -> str:
         text = str(value or "").strip().lower()
-        if text in {"gallery", "photos", "photo gallery"}:
-            return "gallery"
+        if text in {"gallery", "photos", "photo gallery", "clustering", "organize"}:
+            # Gallery was folded into Basic Clustering. Keep explicit legacy
+            # programmatic routes working; startup migration happens above.
+            return "clustering"
         if text in {"faces", "face_search", "face search"}:
             return "faces"
         if text in {"names", "people", "saved names"}:
             return "names"
         if text in {"tags", "tag", "tag manager"}:
             return "tags"
+        if text in {"cluster_context", "cluster context", "context"}:
+            return "cluster_context"
+        if text in {"people_cleanup", "people cleanup"}:
+            return "people_cleanup"
+        if text in {"tools", "cleanup", "duplicates", "recovery"}:
+            return "tools"
         if text in {"library", "archive", "photo library"}:
             return "library"
-        return "clustering"
+        return "library"
+
+    @staticmethod
+    def _workspace_group(workspace_id: str) -> str:
+        if workspace_id in {"clustering", "tags", "cluster_context"}:
+            return "organize"
+        if workspace_id in {"faces", "names", "people_cleanup"}:
+            return "people"
+        if workspace_id == "tools":
+            return "tools"
+        return "library"
+
+    def _configure_workspace_subnav(self) -> None:
+        if not hasattr(self, "workspace_subnav"):
+            return
+        group = self._workspace_group(self._active_workspace)
+        sections = {
+            "library": (
+                ("Timeline", "timeline"),
+                ("All Photos", "all_photos"),
+                ("Search", "search"),
+                ("Albums", "albums"),
+            ),
+            "organize": (
+                ("Photos", "photos"),
+                ("Tags", "tags"),
+                ("Context", "context"),
+            ),
+            "people": (
+                ("People", "people"),
+                ("All Faces", "all_faces"),
+                ("Unnamed", "unnamed"),
+                ("Detect", "detect"),
+                ("Review", "review"),
+                ("Review && Name", "review_name"),
+                ("Find", "find"),
+                ("Manage", "identities"),
+            ),
+            "tools": (
+                ("Duplicates", "duplicates"),
+                ("Rename && Metadata", "rename"),
+                ("Recovery", "recovery"),
+            ),
+        }
+        active = self._workspace_sections.get(group, sections[group][0][1])
+        people_section_help = {
+            "people": "Browse durable saved people and their photos.",
+            "all_faces": "Browse all durable named and unnamed face regions.",
+            "unnamed": "Browse only durable face regions that do not have a saved name.",
+            "detect": "Detect and review face regions for the active roots; opening this section never starts a scan.",
+            "review": "Review pending automatic name proposals separately from durable saved names.",
+            "review_name": "Review saved face regions and explicitly apply durable names.",
+            "find": "Find photos from a query face or a durable saved person name.",
+            "identities": "Browse and maintain durable identities, imports, exports, and guarded maintenance.",
+        }
+        self.workspace_subnav.blockSignals(True)
+        try:
+            while self.workspace_subnav.count():
+                self.workspace_subnav.removeTab(0)
+            selected_index = 0
+            for index, (label, key) in enumerate(sections[group]):
+                self.workspace_subnav.addTab(label)
+                self.workspace_subnav.setTabData(index, key)
+                if group == "people":
+                    self.workspace_subnav.setTabToolTip(index, people_section_help[key])
+                if key == active:
+                    selected_index = index
+            self.workspace_subnav.setCurrentIndex(selected_index)
+        finally:
+            self.workspace_subnav.blockSignals(False)
+
+    def _on_workspace_subnav_changed(self, index: int) -> None:
+        if self._updating_workspace_subnav or index < 0:
+            return
+        section = str(self.workspace_subnav.tabData(index) or "")
+        group = self._workspace_group(self._active_workspace)
+        if not section:
+            return
+        self._workspace_sections[group] = section
+        self._updating_workspace_subnav = True
+        try:
+            if group == "library":
+                self.set_active_workspace("library")
+                self.library_pane.set_surface_group("library", section)
+            elif group == "organize":
+                if section == "tags":
+                    self.set_active_workspace("tags")
+                elif section == "context":
+                    self.set_active_workspace("cluster_context")
+                else:
+                    self.set_active_workspace("clustering")
+            elif group == "people":
+                self._pending_people_section = section
+                if section == "people":
+                    self.set_active_workspace("names")
+                elif section == "review":
+                    self.set_active_workspace("people_cleanup")
+                else:
+                    self.set_active_workspace("faces")
+            else:
+                self.set_active_workspace("tools")
+                self.library_pane.set_surface_group("tools", section)
+        finally:
+            self._updating_workspace_subnav = False
+
+    def _apply_people_section(self) -> None:
+        pane = self.faces_pane
+        if pane is None:
+            return
+        # The Faces pane owns tab activation and lazy loading.  Calling the
+        # old show helpers followed by ensure_current_faces_tab_loaded() made
+        # one People navigation publish the same album twice (once from the
+        # QTabWidget signal and once directly here).
+        pane.activate_people_section(self._pending_people_section)
 
     @staticmethod
     def _normalize_ui_mode(mode: str) -> str:
@@ -1858,65 +2454,23 @@ class ProductionClusterApp(QMainWindow):
             embedder_id,
             face_search.default_face_embedder_id(self._face_model_root(), mode_id),
         )
-        detector, embedder = face_search.resolve_ready_face_pipeline_ids(
-            self._face_model_root(),
-            mode_id,
-            requested_detector,
-            requested_embedder,
-        )
-        if (detector, embedder) != (requested_detector, requested_embedder):
-            LOGGER.info(
-                "Face pipeline %s/%s is not ready; using ready pipeline %s/%s.",
-                requested_detector,
-                requested_embedder,
-                detector,
-                embedder,
-            )
-        key = (scope_id, mode_id, detector, embedder)
+        key = (scope_id, mode_id, requested_detector, requested_embedder)
         service = self._face_service_cache.get(key)
         if service is None:
-            service = face_search.FaceIndexService(
-                mode=mode_id,
-                execution_policy=self.execution_policy,
-                runtime_service=self.runtime_service,
-                model_root=self._face_model_root(),
-                detector_id=detector,
-                embedder_id=embedder,
-                detector_score_threshold=self._preferred_face_detector_score_threshold(mode_id),
-                detector_max_detections=self._preferred_face_max_detections(mode_id),
-                performance_profile=self.performance_profile,
-                db_path=self._face_db_path_for_pipeline(scope_id, mode_id, detector, embedder),
+            service = self.face_service_session if scope_id == "session" else self.face_service_global
+            if service is None:
+                raise RuntimeError("Face services are still being prepared in the background.")
+            LOGGER.info(
+                "Using the current face service while the requested pipeline is prepared in the background."
             )
-            self._face_service_cache[key] = service
         return service
-
-    def _build_face_services(self, *, reset_face_session: bool) -> None:
-        if reset_face_session:
-            self._clear_face_session_dbs()
-        self._face_service_cache = {}
-        self.face_services_global = {
-            mode: self._face_service_for_pipeline(
-                "global",
-                mode,
-                self._preferred_face_detector(mode),
-                self._preferred_face_embedder(mode),
-            )
-            for mode in ("human",)
-        }
-        self.face_services_session = {
-            mode: self._face_service_for_pipeline(
-                "session",
-                mode,
-                self._preferred_face_detector(mode),
-                self._preferred_face_embedder(mode),
-            )
-            for mode in ("human",)
-        }
-        self.face_service_global = self.face_services_global["human"]
-        self.face_service_session = self.face_services_session["human"]
 
     def _apply_workspace_preferences(self) -> None:
         thumbnail_size = int(self.settings_registry.get(self.settings_store, "gallery/thumbnail_size", self.settings.thumbnail_size))
+        compact_density = bool(self.settings_registry.get(self.settings_store, "workspace/dense_ui", self.settings.default_dense_ui))
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_density(app, compact_density)
         power_user_mode = bool(self.settings_registry.get(self.settings_store, "workspace/power_user_mode", False))
         self.setProperty("powerUserMode", power_user_mode)
         if power_user_mode:
@@ -1995,53 +2549,89 @@ class ProductionClusterApp(QMainWindow):
                 self.mode_selector.blockSignals(False)
 
     def _sync_workspace_buttons(self) -> None:
+        active_group = self._workspace_group(self._active_workspace)
         for key, button in {
-            "gallery": self.gallery_workspace_button,
-            "clustering": self.clustering_workspace_button,
-            "faces": self.faces_workspace_button,
-            "names": self.names_workspace_button,
-            "tags": self.tags_workspace_button,
             "library": self.library_workspace_button,
+            "organize": self.organize_workspace_button,
+            "people": self.people_workspace_button,
+            "tools": self.tools_workspace_button,
         }.items():
             button.blockSignals(True)
-            button.setChecked(self._active_workspace == key)
+            button.setChecked(active_group == key)
             button.blockSignals(False)
 
     def _source_pane_visible(self) -> bool:
-        if self._scope_editor_pinned:
-            return True
-        if self._active_workspace == "gallery":
-            return True
-        if self._active_workspace in {"names", "tags", "library"}:
-            return False
-        if self._active_workspace == "faces":
-            return bool(self._advanced_pane_visibility["source"])
-        if self._clustering_mode == "basic":
-            return True
-        return bool(self._pane_visibility["source"])
+        # Roots is an on-demand editor even before a first root exists. The
+        # Library empty state and its header action provide discovery without
+        # permanently consuming the photo workspace with a source rail.
+        return bool(self._scope_editor_pinned)
 
     def _edit_active_roots(self) -> None:
         self._scope_editor_pinned = True
+        self._empty_scope_drawer_dismissed = False
+        self.source_pane.begin_edit()
+        self.source_pane.tabs.setCurrentIndex(0)
         self._reflow_main_splitter(force=True)
         self.source_pane.file_tree.setFocus(Qt.FocusReason.ShortcutFocusReason)
-        self.footer_bar.set_status("Edit the checked active roots. This does not start a scan.")
+        self.footer_bar.set_status("Choose roots, then Apply. No scan starts until a workspace needs the new scope.")
 
     def _hide_source_pane(self) -> None:
+        if self.source_pane.has_dirty_draft:
+            self._request_close_source_pane()
+            return
+        if self.source_pane.is_editing:
+            self.source_pane.discard_draft()
+        self._finish_hiding_source_pane()
+
+    def _request_close_source_pane(self) -> None:
+        if not self.source_pane.has_dirty_draft:
+            self._hide_source_pane()
+            return
+        focus_return = QApplication.focusWidget()
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Unapplied source changes")
+        dialog.setText("Apply the staged source changes before closing Roots?")
+        dialog.setInformativeText("The current workspace scope has not changed yet.")
+        apply_button = dialog.addButton("Apply", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = dialog.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.addButton("Continue editing", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(apply_button)
+        dialog.exec()
+        if dialog.clickedButton() is apply_button:
+            self.source_pane.apply_draft()
+        elif dialog.clickedButton() is discard_button:
+            self.source_pane.discard_draft()
+            self._finish_hiding_source_pane()
+        fallback = self.edit_roots_button if self.source_pane.isHidden() else self.source_pane.hide_button
+        self._restore_focus_after_dialog(focus_return, fallback)
+
+    def _close_applied_source_pane(self) -> None:
+        self._finish_hiding_source_pane()
+
+    def _finish_hiding_source_pane(self) -> None:
         self._scope_editor_pinned = False
-        self._set_pane_visible("source", False)
+        if self.source_pane.active_scope.is_empty:
+            self._empty_scope_drawer_dismissed = True
+        self._advanced_pane_visibility["source"] = False
+        self._pane_visibility["source"] = False
+        self._sync_pane_toggle_buttons()
         self._reflow_main_splitter(force=True)
 
     def _refresh_workspace_ui(self) -> None:
-        is_gallery = self._active_workspace == "gallery"
         is_clustering = self._active_workspace == "clustering"
         is_faces = self._active_workspace == "faces"
         is_names = self._active_workspace == "names"
         is_tags = self._active_workspace == "tags"
         is_library = self._active_workspace == "library"
-        faces_pane = self._ensure_faces_workspace() if is_faces else None
-        names_pane = self._ensure_names_workspace() if is_names else None
-        if is_gallery:
-            self.workspace_stack.setCurrentWidget(self.photo_gallery_workspace)
+        is_context = self._active_workspace == "cluster_context"
+        is_people_cleanup = self._active_workspace == "people_cleanup"
+        is_tools = self._active_workspace == "tools"
+        scope_is_empty = self.source_pane.active_scope.is_empty
+        faces_pane = self._ensure_faces_workspace() if is_faces and not scope_is_empty else None
+        names_pane = self._ensure_names_workspace() if is_names and not scope_is_empty else None
+        if scope_is_empty:
+            self.workspace_stack.setCurrentWidget(self.empty_scope_panel)
         elif is_names:
             self.workspace_stack.setCurrentWidget(names_pane)
         elif is_tags:
@@ -2050,15 +2640,29 @@ class ProductionClusterApp(QMainWindow):
                 self.tags_pane.refresh()
         elif is_library:
             self.workspace_stack.setCurrentWidget(self.library_pane)
+            self.library_pane.set_surface_group("library", self._workspace_sections["library"])
             if self._library_catalog_refresh_pending:
                 self._library_catalog_refresh_pending = False
                 self.library_pane.invalidate_catalog_view()
             self.library_pane.ensure_timeline_loaded()
+        elif is_context:
+            self.workspace_stack.setCurrentWidget(self.library_pane)
+            self.library_pane.set_surface_group("context", "context")
+        elif is_people_cleanup:
+            self.workspace_stack.setCurrentWidget(self.library_pane)
+            self.library_pane.set_surface_group("people", "review")
+        elif is_tools:
+            self.workspace_stack.setCurrentWidget(self.library_pane)
+            self.library_pane.set_surface_group("tools", self._workspace_sections["tools"])
         else:
             self.workspace_stack.setCurrentWidget(self.clustering_workspace if is_clustering else faces_pane)
-        if is_faces and self.faces_pane is not None:
-            self.faces_pane.ensure_current_faces_tab_loaded()
-        if self.faces_pane is not None:
+        if is_clustering:
+            self.clustering_gallery_stack.setCurrentWidget(
+                self.photo_gallery if self._clustering_mode == "basic" else self.gallery_pane
+            )
+        if is_faces and self.faces_pane is not None and not scope_is_empty:
+            self._apply_people_section()
+        if self.faces_pane is not None and not scope_is_empty:
             self.faces_pane.set_ui_mode(self._faces_mode)
         self.source_pane.set_basic_mode(
             is_clustering and self._clustering_mode == "basic",
@@ -2070,8 +2674,16 @@ class ProductionClusterApp(QMainWindow):
         self.feature_label.setText(PRODUCTION_DISPLAY_NAME)
         self.controls_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
         self.details_view_action.setVisible(is_clustering and self._clustering_mode == "advanced")
-        self.source_view_action.setVisible((is_faces) or (is_clustering and self._clustering_mode == "advanced"))
-        self.mode_selector.setVisible(not is_gallery and not is_names and not is_tags and not is_library)
+        self.source_view_action.setVisible(
+            not scope_is_empty and ((is_faces) or (is_clustering and self._clustering_mode == "advanced"))
+        )
+        self.mode_selector.setVisible(not scope_is_empty and is_clustering)
+        self.view_button.setVisible(not scope_is_empty and (is_faces or (is_clustering and self._clustering_mode == "advanced")))
+        self.edit_roots_button.setVisible(not scope_is_empty)
+        self._configure_workspace_subnav()
+        self.workspace_subnav.setVisible(not scope_is_empty)
+        if scope_is_empty and hasattr(self, "footer_bar"):
+            self.footer_bar.set_status("Choose photo roots to begin.")
         self._sync_mode_buttons()
         self._sync_workspace_buttons()
         self._sync_pane_toggle_buttons()
@@ -2079,6 +2691,22 @@ class ProductionClusterApp(QMainWindow):
 
     def set_active_workspace(self, workspace_id: str) -> None:
         target = self._normalize_workspace_id(workspace_id)
+        if target == "clustering":
+            self._workspace_sections["organize"] = "photos"
+        elif target == "tags":
+            self._workspace_sections["organize"] = "tags"
+        elif target == "cluster_context":
+            self._workspace_sections["organize"] = "context"
+        elif target == "names":
+            self._workspace_sections["people"] = "people"
+        elif target == "people_cleanup":
+            self._workspace_sections["people"] = "review"
+        elif target == "faces":
+            self._workspace_sections["people"] = (
+                self._pending_people_section
+                if self._pending_people_section in {"all_faces", "unnamed", "detect", "review_name", "find", "identities"}
+                else "unnamed"
+            )
         if self._active_workspace == "faces" and target != "faces":
             self._cancel_faces_workspace_load()
         self._active_workspace = target
@@ -2086,7 +2714,7 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_workspace_ui()
 
     def set_active_workspace_mode(self, mode: str) -> None:
-        if self._active_workspace in {"gallery", "names", "tags", "library"}:
+        if self._active_workspace in {"names", "tags", "library"}:
             return
         if self._active_workspace == "faces":
             self.set_faces_mode(mode)
@@ -2120,16 +2748,18 @@ class ProductionClusterApp(QMainWindow):
         if not self._startup_maintenance_complete:
             self._start_startup_maintenance()
             return
+        if not self._model_storage_recovery_complete:
+            self._start_model_storage_recovery()
+            return
         previous_job = self._startup_readiness_job
         if previous_job is not None:
-            try:
-                previous_job.cancel()
-            except Exception:
-                pass
+            self._cancel_app_async_job(previous_job)
         self._startup_readiness_generation += 1
         generation = self._startup_readiness_generation
         self._startup_readiness_report = None
         self._startup_readiness_error = ""
+        if self._can_update_widget(getattr(self, "runtime_badge", None)):
+            self.runtime_badge.update_runtime(None, None)
         self._apply_startup_workflow_gate()
         clustering_models = self._selected_startup_clustering_models()
         face_detector, face_embedder = self._preferred_face_pipeline_request_ids("human")
@@ -2153,12 +2783,6 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._startup_readiness_job = job
-        job_id = self.job_manager.register_job(
-            "Checking runtime readiness",
-            cancel_fn=job.cancel,
-            origin="Startup",
-        )
-        self._startup_readiness_job_id = job_id
         thread_holder: dict[str, object | None] = {"thread": None}
 
         def _finish(status: str, error: str = "") -> None:
@@ -2194,24 +2818,14 @@ class ProductionClusterApp(QMainWindow):
             self._apply_startup_workflow_gate()
             if self._pending_photo_face_tool_requests:
                 if report.face_ready:
-                    if not self._thread_is_running(self._names_init_thread):
+                    if self._names_init_job is None:
                         self._start_faces_workspace_load()
                 else:
                     self._finish_pending_photo_face_tool_requests(error=report.face_message)
-            if report.clustering_ready and report.face_ready:
-                self.footer_bar.set_status("Runtime, clustering models, and face models are ready.")
-                self._set_activity("Ready")
-            else:
-                missing = " | ".join(
-                    message
-                    for ready, message in (
-                        (report.clustering_ready, report.clustering_message),
-                        (report.face_ready, report.face_message),
-                    )
-                    if not ready
-                )
-                self.footer_bar.set_status(missing)
-                self._set_activity("Model setup required")
+            # Runtime readiness is persistent shell state. The badge, Jobs
+            # entry, disabled-action tooltip, and Settings own its detailed
+            # remediation; a late automatic probe must not overwrite the
+            # footer's most recent user-visible workspace action.
             _finish("finished")
             _cleanup()
 
@@ -2226,26 +2840,47 @@ class ProductionClusterApp(QMainWindow):
                 return
             text = str(message or "Readiness check failed.").strip()
             self._startup_readiness_error = text
-            self.footer_bar.set_status(f"Runtime readiness could not be confirmed: {text}")
-            self._set_activity("Readiness check failed")
+            if self._can_update_widget(getattr(self, "runtime_badge", None)):
+                self.runtime_badge.set_runtime_failure(text)
+            self._apply_startup_workflow_gate()
             self._finish_pending_photo_face_tool_requests(error=text)
             _finish("failed", text)
             _cleanup()
 
         def _cancelled() -> None:
+            if (
+                generation == self._startup_readiness_generation
+                and not self._is_shutting_down
+                and self._can_update_widget(getattr(self, "runtime_badge", None))
+            ):
+                self._startup_readiness_error = "Runtime readiness check was cancelled. Rescan GPU Resources in Settings to retry."
+                self.runtime_badge.set_runtime_failure(self._startup_readiness_error)
+                self._apply_startup_workflow_gate()
             _finish("cancelled")
             _cleanup()
 
-        job.progress.connect(
-            lambda value, text: self.job_manager.update(job_id, progress=value, text=str(text))
-        )
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._startup_readiness_thread = thread
-        self._retain_async_refs(job, thread)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._startup_readiness_thread = thread
+            self._retain_async_refs(job, thread)
+
+        job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Checking runtime readiness",
+                origin="Startup",
+                io_bound=True,
+                data_home_read=True,
+                model_cache_read=True,
+            ),
+            _launch,
+        )
+        self._startup_readiness_job_id = job_id
 
     def _apply_startup_workflow_gate(self) -> None:
         """Keep model-dependent workflows disabled until local readiness is known."""
@@ -2281,7 +2916,7 @@ class ProductionClusterApp(QMainWindow):
             elif button is getattr(getattr(self, "photo_gallery", None), "organize_button", None):
                 can_run = can_run and len(self._gallery_paths) >= 2
             button.setEnabled(can_run)
-            button.setToolTip(clustering_tip if not clustering_ready else "Run clustering with the selected local model.")
+            button.setToolTip(clustering_tip if not clustering_ready else "Organize photos with the selected local model.")
         if self._can_update_widget(self.faces_pane):
             self.faces_pane.set_startup_readiness(
                 face_ready,
@@ -2310,7 +2945,7 @@ class ProductionClusterApp(QMainWindow):
             if report is None
             else report.clustering_message
         )
-        errorBox("Clustering is not ready", message)
+        errorBox("Organize is not ready", message)
         return False
 
     def _build_request(self, *, source_paths: list[str] | None = None) -> ProductionClusterRequest:
@@ -2371,19 +3006,26 @@ class ProductionClusterApp(QMainWindow):
         return bool(confirmBox("Large folder guardrail", message, parent=self))
 
     def run_clustering(self) -> None:
+        if (
+            self._active_workspace == "clustering"
+            and self._clustering_mode == "basic"
+            and not self.tags_pane.selected_filter_tags()
+        ):
+            self.run_gallery_organize()
+            return
         if not self._clustering_ready_for_action():
             return
         if self._run_request_active():
             errorBox("Busy", "A production clustering run is already active.")
             return
-        if self._thread_is_running(self._storage_clear_thread):
+        if self._storage_clear_job is not None:
             errorBox("Busy", "Wait for storage cleanup to finish before starting a new clustering run.")
             return
         try:
             request = self._build_request()
         except Exception as exc:
             LOGGER.exception("Failed to build clustering request")
-            errorBox("Clustering could not start", str(exc))
+            errorBox("Organize could not start", str(exc))
             return
         self._start_request_preflight(request)
 
@@ -2393,7 +3035,7 @@ class ProductionClusterApp(QMainWindow):
         if self._run_request_active():
             errorBox("Busy", "A production clustering run is already active.")
             return
-        if self._thread_is_running(self._storage_clear_thread):
+        if self._storage_clear_job is not None:
             errorBox("Busy", "Wait for storage cleanup to finish before starting a new clustering run.")
             return
         target = self.cluster_pane.current_selection_target()
@@ -2503,10 +3145,22 @@ class ProductionClusterApp(QMainWindow):
         if self._preflight_job is not None:
             self._cancel_request_preflight()
             return
-        if self._pending_model_download_run is not None and self.model_download_controller.is_running():
-            self.model_download_controller.cancel()
+        if self._model_download_job_id is not None:
+            self.work_coordinator.cancel(self._model_download_job_id)
+            return
+        if self._active_job_id is not None:
+            self.work_coordinator.cancel(self._active_job_id)
             return
         self.session_controller.cancel()
+
+    def cancel_active_work(self) -> None:
+        """Cancel the most recent visible foreground Job before clustering."""
+
+        active = self.job_manager.most_recent_active(foreground_only=True)
+        if active is not None and active.cancellable:
+            self.job_manager.cancel(active.job_id)
+            return
+        self.cancel_clustering()
 
     def _start_request_with_assets(self, request: ProductionClusterRequest, *, run_origin: str) -> bool:
         if not request.allow_model_downloads:
@@ -2520,23 +3174,33 @@ class ProductionClusterApp(QMainWindow):
         items = self._model_download_items_for_plan(plan)
         if not items:
             return self._start_request(replace(request, allow_model_downloads=False), run_origin=run_origin)
-        if self.model_download_controller.is_running():
+        if self._model_download_job_id is not None or self.model_download_controller.is_running():
             return False
 
         # Network access and model initialization are deliberately completed in
         # a separate killable process. The clustering worker itself is offline.
         self._pending_model_download_run = (replace(request, allow_model_downloads=False), str(run_origin))
         self._set_running_state(True)
-        if self.model_download_controller.start(items):
+        if self._queue_model_download(items):
             return True
         self._pending_model_download_run = None
         self._set_running_state(False)
         return False
 
     def _start_request(self, request: ProductionClusterRequest, *, run_origin: str) -> bool:
-        policy = self.runtime_service.select_policy(request.preferred_execution_mode, refresh=True)
+        # Runtime/provider probing is owned by the cancellable Startup
+        # readiness job.  Starting a run consumes that immutable snapshot and
+        # must never import Torch/ONNX or create a provider on the Qt thread.
+        report = self._startup_readiness_report
+        policy = getattr(report, "execution_policy", None) or self.execution_policy
+        requested_mode = str(request.preferred_execution_mode or "auto").strip().lower()
+        if str(getattr(policy, "preferred_mode", "auto") or "auto").strip().lower() != requested_mode:
+            message = "Runtime settings changed. Wait for the background readiness check, then retry."
+            self.footer_bar.set_status(message)
+            self._set_activity("Runtime checking…")
+            self._begin_startup_readiness_check()
+            return False
         self.execution_policy = policy
-        self.runtime_badge.update_runtime(self.runtime_service.detect(), policy)
         if policy.cuda_required_unavailable:
             message = policy.error or policy.reason or "CUDA was requested, but no compatible CUDA runtime is available."
             self.footer_bar.set_status(message)
@@ -2545,7 +3209,11 @@ class ProductionClusterApp(QMainWindow):
             return False
         self.current_run_origin = str(run_origin or "folder")
         self._active_cluster_directory = str(request.directory or "")
-        self._active_cluster_scope_signature = PathScope.from_paths(request.source_roots).signature if request.source_roots else ""
+        self._active_cluster_scope_signature = (
+            PathScope.from_paths(request.source_roots, resolve_symlinks=False).signature
+            if request.source_roots
+            else ""
+        )
         self.current_tag_filter = tuple(request.tag_filter)
         self.current_tag_match = request.tag_match or "Any"
         self._cancel_cluster_tag_context_refresh()
@@ -2573,12 +3241,51 @@ class ProductionClusterApp(QMainWindow):
         self.footer_bar.set_metrics("")
         self.footer_bar.set_status("Preparing clustering run...")
         self._set_activity("Preparing clustering run...")
-        return self.session_controller.start(request)
+        source_reads = tuple(request.source_paths or request.source_roots or ([request.directory] if request.directory else ()))
+        preferred_mode = str(request.preferred_execution_mode or "auto").strip().lower()
+
+        def _start(job_id: int, use_cpu_fallback: bool) -> None:
+            self._coordinated_process_job_ids.add(job_id)
+            self._active_job_id = job_id
+            started_request = replace(request, preferred_execution_mode="cpu") if use_cpu_fallback else request
+            if not self.session_controller.start(started_request):
+                self._active_job_id = None
+                self.work_coordinator.finish(
+                    job_id,
+                    status="failed",
+                    error="The clustering worker could not start.",
+                )
+
+        job_id = self.work_coordinator.submit(
+            JobSpec(
+                "Organizing photos",
+                origin="Organize",
+                uses_gpu=preferred_mode != "cpu",
+                cpu_fallback=preferred_mode == "auto",
+                source_reads=source_reads,
+                data_home_write=True,
+                model_cache_read=True,
+            ),
+            _start,
+            cancel=self.session_controller.cancel,
+        )
+        state = self.job_manager.get(job_id)
+        accepted = state is not None and state.status in {"queued", "running", "cancelling"}
+        if accepted:
+            self._coordinated_process_job_ids.add(job_id)
+            self._active_job_id = job_id
+            self._set_running_state(True)
+        else:
+            self._coordinated_process_job_ids.discard(job_id)
+            self._active_job_id = None
+        return accepted
 
     def _run_request_active(self) -> bool:
         return (
             self.session_controller.is_running()
-            or self._thread_is_running(self._preflight_thread)
+            or self._active_job_id is not None
+            or self._preflight_job is not None
+            or self._model_download_job_id is not None
             or self.model_download_controller.is_running()
         )
 
@@ -2586,9 +3293,9 @@ class ProductionClusterApp(QMainWindow):
         return any(
             (
                 self._run_request_active(),
-                self._thread_is_running(self._tag_context_thread),
-                self._thread_is_running(self._storage_usage_thread),
-                self._thread_is_running(self._storage_clear_thread),
+                self._tag_context_job is not None,
+                self._storage_usage_job is not None,
+                self._storage_clear_job is not None,
                 self.model_download_controller.is_running(),
             )
         )
@@ -2611,18 +3318,15 @@ class ProductionClusterApp(QMainWindow):
         self.footer_bar.set_status("Scanning active roots...")
         self._set_activity("Preparing clustering run...")
         self._update_footer_storage_state()
-        job_id = self.job_manager.register_job(
-            "Preparing clustering run", cancel_fn=self.cancel_clustering, origin="Clustering"
-        )
-        self._preflight_job_id = job_id
         request_copy = replace(request)
+        source_admission_policy = self._source_admission_policy()
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
             from app.services.embedding_index import EmbeddingIndexService
 
             progress(-1, "Scanning active roots...")
-            discovery_service = ImageDiscoveryService()
+            discovery_service = ImageDiscoveryService(admission_policy=source_admission_policy)
             if request_copy.source_roots:
                 discovered = discovery_service.discover_roots_result(
                     list(request_copy.source_roots),
@@ -2739,7 +3443,7 @@ class ProductionClusterApp(QMainWindow):
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="finished")
             if not self._confirm_large_folder_if_needed(payload.request):
-                self.footer_bar.set_status("Clustering cancelled before inference.")
+                self.footer_bar.set_status("Organizing was cancelled before analysis.")
                 self._set_activity("Cancelled")
                 self._set_running_state(False)
                 _cleanup()
@@ -2760,7 +3464,7 @@ class ProductionClusterApp(QMainWindow):
             self._set_activity("Starting worker...")
             started = self._start_request_with_assets(prepared_request, run_origin=payload.run_origin)
             if not started:
-                self.footer_bar.set_status("Clustering could not start because another run is active.")
+                self.footer_bar.set_status("Organizing could not start because another run is active.")
                 self._set_activity("Idle")
                 self._set_running_state(False)
             _cleanup()
@@ -2773,10 +3477,10 @@ class ProductionClusterApp(QMainWindow):
             self._preflight_job_id = None
             if preflight_job_id is not None:
                 self.job_manager.finish(preflight_job_id, status="failed", error=message)
-            self.footer_bar.set_status(f"Clustering could not start: {message}")
+            self.footer_bar.set_status(f"Organizing could not start: {message}")
             self._set_activity("Preflight failed")
             self._set_running_state(False)
-            errorBox("Clustering could not start", message)
+            errorBox("Organize could not start", message)
             _cleanup()
 
         def _cancelled() -> None:
@@ -2796,9 +3500,23 @@ class ProductionClusterApp(QMainWindow):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._preflight_thread = thread
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._preflight_thread = thread
+            self._retain_async_refs(job, thread)
+
+        self._preflight_job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Preparing photo organization",
+                origin="Organize",
+                io_bound=True,
+                source_reads=tuple(request_copy.source_roots or ([request_copy.directory] if request_copy.directory else ())),
+                data_home_read=bool(request_copy.tag_filter),
+            ),
+            _launch,
+        )
         self._update_footer_storage_state()
 
     def _cancel_request_preflight(self) -> None:
@@ -2809,10 +3527,7 @@ class ProductionClusterApp(QMainWindow):
         self._preflight_thread = None
         if job is None:
             return
-        try:
-            job.cancel()
-        except Exception:
-            pass
+        self._cancel_app_async_job(job)
         self._update_footer_storage_state()
 
     def _on_preflight_progress(self, job_id: int | None, value: int, status: str) -> None:
@@ -2836,7 +3551,7 @@ class ProductionClusterApp(QMainWindow):
             legacy = str(self.settings_store.value("workspace/selected_folder", "") or "").strip()
             if legacy:
                 roots = [legacy]
-        return PathScope.from_paths(roots).roots
+        return PathScope.from_paths(roots, resolve_symlinks=False).roots
 
     def _update_scope_summary(self, scope: PathScope) -> None:
         if scope.is_empty:
@@ -2865,7 +3580,7 @@ class ProductionClusterApp(QMainWindow):
         self.settings_store.setValue("workspace/selected_folder", scope.primary_root)
         changed_history = False
         for root in scope.roots:
-            changed_history = self.recent_folder_history.record(root) or changed_history
+            changed_history = self.recent_folder_history.record_verified(root) or changed_history
         if changed_history:
             self._refresh_recent_folder_menus()
         self._update_scope_summary(scope)
@@ -2886,11 +3601,12 @@ class ProductionClusterApp(QMainWindow):
             self.library_pane.active_scope_changed()
         self._load_gallery_scope(scope)
         self._apply_startup_workflow_gate()
+        self._refresh_workspace_ui()
 
     def _load_gallery_folder(self, directory: str) -> None:
         """Compatibility wrapper for focused legacy callers/tests."""
 
-        self._load_gallery_scope(PathScope.from_paths([directory]))
+        self._load_gallery_scope(PathScope.from_paths([directory], resolve_symlinks=False))
 
     def _load_gallery_scope(self, scope: PathScope) -> None:
         """Discover the active-root union in a worker without blocking Qt."""
@@ -2898,48 +3614,73 @@ class ProductionClusterApp(QMainWindow):
         generation = self._gallery_discovery_generation
         previous = self._gallery_discovery_job
         if previous is not None:
-            try:
-                previous.cancel()
-            except Exception:
-                pass
+            self._cancel_app_async_job(previous)
         self._gallery_paths = []
         self._gallery_snapshot_key = ""
         if scope.is_empty:
             self.photo_gallery.set_empty_state("Choose active roots to show their photos.")
             return
         self.photo_gallery.set_loading_state(f"Finding photos in {len(scope.roots)} active root(s)…")
+        source_admission_policy = self._source_admission_policy()
+        recursive = bool(self.clustering_pane.recursive_checkbox.isChecked())
 
         def _run(progress, cancel_check):
             from app.services.discovery import ImageDiscoveryService
 
-            return ImageDiscoveryService().discover_roots_result(
+            result = ImageDiscoveryService(admission_policy=source_admission_policy).discover_roots_result(
                 list(scope.roots),
-                recursive=bool(self.clustering_pane.recursive_checkbox.isChecked()),
+                recursive=recursive,
                 progress_callback=progress,
                 cancel_check=cancel_check,
             )
+            sections: list[GallerySection] = []
+            for root in scope.roots:
+                root_scope = PathScope.from_paths([root])
+                paths: list[str] = []
+                for index, path in enumerate(result.paths):
+                    if index % 256 == 0:
+                        raise_if_cancelled(cancel_check)
+                    if root_scope.contains(path):
+                        paths.append(path)
+                if paths:
+                    sections.append(
+                        GallerySection(f"root:{root}", tuple(paths), kind="all", title=Path(root).name or root)
+                    )
+            return result, tuple(sections)
 
         job = AsyncJob(_run)
         self._gallery_discovery_job = job
-        self.job_manager.bind_async_job(job, "Finding active-root photos", origin="Gallery")
+        thread_holder: dict[str, object | None] = {"thread": None}
 
-        def _finished(result) -> None:
+        def _cleanup() -> None:
+            thread = thread_holder["thread"]
+            self._release_async_refs(job, thread)
+            if self._gallery_discovery_thread is thread:
+                self._gallery_discovery_thread = None
+            if self._gallery_discovery_job is job:
+                self._gallery_discovery_job = None
+
+        def _finished(payload) -> None:
             if generation != self._gallery_discovery_generation or self._is_shutting_down:
                 return
+            result, sections = payload
             self._gallery_paths = list(getattr(result, "paths", ()) or ())
             self._gallery_snapshot_key = str(getattr(result, "snapshot_key", "") or "")
+            filtered_count = int(getattr(result, "filtered_count", 0) or 0)
             if not self._gallery_paths:
-                self.photo_gallery.set_empty_state("No supported photos were found in the active roots.", can_organize=False)
+                message = "No supported photos were found in the active roots."
+                if filtered_count:
+                    message += f" {filtered_count} file(s) were excluded by the active source filters."
+                self.photo_gallery.set_empty_state(message, can_organize=False)
                 self._apply_startup_workflow_gate()
                 return
-            sections = []
-            for root in scope.roots:
-                paths = tuple(path for path in self._gallery_paths if PathScope.from_paths([root]).contains(path))
-                if paths:
-                    sections.append(GallerySection(f"root:{root}", paths, kind="all", title=Path(root).name or root))
             self.photo_gallery.set_sections(
-                sections or [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
-                status=f"Showing {len(self._gallery_paths)} photos across {len(scope.roots)} active root(s). Organize when you are ready.",
+                list(sections) or [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")],
+                status=(
+                    f"Showing {len(self._gallery_paths)} photos across {len(scope.roots)} active root(s). "
+                    + (f"{filtered_count} file(s) excluded by source filters. " if filtered_count else "")
+                    + "Organize when you are ready."
+                ),
             )
             self._apply_startup_workflow_gate()
 
@@ -2948,11 +3689,27 @@ class ProductionClusterApp(QMainWindow):
                 self.photo_gallery.set_empty_state(f"Could not read the active roots: {message}")
 
         job.completed.connect(_finished)
+        job.completed.connect(lambda _result: _cleanup())
         job.failed.connect(_failed)
-        thread = start_job_in_thread(job)
-        self._gallery_discovery_thread = thread
-        self._retain_async_refs(job, thread)
-        thread.finished.connect(lambda: self._release_async_refs(job, thread), Qt.ConnectionType.QueuedConnection)
+        job.failed.connect(lambda _message: _cleanup())
+        job.cancelled.connect(_cleanup)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._gallery_discovery_thread = thread
+            self._retain_async_refs(job, thread)
+
+        self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Finding active-root photos",
+                origin="Organize",
+                io_bound=True,
+                source_reads=tuple(scope.roots),
+            ),
+            _launch,
+        )
 
     @staticmethod
     def _unique_photo_paths(paths: list[str] | tuple[str, ...]) -> list[str]:
@@ -2983,10 +3740,10 @@ class ProductionClusterApp(QMainWindow):
         if append and self._photo_set_route is not None:
             route_context = {**self._photo_set_route.context_by_path, **route_context}
         route = PhotoSetRoute(
-            source=str(source or "Gallery"),
+            source=str(source or "Photos"),
             title=str(title or "Photo set"),
             paths=tuple(route_paths),
-            return_workspace=str(return_workspace or "gallery"),
+            return_workspace=str(return_workspace or "clustering"),
             context_by_path=route_context,
         )
         self._photo_set_route = route
@@ -2994,7 +3751,7 @@ class ProductionClusterApp(QMainWindow):
         self.photo_gallery.set_photo_set_route(
             title=f"{route.title} · {len(route.paths)} photos",
             source=route.return_workspace,
-            can_return=route.return_workspace != "gallery",
+            can_return=route.return_workspace != "clustering",
             can_review_faces=True,
             can_analyze=True,
         )
@@ -3002,9 +3759,10 @@ class ProductionClusterApp(QMainWindow):
             [GallerySection("route", route.paths, kind="photos", title=route.title)],
             status=f"Showing {len(route.paths)} photo(s) from {route.source}. Select photos, then use the visible route actions.",
         )
-        self.set_active_workspace("gallery")
-        self.footer_bar.set_status(f"Opened {len(route.paths)} photo(s) from {route.source} in Gallery.")
-        self._set_activity(f"Gallery route: {route.source}")
+        self.set_clustering_mode("basic")
+        self.set_active_workspace("clustering")
+        self.footer_bar.set_status(f"Opened {len(route.paths)} photo(s) from {route.source} in Organize.")
+        self._set_activity(f"Photo route: {route.source}")
 
     def _return_to_folder_photo_gallery(self) -> None:
         """Drop only session routing; the selected-folder gallery remains durable."""
@@ -3022,7 +3780,7 @@ class ProductionClusterApp(QMainWindow):
 
     def _return_to_photo_set_source(self, workspace_id: str) -> None:
         target = self._normalize_workspace_id(workspace_id)
-        if target == "gallery":
+        if target == "clustering":
             return
         self.set_active_workspace(target)
         self.footer_bar.set_status("Returned to the workspace that opened this photo set.")
@@ -3043,7 +3801,7 @@ class ProductionClusterApp(QMainWindow):
             generate_cluster_explanations=False,
         )
         self.set_active_workspace("clustering")
-        self.footer_bar.set_status(f"Preparing {len(selected_paths)} Gallery photo(s) for clustering…")
+        self.footer_bar.set_status(f"Preparing {len(selected_paths)} selected photo(s) for organizing…")
         self._start_request_preflight(request)
 
     def _review_photo_set_in_faces(self, paths: list[str]) -> None:
@@ -3053,10 +3811,12 @@ class ProductionClusterApp(QMainWindow):
         # This is only a review hand-off.  SearchPane displays the explicit
         # scope and waits for its Detect Faces action before indexing anything.
         self._pending_face_review_paths = selected_paths
+        self._pending_people_section = "detect"
+        self._workspace_sections["people"] = "detect"
         self.set_active_workspace("faces")
         if self.faces_pane is not None:
             self._apply_pending_photo_face_review(self.faces_pane)
-        self.footer_bar.set_status(f"{len(selected_paths)} photo(s) are ready in Faces. Choose Detect Faces to start indexing.")
+        self.footer_bar.set_status(f"{len(selected_paths)} photo(s) are ready in People. Choose Detect to start indexing.")
 
     def _apply_pending_photo_face_review(self, pane) -> None:
         paths = tuple(self._pending_face_review_paths)
@@ -3129,12 +3889,54 @@ class ProductionClusterApp(QMainWindow):
             sections.append(GallerySection("other:unassigned", tuple(remaining), kind="other", title="Other photos"))
         return sections or [GallerySection("all", tuple(self._gallery_paths), kind="all", title="All photos")]
 
-    def _on_model_download_started(self, item_keys: tuple) -> None:
-        label = "Downloading model assets"
-        job_id = self.job_manager.register_job(
-            label, cancel_fn=self.model_download_controller.cancel, origin="Models"
+    def _queue_model_download(self, items: tuple[ModelDownloadItem, ...] | list[ModelDownloadItem]) -> bool:
+        """Admit a model acquisition before creating its worker process."""
+
+        if self._model_download_job_id is not None or self.model_download_controller.is_running():
+            return False
+        requested_items = tuple(items)
+
+        def _start(job_id: int, _use_cpu_fallback: bool) -> None:
+            self._coordinated_process_job_ids.add(job_id)
+            self._model_download_job_id = job_id
+            if not self.model_download_controller.start(requested_items):
+                self._model_download_job_id = None
+                self.work_coordinator.finish(
+                    job_id,
+                    status="failed",
+                    error="The model download worker could not start.",
+                )
+
+        job_id = self.work_coordinator.submit(
+            JobSpec(
+                "Downloading model assets",
+                origin="Models",
+                io_bound=True,
+                data_home_write=True,
+                model_cache_write=True,
+            ),
+            _start,
+            cancel=self.model_download_controller.cancel,
         )
+        state = self.job_manager.get(job_id)
+        if state is None or state.status not in {"queued", "running", "cancelling"}:
+            self._coordinated_process_job_ids.discard(job_id)
+            self._model_download_job_id = None
+            return False
+        self._coordinated_process_job_ids.add(job_id)
         self._model_download_job_id = job_id
+        self._update_footer_storage_state()
+        return True
+
+    def _on_model_download_started(self, item_keys: tuple) -> None:
+        job_id = self._model_download_job_id
+        if job_id is None:
+            job_id = self.job_manager.register_job(
+                "Downloading model assets",
+                cancel_fn=self.model_download_controller.cancel,
+                origin="Models",
+            )
+            self._model_download_job_id = job_id
         item_text = ", ".join(str(item).split(":text=", 1)[0] for item in item_keys)
         status = f"Downloading model assets: {item_text}" if item_text else "Downloading model assets"
         self.job_manager.update(job_id, progress=-1, text="Cache lookup and download starting")
@@ -3160,7 +3962,10 @@ class ProductionClusterApp(QMainWindow):
                 text=cache_text,
                 cache_status=cache_text,
             )
-        self.job_manager.finish(job_id, status=status, error=error, cache_status=cache_text)
+        if job_id in self._coordinated_process_job_ids:
+            self.work_coordinator.finish(job_id, status=status, error=error)
+        else:
+            self.job_manager.finish(job_id, status=status, error=error, cache_status=cache_text)
 
     def _on_model_download_completed(self, result: dict) -> None:
         requested = tuple(str(item) for item in result.get("requested") or ())
@@ -3205,7 +4010,7 @@ class ProductionClusterApp(QMainWindow):
             self._set_activity("Starting clustering worker...")
             if not self._start_request(replace(request, allow_model_downloads=False), run_origin=run_origin):
                 self._set_running_state(False)
-                errorBox("Clustering could not start", "The model cache is ready, but the clustering worker could not start.")
+                errorBox("Organize could not start", "The model cache is ready, but the organization worker could not start.")
             return
         if post_install_name:
             infoBox("Model downloaded", f"{model_label(post_install_name)} is ready in the shared runtime cache.")
@@ -3236,12 +4041,12 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_footer_storage_usage()
 
     def _on_clustering_started(self) -> None:
-        job_id = self.job_manager.register_job(
-            "Production clustering", cancel_fn=self.session_controller.cancel, origin="Clustering"
-        )
-        self._active_job_id = job_id
-        self.footer_bar.set_status("Clustering started.")
-        self._set_activity("Clustering started...")
+        if self._active_job_id is None:
+            self._active_job_id = self.job_manager.register_job(
+                "Organizing photos", cancel_fn=self.session_controller.cancel, origin="Organize"
+            )
+        self.footer_bar.set_status("Organizing photos started.")
+        self._set_activity("Organizing photos…")
         self._update_footer_storage_state()
 
     def _on_clustering_progress(self, value: int, status: str) -> None:
@@ -3251,11 +4056,14 @@ class ProductionClusterApp(QMainWindow):
             self.job_manager.update(job_id, progress=value, text=status)
 
     def _on_clustering_completed(self, payload: dict) -> None:
-        self.footer_bar.set_status("Clustering finished.")
+        self.footer_bar.set_status("Photo organization finished.")
         job_id = getattr(self, "_active_job_id", None)
-        self.cluster_data = _restore_cluster_dict(payload.get("clusters_by_key") or {})
-        self.membership_by_image = _restore_membership(payload.get("membership_by_image") or {})
-        self.metrics_by_backend = {str(key): dict(value) for key, value in dict(payload.get("metrics_by_key") or {}).items()}
+        prepared = payload.get("_prepared") if isinstance(payload.get("_prepared"), dict) else None
+        if prepared is None:
+            prepared = _prepare_clustering_result_payload(payload)["_prepared"]
+        self.cluster_data = prepared["cluster_data"]
+        self.membership_by_image = prepared["membership_by_image"]
+        self.metrics_by_backend = prepared["metrics_by_backend"]
         fallback_reasons = list(
             dict.fromkeys(
                 str(metrics.get("compute_fallback_reason") or "").strip()
@@ -3265,22 +4073,23 @@ class ProductionClusterApp(QMainWindow):
         )
         fallback_notice = f" CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else ""
         if job_id is not None:
-            self.job_manager.finish(
-                job_id,
-                status="finished",
-                cache_status=f"CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else "",
-            )
             self._active_job_id = None
-        self.cluster_explanations = _restore_cluster_explanations(payload.get("cluster_explanations_by_key") or {})
-        self.cluster_meanings = _restore_cluster_meanings(payload.get("cluster_meanings_by_key") or {})
-        self.last_run_metrics = dict(payload.get("metrics") or {})
+            cache_status = f"CPU fallback: {'; '.join(fallback_reasons)}" if fallback_reasons else ""
+            self.job_manager.update(job_id, cache_status=cache_status)
+            if job_id in self._coordinated_process_job_ids:
+                self.work_coordinator.finish(job_id, status="finished")
+            else:
+                self.job_manager.finish(job_id, status="finished", cache_status=cache_status)
+        self.cluster_explanations = prepared["cluster_explanations"]
+        self.cluster_meanings = prepared["cluster_meanings"]
+        self.last_run_metrics = prepared["metrics"]
         self.last_run_metrics["run_origin"] = self.current_run_origin
         self.last_run_metrics["tag_match"] = self.current_tag_match
         if fallback_reasons:
             self.last_run_metrics["compute_fallback_reason"] = "; ".join(fallback_reasons)
         if self.current_tag_filter:
             self.last_run_metrics["tag_filter"] = ", ".join(self.current_tag_filter)
-        self.cluster_tag_summaries = _restore_cluster_summaries(payload.get("cluster_summaries") or {})
+        self.cluster_tag_summaries = prepared["cluster_tag_summaries"]
         self.cluster_pane.update_clusters(
             self.cluster_data,
             membership_by_image=self.membership_by_image,
@@ -3295,6 +4104,8 @@ class ProductionClusterApp(QMainWindow):
                 self._gallery_sections_from_clusters(),
                 status="Photos organized by the current primary clustering result.",
             )
+        if self._active_workspace == "clustering" and self._clustering_mode == "basic":
+            self._reflow_main_splitter(force=True)
         self.gallery_pane.inspector_context_provider = self._main_gallery_context_for_path
         self.clustering_pane.update_metrics(self.last_run_metrics)
         self.footer_bar.set_metrics(self.clustering_pane._last_metrics_text)
@@ -3302,11 +4113,11 @@ class ProductionClusterApp(QMainWindow):
         if default_selection is not None:
             comparison_key, cluster_id = default_selection
             warm_note = " Worker kept warm for the next run." if self.session_controller.is_worker_warm() else ""
-            self.footer_bar.set_status(f"Clustering finished. Showing {comparison_key} / cluster {cluster_id}.{fallback_notice}{warm_note}")
+            self.footer_bar.set_status(f"Photo organization finished. Showing {comparison_key} / group {cluster_id}.{fallback_notice}{warm_note}")
             self.update_gallery(comparison_key, cluster_id)
         else:
             warm_note = " Worker kept warm for the next run." if self.session_controller.is_worker_warm() else ""
-            self.footer_bar.set_status(f"Clustering finished with no clusters to preview.{fallback_notice}{warm_note}")
+            self.footer_bar.set_status(f"Photo organization finished with no groups to preview.{fallback_notice}{warm_note}")
         self._set_activity("Refreshing tag summaries...")
         self._start_cluster_tag_context_refresh()
         if self.library_pane is not None:
@@ -3314,21 +4125,27 @@ class ProductionClusterApp(QMainWindow):
         self._refresh_footer_storage_usage()
 
     def _on_clustering_failed(self, message: str) -> None:
-        self.footer_bar.set_status(f"Clustering failed: {message}")
+        self.footer_bar.set_status(f"Photo organization failed: {message}")
         self._set_activity("Failed")
         job_id = getattr(self, "_active_job_id", None)
         if job_id is not None:
-            self.job_manager.finish(job_id, status="failed", error=message)
             self._active_job_id = None
+            if job_id in self._coordinated_process_job_ids:
+                self.work_coordinator.finish(job_id, status="failed", error=message)
+            else:
+                self.job_manager.finish(job_id, status="failed", error=message)
         self._refresh_footer_storage_usage()
-        errorBox("Clustering failed", message)
+        errorBox("Organize failed", message)
 
     def _on_clustering_cancelled(self) -> None:
-        self.footer_bar.set_status("Clustering cancelled.")
+        self.footer_bar.set_status("Photo organization cancelled.")
         job_id = getattr(self, "_active_job_id", None)
         if job_id is not None:
-            self.job_manager.finish(job_id, status="cancelled")
             self._active_job_id = None
+            if job_id in self._coordinated_process_job_ids:
+                self.work_coordinator.finish(job_id, status="cancelled")
+            else:
+                self.job_manager.finish(job_id, status="cancelled")
         self.last_run_metrics = {
             "status": "cancelled",
             "run_origin": self.current_run_origin,
@@ -3570,15 +4387,10 @@ class ProductionClusterApp(QMainWindow):
     def _set_pane_visible(self, pane_key: str, visible: bool) -> None:
         visible = bool(visible)
         if pane_key == "source":
-            if self._active_workspace == "clustering" and self._clustering_mode != "advanced":
-                return
-            if self._advanced_pane_visibility.get("source") == visible and self._pane_visibility.get("source") == visible:
-                self._sync_pane_toggle_buttons()
-                return
-            self._advanced_pane_visibility["source"] = visible
-            self._pane_visibility["source"] = visible
-            self._sync_pane_toggle_buttons()
-            self._reflow_main_splitter(force=True)
+            if visible:
+                self._edit_active_roots()
+            else:
+                self._hide_source_pane()
             return
         if self._active_workspace != "clustering" or self._clustering_mode != "advanced":
             return
@@ -3596,6 +4408,8 @@ class ProductionClusterApp(QMainWindow):
         widths = self._layout_widths()
         total_width = max(widths["window"], int(self.width() or self._screen_available_width or widths["window"]))
         source_visible = self._source_pane_visible()
+        if source_visible:
+            self.source_pane.begin_edit()
         source = min(widths["source_max"], max(widths["source"], int(self._pane_restore_widths["source"]))) if source_visible else 0
         workspace = max(widths["workspace"], total_width - source - 24)
         if source_visible and source + workspace + 24 > total_width:
@@ -3604,13 +4418,18 @@ class ProductionClusterApp(QMainWindow):
         self.main_splitter.setSizes([source, workspace])
         if self._clustering_mode == "basic":
             controls = 0
-            details = min(widths["details_max"], max(widths["details"], int(self._pane_restore_widths["details"])))
+            has_cluster_details = bool(self.cluster_data)
+            details = (
+                min(widths["details_max"], max(widths["details"], int(self._pane_restore_widths["details"])))
+                if has_cluster_details
+                else 0
+            )
             gallery = max(widths["gallery"], workspace - details - 18)
             if gallery + details > workspace:
                 details = max(widths["details"], workspace - widths["gallery"])
                 gallery = max(widths["gallery"], workspace - details)
             self.clustering_pane.setVisible(False)
-            self.cluster_right_splitter.setVisible(True)
+            self.cluster_right_splitter.setVisible(has_cluster_details)
             self.clustering_splitter.setSizes([controls, gallery, details])
             return
 
@@ -3637,6 +4456,7 @@ class ProductionClusterApp(QMainWindow):
         self._screen_available_width = max(1, int(width))
         self._screen_available_height = max(1, int(height))
         widths = self._layout_widths()
+        self._apply_header_responsive_state()
         min_height = min(900, max(720, self._screen_available_height))
         self.setMinimumSize(widths["window"], min_height)
         self.source_pane.setMinimumWidth(widths["source"])
@@ -3656,13 +4476,43 @@ class ProductionClusterApp(QMainWindow):
             self.library_pane.setMinimumWidth(widths["faces"])
         self._reflow_main_splitter(force=True)
 
+    def _apply_header_responsive_state(self) -> None:
+        scale = int(self.theme_manager.text_scale) if self.theme_manager is not None else 100
+        compact = self._screen_available_width < COMPACT_LAYOUT_WIDTH or scale >= 150
+        self.jobs_widget.set_compact(compact)
+        self.runtime_badge.set_compact(compact)
+        self.feature_label.setVisible(not (self._screen_available_width <= 1280 and scale >= 150))
+
+    def _queue_text_scale_reflow(self, _text_scale: int) -> None:
+        if not self._is_shutting_down:
+            self._text_scale_reflow_timer.start(0)
+
+    def _apply_text_scale_reflow(self) -> None:
+        if self._is_shutting_down:
+            return
+        central = self.centralWidget()
+        if central is not None:
+            central.updateGeometry()
+            for child in central.findChildren(QWidget):
+                child.updateGeometry()
+            layout = central.layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+        if self.faces_pane is not None:
+            self.faces_pane.reflow_for_text_scale()
+        self._apply_header_responsive_state()
+        self.apply_screen_geometry_constraints(
+            (self._screen_available_width, self._screen_available_height)
+        )
+
     def _layout_widths(self) -> dict[str, int]:
         compact = int(self._screen_available_width or MIN_SUPPORTED_SCREEN_WIDTH) < COMPACT_LAYOUT_WIDTH
         if compact:
             return {
                 "window": min(COMPACT_LAYOUT_WIDTH, max(800, int(self._screen_available_width or 1080))),
-                "source": 168,
-                "source_max": 220,
+                "source": 240,
+                "source_max": 280,
                 "workspace": 720,
                 "controls": 240,
                 "controls_max": 320,
@@ -3673,10 +4523,26 @@ class ProductionClusterApp(QMainWindow):
                 "activity": 120,
                 "health": 100,
             }
+        medium = int(self._screen_available_width or MIN_SUPPORTED_SCREEN_WIDTH) < MEDIUM_LAYOUT_WIDTH
+        if medium:
+            return {
+                "window": 1440,
+                "source": 280,
+                "source_max": 320,
+                "workspace": 900,
+                "controls": 300,
+                "controls_max": 380,
+                "gallery": 520,
+                "details": 300,
+                "details_max": 440,
+                "faces": 900,
+                "activity": 180,
+                "health": 110,
+            }
         return {
             "window": 1440,
-            "source": 220,
-            "source_max": 280,
+            "source": 320,
+            "source_max": 360,
             "workspace": 1040,
             "controls": 380,
             "controls_max": 460,
@@ -3715,13 +4581,21 @@ class ProductionClusterApp(QMainWindow):
             self.names_pane.set_read_only_mode(read_only)
         if self.library_pane is not None:
             self.library_pane.set_read_only_mode(read_only)
+        self.source_pane.set_read_only_mode(read_only)
         self._refresh_health_badge()
 
     def _apply_runtime_status(self) -> None:
         self.performance_profile = self._effective_performance_profile()
-        capabilities = self.runtime_service.detect()
-        self.execution_policy = self.runtime_service.select_policy(self._preferred_execution_mode())
-        self.runtime_badge.update_runtime(capabilities, self.execution_policy)
+        # Applying Settings only invalidates the snapshot.  The caller starts
+        # the coordinated readiness job after the remaining settings/services
+        # are updated, keeping imports and provider probes off the Qt thread.
+        self.execution_policy = ExecutionPolicy(
+            preferred_mode=self._preferred_execution_mode(),
+            reason="Runtime readiness is being refreshed in the background.",
+        )
+        self._startup_readiness_report = None
+        self._startup_readiness_error = ""
+        self.runtime_badge.update_runtime(None, None)
         if self.faces_pane is not None:
             self.faces_pane.reset_similarity_execution_services()
         self._refresh_health_badge()
@@ -3764,7 +4638,7 @@ class ProductionClusterApp(QMainWindow):
         running = self._tag_suggestion_job is not None
         if target is None:
             self.tags_pane.set_cluster_suggestion_state(
-                "Cluster suggestions: select a cluster in Clustering.", can_generate=False, can_apply=False
+                "Suggestions: select a group.", can_generate=False, can_apply=False
             )
             return
         if running:
@@ -3788,7 +4662,7 @@ class ProductionClusterApp(QMainWindow):
         self.run_clustering()
 
     def generate_cluster_tag_suggestions(self) -> None:
-        if self._thread_is_running(self._tag_suggestion_thread):
+        if self._tag_suggestion_job is not None:
             self.footer_bar.set_status("Cluster tag suggestions are already being generated.")
             return
         target = self.cluster_pane.current_selection_target()
@@ -3850,9 +4724,7 @@ class ProductionClusterApp(QMainWindow):
             )
 
         job = AsyncJob(_run)
-        job_id = self.job_manager.register_job("Generating cluster tag suggestions", cancel_fn=job.cancel, origin="Tags")
         self._tag_suggestion_job = job
-        self._tag_suggestion_job_id = job_id
         thread_holder: dict[str, object] = {}
         self._refresh_tags_suggestion_state()
 
@@ -3906,10 +4778,25 @@ class ProductionClusterApp(QMainWindow):
         job.failed.connect(lambda _message: _cleanup())
         job.cancelled.connect(_cancelled)
         job.cancelled.connect(_cleanup)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._tag_suggestion_thread = thread
-        self._retain_async_refs(job, thread)
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._tag_suggestion_thread = thread
+            self._retain_async_refs(job, thread)
+
+        job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Generating group tag suggestions",
+                origin="Organize",
+                uses_gpu=preferred_mode != "cpu",
+                source_reads=tuple(source_paths),
+                data_home_write=use_embedding_cache_lookup,
+                model_cache_read=True,
+            ),
+            _launch,
+        )
+        self._tag_suggestion_job_id = job_id
 
     def _selected_cluster_meaning_tags(self) -> tuple[list[str], SelectionTarget | None]:
         target = self.cluster_pane.current_selection_target()
@@ -3977,9 +4864,6 @@ class ProductionClusterApp(QMainWindow):
             infoBox("Suggested tags applied", f"Added {', '.join(tags)} to {len(affected_paths)} image(s).")
 
         job = AsyncJob(_run)
-        suggested_tags_job_id = self.job_manager.register_job(
-            "Applying suggested tags", cancel_fn=job.cancel, origin="Tags"
-        )
         thread_holder: dict[str, object] = {}
 
         def _cleanup() -> None:
@@ -4021,9 +4905,22 @@ class ProductionClusterApp(QMainWindow):
         job.failed.connect(lambda _message: _cleanup())
         job.cancelled.connect(_cancelled)
         job.cancelled.connect(_cleanup)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._retain_async_refs(job, thread)
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._retain_async_refs(job, thread)
+
+        suggested_tags_job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Applying suggested tags",
+                origin="Organize",
+                io_bound=True,
+                source_reads=tuple(source_paths),
+                data_home_write=True,
+            ),
+            _launch,
+        )
 
     def _create_settings_dialog(self, *, parent=None) -> ProductionSettingsDialog:
         return ProductionSettingsDialog(
@@ -4046,12 +4943,15 @@ class ProductionClusterApp(QMainWindow):
             support_metadata_provider=self._support_metadata,
             model_download_controller=self.model_download_controller,
             job_manager=self.job_manager,
+            work_coordinator=self.work_coordinator,
             auto_refresh=not self._packaged_launch_smoke,
             parent=self if parent is None else parent,
         )
 
     def open_settings_dialog(self, initial_tab: str | None = None) -> None:
+        focus_return = QApplication.focusWidget()
         dialog = self._create_settings_dialog(parent=self)
+        appearance_snapshot = self._connect_settings_appearance_preview(dialog)
         dialog.runtime_rescanned.connect(self._begin_startup_readiness_check)
         if initial_tab:
             aliases = {
@@ -4059,28 +4959,82 @@ class ProductionClusterApp(QMainWindow):
                 "face models": "Face Models",
             }
             target_tab = aliases.get(str(initial_tab).casefold(), str(initial_tab))
-            for index in range(dialog.tabs.count()):
-                if dialog.tabs.tabText(index).casefold() == target_tab.casefold():
-                    dialog.tabs.setCurrentIndex(index)
-                    break
+            dialog.select_section(target_tab)
         dialog_result = dialog.exec()
         face_models_changed = bool(dialog.face_model_inventory_changed())
         if dialog_result != dialog.DialogCode.Accepted:
+            self._restore_settings_appearance(appearance_snapshot)
             if face_models_changed:
                 self._reload_face_services_from_settings()
                 self._begin_startup_readiness_check()
             self._refresh_workspace_ui()
+            self._restore_focus_after_dialog(focus_return, self.settings_button)
             return
         self._apply_settings_values(dialog.values())
         self.footer_bar.set_status("Production settings updated.")
         self._set_activity("Settings updated")
         self._refresh_footer_storage_usage()
         self._refresh_workspace_ui()
+        self._restore_focus_after_dialog(focus_return, self.settings_button)
+
+    def _restore_focus_after_dialog(self, target: QWidget | None, fallback: QWidget) -> None:
+        """Return keyboard users to the control that opened a modal surface."""
+
+        candidate = target
+        try:
+            usable = bool(
+                candidate is not None
+                and not sip.isdeleted(candidate)
+                and candidate.isEnabled()
+                and candidate.isVisibleTo(self)
+            )
+        except RuntimeError:
+            usable = False
+        if not usable:
+            candidate = fallback
+        try:
+            if candidate is not None and not sip.isdeleted(candidate) and candidate.isEnabled():
+                candidate.setFocus(Qt.FocusReason.OtherFocusReason)
+        except RuntimeError:
+            return
+
+    def _connect_settings_appearance_preview(
+        self,
+        dialog: ProductionSettingsDialog,
+    ) -> tuple[str, str, int] | None:
+        manager = self.theme_manager
+        if manager is None:
+            return None
+        snapshot = (
+            str(manager.theme_preference),
+            str(manager.viewer_backdrop),
+            int(manager.text_scale),
+        )
+        dialog.appearance_preview_requested.connect(self._preview_settings_appearance)
+        return snapshot
+
+    def _preview_settings_appearance(self, theme: str, backdrop: str, text_scale: int) -> None:
+        manager = self.theme_manager
+        if manager is None:
+            return
+        manager.set_text_scale(text_scale, persist=False)
+        manager.set_preferences(theme, backdrop, persist=False)
+
+    def _restore_settings_appearance(self, snapshot: tuple[str, str, int] | None) -> None:
+        manager = self.theme_manager
+        if manager is None or snapshot is None:
+            return
+        theme, backdrop, text_scale = snapshot
+        manager.set_text_scale(text_scale, persist=False)
+        manager.set_preferences(theme, backdrop, persist=False)
 
     def _apply_settings_values(self, values: dict[str, object]) -> None:
+        previous_source_policy = self._source_admission_policy()
         for key, value in self.settings_registry.validate_values(values).items():
             self.settings_registry.set(self.settings_store, key, value)
         self.settings_store.sync()
+        if self.theme_manager is not None:
+            self.theme_manager.configure(self.settings_store)
         self._apply_runtime_status()
         self.work_coordinator.gpu_policy = self._gpu_conflict_policy()
         self._apply_workspace_preferences()
@@ -4088,6 +5042,15 @@ class ProductionClusterApp(QMainWindow):
         self.session_controller.set_keep_worker_warm(self._keep_worker_warm())
         self._reload_face_services_from_settings()
         self._begin_startup_readiness_check()
+        current_source_policy = self._source_admission_policy()
+        if current_source_policy != previous_source_policy:
+            self._load_gallery_scope(self.source_pane.active_scope)
+            if self.library_pane is not None:
+                self.library_pane.catalog.set_source_admission_policy(current_source_policy)
+                self.library_pane.status_label.setText(
+                    "Global source filters changed. Refreshing registered Library roots in a cancellable Job."
+                )
+                self.library_pane.scan_roots()
 
     def _reload_face_services_from_settings(self) -> None:
         if self.faces_pane is None:
@@ -4097,27 +5060,17 @@ class ProductionClusterApp(QMainWindow):
             self.face_service_global = None
             self.face_service_session = None
             if self.names_pane is not None:
-                self.names_pane.status_label.setText("Face settings changed. Reload Names to use the selected pipeline.")
+                self.names_pane.status_label.setText("Face settings changed. Reload People to use the selected pipeline.")
                 self.names_pane.refresh_button.setEnabled(False)
                 self._start_names_workspace_load()
             return
-        self._build_face_services(reset_face_session=False)
-        self.faces_pane.face_service_global = self.face_service_global
-        self.faces_pane.face_service_session = self.face_service_session
-        self.faces_pane.set_face_services(
-            face_services_global=self.face_services_global,
-            face_services_session=self.face_services_session,
-            refresh=False,
-        )
-        self.faces_pane.set_face_service_provider(self._face_service_for_pipeline)
-        self.faces_pane.configure_face_pipeline_options(
-            self._face_model_root(),
-            self._preferred_face_pipeline_defaults(),
-            refresh=False,
-        )
-        self.faces_pane.set_active_face_mode("human", refresh=True)
-        if self.names_pane is not None:
-            self.names_pane.refresh_names()
+        self._cancel_faces_workspace_load()
+        self.faces_pane.setEnabled(False)
+        self.footer_bar.set_status("Reloading People services for the updated settings…")
+        if self._faces_init_job is not None:
+            self._faces_reload_pending = True
+            return
+        self._start_faces_workspace_load(reload_existing=True)
 
     def _post_startup_checks(self) -> None:
         if self._is_shutting_down or self._close_pending or not self.isVisible():
@@ -4158,7 +5111,7 @@ class ProductionClusterApp(QMainWindow):
         model_name = str(model_name or self.settings.default_model).strip().lower()
         if not model_name:
             return
-        if self.model_download_controller.is_running():
+        if self._model_download_job_id is not None or self.model_download_controller.is_running():
             self.footer_bar.set_status("A model download is already active. Open Jobs to monitor or cancel it.")
             return
         self.settings_store.setValue("models/download_default_after_setup", False)
@@ -4169,7 +5122,7 @@ class ProductionClusterApp(QMainWindow):
             self._set_activity("Model ready")
             return
         self._active_post_install_model_name = model_name
-        if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
+        if not self._queue_model_download([ModelDownloadItem(model_name, require_text=require_text)]):
             self._active_post_install_model_name = None
             self.footer_bar.set_status("The model download could not start.")
 
@@ -4180,7 +5133,7 @@ class ProductionClusterApp(QMainWindow):
             self._reload_face_services_from_settings()
             self.footer_bar.set_status(f"{model_label(model_name)} is already available locally. Scan again to continue.")
             return
-        if self.model_download_controller.is_running():
+        if self._model_download_job_id is not None or self.model_download_controller.is_running():
             infoBox(
                 "Model download already running",
                 "Another model download is active. Open Jobs to monitor or cancel it, then scan again.",
@@ -4200,7 +5153,7 @@ class ProductionClusterApp(QMainWindow):
             self.footer_bar.set_status("Face-model installation cancelled. No download was started.")
             return
         self._active_post_install_model_name = model_name
-        if not self.model_download_controller.start([ModelDownloadItem(model_name, require_text=require_text)]):
+        if not self._queue_model_download([ModelDownloadItem(model_name, require_text=require_text)]):
             self._active_post_install_model_name = None
             errorBox("Model download could not start", "Open Settings > Face Models and try the installation again.")
 
@@ -4233,19 +5186,31 @@ class ProductionClusterApp(QMainWindow):
         before = self.cache_maintenance_service.describe_rebuildable_caches(cancel_check=cancel_check)
         raise_if_cancelled(cancel_check)
         cleared_targets, failures = self._clear_embedding_cache(cancel_check=cancel_check)
-        disk_cleared, disk_failures = self.cache_maintenance_service.clear_rebuildable_disk_targets(
-            exclude={"embeddings.sqlite3"},
-            progress_callback=progress_callback,
-            cancel_check=cancel_check,
-        )
-        cleared_targets.extend(disk_cleared)
-        failures.extend(disk_failures)
-        raise_if_cancelled(cancel_check)
-        after = self.cache_maintenance_service.describe_rebuildable_caches(cancel_check=cancel_check)
+        cancelled_after_commit = False
+        try:
+            disk_cleared, disk_failures = self.cache_maintenance_service.clear_rebuildable_disk_targets(
+                exclude={"embeddings.sqlite3"},
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            cleared_targets.extend(disk_cleared)
+            failures.extend(disk_failures)
+            raise_if_cancelled(cancel_check)
+        except Cancelled:
+            if not cleared_targets:
+                raise
+            cancelled_after_commit = True
+            failures.append(
+                "Cancellation arrived after a cache target committed; completed removals are retained and any staged cleanup can be retried."
+            )
+        retry_targets = self.cache_maintenance_service.pending_rebuildable_cleanup_targets()
+        after = self.cache_maintenance_service.describe_rebuildable_caches(cancel_check=None)
         return CacheClearResult(
             cleared_targets=tuple(cleared_targets),
             freed_bytes=max(0, int(before.total_bytes - after.total_bytes)),
             failures=tuple(failures),
+            completion_survives_cancellation=cancelled_after_commit or bool(retry_targets),
+            retry_targets=retry_targets,
         )
 
     def _describe_generated_storage(self, *, progress_callback=None, cancel_check=None):
@@ -4313,9 +5278,49 @@ class ProductionClusterApp(QMainWindow):
         )
 
     def _clear_face_storage(self, *, progress_callback=None, cancel_check=None):
-        return self._clear_generated_storage_categories(
-            ("face_databases", "ann_files"), progress_callback=progress_callback, cancel_check=cancel_check
+        before = self._describe_generated_storage(cancel_check=cancel_check)
+        if progress_callback:
+            progress_callback(0, "Clearing recoverable face-library storage")
+        cleared, failures = self.cache_maintenance_service.clear_face_storage_targets(
+            cancel_check=cancel_check,
         )
+        # Once the first database commits, the service deliberately completes
+        # the small managed batch.  Do not reinterpret a late Cancel click as
+        # if no files changed.
+        after = self._describe_generated_storage(cancel_check=None)
+        self.face_storage_cleared.emit()
+        freed_bytes = sum(
+            max(0, int(before.target_bytes.get(category, 0)) - int(after.target_bytes.get(category, 0)))
+            for category in ("face_databases", "ann_files")
+        )
+        return CacheClearResult(
+            cleared_targets=tuple(cleared),
+            freed_bytes=freed_bytes,
+            failures=tuple(failures),
+            completion_survives_cancellation=True,
+        )
+
+    def _on_face_storage_cleared(self) -> None:
+        seen: set[int] = set()
+        services = [
+            *tuple(getattr(self, "_face_service_cache", {}).values()),
+            *tuple(getattr(self, "face_services_global", {}).values()),
+            *tuple(getattr(self, "face_services_session", {}).values()),
+            self.face_service_global,
+            self.face_service_session,
+        ]
+        for service in services:
+            if service is None or id(service) in seen:
+                continue
+            seen.add(id(service))
+            release = getattr(service, "release_storage_caches", None)
+            if callable(release):
+                release()
+        if self._can_update_widget(self.faces_pane):
+            self.faces_pane._invalidate_face_storage_views()
+            self.faces_pane._refresh_face_db_usage_label()
+        if self._can_update_widget(self.names_pane):
+            self.names_pane.refresh_names()
 
     def _clear_model_caches(self, *, progress_callback=None, cancel_check=None):
         return self._clear_generated_storage_categories(
@@ -4340,18 +5345,12 @@ class ProductionClusterApp(QMainWindow):
         )
 
     def _clear_embedding_cache(self, *, cancel_check=None) -> tuple[list[str], list[str]]:
-        failures: list[str] = []
         db_path = Path(self.settings.embedding_cache_db)
-        removed = False
-        for suffix in ("", "-wal", "-shm"):
-            raise_if_cancelled(cancel_check)
-            target = db_path.with_name(db_path.name + suffix)
-            try:
-                if target.exists():
-                    target.unlink(missing_ok=True)
-                    removed = True
-            except OSError as exc:
-                failures.append(f"{target.name}: {exc}")
+        removed, bundle_failures = self.cache_maintenance_service.clear_sqlite_cache_bundle(
+            db_path,
+            cancel_check=cancel_check,
+        )
+        failures = list(bundle_failures)
         try:
             self.settings.cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -4396,9 +5395,9 @@ class ProductionClusterApp(QMainWindow):
     def _refresh_footer_storage_usage(self) -> None:
         if self._is_shutting_down or not self._can_update_widget(getattr(self, "footer_bar", None)):
             return
-        if self._thread_is_running(self._storage_clear_thread):
+        if self._storage_clear_job is not None:
             return
-        if self._thread_is_running(self._storage_usage_thread):
+        if self._storage_usage_job is not None:
             return
         self._storage_usage_generation += 1
         generation = self._storage_usage_generation
@@ -4450,9 +5449,24 @@ class ProductionClusterApp(QMainWindow):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cleanup)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._storage_usage_thread = thread
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._storage_usage_thread = thread
+            self._retain_async_refs(job, thread)
+
+        self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Scanning runtime storage",
+                origin="Storage",
+                foreground=False,
+                io_bound=True,
+                data_home_read=True,
+            ),
+            _launch,
+        )
         self._update_footer_storage_state()
 
     def _request_runtime_storage_clear(self) -> None:
@@ -4486,30 +5500,39 @@ class ProductionClusterApp(QMainWindow):
             )
             raise_if_cancelled(cancel_check)
             cleared_targets, failures = self._clear_embedding_cache(cancel_check=cancel_check)
-            disk_cleared, disk_failures = self.cache_maintenance_service.clear_runtime_cleanup_targets(
-                self.runtime_layout,
-                exclude={"embeddings.sqlite3"},
-                progress_callback=progress,
-                cancel_check=cancel_check,
-            )
-            cleared_targets.extend(disk_cleared)
-            failures.extend(disk_failures)
-            raise_if_cancelled(cancel_check)
+            cancelled_after_commit = False
+            try:
+                disk_cleared, disk_failures = self.cache_maintenance_service.clear_runtime_cleanup_targets(
+                    self.runtime_layout,
+                    exclude={"embeddings.sqlite3"},
+                    progress_callback=progress,
+                    cancel_check=cancel_check,
+                )
+                cleared_targets.extend(disk_cleared)
+                failures.extend(disk_failures)
+                raise_if_cancelled(cancel_check)
+            except Cancelled:
+                if not cleared_targets:
+                    raise
+                cancelled_after_commit = True
+                failures.append(
+                    "Cancellation arrived after a cache target committed; completed removals are retained and staged cleanup can be retried."
+                )
+            retry_targets = self.cache_maintenance_service.pending_rebuildable_cleanup_targets()
             after = self.cache_maintenance_service.describe_runtime_storage(
                 self.runtime_layout,
-                cancel_check=cancel_check,
+                cancel_check=None,
             )
             return CacheClearResult(
                 cleared_targets=tuple(cleared_targets),
                 freed_bytes=max(0, int(before.total_bytes - after.total_bytes)),
                 failures=tuple(failures),
+                completion_survives_cancellation=cancelled_after_commit or bool(retry_targets),
+                retry_targets=retry_targets,
             )
 
         job = AsyncJob(_run)
         self._storage_clear_job = job
-        storage_clear_job_id = self.job_manager.register_job(
-            "Clearing runtime caches", cancel_fn=job.cancel, origin="Storage"
-        )
         thread_holder: dict[str, object | None] = {"thread": None}
 
         def _cleanup() -> None:
@@ -4536,6 +5559,12 @@ class ProductionClusterApp(QMainWindow):
                 self.footer_bar.set_status(
                     f"Cleared {len(result.cleared_targets)} targets and freed {self._format_bytes(result.freed_bytes)}."
                 )
+                if result.retry_targets:
+                    self.footer_bar.set_status(
+                        "Cache files were detached safely; cleanup is still pending for "
+                        + ", ".join(result.retry_targets)
+                        + ". Run Clear again to retry."
+                    )
                 self._set_activity("Caches cleared")
                 if result.failures:
                     LOGGER.warning("Runtime cache clear completed with errors: %s", "; ".join(result.failures))
@@ -4571,9 +5600,22 @@ class ProductionClusterApp(QMainWindow):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._storage_clear_thread = thread
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._storage_clear_thread = thread
+            self._retain_async_refs(job, thread)
+
+        storage_clear_job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Clearing runtime caches",
+                origin="Storage",
+                io_bound=True,
+                data_home_write=True,
+            ),
+            _launch,
+        )
         self._update_footer_storage_state()
 
     def _support_metadata(self) -> dict[str, object]:
@@ -4763,14 +5805,15 @@ class ProductionClusterApp(QMainWindow):
             notes.append("Model policy: prompt before downloads")
         if self._read_only_mode():
             notes.append("Data safety: read-only mode enabled")
-        try:
-            bundled = self.model_asset_service.bundled_model_names(valid_only=True)
-            if bundled:
-                notes.append(f"Valid bundled models: {', '.join(bundled)}")
-            else:
-                issues.append("No valid bundled fallback model asset found")
-        except Exception as exc:
-            issues.append(f"Model asset check failed: {exc}")
+        # Model inventory is proportional filesystem work and belongs to the
+        # readiness/Settings workers. The frequently refreshed header consumes
+        # only their immutable state instead of scanning bundle directories.
+        if self._startup_readiness_report is not None:
+            notes.append("Model readiness: verified by the latest background check")
+        elif self._startup_readiness_error:
+            issues.append(f"Model readiness check failed: {self._startup_readiness_error}")
+        else:
+            notes.append("Model readiness: checking in background")
         if self.runtime_layout.last_crash_json.exists():
             issues.append("Crash report present")
             notes.append(f"Last crash: {self.runtime_layout.last_crash_json}")
@@ -4824,23 +5867,78 @@ class ProductionClusterApp(QMainWindow):
             if self._tag_context_job is job:
                 self._tag_context_job = None
 
-    def _cancel_cluster_tag_context_refresh(self) -> None:
-        job = self._tag_context_job
-        thread = self._tag_context_thread
-        job_id = self._tag_context_job_id
-        self._retain_async_refs(job, thread)
-        self._tag_context_job = None
-        self._tag_context_thread = None
-        self._tag_context_job_id = None
-        if job_id is not None:
-            self.job_manager.finish(job_id, status="cancelled")
+    def _submit_app_async_job(self, job: AsyncJob, spec: JobSpec, starter) -> int:
+        """Admit one shell-owned AsyncJob before its worker thread exists."""
+
+        def _terminal_cleanup(*_args) -> None:
+            self._coordinated_async_job_ids.pop(job, None)
+
+        job.completed.connect(_terminal_cleanup)
+        job.failed.connect(_terminal_cleanup)
+        job.cancelled.connect(_terminal_cleanup)
+        job_id = self.work_coordinator.submit_async_job(spec, job, starter)
+        state = self.job_manager.get(job_id)
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._coordinated_async_job_ids[job] = job_id
+        return job_id
+
+    def _cancel_app_async_job(self, job: AsyncJob | None) -> None:
         if job is None:
             return
-        self._tag_context_generation += 1
+        job_id = self._coordinated_async_job_ids.get(job)
+        if job_id is not None:
+            self.work_coordinator.cancel(job_id)
+            return
         try:
             job.cancel()
         except Exception:
             pass
+
+    def _on_coordinated_process_finished(self, job_id: int, status: str) -> None:
+        """Unwind a process request cancelled or rejected before process start."""
+
+        job_id = int(job_id)
+        if job_id not in self._coordinated_process_job_ids:
+            return
+        self._coordinated_process_job_ids.discard(job_id)
+        if self._model_download_job_id == job_id and not self.model_download_controller.is_running():
+            self._model_download_job_id = None
+            self._pending_model_download_run = None
+            self._active_post_install_model_name = None
+            if status == "cancelled":
+                self.footer_bar.set_status("Model download cancelled before it started.")
+                self._set_activity("Model download cancelled")
+            else:
+                self.footer_bar.set_status("The model download could not start.")
+                self._set_activity("Model download failed")
+            self._set_running_state(False)
+        if self._active_job_id == job_id and not self.session_controller.is_running():
+            self._active_job_id = None
+            self.last_run_metrics = {
+                "status": "cancelled" if status == "cancelled" else "failed",
+                "run_origin": self.current_run_origin,
+                "tag_match": self.current_tag_match,
+            }
+            self.footer_bar.set_status(
+                "Photo organization cancelled before it started."
+                if status == "cancelled"
+                else "Photo organization could not start."
+            )
+            self._set_activity("Cancelled" if status == "cancelled" else "Failed")
+            self._set_running_state(False)
+        self._update_footer_storage_state()
+
+    def _cancel_cluster_tag_context_refresh(self) -> None:
+        job = self._tag_context_job
+        thread = self._tag_context_thread
+        self._retain_async_refs(job, thread)
+        self._tag_context_job = None
+        self._tag_context_thread = None
+        self._tag_context_job_id = None
+        if job is None:
+            return
+        self._tag_context_generation += 1
+        self._cancel_app_async_job(job)
         self._update_footer_storage_state()
 
     def _start_cluster_tag_context_refresh(self) -> None:
@@ -4865,18 +5963,18 @@ class ProductionClusterApp(QMainWindow):
         run_origin = self.current_run_origin
         tag_filter = tuple(self.current_tag_filter)
         tag_match = self.current_tag_match or "Any"
+        resource_paths = tuple(
+            dict.fromkeys(
+                str(image_path)
+                for clusters in snapshot.values()
+                for image_paths in clusters.values()
+                for image_path in image_paths
+                if str(image_path or "").strip()
+            )
+        )
 
         def _run(progress, cancel_check):
-            all_paths: list[str] = []
-            seen: set[str] = set()
-            for clusters in snapshot.values():
-                for image_paths in clusters.values():
-                    for image_path in image_paths:
-                        normalized = str(image_path or "").strip()
-                        if not normalized or normalized in seen:
-                            continue
-                        seen.add(normalized)
-                        all_paths.append(normalized)
+            all_paths = list(resource_paths)
 
             def _tag_progress(value: int, status: str) -> None:
                 progress(min(80, max(0, int(value * 0.8))), status)
@@ -4918,18 +6016,6 @@ class ProductionClusterApp(QMainWindow):
 
         job = AsyncJob(_run)
         self._tag_context_job = job
-        job_id = self.job_manager.register_job(
-            "Refreshing cluster tag context",
-            cancel_fn=job.cancel,
-            origin="Clustering",
-            foreground=False,
-        )
-        self._tag_context_job_id = job_id
-        job.progress.connect(
-            lambda value, text, job_id=job_id: self.job_manager.update(
-                job_id, progress=value, text=str(text)
-            )
-        )
         self._set_activity("Refreshing cluster tag context...")
         thread_holder: dict[str, object | None] = {"thread": None}
 
@@ -4999,9 +6085,25 @@ class ProductionClusterApp(QMainWindow):
         job.failed.connect(lambda _message: _cleanup())
         job.cancelled.connect(_cancelled)
         job.cancelled.connect(lambda: _cleanup())
-        thread = start_job_in_thread(job)
-        thread_holder["thread"] = thread
-        self._tag_context_thread = thread
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._tag_context_thread = thread
+            self._retain_async_refs(job, thread)
+
+        job_id = self._submit_app_async_job(
+            job,
+            JobSpec(
+                "Refreshing cluster tag context",
+                origin="Organize",
+                foreground=False,
+                io_bound=True,
+                source_reads=resource_paths,
+                data_home_read=True,
+            ),
+            _launch,
+        )
+        self._tag_context_job_id = job_id
         self._update_footer_storage_state()
 
     def closeEvent(self, event) -> None:
@@ -5011,7 +6113,9 @@ class ProductionClusterApp(QMainWindow):
         self._close_pending = True
         self._is_shutting_down = True
         self.job_presentation.shutdown()
+        self.jobs_widget.shutdown()
         self._startup_check_timer.stop()
+        self._startup_maintenance_timer.stop()
         self._post_install_timer.stop()
         self._pending_post_install_model_name = None
         self._pending_model_download_run = None
@@ -5019,8 +6123,13 @@ class ProductionClusterApp(QMainWindow):
         self._cancel_faces_workspace_load()
         self._cancel_request_preflight()
         self._cancel_cluster_tag_context_refresh()
+        if self._model_download_job_id is not None:
+            self.work_coordinator.cancel(self._model_download_job_id)
+        if self._active_job_id is not None:
+            self.work_coordinator.cancel(self._active_job_id)
         runtime_jobs = (
             (self._startup_maintenance_job, self._startup_maintenance_thread),
+            (self._model_storage_recovery_job, self._model_storage_recovery_thread),
             (self._storage_usage_job, self._storage_usage_thread),
             (self._storage_clear_job, self._storage_clear_thread),
             (self._post_install_model_job, self._post_install_model_thread),
@@ -5034,14 +6143,13 @@ class ProductionClusterApp(QMainWindow):
             if job is None:
                 continue
             self._retain_async_refs(job, thread)
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_app_async_job(job)
         self._storage_usage_job = None
         self._storage_usage_thread = None
         self._startup_maintenance_job = None
         self._startup_maintenance_thread = None
+        self._model_storage_recovery_job = None
+        self._model_storage_recovery_thread = None
         self._storage_clear_job = None
         self._storage_clear_thread = None
         self._post_install_model_job = None
@@ -5068,27 +6176,24 @@ class ProductionClusterApp(QMainWindow):
         # to run before the following close attempt can succeed.
         ready_to_close = self._wait_for_thread(self._tag_context_thread, drain_timeout_ms)
         retained_jobs = list(self._retained_async_refs)
+        retained_while_running: list[tuple[object | None, object | None]] = []
         for job, thread in retained_jobs:
             if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    pass
-            ready_to_close = self._wait_for_thread(thread, drain_timeout_ms) and ready_to_close
-        if ready_to_close:
+                self._cancel_app_async_job(job)
+            thread_ready = self._wait_for_thread(thread, drain_timeout_ms)
+            ready_to_close = thread_ready and ready_to_close
+            if not thread_ready:
+                retained_while_running.append((job, thread))
+        if not retained_while_running:
             for job, thread in (*runtime_jobs, *retained_jobs):
-                dispose = getattr(job, "dispose", None)
-                if callable(dispose):
-                    try:
-                        dispose()
-                    except Exception:
-                        pass
+                if isinstance(job, AsyncJob):
+                    defer_async_job_dispose(job)
                 try:
                     if getattr(thread, "_job", None) is job:
                         thread._job = None
                 except (AttributeError, RuntimeError):
                     pass
-        self._retained_async_refs = []
+        self._retained_async_refs = retained_while_running
         ready_to_close = self.model_download_controller.shutdown(drain_timeout_ms) and ready_to_close
         ready_to_close = self.session_controller.shutdown(drain_timeout_ms) and ready_to_close
         try:
@@ -5132,6 +6237,12 @@ class ProductionClusterApp(QMainWindow):
 
                 def _retry_close() -> None:
                     self._close_retry_scheduled = False
+                    if sip.isdeleted(self):
+                        try:
+                            _CLOSE_PENDING_WINDOWS.remove(self)
+                        except ValueError:
+                            pass
+                        return
                     if self._close_pending:
                         self.close()
 
@@ -5147,6 +6258,11 @@ class ProductionClusterApp(QMainWindow):
             pass
         self.settings_store.setValue("workspace/default_view", self._active_workspace)
         self.settings_store.setValue("workspace/faces_mode", self._faces_mode)
+        if self.faces_pane is not None:
+            self.settings_store.setValue(
+                PEOPLE_WORKSPACE_STATE_KEY,
+                json.dumps(self.faces_pane.export_workspace_state(), sort_keys=True),
+            )
         self.settings_store.sync()
         super().closeEvent(event)
 
@@ -5154,11 +6270,16 @@ class ProductionClusterApp(QMainWindow):
         self._is_shutting_down = True
         self._pending_model_download_run = None
         self._active_post_install_model_name = None
-        try:
-            self.model_download_controller.cancel()
-        except Exception:
-            pass
-        for timer_name in ("_startup_check_timer", "_post_install_timer"):
+        if self._model_download_job_id is not None:
+            self.work_coordinator.cancel(self._model_download_job_id)
+        else:
+            try:
+                self.model_download_controller.cancel()
+            except Exception:
+                pass
+        if self._active_job_id is not None:
+            self.work_coordinator.cancel(self._active_job_id)
+        for timer_name in ("_startup_check_timer", "_startup_maintenance_timer", "_post_install_timer"):
             timer = getattr(self, timer_name, None)
             if timer is None:
                 continue
@@ -5185,6 +6306,7 @@ class ProductionClusterApp(QMainWindow):
             "_storage_clear_job",
             "_post_install_model_job",
             "_startup_readiness_job",
+            "_model_storage_recovery_job",
             "_faces_init_job",
             "_names_init_job",
             "_gallery_discovery_job",
@@ -5192,10 +6314,7 @@ class ProductionClusterApp(QMainWindow):
             job = getattr(self, job_name, None)
             if job is None:
                 continue
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_app_async_job(job)
         self._finish_pending_photo_face_tool_requests(error="The application is closing.")
 
 
@@ -5207,6 +6326,31 @@ def _restore_cluster_dict(raw: dict[str, object]) -> dict[str, dict[int, list[st
             for cluster_id, image_paths in dict(clusters).items()
         }
     return restored
+
+
+def _prepare_clustering_result_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Normalize a potentially large worker result before its bounded Qt commit."""
+
+    return {
+        "_prepared": {
+            "cluster_data": _restore_cluster_dict(dict(payload.get("clusters_by_key") or {})),
+            "membership_by_image": _restore_membership(dict(payload.get("membership_by_image") or {})),
+            "metrics_by_backend": {
+                str(key): dict(value)
+                for key, value in dict(payload.get("metrics_by_key") or {}).items()
+            },
+            "cluster_explanations": _restore_cluster_explanations(
+                dict(payload.get("cluster_explanations_by_key") or {})
+            ),
+            "cluster_meanings": _restore_cluster_meanings(
+                dict(payload.get("cluster_meanings_by_key") or {})
+            ),
+            "metrics": dict(payload.get("metrics") or {}),
+            "cluster_tag_summaries": _restore_cluster_summaries(
+                dict(payload.get("cluster_summaries") or {})
+            ),
+        }
+    }
 
 
 def _restore_membership(raw: dict[str, object]) -> dict[str, dict[str, dict[str, object]]]:
@@ -5267,7 +6411,7 @@ def _build_gallery_context(
     return context
 
 
-def run() -> int:
+def run(*, new_instance: bool = False) -> int:
     configure_rotating_logging(RUNTIME_LAYOUT, force=True)
     startup_id = uuid.uuid4().hex[:8]
     LOGGER.info(
@@ -5285,6 +6429,14 @@ def run() -> int:
         app.setApplicationName(PRODUCTION_DISPLAY_NAME)
         app.setApplicationDisplayName(PRODUCTION_DISPLAY_NAME)
         app.setOrganizationName(PRODUCTION_QSETTINGS_ORG)
+        smoke_scenario = str(os.environ.get(PACKAGED_LAUNCH_SMOKE_ENV) or "").strip()
+        coordinator = None
+        platform_name = str(app.platformName() or "").lower()
+        if not new_instance and not smoke_scenario and platform_name not in {"offscreen", "minimal"}:
+            coordinator = SingleInstanceCoordinator(RUNTIME_LAYOUT.root, app)
+            if not coordinator.acquire_or_handoff(lambda: _activate_existing_window(app)):
+                LOGGER.info("startup delegated to existing instance | id=%s", startup_id)
+                return 0
         desktop_entry_path = configure_linux_desktop_entry(app, executable_path=Path(sys.executable))
         icon_path = production_icon_path()
         app_icon = production_app_icon()
@@ -5303,10 +6455,18 @@ def run() -> int:
         )
         install_qt_message_handler()
         LOGGER.info("qt diagnostics installed | id=%s log=%s", startup_id, RUNTIME_LAYOUT.qt_diagnostics_log)
-        apply_ultra_dark(app)
-        LOGGER.info("theme applied | id=%s", startup_id)
+        theme_manager = install_theme_manager(app, production_settings_store())
+        LOGGER.info(
+            "theme applied | id=%s preference=%s resolved=%s viewer_backdrop=%s",
+            startup_id,
+            theme_manager.theme_preference,
+            theme_manager.resolved_theme,
+            theme_manager.viewer_backdrop,
+        )
         window = ProductionClusterApp(RUNTIME_LAYOUT)
-        smoke_scenario = str(os.environ.get(PACKAGED_LAUNCH_SMOKE_ENV) or "").strip()
+        if coordinator is not None:
+            coordinator.set_activation_handler(lambda: _activate_window(window))
+            app.aboutToQuit.connect(coordinator.close)
         if smoke_scenario:
             # The launch verifier always supplies an isolated runtime root. Do
             # not let the first-run modal race its noninteractive smoke path.
@@ -5345,6 +6505,24 @@ def run() -> int:
         flush_logging_handlers()
 
 
+def _activate_window(window: QMainWindow) -> None:
+    """Make a handoff target visible without changing its workspace state."""
+
+    if window.isMinimized():
+        window.showNormal()
+    elif not window.isVisible():
+        window.show()
+    window.raise_()
+    window.activateWindow()
+
+
+def _activate_existing_window(app: QApplication) -> None:
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, QMainWindow) and widget.isVisible():
+            _activate_window(widget)
+            return
+
+
 def _complete_packaged_launch_smoke(
     app: QApplication,
     window: ProductionClusterApp,
@@ -5367,7 +6545,6 @@ def _complete_packaged_launch_smoke(
         dialog = window._create_settings_dialog(parent=window)
         dialog.show()
         app.processEvents()
-        storage_tab_names = [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())]
         expected_categories = set(
             window.cache_maintenance_service.generated_storage_targets(runtime_layout=window.runtime_layout)
         )
@@ -5382,7 +6559,7 @@ def _complete_packaged_launch_smoke(
             "frozen_executable": bool(getattr(sys, "frozen", False)),
             "window_icon": not app.windowIcon().isNull(),
             "settings_dialog_visible": bool(dialog.isVisible()),
-            "storage_tab": "Storage" in storage_tab_names,
+            "storage_tab": _select_settings_storage_section(dialog),
             "generated_storage_controls": all(
                 getattr(dialog, attribute, None) is not None
                 for attribute in (
@@ -5422,6 +6599,18 @@ def _complete_packaged_launch_smoke(
         # contract is to wait for user-visible background work to finish.
         window.hide()
         app.quit()
+
+
+def _select_settings_storage_section(dialog) -> bool:
+    """Select and verify the stable Storage destination without copy coupling."""
+
+    section = getattr(dialog, "settings_section_tabs", {}).get("Storage")
+    if section is None or not dialog.select_section("Storage"):
+        return False
+    top_index, nested, page = section
+    if dialog.tabs.currentIndex() != top_index:
+        return False
+    return nested is None or nested.currentWidget() is page
 
 
 def _show_main_window_on_screen(window: ProductionClusterApp) -> None:

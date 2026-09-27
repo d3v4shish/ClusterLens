@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.path_scope import PathScope
+from app.services.source_admission import SourceAdmissionPolicy
 from infra.cancel import Cancelled
 from infra.settings import get_settings
 
@@ -19,11 +20,15 @@ class DiscoveryResult:
     fingerprints: tuple[tuple[str, int, int], ...] = ()
     complete: bool = True
     warning_count: int = 0
+    filtered_count: int = 0
 
 
 class ImageDiscoveryService:
-    def __init__(self) -> None:
+    def __init__(self, *, admission_policy: SourceAdmissionPolicy | None = None) -> None:
         self.settings = get_settings()
+        # Settings are snapshotted when a background operation is created, so
+        # a scan cannot change its own source set halfway through.
+        self.admission_policy = admission_policy or SourceAdmissionPolicy.from_global_settings()
 
     def discover(self, directory: str, recursive: bool | None = None) -> list[str]:
         return list(self.discover_result(directory, recursive=recursive).paths)
@@ -50,6 +55,7 @@ class ImageDiscoveryService:
         records_by_identity: dict[object, tuple[str, int, int]] = {}
         complete = True
         warning_count = 0
+        filtered_count = 0
         total_roots = len(scope.roots)
         for root_index, root in enumerate(scope.roots, start=1):
             if callable(cancel_check) and cancel_check():
@@ -75,6 +81,7 @@ class ImageDiscoveryService:
             )
             complete = bool(complete and result.complete)
             warning_count += int(result.warning_count)
+            filtered_count += int(result.filtered_count)
             for path, mtime_ns, size in result.fingerprints:
                 if callable(cancel_check) and cancel_check():
                     raise Cancelled()
@@ -90,6 +97,8 @@ class ImageDiscoveryService:
         payload = "\n".join(f"{path}|{mtime_ns}|{size}" for path, mtime_ns, size in records)
         if progress_callback is not None:
             message = f"Active-root scan complete: {len(records)} image(s) discovered across {total_roots} root(s)."
+            if filtered_count:
+                message += f" {filtered_count} file(s) were excluded by source filters."
             if not complete:
                 message += " Some paths could not be read."
             progress_callback(0, message)
@@ -100,6 +109,7 @@ class ImageDiscoveryService:
             fingerprints=tuple(records),
             complete=complete,
             warning_count=warning_count,
+            filtered_count=filtered_count,
         )
 
     def discover_result(self, directory: str, recursive: bool | None = None, progress_callback=None, cancel_check=None) -> DiscoveryResult:
@@ -115,6 +125,7 @@ class ImageDiscoveryService:
         last_progress_s = 0.0
         complete = True
         warning_count = 0
+        filtered_count = 0
         visited_dirs: set[object] = set()
 
         def mark_warning() -> None:
@@ -178,6 +189,10 @@ class ImageDiscoveryService:
                             if Path(entry.name).suffix.lower() not in extensions:
                                 continue
                             stat = entry.stat(follow_symlinks=True)
+                            decision = self.admission_policy.decide(entry_path, stat_result=stat)
+                            if not decision.admitted:
+                                filtered_count += 1
+                                continue
                             file_key = identity_key(entry_path, stat)
                             if file_key not in records_by_key:
                                 records_by_key[file_key] = (entry_path, int(stat.st_mtime_ns), int(stat.st_size))
@@ -197,6 +212,8 @@ class ImageDiscoveryService:
         payload = "\n".join(f"{path}|{mtime_ns}|{size}" for path, mtime_ns, size in records)
         if progress_callback is not None:
             message = f"Folder scan complete: {len(records)} image(s) discovered."
+            if filtered_count:
+                message += f" {filtered_count} file(s) were excluded by source filters."
             if not complete:
                 message = f"{message} Some paths could not be read."
             progress_callback(0, message)
@@ -207,6 +224,7 @@ class ImageDiscoveryService:
             fingerprints=tuple(records),
             complete=bool(complete),
             warning_count=int(warning_count),
+            filtered_count=int(filtered_count),
         )
 
     @staticmethod

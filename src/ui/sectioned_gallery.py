@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -25,11 +27,15 @@ from PyQt6.QtWidgets import (
 from app.selection import SelectionTarget
 from app.services.photo_metadata import PhotoMetadataService
 from app.services.thumbnails import ThumbnailService
+from infra.cancel import raise_if_cancelled
+from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
+from ui.count_copy import showing, thumbnail_progress
 from ui.gallery_model import GalleryImageModel
 from ui.gallery_pane import GalleryPane
 from ui.job_manager import JobManager
 from ui.photo_inspector_dialog import PhotoInspectorDialog
-from ui.theme import COLORS
+from ui.theme import COLORS, get_theme_manager
+from ui.work_coordinator import JobSpec, WorkCoordinator
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,22 @@ class _GridRow:
     depth: int = 0
 
 
+@dataclass(frozen=True)
+class _PreparedSectionedGalleryState:
+    """Pure, worker-safe hierarchy data ready for one model-reset commit."""
+
+    sections: tuple[GallerySection, ...]
+    columns: int
+    sections_by_id: dict[str, GallerySection]
+    paths_by_section: dict[str, tuple[str, ...]]
+    depth_by_section: dict[str, int]
+    all_paths: tuple[str, ...]
+    rows: tuple[_GridRow, ...]
+    path_locations: dict[str, tuple[int, int]]
+    header_rows: tuple[int, ...]
+    collapsed_section_ids: frozenset[str]
+
+
 class SectionedGalleryModel(QAbstractTableModel):
     HeaderRole = Qt.ItemDataRole.UserRole + 41
     PathRole = GalleryImageModel.PathRole
@@ -65,6 +87,8 @@ class SectionedGalleryModel(QAbstractTableModel):
         self._columns = 4
         self._sections: list[GallerySection] = []
         self._rows: list[_GridRow] = []
+        self._header_rows: tuple[int, ...] = ()
+        self._path_locations: dict[str, tuple[int, int]] = {}
         self._sections_by_id: dict[str, GallerySection] = {}
         self._paths_by_section: dict[str, tuple[str, ...]] = {}
         self._depth_by_section: dict[str, int] = {}
@@ -191,24 +215,54 @@ class SectionedGalleryModel(QAbstractTableModel):
         image = self._images.get(str(path))
         return QImage(image) if image is not None else None
 
-    def set_sections(self, sections: list[GallerySection], *, reset_scroll_state: bool = True) -> None:
+    @staticmethod
+    def prepare_sections(
+        sections: list[GallerySection] | tuple[GallerySection, ...],
+        *,
+        columns: int,
+        collapsed_section_ids: set[str] | frozenset[str] = frozenset(),
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> _PreparedSectionedGalleryState:
+        """Normalize and lay out sections without touching Qt model state.
+
+        This is intentionally a pure operation so a large hierarchy can be
+        prepared by an owned worker.  Scope/path validation belongs to the
+        caller that builds ``GallerySection``; this function only preserves
+        the gallery's stable ID and first-path-wins presentation contract.
+        """
+
+        effective_columns = max(1, int(columns))
         unique: list[GallerySection] = []
         seen_paths: set[str] = set()
         seen_ids: set[str] = set()
+        checks = 0
+
+        def _check_cancelled() -> None:
+            nonlocal checks
+            checks += 1
+            if checks % 128 == 0:
+                raise_if_cancelled(cancel_check)
 
         def _normalize(section: GallerySection) -> GallerySection | None:
+            _check_cancelled()
             section_id = str(section.section_id or "").strip()
             if not section_id or section_id in seen_ids:
                 return None
             seen_ids.add(section_id)
-            paths = tuple(str(path) for path in section.paths if path and str(path) not in seen_paths)
-            seen_paths.update(paths)
+            paths: list[str] = []
+            for path in section.paths:
+                _check_cancelled()
+                normalized_path = str(path or "").strip()
+                if not normalized_path or normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                paths.append(normalized_path)
             children = tuple(child for child in (_normalize(item) for item in section.children) if child is not None)
             if not paths and not children:
                 return None
             return GallerySection(
                 section_id,
-                paths,
+                tuple(paths),
                 section.kind,
                 section.title,
                 section.anchor_path,
@@ -220,36 +274,101 @@ class SectionedGalleryModel(QAbstractTableModel):
             normalized = _normalize(section)
             if normalized is not None:
                 unique.append(normalized)
-        self.beginResetModel()
-        self._sections = unique
-        self._sections_by_id = {}
-        self._paths_by_section = {}
-        self._depth_by_section = {}
+        raise_if_cancelled(cancel_check)
+        sections_by_id: dict[str, GallerySection] = {}
+        paths_by_section: dict[str, tuple[str, ...]] = {}
+        depth_by_section: dict[str, int] = {}
 
         def _index(section: GallerySection, depth: int) -> tuple[str, ...]:
-            self._sections_by_id[section.section_id] = section
-            self._depth_by_section[section.section_id] = depth
+            _check_cancelled()
+            sections_by_id[section.section_id] = section
+            depth_by_section[section.section_id] = depth
             paths = list(section.paths)
             for child in section.children:
                 paths.extend(_index(child, depth + 1))
             unique_paths = tuple(dict.fromkeys(paths))
-            self._paths_by_section[section.section_id] = unique_paths
+            paths_by_section[section.section_id] = unique_paths
             return unique_paths
 
         all_paths: list[str] = []
         for section in unique:
             all_paths.extend(_index(section, 0))
-        self._all_paths = tuple(dict.fromkeys(all_paths))
-        valid_paths = set(self._all_paths)
+        normalized_all_paths = tuple(dict.fromkeys(all_paths))
+        collapsed = frozenset(str(section_id) for section_id in collapsed_section_ids if str(section_id) in sections_by_id)
+        rows: list[_GridRow] = []
+
+        def _append(section: GallerySection, depth: int) -> None:
+            _check_cancelled()
+            rows.append(_GridRow("header", section.section_id, depth=depth))
+            if section.section_id in collapsed:
+                return
+            for offset in range(0, len(section.paths), effective_columns):
+                rows.append(
+                    _GridRow(
+                        "photos",
+                        section.section_id,
+                        section.paths[offset : offset + effective_columns],
+                        depth,
+                    )
+                )
+            for child in section.children:
+                _append(child, depth + 1)
+
+        for section in unique:
+            _append(section, 0)
+        path_locations = {
+            path: (row_index, column)
+            for row_index, row in enumerate(rows)
+            if row.kind == "photos"
+            for column, path in enumerate(row.paths)
+        }
+        header_rows = tuple(index for index, row in enumerate(rows) if row.kind == "header")
+        raise_if_cancelled(cancel_check)
+        return _PreparedSectionedGalleryState(
+            sections=tuple(unique),
+            columns=effective_columns,
+            sections_by_id=sections_by_id,
+            paths_by_section=paths_by_section,
+            depth_by_section=depth_by_section,
+            all_paths=normalized_all_paths,
+            rows=tuple(rows),
+            path_locations=path_locations,
+            header_rows=header_rows,
+            collapsed_section_ids=collapsed,
+        )
+
+    def apply_prepared_sections(self, prepared: _PreparedSectionedGalleryState) -> None:
+        """Commit one already-normalized hierarchy in a single Qt reset."""
+
+        valid_paths = set(prepared.all_paths)
+        self.beginResetModel()
+        self._sections = list(prepared.sections)
+        self._columns = max(1, int(prepared.columns))
+        self._sections_by_id = dict(prepared.sections_by_id)
+        self._paths_by_section = dict(prepared.paths_by_section)
+        self._depth_by_section = dict(prepared.depth_by_section)
+        self._all_paths = tuple(prepared.all_paths)
         self._paths = valid_paths
-        self._collapsed.intersection_update(self._sections_by_id)
+        self._collapsed = set(prepared.collapsed_section_ids)
         self._checked_sections.intersection_update(self._sections_by_id)
         self._checked_paths.intersection_update(valid_paths)
         self._images = OrderedDict((path, image) for path, image in self._images.items() if path in valid_paths)
         self._labels = {path: label for path, label in self._labels.items() if path in valid_paths}
         self._failed = {path: error for path, error in self._failed.items() if path in valid_paths}
-        self._rebuild_rows()
+        self._rows = list(prepared.rows)
+        self._path_locations = dict(prepared.path_locations)
+        self._header_rows = tuple(prepared.header_rows)
         self.endResetModel()
+
+    def set_sections(self, sections: list[GallerySection], *, reset_scroll_state: bool = True) -> None:
+        _ = reset_scroll_state
+        self.apply_prepared_sections(
+            self.prepare_sections(
+                sections,
+                columns=self._columns,
+                collapsed_section_ids=self._collapsed,
+            )
+        )
 
     def set_column_count(self, columns: int) -> None:
         columns = max(1, int(columns))
@@ -275,6 +394,13 @@ class SectionedGalleryModel(QAbstractTableModel):
         for section in self._sections:
             _append(section, 0)
         self._rows = rows
+        self._header_rows = tuple(index for index, row in enumerate(rows) if row.kind == "header")
+        self._path_locations = {
+            path: (row_index, column)
+            for row_index, row in enumerate(rows)
+            if row.kind == "photos"
+            for column, path in enumerate(row.paths)
+        }
 
     def toggle_collapsed(self, section_id: str) -> None:
         if section_id not in self._sections_by_id:
@@ -351,12 +477,12 @@ class SectionedGalleryModel(QAbstractTableModel):
         self._emit_path_changed(path, [self.FailedRole])
 
     def _emit_path_changed(self, path: str, roles: list[int]) -> None:
-        for row_index, row in enumerate(self._rows):
-            if row.kind != "photos" or path not in row.paths:
-                continue
-            column = row.paths.index(path)
-            index = self.index(row_index, column)
-            self.dataChanged.emit(index, index, roles)
+        location = self._path_locations.get(str(path))
+        if location is None:
+            return
+        row_index, column = location
+        index = self.index(row_index, column)
+        self.dataChanged.emit(index, index, roles)
 
 
 class _SectionedPhotoDelegate(QStyledItemDelegate):
@@ -522,6 +648,20 @@ class _GroupHoverPreviewPopup(QFrame):
         self.note.setStyleSheet(f"color: {COLORS['text_muted']};")
         layout.addWidget(self.note)
         self.setFixedWidth(240)
+        manager = get_theme_manager()
+        if manager is not None:
+            manager.theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, *_args) -> None:
+        self.setStyleSheet(
+            f"QFrame#groupHoverPreviewPopup {{ background: {COLORS['surface_raised']}; "
+            f"border: 1px solid {COLORS['border_strong']}; border-radius: 8px; }} "
+            f"QLabel {{ color: {COLORS['text']}; }}"
+        )
+        self.image.setStyleSheet(
+            f"background: {COLORS['surface_sunken']}; border: 1px solid {COLORS['border']};"
+        )
+        self.note.setStyleSheet(f"color: {COLORS['text_muted']};")
 
     def set_group(self, section: GallerySection, image: QImage, *, paths: tuple[str, ...], loading: bool) -> None:
         self.title.setText(f"{section.title or 'Photos'} · {len(paths)} photos")
@@ -535,6 +675,7 @@ class _GroupHoverPreviewPopup(QFrame):
 
 
 class SectionedGallery(QWidget):
+    ASYNC_PREPARE_PATH_THRESHOLD = 2_000
     organize_requested = pyqtSignal()
     analyze_requested = pyqtSignal(list)
     review_faces_requested = pyqtSignal(list)
@@ -557,11 +698,21 @@ class SectionedGallery(QWidget):
         self._loading_paths: set[str] = set()
         self._label_paths: set[str] = set()
         self._job_manager: JobManager | None = None
+        self._work_coordinator: WorkCoordinator | None = None
+        self._job_origin = "Photos"
         self._viewport_job_id: int | None = None
         self._viewport_job_generation = -1
         self._viewport_tasks: set[tuple[str, str]] = set()
         self._viewport_completed_tasks: set[tuple[str, str]] = set()
         self._generation = 0
+        self._section_prepare_generation = 0
+        self._section_prepare_job = None
+        self._section_prepare_thread = None
+        self._section_prepare_coordinated_job_ids: dict[AsyncJob, int] = {}
+        self._pending_section_column_count: int | None = None
+        self._retained_section_prepare_refs: list[tuple[object, object]] = []
+        self._viewport_paths: set[str] = set()
+        self._table_geometry: tuple[int, int, int, int] | None = None
         self._read_only = False
         self.face_service_provider = None
         # A routed gallery can retain the exact source context that opened a
@@ -599,15 +750,15 @@ class SectionedGallery(QWidget):
         self.progress_bar.setAccessibleName("Visible photo loading progress")
         self.progress_bar.hide()
         self.organize_button = QPushButton("Organize")
-        self.organize_button.setToolTip("Arrange this folder using the current Clustering settings.")
+        self.organize_button.setToolTip("Arrange this folder using the current Organize preset.")
         self.organize_button.clicked.connect(self.organize_requested.emit)
-        self.analyze_button = QPushButton("Analyze in Clustering")
-        self.analyze_button.setToolTip("Use this explicit photo set as the input to Clustering.")
-        self.analyze_button.setAccessibleName("Analyze current photo set in Clustering")
+        self.analyze_button = QPushButton("Organize this photo set")
+        self.analyze_button.setToolTip("Use this explicit photo set as the input to Organize.")
+        self.analyze_button.setAccessibleName("Organize current photo set")
         self.analyze_button.clicked.connect(lambda: self.analyze_requested.emit(self.selected_or_all_paths()))
-        self.review_faces_button = QPushButton("Review Faces")
-        self.review_faces_button.setToolTip("Open this explicit photo set in Faces. Detection starts only after you choose Detect Faces.")
-        self.review_faces_button.setAccessibleName("Review current photo set in Faces")
+        self.review_faces_button = QPushButton("Review people")
+        self.review_faces_button.setToolTip("Open this explicit photo set in People. Detection starts only after you choose Detect faces.")
+        self.review_faces_button.setAccessibleName("Review people in current photo set")
         self.review_faces_button.clicked.connect(lambda: self.review_faces_requested.emit(self.selected_or_all_paths()))
         self.back_to_folder_button = QPushButton("Back to Folder Photos")
         self.back_to_folder_button.setToolTip("Return to all photos in the selected folder.")
@@ -685,10 +836,18 @@ class SectionedGallery(QWidget):
         self.table.selectionModel().selectionChanged.connect(lambda *_args: self._refresh_group_bar())
         layout.addWidget(self.table, stretch=1)
 
-    def set_job_manager(self, job_manager: JobManager | None) -> None:
+    def set_job_manager(
+        self,
+        job_manager: JobManager | None,
+        *,
+        origin: str = "Photos",
+        work_coordinator: WorkCoordinator | None = None,
+    ) -> None:
         """Route visible gallery work to the shared Jobs surface."""
         self._job_manager = job_manager
-        self._actions.job_manager = job_manager
+        self._work_coordinator = work_coordinator
+        self._job_origin = str(origin or "Photos")
+        self._actions.configure_jobs(job_manager, work_coordinator, origin=self._job_origin)
 
     def set_photo_set_route(
         self,
@@ -730,6 +889,178 @@ class SectionedGallery(QWidget):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
 
+    @staticmethod
+    def _section_path_count(sections: list[GallerySection] | tuple[GallerySection, ...]) -> int:
+        """Count declared paths without traversing or normalizing each path."""
+
+        total = 0
+        pending = list(sections)
+        while pending:
+            section = pending.pop()
+            total += len(section.paths)
+            pending.extend(section.children)
+        return total
+
+    def _selected_paths_and_anchor(self) -> tuple[set[str], str]:
+        selection_model = self.table.selectionModel()
+        selected_paths = {
+            self._model.path_at(index)
+            for index in (selection_model.selectedIndexes() if selection_model is not None else ())
+            if self._model.path_at(index)
+        }
+        anchor_index = self.table.indexAt(QPoint(0, 0))
+        anchor_path = self._model.path_at(anchor_index)
+        return selected_paths, anchor_path
+
+    def _restore_paths_and_anchor(self, selected_paths: set[str], anchor_path: str) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.table):
+            return
+        selection_model = self.table.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            for path in selected_paths:
+                location = self._model._path_locations.get(path)  # noqa: SLF001 - model owns stable row identity
+                if location is None:
+                    continue
+                index = self._model.index(*location)
+                selection_model.select(index, QItemSelectionModel.SelectionFlag.Select)
+        location = self._model._path_locations.get(str(anchor_path))  # noqa: SLF001 - model owns stable row identity
+        if location is not None:
+            self.table.scrollTo(self._model.index(*location), QAbstractItemView.ScrollHint.PositionAtTop)
+
+    def _cancel_section_preparation(self) -> None:
+        job = self._section_prepare_job
+        if job is not None:
+            coordinated_job_id = self._section_prepare_coordinated_job_ids.get(job)
+            if self._work_coordinator is not None and coordinated_job_id is not None:
+                self._work_coordinator.cancel(coordinated_job_id)
+            else:
+                try:
+                    job.cancel()
+                except Exception:
+                    pass
+        self._section_prepare_job = None
+        self._section_prepare_thread = None
+        self._pending_section_column_count = None
+
+    def _release_section_preparation_thread(self, thread: object) -> None:
+        self._retained_section_prepare_refs = [
+            (job, retained_thread)
+            for job, retained_thread in self._retained_section_prepare_refs
+            if retained_thread is not thread
+        ]
+
+    def _publish_prepared_sections(
+        self,
+        prepared: _PreparedSectionedGalleryState,
+        *,
+        status: str,
+        selected_paths: set[str],
+        anchor_path: str,
+    ) -> None:
+        self._model.apply_prepared_sections(prepared)
+        self.progress_bar.hide()
+        # Section resets can change which rows span the whole table even when
+        # the viewport size and number of columns are unchanged.
+        self._table_geometry = None
+        self._apply_table_geometry()
+        self.status_label.setText(status or f"{showing(len(self._model.all_paths()), 'photo')}.")
+        self._refresh_group_bar()
+        QTimer.singleShot(0, lambda: self._restore_paths_and_anchor(selected_paths, anchor_path))
+        QTimer.singleShot(0, self._queue_visible_loads)
+
+    def _prepare_sections_in_background(
+        self,
+        sections: tuple[GallerySection, ...],
+        *,
+        columns: int,
+        collapsed_section_ids: set[str],
+        status: str,
+        selected_paths: set[str],
+        anchor_path: str,
+    ) -> None:
+        self._cancel_section_preparation()
+        self._section_prepare_generation += 1
+        generation = self._section_prepare_generation
+        columns = max(1, int(columns))
+        self._pending_section_column_count = columns
+        self.status_label.setText(f"Preparing {self._section_path_count(sections)} photo rows…")
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
+
+        def _run(_progress, cancel_check):
+            return SectionedGalleryModel.prepare_sections(
+                sections,
+                columns=columns,
+                collapsed_section_ids=collapsed_section_ids,
+                cancel_check=cancel_check,
+            )
+
+        job = AsyncJob(_run)
+        self._section_prepare_job = job
+        thread_holder: dict[str, object | None] = {"thread": None}
+
+        def _clear() -> None:
+            thread = thread_holder["thread"]
+            self._section_prepare_coordinated_job_ids.pop(job, None)
+            if self._section_prepare_job is job:
+                self._section_prepare_job = None
+                self._pending_section_column_count = None
+            if self._section_prepare_thread is thread:
+                self._section_prepare_thread = None
+
+        def _completed(prepared: object) -> None:
+            if self._shutting_down or generation != self._section_prepare_generation:
+                _clear()
+                return
+            if not isinstance(prepared, _PreparedSectionedGalleryState):
+                self.status_label.setText("Photo layout preparation returned an invalid result.")
+                self.progress_bar.hide()
+                _clear()
+                return
+            self.progress_bar.hide()
+            self._publish_prepared_sections(
+                prepared,
+                status=status,
+                selected_paths=selected_paths,
+                anchor_path=anchor_path,
+            )
+            _clear()
+
+        def _failed(message: str) -> None:
+            if not self._shutting_down and generation == self._section_prepare_generation:
+                self.status_label.setText(f"Photo layout preparation stopped: {str(message or 'unknown error')}")
+                self.progress_bar.hide()
+            _clear()
+
+        job.completed.connect(_completed)
+        job.failed.connect(_failed)
+        job.cancelled.connect(_clear)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            thread_holder["thread"] = thread
+            self._section_prepare_thread = thread
+            self._retained_section_prepare_refs.append((job, thread))
+            thread.finished.connect(lambda thread=thread: self._release_section_preparation_thread(thread))
+
+        if self._work_coordinator is None:
+            _launch()
+            return
+        coordinated_job_id = self._work_coordinator.submit_async_job(
+            JobSpec(
+                "Preparing photo layout",
+                origin=self._job_origin,
+                foreground=False,
+                cpu_slots=1,
+            ),
+            job,
+            _launch,
+        )
+        state = self._work_coordinator.job_manager.get(coordinated_job_id)
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._section_prepare_coordinated_job_ids[job] = coordinated_job_id
+
     def set_sections(self, sections: list[GallerySection], *, status: str = "") -> None:
         if self._shutting_down:
             return
@@ -738,11 +1069,32 @@ class SectionedGallery(QWidget):
         self._generation += 1
         self._loading_paths.clear()
         self._label_paths.clear()
-        self._model.set_sections(sections)
-        self._apply_table_geometry()
-        self.status_label.setText(status or f"Showing {len(self._model.all_paths())} photos.")
-        self._refresh_group_bar()
-        QTimer.singleShot(0, self._queue_visible_loads)
+        snapshot = tuple(sections)
+        selected_paths, anchor_path = self._selected_paths_and_anchor()
+        collapsed_section_ids = set(self._model._collapsed)  # noqa: SLF001 - model owns collapse identity
+        if self._section_path_count(snapshot) >= self.ASYNC_PREPARE_PATH_THRESHOLD:
+            self._prepare_sections_in_background(
+                snapshot,
+                columns=self._model.columnCount(),
+                collapsed_section_ids=collapsed_section_ids,
+                status=status,
+                selected_paths=selected_paths,
+                anchor_path=anchor_path,
+            )
+            return
+        self._cancel_section_preparation()
+        self._section_prepare_generation += 1
+        prepared = SectionedGalleryModel.prepare_sections(
+            snapshot,
+            columns=self._model.columnCount(),
+            collapsed_section_ids=collapsed_section_ids,
+        )
+        self._publish_prepared_sections(
+            prepared,
+            status=status,
+            selected_paths=selected_paths,
+            anchor_path=anchor_path,
+        )
 
     def set_sections_with_collapsed(
         self,
@@ -760,12 +1112,31 @@ class SectionedGallery(QWidget):
         self._generation += 1
         self._loading_paths.clear()
         self._label_paths.clear()
-        self._model.set_sections(sections)
-        self._model.set_collapsed_sections(collapsed_section_ids)
-        self._apply_table_geometry()
-        self.status_label.setText(status or f"Showing {len(self._model.all_paths())} photos.")
-        self._refresh_group_bar()
-        QTimer.singleShot(0, self._queue_visible_loads)
+        snapshot = tuple(sections)
+        selected_paths, anchor_path = self._selected_paths_and_anchor()
+        if self._section_path_count(snapshot) >= self.ASYNC_PREPARE_PATH_THRESHOLD:
+            self._prepare_sections_in_background(
+                snapshot,
+                columns=self._model.columnCount(),
+                collapsed_section_ids=set(collapsed_section_ids),
+                status=status,
+                selected_paths=selected_paths,
+                anchor_path=anchor_path,
+            )
+            return
+        self._cancel_section_preparation()
+        self._section_prepare_generation += 1
+        prepared = SectionedGalleryModel.prepare_sections(
+            snapshot,
+            columns=self._model.columnCount(),
+            collapsed_section_ids=collapsed_section_ids,
+        )
+        self._publish_prepared_sections(
+            prepared,
+            status=status,
+            selected_paths=selected_paths,
+            anchor_path=anchor_path,
+        )
 
     def set_empty_state(self, text: str, *, can_organize: bool = False) -> None:
         if self._shutting_down:
@@ -802,6 +1173,22 @@ class SectionedGallery(QWidget):
         self.return_to_source_button.hide()
         self.table.setAccessibleName("Library timeline photos")
 
+    def set_embedded_review_mode(self, enabled: bool) -> None:
+        """Trim non-review controls when this is a small, virtual preview."""
+
+        if not enabled:
+            return
+        self.route_label.hide()
+        self.organize_button.hide()
+        self.analyze_button.hide()
+        self.review_faces_button.hide()
+        self.back_to_folder_button.hide()
+        self.return_to_source_button.hide()
+        self.expand_all_button.hide()
+        self.collapse_all_button.hide()
+        self.group_bar.hide()
+        self.table.setAccessibleName("Selected duplicate group photo preview")
+
     def configure_photo_tools(
         self,
         *,
@@ -830,28 +1217,53 @@ class SectionedGallery(QWidget):
         if not hasattr(self, "table"):
             return
         columns = max(1, self.table.viewport().width() // max(120, self._tile_size + 18))
-        self._model.set_column_count(columns)
-        self.table.clearSpans()
         width = max(80, self.table.viewport().width() // columns)
+        if columns != self._model.columnCount():
+            if self._section_path_count(tuple(self._model.root_sections())) >= self.ASYNC_PREPARE_PATH_THRESHOLD:
+                if self._pending_section_column_count != columns:
+                    selected_paths, anchor_path = self._selected_paths_and_anchor()
+                    self._prepare_sections_in_background(
+                        tuple(self._model.root_sections()),
+                        columns=columns,
+                        collapsed_section_ids=set(self._model._collapsed),  # noqa: SLF001 - model owns collapse identity
+                        status=self.status_label.text(),
+                        selected_paths=selected_paths,
+                        anchor_path=anchor_path,
+                    )
+                return
+            self._model.set_column_count(columns)
+        geometry = (columns, width, self._model.rowCount(), self._tile_size)
+        if geometry == self._table_geometry:
+            return
+        self._table_geometry = geometry
+        self.table.clearSpans()
+        vertical_header = self.table.verticalHeader()
+        vertical_header.setDefaultSectionSize(self._tile_size + 58)
         for column in range(columns):
             self.table.setColumnWidth(column, width)
-        for row in range(self._model.rowCount()):
-            index = self._model.index(row, 0)
-            if self._model.section_at_header(index) is not None:
-                if columns > 1:
-                    self.table.setSpan(row, 0, 1, columns)
-                self.table.setRowHeight(row, 42)
-            else:
-                self.table.setRowHeight(row, self._tile_size + 58)
+        for row in self._model._header_rows:  # noqa: SLF001 - model precomputes sparse header geometry
+            if columns > 1:
+                self.table.setSpan(row, 0, 1, columns)
+            self.table.setRowHeight(row, 42)
+
+    def _visible_row_bounds(self) -> tuple[int, int]:
+        count = self._model.rowCount()
+        if count == 0:
+            return 0, -1
+        viewport = self.table.viewport().rect()
+        first = self.table.rowAt(viewport.top())
+        last = self.table.rowAt(max(viewport.top(), viewport.bottom() - 1))
+        if first < 0:
+            first = 0
+        if last < 0:
+            last = count - 1
+        return max(0, first), min(count - 1, last)
 
     def _visible_indexes(self) -> list[QModelIndex]:
-        viewport = self.table.viewport().rect()
         indexes: list[QModelIndex] = []
-        for row in range(self._model.rowCount()):
+        first, last = self._visible_row_bounds()
+        for row in range(first, last + 1):
             index = self._model.index(row, 0)
-            rect = self.table.visualRect(index)
-            if rect.bottom() < viewport.top() or rect.top() > viewport.bottom():
-                continue
             if self._model.section_at_header(index) is not None:
                 continue
             for column in range(self._model.columnCount()):
@@ -864,19 +1276,32 @@ class SectionedGallery(QWidget):
         if self._shutting_down:
             return
         preview_paths: list[str] = []
-        viewport = self.table.viewport().rect()
-        for row in range(self._model.rowCount()):
+        first, last = self._visible_row_bounds()
+        for row in range(first, last + 1):
             index = self._model.index(row, 0)
             if self._model.section_at_header(index) is None:
-                continue
-            rect = self.table.visualRect(index)
-            if rect.bottom() < viewport.top() or rect.top() > viewport.bottom():
                 continue
             section = self._model.section_at_header(index)
             if section is not None:
                 preview_paths.extend(self._model.paths_for_section(section.section_id)[:3])
         visible_paths = [self._model.path_at(index) for index in self._visible_indexes()]
-        self._queue_paths((preview_paths + visible_paths)[:48])
+        visible_paths = [str(path) for path in visible_paths if path]
+        next_visible = set(visible_paths)
+        if next_visible != self._viewport_paths:
+            # A QThreadPool cannot interrupt an image decode safely, but it can
+            # discard not-yet-started work.  A fresh epoch prevents an old
+            # viewport result from repainting after a fast scroll.
+            self._generation += 1
+            self._job_pool.clear()
+            self._loading_paths.clear()
+            self._label_paths.clear()
+            self._finish_viewport_job(status="cancelled")
+            self._viewport_paths = next_visible
+        # Current tiles always enter the high-priority queue first.  Header
+        # contact-sheet previews are convenience work and must never delay the
+        # images the user can actually see.
+        self._queue_paths(visible_paths[:48], priority=10)
+        self._queue_paths(preview_paths[:24], priority=-10)
 
     def _queue_visible_loads_after_layout(self) -> None:
         # Model resets can report stale visual rectangles for one event loop.
@@ -884,7 +1309,7 @@ class SectionedGallery(QWidget):
         QTimer.singleShot(0, self._queue_visible_loads)
         QTimer.singleShot(60, self._queue_visible_loads)
 
-    def _queue_paths(self, paths: list[str] | tuple[str, ...]) -> None:
+    def _queue_paths(self, paths: list[str] | tuple[str, ...], *, priority: int = 0) -> None:
         if self._shutting_down:
             return
         generation = self._generation
@@ -897,16 +1322,17 @@ class SectionedGallery(QWidget):
                 )
                 runnable.loaded.connect(self._on_thumbnail_loaded)
                 runnable.failed.connect(self._on_thumbnail_failed)
-                self._job_pool.start(runnable)
+                self._job_pool.start(runnable, int(priority))
             if path not in self._label_paths:
                 self._label_paths.add(path)
                 self._begin_viewport_task(generation, path, "label")
                 label_runnable = _LabelRunnable(path, generation, self._job_pool)
                 label_runnable.loaded.connect(self._on_label_loaded)
-                self._job_pool.start(label_runnable)
+                self._job_pool.start(label_runnable, int(priority))
 
     def _on_thumbnail_loaded(self, generation: int, path: str, image: QImage) -> None:
-        self._loading_paths.discard(path)
+        if generation == self._generation:
+            self._loading_paths.discard(path)
         self._complete_viewport_task(generation, path, "thumbnail")
         if self._shutting_down or generation != self._generation or image.isNull():
             return
@@ -914,19 +1340,26 @@ class SectionedGallery(QWidget):
         self._refresh_hover_preview_for_path(path)
 
     def _on_thumbnail_failed(self, generation: int, path: str, error: str) -> None:
-        self._loading_paths.discard(path)
+        if generation == self._generation:
+            self._loading_paths.discard(path)
         self._complete_viewport_task(generation, path, "thumbnail")
         if not self._shutting_down and generation == self._generation:
             self._model.set_failed(path, error)
             self._refresh_hover_preview_for_path(path)
 
     def _on_label_loaded(self, generation: int, path: str, label: str) -> None:
-        self._label_paths.discard(path)
+        if generation == self._generation:
+            self._label_paths.discard(path)
         self._complete_viewport_task(generation, path, "label")
         if not self._shutting_down and generation == self._generation:
             self._model.set_label(path, label)
 
     def _begin_viewport_task(self, generation: int, path: str, kind: str) -> None:
+        # Label reads have their own cache and are not thumbnail work.  Keeping
+        # them out of this job makes the displayed denominator a truthful count
+        # of image decodes instead of a mixture of unrelated task units.
+        if str(kind) != "thumbnail":
+            return
         if generation != self._viewport_job_generation:
             self._finish_viewport_job(status="cancelled")
             self._viewport_job_generation = generation
@@ -938,11 +1371,13 @@ class SectionedGallery(QWidget):
         self._viewport_tasks.add(task)
         if self._viewport_job_id is None and self._job_manager is not None:
             self._viewport_job_id = self._job_manager.register_job(
-                "Loading visible photos", origin="Photos", foreground=False
+                "Loading visible thumbnails", origin=self._job_origin, foreground=False
             )
         self._update_viewport_progress()
 
     def _complete_viewport_task(self, generation: int, path: str, kind: str) -> None:
+        if str(kind) != "thumbnail":
+            return
         if generation != self._viewport_job_generation:
             return
         task = (str(path), str(kind))
@@ -963,7 +1398,7 @@ class SectionedGallery(QWidget):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(max(0, min(100, value)))
         self.progress_bar.show()
-        text = f"Loading visible photos: {completed}/{total}"
+        text = thumbnail_progress(completed, total, qualifier="visible")
         self.status_label.setText(text)
         if self._job_manager is not None and self._viewport_job_id is not None:
             self._job_manager.update(self._viewport_job_id, progress=value, text=text)
@@ -979,11 +1414,44 @@ class SectionedGallery(QWidget):
         self._viewport_completed_tasks.clear()
         self.progress_bar.hide()
         if status == "finished" and total:
-            self.status_label.setText(f"Loaded {completed}/{total} visible photo tasks.")
+            self.status_label.setText(f"{thumbnail_progress(completed, total, done=True)}.")
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         """Drain view-owned thumbnail work before Qt tears down this view."""
         self._shutting_down = True
+        self._section_prepare_generation += 1
+        section_refs = [
+            (getattr(self, "_section_prepare_job", None), getattr(self, "_section_prepare_thread", None)),
+            *list(self._retained_section_prepare_refs),
+        ]
+        self._section_prepare_job = None
+        self._section_prepare_thread = None
+        self._retained_section_prepare_refs = []
+        coordinated_job_ids = tuple(self._section_prepare_coordinated_job_ids.values())
+        if coordinated_job_ids and self._work_coordinator is not None:
+            for coordinated_job_id in coordinated_job_ids:
+                self._work_coordinator.cancel(coordinated_job_id)
+        else:
+            for job, _thread in section_refs:
+                if job is not None:
+                    try:
+                        job.cancel()
+                    except Exception:
+                        pass
+        for _job, thread in section_refs:
+            if thread is None:
+                continue
+            try:
+                if thread.isRunning() and not wait_for_thread_shutdown(thread, timeout_ms=int(timeout_ms)):
+                    return False
+            except RuntimeError:
+                continue
+            except Exception:
+                return False
+        if self._work_coordinator is not None:
+            for coordinated_job_id in coordinated_job_ids:
+                self._work_coordinator.finish(coordinated_job_id, status="cancelled")
+        self._section_prepare_coordinated_job_ids.clear()
         self._finish_viewport_job(status="cancelled")
         self._generation += 1
         self._loading_paths.clear()
@@ -1192,9 +1660,13 @@ class SectionedGallery(QWidget):
             metadata_service=self._metadata_service,
             display_mode="basic",
             face_service=self._active_face_service(),
-            allow_face_edit=bool(not self._read_only and self._active_face_service() is not None),
+            allow_face_edit=not self._read_only,
             face_edit_saved_callback=self.face_edit_saved_callback,
+            allow_metadata_edit=not self._read_only,
+            allow_file_rename=not self._read_only,
+            rename_current_callback=lambda path: self._run_for_paths((path,), self._actions.slotPreviewBatchRename),
             job_manager=self._job_manager,
+            work_coordinator=self._work_coordinator,
             parent=self,
         )
         dialog.exec()
@@ -1212,13 +1684,13 @@ class SectionedGallery(QWidget):
             metadata_service=self._metadata_service,
             display_mode="basic",
             face_service=self._active_face_service(),
-            allow_face_edit=bool(
-                not self._read_only
-                and self._active_face_service() is not None
-                and (allow_face_edit is True or allow_face_edit is None)
-            ),
+            allow_face_edit=bool(not self._read_only and (allow_face_edit is True or allow_face_edit is None)),
             face_edit_saved_callback=self.face_edit_saved_callback,
+            allow_metadata_edit=not self._read_only,
+            allow_file_rename=not self._read_only,
+            rename_current_callback=lambda selected_path: self._run_for_paths((selected_path,), self._actions.slotPreviewBatchRename),
             job_manager=self._job_manager,
+            work_coordinator=self._work_coordinator,
             parent=self,
         )
         dialog.exec()

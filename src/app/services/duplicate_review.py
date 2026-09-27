@@ -25,6 +25,7 @@ class DuplicateCandidate:
     file_size: int
     hash_distance: int = -1
     visual_score: float | None = None
+    hash_backends: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,41 +61,72 @@ class DuplicateReviewService:
         near_hash_distance: int = 6,
         near_visual_score: float = 0.92,
         burst_seconds: int = 3,
+        kinds: Iterable[str] = ("exact", "near", "burst"),
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> list[DuplicateGroup]:
+        requested_kinds = self._normalize_kinds(kinds)
         assets = self._all_assets(root_ids, scope_paths=scope_paths)
         if not assets:
             return []
         paths = [asset.image_path for asset in assets]
         by_path = {asset.image_path: asset for asset in assets}
-        if progress_callback:
-            progress_callback(0, "Preparing duplicate fingerprints")
-        exact_pairs = self._exact_pairs(assets, progress_callback=progress_callback, cancel_check=cancel_check)
-        if progress_callback:
-            progress_callback(35, "Loading perceptual hashes")
-        hashes = self.phash_service.load_hash_values(paths, cancel_check=cancel_check)
-        vectors = self._vectors_for_paths(paths, embedding_model, cancel_check=cancel_check)
-        if progress_callback:
-            progress_callback(55, "Finding near-duplicate candidates")
-        near_pairs = self._near_pairs(
-            hashes, vectors, max_hash_distance=max(0, int(near_hash_distance)), min_visual_score=float(near_visual_score),
-            exact_pairs=exact_pairs, cancel_check=cancel_check,
-        )
-        if progress_callback:
-            progress_callback(75, "Finding burst candidates")
-        burst_pairs = self._burst_pairs(
-            assets, hashes, vectors, seconds=max(0, int(burst_seconds)), cancel_check=cancel_check,
-        )
+        exact_pairs: list[tuple[str, str, int, float | None]] = []
+        near_pairs: list[tuple[str, str, int, float | None, tuple[str, ...]]] = []
+        burst_pairs: list[tuple[str, str, int, float | None]] = []
+        if "exact" in requested_kinds:
+            if progress_callback:
+                progress_callback(0, "Hashing exact-byte candidates")
+            exact_pairs = self._exact_pairs(assets, progress_callback=progress_callback, cancel_check=cancel_check)
+
+        vectors: dict[str, np.ndarray] = {}
+        if "near" in requested_kinds or "burst" in requested_kinds:
+            vectors = self._vectors_for_paths(paths, embedding_model, cancel_check=cancel_check)
+
+        if "near" in requested_kinds:
+            if progress_callback:
+                progress_callback(35, "Loading pHash, dHash, and wHash")
+            hashes_by_backend = {
+                backend: self.phash_service.load_hash_values(paths, hash_backend=backend, cancel_check=cancel_check)
+                for backend in self.phash_service.SUPPORTED_HASHES
+            }
+            if progress_callback:
+                progress_callback(55, "Finding similar-photo candidates")
+            near_pairs = self._similar_pairs(
+                hashes_by_backend,
+                vectors,
+                max_hash_distance=max(0, int(near_hash_distance)),
+                min_visual_score=float(near_visual_score),
+                exact_pairs=exact_pairs,
+                cancel_check=cancel_check,
+            )
+
+        if "burst" in requested_kinds:
+            if progress_callback:
+                progress_callback(75, "Finding burst candidates")
+            burst_hashes = self.phash_service.load_hash_values(paths, cancel_check=cancel_check)
+            burst_pairs = self._burst_pairs(
+                assets, burst_hashes, vectors, seconds=max(0, int(burst_seconds)), cancel_check=cancel_check,
+            )
         groups: list[DuplicateGroup] = []
-        for kind, pairs in (("exact", exact_pairs), ("near", near_pairs), ("burst", burst_pairs)):
-            groups.extend(self._groups_for_pairs(kind, pairs, by_path))
+        if "exact" in requested_kinds:
+            groups.extend(self._groups_for_pairs("exact", exact_pairs, by_path))
+        if "near" in requested_kinds:
+            groups.extend(self._groups_for_pairs("near", near_pairs, by_path))
+        if "burst" in requested_kinds:
+            groups.extend(self._groups_for_pairs("burst", burst_pairs, by_path))
         suppressed = self.catalog.duplicate_feedback(key for group in groups for key in group.review_keys)
         filtered = [group for group in groups if not all(suppressed.get(key) == "not-duplicate" for key in group.review_keys)]
         filtered.sort(key=lambda group: ({"exact": 0, "near": 1, "burst": 2}.get(group.kind, 9), -len(group.members), group.keeper_path))
         if progress_callback:
-            progress_callback(100, f"Prepared {len(filtered)} duplicate and burst review groups")
+            progress_callback(100, f"Prepared {len(filtered)} manual review groups")
         return filtered
+
+    @staticmethod
+    def _normalize_kinds(kinds: Iterable[str]) -> tuple[str, ...]:
+        aliases = {"similar": "near", "near": "near", "exact": "exact", "burst": "burst"}
+        normalized = {aliases.get(str(kind or "").strip().lower(), "") for kind in kinds}
+        return tuple(kind for kind in ("exact", "near", "burst") if kind in normalized)
 
     def mark_not_duplicate(
         self,
@@ -183,10 +215,21 @@ class DuplicateReviewService:
 
     def _near_pairs(self, hashes, vectors, *, max_hash_distance: int, min_visual_score: float, exact_pairs, cancel_check=None) -> list[tuple[str, str, int, float | None]]:
         exact_path_pairs = {tuple(sorted((left, right))) for left, right, _distance, _score in exact_pairs}
-        buckets: dict[tuple[int, int], list[str]] = defaultdict(list)
+        # A radius of N has a guaranteed matching block when 64 bits are split
+        # into N + 1 non-overlapping partitions. Four 16-bit bands only cover
+        # differences of three or fewer bits and missed valid radius-six pairs.
+        partition_count = min(64, max(1, int(max_hash_distance) + 1))
+        base_width, extra_bits = divmod(64, partition_count)
+        partitions: list[tuple[int, int]] = []
+        offset = 0
+        for partition in range(partition_count):
+            width = base_width + (1 if partition < extra_bits else 0)
+            partitions.append((offset, width))
+            offset += width
+        buckets: dict[tuple[int, int, int], list[str]] = defaultdict(list)
         for path, value in hashes.items():
-            for band in range(4):
-                buckets[(band, (int(value) >> (band * 16)) & 0xFFFF)].append(path)
+            for partition, (offset, width) in enumerate(partitions):
+                buckets[(partition, width, (int(value) >> offset) & ((1 << width) - 1))].append(path)
         pairs: dict[tuple[str, str], tuple[int, float | None]] = {}
         for paths in buckets.values():
             ordered = sorted(set(paths))
@@ -208,6 +251,45 @@ class DuplicateReviewService:
                         continue
                     pairs[key] = (distance, score)
         return [(left, right, distance, score) for (left, right), (distance, score) in pairs.items()]
+
+    def _similar_pairs(
+        self,
+        hashes_by_backend: dict[str, dict[str, int]],
+        vectors: dict[str, np.ndarray],
+        *,
+        max_hash_distance: int,
+        min_visual_score: float,
+        exact_pairs,
+        cancel_check=None,
+    ) -> list[tuple[str, str, int, float | None, tuple[str, ...]]]:
+        """Require agreement from at least two perceptual hashes.
+
+        pHash, dHash, and wHash fail differently on crops, tones, and small
+        edits. Requiring two bounded candidates makes this queue conservative;
+        an optional embedding score still rejects known visual mismatches.
+        """
+
+        votes: dict[tuple[str, str], list[tuple[str, int, float | None]]] = defaultdict(list)
+        for backend, hashes in hashes_by_backend.items():
+            for left, right, distance, score in self._near_pairs(
+                hashes,
+                vectors,
+                max_hash_distance=max_hash_distance,
+                min_visual_score=min_visual_score,
+                exact_pairs=exact_pairs,
+                cancel_check=cancel_check,
+            ):
+                votes[(left, right)].append((backend, distance, score))
+        pairs: list[tuple[str, str, int, float | None, tuple[str, ...]]] = []
+        for (left, right), matches in votes.items():
+            raise_if_cancelled(cancel_check)
+            if len(matches) < 2:
+                continue
+            backends = tuple(sorted(backend for backend, _distance, _score in matches))
+            distance = min(distance for _backend, distance, _score in matches)
+            scores = [score for _backend, _distance, score in matches if score is not None]
+            pairs.append((left, right, distance, max(scores) if scores else None, backends))
+        return pairs
 
     def _burst_pairs(self, assets, hashes, vectors, *, seconds: int, cancel_check=None) -> list[tuple[str, str, int, float | None]]:
         ordered = sorted(assets, key=lambda item: (_timestamp(item.captured_at), item.image_path))
@@ -234,12 +316,14 @@ class DuplicateReviewService:
 
     def _groups_for_pairs(self, kind: str, pairs, assets_by_path: dict[str, CatalogAsset]) -> list[DuplicateGroup]:
         parent: dict[str, str] = {}
-        pair_data: dict[tuple[str, str], tuple[int, float | None]] = {}
-        for left, right, distance, score in pairs:
+        pair_data: dict[tuple[str, str], tuple[int, float | None, tuple[str, ...]]] = {}
+        for pair in pairs:
+            left, right, distance, score = pair[:4]
+            backends = tuple(pair[4]) if len(pair) > 4 else ()
             parent.setdefault(left, left)
             parent.setdefault(right, right)
             _union(parent, left, right)
-            pair_data[tuple(sorted((left, right)))] = (int(distance), score)
+            pair_data[tuple(sorted((left, right)))] = (int(distance), score, backends)
         components: dict[str, list[str]] = defaultdict(list)
         for path in parent:
             components[_find(parent, path)].append(path)
@@ -254,9 +338,12 @@ class DuplicateReviewService:
             review_keys: list[str] = []
             for asset in sorted(assets, key=lambda item: (item.image_path != keeper.image_path, item.image_path)):
                 if asset.image_path == keeper.image_path:
-                    distance, score = 0, 1.0
+                    distance, score, backends = 0, 1.0, ()
                 else:
-                    distance, score = pair_data.get(tuple(sorted((keeper.image_path, asset.image_path))), (-1, None))
+                    distance, score, backends = pair_data.get(
+                        tuple(sorted((keeper.image_path, asset.image_path))),
+                        (-1, None, ()),
+                    )
                     review_keys.append(
                         self.pair_key(
                             kind,
@@ -268,9 +355,24 @@ class DuplicateReviewService:
                             right_fingerprint=_asset_fingerprint(asset),
                         )
                     )
-                candidates.append(DuplicateCandidate(asset.image_path, asset.captured_at, asset.width, asset.height, asset.file_size, distance, score))
+                candidates.append(
+                    DuplicateCandidate(
+                        asset.image_path,
+                        asset.captured_at,
+                        asset.width,
+                        asset.height,
+                        asset.file_size,
+                        distance,
+                        score,
+                        backends,
+                    )
+                )
             group_id = hashlib.sha256(f"{kind}|{'|'.join(ordered_paths)}".encode("utf-8")).hexdigest()[:20]
-            summary = {"exact": "Identical file bytes", "near": "Perceptual hash with optional visual verification", "burst": "Capture-time and visual-similarity burst"}.get(kind, kind)
+            summary = {
+                "exact": "Identical file bytes (SHA-256)",
+                "near": "Similar photos: at least two of pHash, dHash, and wHash agree; optional visual verification applied",
+                "burst": "Capture-time and visual-similarity burst",
+            }.get(kind, kind)
             groups.append(DuplicateGroup(group_id, kind, keeper.image_path, tuple(candidates), summary, tuple(review_keys)))
         return groups
 

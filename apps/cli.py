@@ -140,7 +140,13 @@ def run(args: argparse.Namespace) -> int:
         payload = {
             "total_count": page.total_count,
             "items": [
-                {"path": item.image_path, "captured_at": item.captured_at, "capture_source": item.capture_source, "camera": item.camera}
+                {
+                    "path": item.image_path,
+                    "captured_at": item.captured_at,
+                    "capture_source": item.capture_source,
+                    "capture_sequence": item.capture_sequence,
+                    "camera": item.camera,
+                }
                 for item in page.items
             ],
         }

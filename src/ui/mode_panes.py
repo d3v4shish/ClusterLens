@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
-
-from PyQt6.QtCore import QDir, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import QFileSystemModel
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -14,12 +13,11 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMenu,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
-    QTreeView,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -38,7 +36,9 @@ from app.services.clustering_options import (
 from app.services.similarity_modes import SUPPORTED_SIMILARITY_MODES, normalize_similarity_modes
 from app.path_scope import PathScope, path_is_within_scope
 from infra.settings import get_settings
-from .common import build_help_inline, build_help_label
+from .common import ResponsiveFlowLayout, build_help_inline, build_help_label
+from .icons import apply_icon
+from .theme import apply_field_size
 
 
 CLUSTERING_HELP = {
@@ -159,381 +159,9 @@ class ActiveRootFileSystemModel(QFileSystemModel):
         return super().setData(index, value, role)
 
 
-class SourcePane(QWidget):
-    directory_changed = pyqtSignal(str)
-    scope_changed = pyqtSignal(object)
-    recent_folder_remove_requested = pyqtSignal(str)
-    recent_folders_clear_requested = pyqtSignal()
-    state_changed = pyqtSignal()
-    hide_requested = pyqtSignal()
-    run_requested = pyqtSignal()
-    cancel_requested = pyqtSignal()
-    data_home_requested = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.settings = get_settings()
-        # The folder tree needs a browse root, but that root is not an implicit
-        # user selection. Keeping these states separate prevents a fresh launch
-        # from reporting both `/home` and "No folder selected".
-        self.selected_directory = ""
-        self.active_scope = PathScope()
-        self._recent_directories: list[str] = []
-        self._browse_root = "C:/" if os.name == "nt" else "/"
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(6)
-
-        title = QLabel("Sources")
-        title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        self.hide_button = QPushButton("Hide")
-        self.hide_button.setProperty("paneToggle", True)
-        self.hide_button.setFixedHeight(24)
-        self.hide_button.clicked.connect(self.hide_requested.emit)
-        header.addWidget(title)
-        header.addStretch(1)
-        self.recent_folders_button = QToolButton(self)
-        self.recent_folders_button.setText("Recent")
-        self.recent_folders_button.setToolTip("Open or manage recently selected folders.")
-        self.recent_folders_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.recent_folders_menu = QMenu(self.recent_folders_button)
-        self.recent_folders_button.setMenu(self.recent_folders_menu)
-        header.addWidget(self.recent_folders_button)
-        header.addWidget(self.hide_button)
-        layout.addLayout(header)
-
-        self.directory_combobox = QComboBox()
-        self.directory_combobox.setToolTip(
-            "Choose the root shown by the complete folder tree. Selecting a folder in the tree does not hide its parents or siblings."
-        )
-        self.populate_drives()
-        self.directory_combobox.currentIndexChanged.connect(self.on_directory_changed)
-        layout.addWidget(self.directory_combobox)
-
-        self.selected_folder_label = QLabel("No folder selected", self)
-        self.selected_folder_label.setObjectName("selectedFolderRoot")
-        self.selected_folder_label.setWordWrap(False)
-        self.selected_folder_label.setToolTip(
-            "Browsing a folder does not change the active scope. Check folders in the tree to include them."
-        )
-        layout.addWidget(self.selected_folder_label)
-
-        active_heading = QLabel("Sources (include subfolders)", self)
-        active_heading.setProperty("role", "help")
-        active_heading.setToolTip("These checked roots are shared by every workspace. Overlapping child roots are folded into their parent.")
-        layout.addWidget(active_heading)
-        self.active_roots_list = QListWidget(self)
-        self.active_roots_list.setObjectName("activeRootsList")
-        self.active_roots_list.setMinimumHeight(54)
-        self.active_roots_list.setMaximumHeight(112)
-        self.active_roots_list.setToolTip("These selected photo sources are shared by Gallery, Clustering, Faces, Names, Tags, and Library.")
-        self.active_roots_list.itemSelectionChanged.connect(self._refresh_active_root_action_state)
-        layout.addWidget(self.active_roots_list)
-        active_actions = QHBoxLayout()
-        active_actions.setContentsMargins(0, 0, 0, 0)
-        self.add_browsed_root_button = QPushButton("Include folder")
-        self.remove_active_root_button = QPushButton("Remove")
-        self.clear_active_roots_button = QPushButton("Clear sources")
-        self.add_browsed_root_button.setToolTip("Include the currently browsed folder in every workspace source scope.")
-        self.remove_active_root_button.setToolTip("Remove the selected active root without touching source files.")
-        self.clear_active_roots_button.setToolTip("Clear the shared active scope. No workspace will scan or search folders until roots are selected again.")
-        self.add_browsed_root_button.clicked.connect(lambda: self.add_active_root(self.selected_directory))
-        self.remove_active_root_button.clicked.connect(self.remove_selected_active_root)
-        self.clear_active_roots_button.clicked.connect(self.clear_active_roots)
-        active_actions.addWidget(self.add_browsed_root_button)
-        active_actions.addWidget(self.remove_active_root_button)
-        active_actions.addWidget(self.clear_active_roots_button)
-        layout.addLayout(active_actions)
-
-        data_home_heading = QLabel("ClusterLens Data Home", self)
-        data_home_heading.setProperty("role", "help")
-        data_home_heading.setToolTip(
-            "This separate location contains app-managed indexes, thumbnails, models, recovery journals, logs, and backups. "
-            "It never contains or deletes your source photos by default."
-        )
-        self.data_home_label = QLabel("Managed data location is available in Storage.", self)
-        self.data_home_label.setWordWrap(True)
-        self.data_home_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.data_home_button = QPushButton("Manage Data Home", self)
-        self.data_home_button.setToolTip(
-            "View all managed app data, backup or clear safe categories, and open Storage settings. Source photos are unaffected."
-        )
-        self.data_home_button.clicked.connect(self.data_home_requested.emit)
-        layout.addWidget(data_home_heading)
-        layout.addWidget(self.data_home_label)
-        layout.addWidget(self.data_home_button)
-
-        self.file_model = ActiveRootFileSystemModel(self)
-        self.file_model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
-        self.file_model.setRootPath(self._browse_root)
-
-        self.file_tree = QTreeView()
-        self.file_tree.setModel(self.file_model)
-        self.file_tree.setRootIndex(self.file_model.index(self._browse_root))
-        self.file_tree.setHeaderHidden(True)
-        self.file_tree.setColumnHidden(1, True)
-        self.file_tree.setColumnHidden(2, True)
-        self.file_tree.setColumnHidden(3, True)
-        self.file_tree.setUniformRowHeights(True)
-        self.file_tree.setStyleSheet(
-            "QTreeView { font-size: 12px; }"
-            "QTreeView::item { height: 24px; padding: 3px; }"
-        )
-        self.file_tree.clicked.connect(self.on_directory_selected)
-        self.file_model.root_toggle_requested.connect(self._on_tree_root_toggled)
-        layout.addWidget(self.file_tree, stretch=1)
-
-        self.basic_action_section = QWidget(self)
-        basic_action_layout = QVBoxLayout(self.basic_action_section)
-        basic_action_layout.setContentsMargins(0, 0, 0, 0)
-        basic_action_layout.setSpacing(6)
-
-        self.basic_run_button = QPushButton("Run Clustering")
-        self.basic_cancel_button = QPushButton("Cancel")
-        self.basic_run_button.setToolTip(CLUSTERING_HELP["run_clustering"])
-        self.basic_cancel_button.setToolTip(CLUSTERING_HELP["cancel"])
-        self.basic_run_button.clicked.connect(self.run_requested.emit)
-        self.basic_cancel_button.clicked.connect(self.cancel_requested.emit)
-        basic_action_layout.addWidget(self.basic_run_button)
-        basic_action_layout.addWidget(self.basic_cancel_button)
-        layout.addWidget(self.basic_action_section)
-        self.set_running(False)
-        self.basic_action_section.hide()
-        self.set_recent_directories([])
-        self._refresh_active_roots_ui()
-
-    @staticmethod
-    def _recent_folder_label(path: str) -> str:
-        normalized = os.path.normpath(str(path or ""))
-        name = os.path.basename(normalized) or normalized
-        parent = os.path.dirname(normalized)
-        return f"{name} — {parent}" if parent and parent != normalized else name
-
-    def set_recent_directories(self, directories: list[str]) -> None:
-        self._recent_directories = [str(path) for path in directories if str(path or "").strip()]
-        self.recent_folders_menu.clear()
-        if not self._recent_directories:
-            empty_action = self.recent_folders_menu.addAction("No recent folders")
-            empty_action.setEnabled(False)
-            self.recent_folders_button.setToolTip("No recent folders yet.")
-            return
-        self.recent_folders_button.setToolTip("Open or manage recently selected folders.")
-        for path in self._recent_directories:
-            action = self.recent_folders_menu.addAction(self._recent_folder_label(path))
-            action.setToolTip(path)
-            action.triggered.connect(lambda _checked=False, value=path: self.set_selected_directory(value))
-        self.recent_folders_menu.addSeparator()
-        remove_menu = self.recent_folders_menu.addMenu("Remove from history")
-        for path in self._recent_directories:
-            action = remove_menu.addAction(self._recent_folder_label(path))
-            action.setToolTip(path)
-            action.triggered.connect(
-                lambda _checked=False, value=path: self.recent_folder_remove_requested.emit(value)
-            )
-        clear_action = self.recent_folders_menu.addAction("Clear history")
-        clear_action.triggered.connect(self.recent_folders_clear_requested.emit)
-
-    def populate_drives(self) -> None:
-        self.directory_combobox.clear()
-        if os.name == "nt":
-            from string import ascii_uppercase
-
-            drives = [f"{letter}:/" for letter in ascii_uppercase if os.path.exists(f"{letter}:/")]
-            self._browse_root = drives[0] if drives else "C:/"
-        else:
-            drives = ["/", "/home"]
-            self._browse_root = "/"
-        self.directory_combobox.addItems(drives)
-
-    def on_directory_selected(self, index) -> None:
-        # Tree-row activation is navigation only; the checkbox is the explicit
-        # multi-root inclusion control.
-        self.set_selected_directory(self.file_model.filePath(index), emit_state=True, activate_scope=False)
-
-    def on_directory_changed(self, _index) -> None:
-        root_directory = self.directory_combobox.currentText()
-        self._browse_root = root_directory
-        self.file_model.setRootPath(root_directory)
-        self.file_tree.setRootIndex(self.file_model.index(root_directory))
-        self.set_selected_directory(root_directory, emit_state=True, activate_scope=False)
-
-    @staticmethod
-    def _path_is_within(directory: str, root: str) -> bool:
-        try:
-            normalized_directory = os.path.normcase(os.path.abspath(directory))
-            normalized_root = os.path.normcase(os.path.abspath(root))
-            return os.path.commonpath((normalized_directory, normalized_root)) == normalized_root
-        except (TypeError, ValueError):
-            return False
-
-    def _ensure_browse_root_contains(self, directory: str) -> None:
-        if self._path_is_within(directory, self._browse_root):
-            return
-        candidates = [self.directory_combobox.itemText(index) for index in range(self.directory_combobox.count())]
-        matching_roots = [root for root in candidates if self._path_is_within(directory, root)]
-        if matching_roots:
-            browse_root = max(matching_roots, key=len)
-        else:
-            drive, _ = os.path.splitdrive(directory)
-            browse_root = f"{drive}{os.path.sep}" if drive else os.path.abspath(os.path.sep)
-        self._browse_root = browse_root
-        combo_index = self.directory_combobox.findText(browse_root)
-        if combo_index >= 0:
-            self.directory_combobox.blockSignals(True)
-            self.directory_combobox.setCurrentIndex(combo_index)
-            self.directory_combobox.blockSignals(False)
-        self.file_model.setRootPath(browse_root)
-        self.file_tree.setRootIndex(self.file_model.index(browse_root))
-
-    def _reveal_selected_directory(self, directory: str) -> None:
-        selected_index = self.file_model.index(directory)
-        if not selected_index.isValid():
-            return
-        root_index = self.file_model.index(self._browse_root)
-        if root_index.isValid():
-            self.file_tree.setRootIndex(root_index)
-
-        ancestors = []
-        ancestor = selected_index.parent()
-        while ancestor.isValid():
-            ancestor_path = self.file_model.filePath(ancestor)
-            if not self._path_is_within(ancestor_path, self._browse_root):
-                break
-            ancestors.append(ancestor)
-            if os.path.normcase(os.path.abspath(ancestor_path)) == os.path.normcase(os.path.abspath(self._browse_root)):
-                break
-            ancestor = ancestor.parent()
-        for index in reversed(ancestors):
-            self.file_tree.expand(index)
-        self.file_tree.expand(selected_index)
-        self.file_tree.setCurrentIndex(selected_index)
-        self.file_tree.scrollTo(selected_index)
-
-    def set_selected_directory(self, directory: str, *, emit_state: bool = False, activate_scope: bool = True) -> None:
-        directory = str(directory or "").strip()
-        if not directory or not os.path.exists(directory):
-            return
-        drive = os.path.splitdrive(directory)[0]
-        if drive:
-            combo_value = f"{drive}/".replace("\\", "/")
-            idx = self.directory_combobox.findText(combo_value)
-            if idx >= 0:
-                self.directory_combobox.blockSignals(True)
-                self.directory_combobox.setCurrentIndex(idx)
-                self.directory_combobox.blockSignals(False)
-        self.selected_directory = directory
-        self._ensure_browse_root_contains(directory)
-        self._reveal_selected_directory(directory)
-        self.selected_folder_label.setText(f"Selected: {directory}")
-        self.selected_folder_label.setToolTip(directory)
-        self._refresh_active_root_action_state()
-        self.directory_changed.emit(self.selected_directory)
-        if activate_scope:
-            # Preserve the historical programmatic/recent-folder contract.
-            # Interactive tree browsing opts out above, so it never replaces a
-            # deliberate multi-root selection.
-            self.set_active_roots([directory], emit_state=emit_state)
-        if emit_state:
-            self.state_changed.emit()
-
-    @property
-    def active_roots(self) -> tuple[str, ...]:
-        return self.active_scope.roots
-
-    def set_active_roots(self, roots, *, emit_state: bool = False) -> None:
-        """Replace the shared root set without scanning source media."""
-
-        scope = roots if isinstance(roots, PathScope) else PathScope.from_paths(roots)
-        changed = scope != self.active_scope
-        self.active_scope = scope
-        self.file_model.set_active_scope(scope)
-        self._refresh_active_roots_ui()
-        if changed:
-            self.scope_changed.emit(scope)
-            if emit_state:
-                self.state_changed.emit()
-
-    def set_data_home_summary(self, path: str, *, detail: str = "") -> None:
-        """Present the current managed-data location without conflating it with photo sources."""
-        location = str(path or "").strip()
-        if not location:
-            self.data_home_label.setText("Managed data location is unavailable.")
-            self.data_home_label.setToolTip("")
-            return
-        suffix = f"\n{str(detail).strip()}" if str(detail).strip() else ""
-        self.data_home_label.setText(f"{location}{suffix}")
-        self.data_home_label.setToolTip(location)
-
-    def add_active_root(self, directory: str) -> None:
-        path = str(directory or "").strip()
-        if not path:
-            return
-        self.set_active_roots([*self.active_scope.roots, path], emit_state=True)
-
-    def remove_active_root(self, directory: str) -> None:
-        target = str(directory or "").strip()
-        if not target:
-            return
-        self.set_active_roots([root for root in self.active_scope.roots if root != target], emit_state=True)
-
-    def remove_selected_active_root(self) -> None:
-        item = self.active_roots_list.currentItem()
-        if item is None:
-            return
-        self.remove_active_root(str(item.data(Qt.ItemDataRole.UserRole) or ""))
-
-    def clear_active_roots(self) -> None:
-        self.set_active_roots((), emit_state=True)
-
-    def _on_tree_root_toggled(self, directory: str, checked: bool) -> None:
-        if checked:
-            self.add_active_root(directory)
-        else:
-            self.remove_active_root(directory)
-
-    def _refresh_active_roots_ui(self) -> None:
-        current = self.active_roots_list.currentItem()
-        selected_path = str(current.data(Qt.ItemDataRole.UserRole) or "") if current is not None else ""
-        self.active_roots_list.blockSignals(True)
-        self.active_roots_list.clear()
-        for root in self.active_scope.roots:
-            label = root if os.path.isdir(root) else f"{root} (unavailable)"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, root)
-            item.setToolTip(root)
-            self.active_roots_list.addItem(item)
-            if root == selected_path:
-                self.active_roots_list.setCurrentItem(item)
-        self.active_roots_list.blockSignals(False)
-        self._refresh_active_root_action_state()
-
-    def _refresh_active_root_action_state(self) -> None:
-        self.add_browsed_root_button.setEnabled(bool(self.selected_directory))
-        self.remove_active_root_button.setEnabled(self.active_roots_list.currentItem() is not None)
-        self.clear_active_roots_button.setEnabled(bool(self.active_scope.roots))
-
-    def set_running(self, running: bool) -> None:
-        self.basic_run_button.setVisible(not running)
-        self.basic_run_button.setEnabled(not running)
-        self.basic_cancel_button.setVisible(running)
-        self.basic_cancel_button.setEnabled(running)
-
-    def update_progress(self, value: int, status: str) -> None:
-        _ = value
-        _ = status
-
-    def set_basic_mode(self, enabled: bool, *, running: bool = False) -> None:
-        enabled = bool(enabled)
-        self.hide_button.setVisible(not enabled)
-        self.basic_action_section.setVisible(enabled)
-        self.set_running(running)
+# Kept in its own module so the global Roots editor has a small, focused
+# state machine instead of sharing the large organize-options module.
+from .source_pane import SourcePane
 
 
 class ClusteringOptionsPane(QWidget):
@@ -548,7 +176,7 @@ class ClusteringOptionsPane(QWidget):
         self.option_scope = str(option_scope or "legacy").strip().lower()
         self._build_ui()
 
-    def _build_ui(self) -> None:
+    def _build_legacy_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -557,7 +185,7 @@ class ClusteringOptionsPane(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
 
-        title = QLabel("Clustering")
+        title = QLabel("Organize photos")
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.hide_button = QPushButton("Hide")
         self.hide_button.setProperty("paneToggle", True)
@@ -569,12 +197,15 @@ class ClusteringOptionsPane(QWidget):
         layout.addLayout(header)
 
         self._applying_preset = False
-        self.preset_group = QGroupBox("Clustering preset", self)
+        self.preset_group = QGroupBox("Organization preset", self)
         preset_layout = QFormLayout(self.preset_group)
         self.preset_combo = QComboBox(self.preset_group)
-        self.preset_combo.addItem("Fast Preview", "fast_preview")
-        self.preset_combo.addItem("Balanced", "balanced")
-        self.preset_combo.addItem("High Quality", "high_quality")
+        self.preset_combo.addItem("Quick groups", "fast_preview")
+        self.preset_combo.addItem("Similar scenes", "balanced")
+        self.preset_combo.addItem("Events", "events")
+        self.preset_combo.addItem("Documents", "documents")
+        self.preset_combo.addItem("People-heavy", "people_heavy")
+        self.preset_combo.addItem("Detailed groups", "high_quality")
         self.preset_combo.addItem("Custom", "custom")
         self.preset_combo.setCurrentIndex(self.preset_combo.findData("balanced"))
         self.preset_summary = QLabel("SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.")
@@ -745,7 +376,7 @@ class ClusteringOptionsPane(QWidget):
         layout.addWidget(self.technical_panel)
 
         button_row = QHBoxLayout()
-        self.cluster_button = QPushButton("Run Clustering")
+        self.cluster_button = QPushButton("Organize photos")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         button_row.addWidget(build_help_inline(self.cluster_button, CLUSTERING_HELP["run_clustering"], help_key="run_clustering"), 1)
@@ -781,6 +412,332 @@ class ClusteringOptionsPane(QWidget):
             self.technical_panel.show()
         self._refresh_hdbscan_controls()
 
+    def _build_ui(self) -> None:
+        """Build the production controls as a compact, tabbed advanced pane."""
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(6)
+        self.controls_scroll = QScrollArea(self)
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls_scroll.setFrameStyle(0)
+        controls_body = QWidget(self.controls_scroll)
+        layout = QVBoxLayout(controls_body)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+        self.controls_scroll.setWidget(controls_body)
+        outer_layout.addWidget(self.controls_scroll, 1)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self.hide_button = QToolButton(self)
+        self.hide_button.setProperty("iconOnly", True)
+        self.hide_button.setToolTip("Hide advanced organize controls.")
+        self.hide_button.setAccessibleName("Hide advanced organize controls")
+        apply_icon(self.hide_button, "collapse")
+        self.hide_button.clicked.connect(self.hide_requested.emit)
+        header.addStretch(1)
+        header.addWidget(self.hide_button)
+        layout.addLayout(header)
+
+        self._applying_preset = False
+        self.preset_group = QGroupBox("Preset", self)
+        preset_layout = QVBoxLayout(self.preset_group)
+        preset_layout.setContentsMargins(8, 8, 8, 8)
+        preset_layout.setSpacing(4)
+        self.preset_combo = QComboBox(self.preset_group)
+        self.preset_combo.addItem("Quick groups", "fast_preview")
+        self.preset_combo.addItem("Similar scenes", "balanced")
+        self.preset_combo.addItem("Events", "events")
+        self.preset_combo.addItem("Documents", "documents")
+        self.preset_combo.addItem("People-heavy", "people_heavy")
+        self.preset_combo.addItem("Detailed groups", "high_quality")
+        self.preset_combo.addItem("Custom", "custom")
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData("balanced"))
+        self.preset_combo.setToolTip("Choose a grouping preset. Changing an option changes this to Custom.")
+        self.preset_summary = QLabel("Balanced visual grouping with GPU-first execution and deterministic CPU fallback.")
+        self.preset_summary.setProperty("role", "helper")
+        self.preset_summary.setWordWrap(True)
+        self.preset_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        self._sync_preset_summary_height()
+        preset_layout.addWidget(self.preset_combo)
+        preset_layout.addWidget(self.preset_summary)
+        self.preset_group.setVisible(self.option_scope == "production")
+        layout.addWidget(self.preset_group)
+
+        def field_cell(label: str, field: QWidget, parent: QWidget) -> QWidget:
+            cell = QWidget(parent)
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(3)
+            title = QLabel(label, cell)
+            title.setProperty("role", "helper")
+            title.setBuddy(field)
+            cell_layout.addWidget(title)
+            cell_layout.addWidget(field)
+            return cell
+
+        self.technical_panel = QTabWidget(self)
+        self.technical_panel.setObjectName("organizeAdvancedTabs")
+        self.technical_panel.setDocumentMode(True)
+
+        models_page = QWidget(self.technical_panel)
+        models_layout = QVBoxLayout(models_page)
+        models_layout.setContentsMargins(0, 0, 0, 0)
+        models_layout.setSpacing(6)
+        embedding_group = QGroupBox("Embedding models", models_page)
+        embedding_group.setToolTip(CLUSTERING_HELP["embedding_models"])
+        embedding_layout = ResponsiveFlowLayout(embedding_group, spacing=8)
+        self.embedding_options_layout = embedding_layout
+        self.embedding_checkboxes = {}
+        for model_name in clustering_model_names(self.option_scope):
+            checkbox = QCheckBox(model_label(model_name), embedding_group)
+            checkbox.setToolTip(model_tooltip(model_name))
+            checkbox.setChecked(model_name == self.settings.default_model)
+            checkbox.toggled.connect(self.state_changed.emit)
+            self.embedding_checkboxes[model_name] = checkbox
+            embedding_layout.addWidget(checkbox)
+        models_layout.addWidget(embedding_group)
+        models_layout.addStretch(1)
+        models_scroll = QScrollArea(self.technical_panel)
+        models_scroll.setWidgetResizable(True)
+        models_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        models_scroll.setWidget(models_page)
+        self.technical_panel.addTab(models_scroll, "Models")
+
+        grouping_page = QWidget(self.technical_panel)
+        grouping_layout = QVBoxLayout(grouping_page)
+        grouping_layout.setContentsMargins(0, 0, 0, 0)
+        grouping_layout.setSpacing(6)
+        backend_group = QGroupBox("Backends", grouping_page)
+        backend_group.setToolTip(CLUSTERING_HELP["cluster_backends"])
+        backend_layout = ResponsiveFlowLayout(backend_group, spacing=8)
+        self.backend_options_layout = backend_layout
+        self.backend_checkboxes = {}
+        default_backends = set(default_backend_names(self.option_scope))
+        for backend in clustering_backend_names(self.option_scope):
+            checkbox = QCheckBox(backend, backend_group)
+            checkbox.setToolTip(backend_tooltip(backend))
+            checkbox.setChecked(backend in default_backends)
+            checkbox.toggled.connect(self.state_changed.emit)
+            self.backend_checkboxes[backend] = checkbox
+            backend_layout.addWidget(checkbox)
+        grouping_layout.addWidget(backend_group)
+
+        comparison_group = QGroupBox("Comparison", grouping_page)
+        comparison_layout = QGridLayout(comparison_group)
+        comparison_layout.setContentsMargins(8, 8, 8, 8)
+        comparison_layout.setHorizontalSpacing(8)
+        comparison_layout.setVerticalSpacing(6)
+        similarity_widget = QWidget(comparison_group)
+        similarity_layout = ResponsiveFlowLayout(similarity_widget, spacing=8)
+        self.similarity_options_layout = similarity_layout
+        self.similarity_checkboxes = {}
+        default_modes = normalize_similarity_modes(None, self.settings.default_similarity_mode)
+        for mode in SUPPORTED_SIMILARITY_MODES:
+            checkbox = QCheckBox(mode.capitalize(), similarity_widget)
+            checkbox.setToolTip(CLUSTERING_HELP["similarity"])
+            checkbox.setChecked(mode in default_modes)
+            checkbox.toggled.connect(self._on_similarity_toggled)
+            self.similarity_checkboxes[mode] = checkbox
+            similarity_layout.addWidget(checkbox)
+        comparison_layout.addWidget(field_cell("Similarity", similarity_widget, comparison_group), 0, 0, 1, 2)
+
+        self.outlier_combobox = QComboBox(comparison_group)
+        self.outlier_combobox.addItems(["assign", "isolate", "keep"])
+        self.outlier_combobox.setCurrentText(self.settings.default_outlier_policy)
+        self.outlier_combobox.setToolTip(CLUSTERING_HELP["outlier"])
+        self.outlier_combobox.currentIndexChanged.connect(self.state_changed.emit)
+        apply_field_size(self.outlier_combobox, "short")
+        self._comparison_outlier_cell = field_cell("Outliers", self.outlier_combobox, comparison_group)
+        comparison_layout.addWidget(self._comparison_outlier_cell, 1, 0)
+
+        self.cluster_spinbox = QSpinBox(comparison_group)
+        self.cluster_spinbox.setMinimum(self.settings.min_cluster_count)
+        self.cluster_spinbox.setMaximum(500)
+        self.cluster_spinbox.setValue(self.settings.default_cluster_count)
+        self.cluster_spinbox.setToolTip(CLUSTERING_HELP["clusters"])
+        self.cluster_spinbox.valueChanged.connect(self.state_changed.emit)
+        apply_field_size(self.cluster_spinbox, "numeric")
+        self._comparison_cluster_cell = field_cell("Clusters", self.cluster_spinbox, comparison_group)
+        comparison_layout.addWidget(self._comparison_cluster_cell, 1, 1)
+        self._comparison_layout = comparison_layout
+        grouping_layout.addWidget(comparison_group)
+
+        self.hdbscan_options_group = QGroupBox("HDBSCAN", grouping_page)
+        self.hdbscan_options_group.setToolTip(
+            "Tune density clustering. Values apply to CUDA cuML when available and native CPU HDBSCAN otherwise."
+        )
+        hdbscan_layout = ResponsiveFlowLayout(self.hdbscan_options_group, spacing=8)
+        self.hdbscan_options_layout = hdbscan_layout
+        self.hdbscan_min_cluster_size_spin = QSpinBox(self.hdbscan_options_group)
+        self.hdbscan_min_cluster_size_spin.setRange(2, 10_000)
+        self.hdbscan_min_cluster_size_spin.setValue(2)
+        self.hdbscan_min_cluster_size_spin.setToolTip("Smallest dense group that HDBSCAN may keep as a cluster.")
+        apply_field_size(self.hdbscan_min_cluster_size_spin, "numeric")
+        hdbscan_layout.addWidget(field_cell("Min cluster", self.hdbscan_min_cluster_size_spin, self.hdbscan_options_group))
+        self.hdbscan_min_samples_spin = QSpinBox(self.hdbscan_options_group)
+        self.hdbscan_min_samples_spin.setRange(0, 10_000)
+        self.hdbscan_min_samples_spin.setSpecialValueText("Auto")
+        self.hdbscan_min_samples_spin.setValue(0)
+        self.hdbscan_min_samples_spin.setToolTip("Auto derives the density threshold from minimum cluster size.")
+        apply_field_size(self.hdbscan_min_samples_spin, "numeric")
+        hdbscan_layout.addWidget(field_cell("Min samples", self.hdbscan_min_samples_spin, self.hdbscan_options_group))
+        self.hdbscan_cluster_selection_epsilon_spin = QDoubleSpinBox(self.hdbscan_options_group)
+        self.hdbscan_cluster_selection_epsilon_spin.setRange(0.0, 2.0)
+        self.hdbscan_cluster_selection_epsilon_spin.setDecimals(3)
+        self.hdbscan_cluster_selection_epsilon_spin.setSingleStep(0.01)
+        self.hdbscan_cluster_selection_epsilon_spin.setValue(0.0)
+        self.hdbscan_cluster_selection_epsilon_spin.setToolTip("Merge clusters closer than this distance; zero disables extra merging.")
+        apply_field_size(self.hdbscan_cluster_selection_epsilon_spin, "numeric")
+        hdbscan_layout.addWidget(field_cell("Merge epsilon", self.hdbscan_cluster_selection_epsilon_spin, self.hdbscan_options_group))
+        self.hdbscan_allow_single_cluster_checkbox = QCheckBox("Allow one cluster", self.hdbscan_options_group)
+        self.hdbscan_allow_single_cluster_checkbox.setToolTip("Permit one overall cluster when density structure supports it.")
+        hdbscan_layout.addWidget(self.hdbscan_allow_single_cluster_checkbox)
+        grouping_layout.addWidget(self.hdbscan_options_group)
+        grouping_layout.addStretch(1)
+        hdbscan_checkbox = self.backend_checkboxes.get("hdbscan")
+        if hdbscan_checkbox is not None:
+            hdbscan_checkbox.toggled.connect(self._refresh_hdbscan_controls)
+        grouping_scroll = QScrollArea(self.technical_panel)
+        grouping_scroll.setWidgetResizable(True)
+        grouping_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        grouping_scroll.setWidget(grouping_page)
+        self.technical_panel.addTab(grouping_scroll, "Grouping")
+
+        runtime_page = QWidget(self.technical_panel)
+        runtime_layout = QVBoxLayout(runtime_page)
+        runtime_layout.setContentsMargins(0, 0, 0, 0)
+        runtime_layout.setSpacing(6)
+        runtime_group = QGroupBox("Runtime", runtime_page)
+        runtime_group.setToolTip("Runtime choices are local, cancellable, and do not alter source photos.")
+        runtime_controls = QVBoxLayout(runtime_group)
+        runtime_controls.setContentsMargins(8, 8, 8, 8)
+        runtime_controls.setSpacing(5)
+        self.recursive_checkbox = QCheckBox("Include subfolders", runtime_group)
+        self.recursive_checkbox.setChecked(self.settings.recursive_scan)
+        self.recursive_checkbox.setToolTip(CLUSTERING_HELP["recursive_scan"])
+        self.recursive_checkbox.toggled.connect(self.state_changed.emit)
+        self.onnx_checkbox = QCheckBox("Use ONNX Runtime", runtime_group)
+        self.onnx_checkbox.setChecked(self.settings.default_use_onnx)
+        self.onnx_checkbox.setToolTip(CLUSTERING_HELP["use_onnx_runtime"])
+        self.onnx_checkbox.toggled.connect(self.state_changed.emit)
+        self.result_cache_checkbox = QCheckBox("Reuse result cache", runtime_group)
+        self.result_cache_checkbox.setChecked(self.settings.default_reuse_result_cache)
+        self.result_cache_checkbox.setToolTip(CLUSTERING_HELP["reuse_cluster_result_cache"])
+        self.result_cache_checkbox.toggled.connect(self.state_changed.emit)
+        self.embedding_cache_lookup_checkbox = QCheckBox("Reuse embeddings", runtime_group)
+        self.embedding_cache_lookup_checkbox.setChecked(True)
+        self.embedding_cache_lookup_checkbox.setToolTip(CLUSTERING_HELP["use_embedding_cache_lookup"])
+        self.embedding_cache_lookup_checkbox.toggled.connect(self.state_changed.emit)
+        for checkbox in (self.recursive_checkbox, self.onnx_checkbox, self.result_cache_checkbox, self.embedding_cache_lookup_checkbox):
+            runtime_controls.addWidget(checkbox)
+        if self.option_scope != "production":
+            self.tag_filter_field = QLineEdit(runtime_group)
+            self.tag_filter_field.setPlaceholderText("Comma-separated tags")
+            self.tag_filter_field.setToolTip(CLUSTERING_HELP["tag_filter"])
+            self.tag_filter_field.textChanged.connect(self.state_changed.emit)
+            self.tag_match_combobox = QComboBox(runtime_group)
+            self.tag_match_combobox.addItems(["Any", "All"])
+            self.tag_match_combobox.setToolTip(CLUSTERING_HELP["tag_match"])
+            self.tag_match_combobox.currentIndexChanged.connect(self.state_changed.emit)
+            apply_field_size(self.tag_match_combobox, "short")
+            tag_grid = QGridLayout()
+            tag_grid.addWidget(field_cell("Tags", self.tag_filter_field, runtime_group), 0, 0, 1, 2)
+            tag_grid.addWidget(field_cell("Match", self.tag_match_combobox, runtime_group), 1, 0)
+            runtime_controls.addLayout(tag_grid)
+        runtime_layout.addWidget(runtime_group)
+        runtime_layout.addStretch(1)
+        runtime_scroll = QScrollArea(self.technical_panel)
+        runtime_scroll.setWidgetResizable(True)
+        runtime_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        runtime_scroll.setWidget(runtime_page)
+        self.technical_panel.addTab(runtime_scroll, "Runtime")
+        self.technical_panel.setTabToolTip(0, "Embedding models")
+        self.technical_panel.setTabToolTip(1, "Grouping and comparison options")
+        self.technical_panel.setTabToolTip(2, "Runtime and cache options")
+        self._sync_technical_tab_labels()
+        self.technical_panel.setCurrentIndex(1)
+        layout.addWidget(self.technical_panel, 1)
+
+        self.run_actions_row = QWidget(self)
+        button_row = ResponsiveFlowLayout(self.run_actions_row, spacing=6)
+        self.cluster_button = QPushButton("Organize", self)
+        self.cluster_button.setProperty("kind", "primary")
+        self.cluster_button.setToolTip(CLUSTERING_HELP["run_clustering"])
+        apply_icon(self.cluster_button, "organize")
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.setToolTip(CLUSTERING_HELP["cancel"])
+        self.cancel_button.setEnabled(False)
+        apply_icon(self.cancel_button, "cancel")
+        button_row.addWidget(self.cluster_button)
+        button_row.addWidget(self.cancel_button)
+        outer_layout.addWidget(self.run_actions_row)
+
+        self.cluster_button.clicked.connect(self.run_requested.emit)
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        self._last_metrics_text = ""
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        for checkbox in (*self.embedding_checkboxes.values(), *self.backend_checkboxes.values(), *self.similarity_checkboxes.values()):
+            checkbox.toggled.connect(self._mark_custom_preset)
+        for widget in (
+            self.outlier_combobox, self.cluster_spinbox, self.recursive_checkbox, self.onnx_checkbox,
+            self.result_cache_checkbox, self.embedding_cache_lookup_checkbox,
+            *([self.tag_filter_field, self.tag_match_combobox] if self.option_scope != "production" else []),
+            self.hdbscan_min_cluster_size_spin, self.hdbscan_min_samples_spin,
+            self.hdbscan_cluster_selection_epsilon_spin, self.hdbscan_allow_single_cluster_checkbox,
+        ):
+            signal = getattr(widget, "textChanged", None) or getattr(widget, "valueChanged", None) or getattr(widget, "toggled", None) or getattr(widget, "currentIndexChanged", None)
+            if signal is not None:
+                signal.connect(self._mark_custom_preset)
+        if self.option_scope == "production":
+            self._apply_preset("balanced")
+        self._refresh_hdbscan_controls()
+
+    def _sync_preset_summary_height(self) -> None:
+        if hasattr(self, "preset_summary"):
+            self.preset_summary.setMinimumHeight(self.preset_summary.fontMetrics().lineSpacing() * 3)
+
+    def _sync_technical_tab_labels(self) -> None:
+        if not hasattr(self, "technical_panel") or self.technical_panel.count() < 3:
+            return
+        app = QApplication.instance()
+        try:
+            scale = int(app.property("clusterlens_text_scale") or 100) if app is not None else 100
+        except (TypeError, ValueError):
+            scale = 100
+        labels = ("Model", "Group", "Run") if scale >= 150 else ("Models", "Grouping", "Runtime")
+        for index, label in enumerate(labels):
+            self.technical_panel.setTabText(index, label)
+
+    def changeEvent(self, event) -> None:
+        result = super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.StyleChange}:
+            self._sync_preset_summary_height()
+            self._sync_technical_tab_labels()
+        return result
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._refresh_compact_grid()
+
+    def _refresh_compact_grid(self) -> None:
+        """Avoid forcing two short controls beside one another in a narrow rail."""
+
+        layout = getattr(self, "_comparison_layout", None)
+        if layout is None:
+            return
+        narrow = self.width() < 350
+        layout.removeWidget(self._comparison_outlier_cell)
+        layout.removeWidget(self._comparison_cluster_cell)
+        if narrow:
+            layout.addWidget(self._comparison_outlier_cell, 1, 0, 1, 2)
+            layout.addWidget(self._comparison_cluster_cell, 2, 0, 1, 2)
+        else:
+            layout.addWidget(self._comparison_outlier_cell, 1, 0)
+            layout.addWidget(self._comparison_cluster_cell, 1, 1)
+
     def _on_preset_changed(self, _index: int) -> None:
         preset = str(self.preset_combo.currentData() or "custom")
         self._apply_preset(preset)
@@ -795,7 +752,7 @@ class ClusteringOptionsPane(QWidget):
             self.preset_combo.setCurrentIndex(custom_index)
             self.preset_combo.blockSignals(False)
         self.technical_panel.show()
-        self.preset_summary.setText("Custom settings. Review model, grouping, cache, and runtime tradeoffs below.")
+        self.preset_summary.setText("Custom configuration.")
 
     def _refresh_hdbscan_controls(self, *_args) -> None:
         checkbox = self.backend_checkboxes.get("hdbscan")
@@ -804,10 +761,13 @@ class ClusteringOptionsPane(QWidget):
     def _apply_preset(self, preset: str) -> None:
         preset = str(preset or "custom")
         summaries = {
-            "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.",
-            "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
-            "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
+            "fast_preview": "Fast, low-memory preview.",
+            "balanced": "Balanced visual grouping with GPU-first execution.",
+            "events": "Event-aware groups with isolated outliers.",
+            "documents": "Broad structure for scans and documents.",
+            "people_heavy": "Stronger comparisons for people-heavy sets.",
+            "high_quality": "Higher-quality groups; uses more time and memory.",
+            "custom": "Custom configuration.",
         }
         self.preset_summary.setText(summaries.get(preset, summaries["custom"]))
         # The production controls pane is only shown in Advanced workspace
@@ -825,6 +785,18 @@ class ClusteringOptionsPane(QWidget):
             "balanced": {
                 "models": {"siglip"}, "backends": {"cosine-kmeans"}, "modes": {"semantic"},
                 "outlier": "isolate", "clusters": 12, "onnx": False,
+            },
+            "events": {
+                "models": {"siglip"}, "backends": {"hdbscan", "graph"}, "modes": {"semantic"},
+                "outlier": "isolate", "clusters": 18, "onnx": False,
+            },
+            "documents": {
+                "models": {"clip"}, "backends": {"cosine-kmeans", "graph"}, "modes": {"cosine"},
+                "outlier": "isolate", "clusters": 12, "onnx": False,
+            },
+            "people_heavy": {
+                "models": {"siglip", "clip"}, "backends": {"cosine-kmeans", "hdbscan"}, "modes": {"semantic", "cosine"},
+                "outlier": "isolate", "clusters": 16, "onnx": False,
             },
             "high_quality": {
                 "models": {"dinov2_base", "clip"}, "backends": {"cosine-kmeans", "graph"}, "modes": {"semantic", "cosine"},
@@ -990,10 +962,13 @@ class ClusteringOptionsPane(QWidget):
         self.technical_panel.setVisible(True)
         self._refresh_hdbscan_controls()
         self.preset_summary.setText({
-            "fast_preview": "Fastest preview with low memory use and a single predictable grouping method.",
-            "balanced": "SigLIP with CUDA-first cosine K-means and deterministic CPU fallback.",
-            "high_quality": "Higher-quality comparison using stronger models; requires more time and memory.",
-            "custom": "Custom settings. Review model, grouping, cache, and runtime tradeoffs below.",
+            "fast_preview": "Fast, low-memory preview.",
+            "balanced": "Balanced visual grouping with GPU-first execution.",
+            "events": "Event-aware groups with isolated outliers.",
+            "documents": "Broad structure for scans and documents.",
+            "people_heavy": "Stronger comparisons for people-heavy sets.",
+            "high_quality": "Higher-quality groups; uses more time and memory.",
+            "custom": "Custom configuration.",
         }.get(preset, "Custom settings."))
 
     def update_metrics(self, metrics: dict) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import QResizeEvent
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QWidget
 
@@ -22,6 +22,12 @@ class ElidedLabel(QLabel):
         super().resizeEvent(event)
         self._apply_elision()
 
+    def changeEvent(self, event) -> None:
+        result = super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.StyleChange}:
+            self._apply_elision()
+        return result
+
     def _apply_elision(self) -> None:
         width = max(32, self.contentsRect().width())
         text = self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, width)
@@ -33,8 +39,10 @@ class WorkspaceFooter(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._progress_owner_active = False
+        self._deferred_status = ""
         self.setObjectName("workspaceFooter")
-        self.setFixedHeight(38)
+        self._sync_height()
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 4, 10, 4)
@@ -72,8 +80,21 @@ class WorkspaceFooter(QWidget):
         layout.addWidget(self.clear_storage_button, stretch=0)
         layout.addWidget(self.progress_bar, stretch=0)
 
+    def _sync_height(self) -> None:
+        self.setFixedHeight(max(38, self.fontMetrics().lineSpacing() + 12))
+
+    def changeEvent(self, event) -> None:
+        result = super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.StyleChange}:
+            self._sync_height()
+        return result
+
     def set_status(self, text: str) -> None:
-        self.status_label.setText(text or "Idle")
+        value = str(text or "Idle")
+        if self._progress_owner_active:
+            self._deferred_status = value
+            return
+        self.status_label.setText(value)
 
     def set_selected_folder(self, path: str) -> None:
         directory = str(path or "").strip()
@@ -102,12 +123,22 @@ class WorkspaceFooter(QWidget):
             )
 
     def set_progress(self, value: int | None, text: str = "") -> None:
-        if text:
-            self.set_status(text)
         if value is None:
+            self._progress_owner_active = False
             self.progress_bar.hide()
             self.progress_bar.reset()
+            if text:
+                self._deferred_status = ""
+                self.status_label.setText(str(text))
+            elif self._deferred_status:
+                deferred = self._deferred_status
+                self._deferred_status = ""
+                self.status_label.setText(deferred)
             return
+        self._progress_owner_active = True
+        if text:
+            self._deferred_status = ""
+            self.status_label.setText(str(text))
         self.progress_bar.show()
         if int(value) < 0:
             self.progress_bar.setRange(0, 0)

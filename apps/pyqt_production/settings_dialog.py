@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QSettings, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QHeaderView,
@@ -40,10 +41,12 @@ from app.services.face_model_installer import FaceModelInstaller, face_model_run
 from app.services.model_assets import TEXT_MODEL_ORDER, ModelAssetService
 from app.services.model_downloads import ModelDownloadItem
 from apps.pyqt_production.model_download_controller import ModelDownloadController
-from ui.async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
+from ui.async_job import AsyncJob, defer_async_job_dispose, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
+from ui.common import KeyboardTabBar, ResponsiveFlowLayout
 from ui.error_mbox import confirmBox, errorBox, infoBox
 from ui.icons import apply_icon
 from ui.job_manager import JobManager
+from ui.work_coordinator import JobSpec, WorkCoordinator
 from apps.pyqt_production.identity import PRODUCTION_DISPLAY_NAME
 from apps.shared.runtime_support import RuntimeLayout, open_path_in_shell
 from apps.shared.support_bundle import export_support_bundle
@@ -90,7 +93,6 @@ class OperationJournalTableModel(QAbstractTableModel):
         if self._role_is(role, Qt.ItemDataRole.UserRole):
             return entry
         return None
-
     def headerData(
         self,
         section: int,
@@ -150,8 +152,44 @@ class OperationJournalTableModel(QAbstractTableModel):
         return role == target_value
 
 
+class FocusTargetTextEdit(QTextEdit):
+    """Read-only text that leaves a nested scroll page predictably on Tab."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._forward_focus_target = None
+        self._backward_focus_target = None
+
+    def set_focus_targets(self, *, forward=None, backward=None) -> None:
+        self._forward_focus_target = forward if isinstance(forward, tuple) else (forward,)
+        self._backward_focus_target = backward if isinstance(backward, tuple) else (backward,)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API override
+        key = event.key()
+        backward = key == Qt.Key.Key_Backtab or (
+            key == Qt.Key.Key_Tab and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        )
+        if key in {Qt.Key.Key_Tab, Qt.Key.Key_Backtab}:
+            targets = self._backward_focus_target if backward else self._forward_focus_target
+            for target in targets:
+                if target is not None and target.isEnabled():
+                    target.setFocus(
+                        Qt.FocusReason.BacktabFocusReason if backward else Qt.FocusReason.TabFocusReason
+                    )
+                    parent = target.parentWidget()
+                    while parent is not None:
+                        if isinstance(parent, QScrollArea):
+                            parent.ensureWidgetVisible(target)
+                            break
+                        parent = parent.parentWidget()
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
+
 class ProductionSettingsDialog(QDialog):
     runtime_rescanned = pyqtSignal()
+    appearance_preview_requested = pyqtSignal(str, str, int)
 
     def __init__(
         self,
@@ -175,6 +213,7 @@ class ProductionSettingsDialog(QDialog):
         support_metadata_provider,
         model_download_controller: ModelDownloadController | None = None,
         job_manager: JobManager | None = None,
+        work_coordinator: WorkCoordinator | None = None,
         auto_refresh: bool = True,
         parent=None,
     ) -> None:
@@ -201,6 +240,7 @@ class ProductionSettingsDialog(QDialog):
         self._owns_model_download_controller = model_download_controller is None
         self.model_download_controller = model_download_controller or ModelDownloadController(runtime_layout, self)
         self.job_manager = job_manager
+        self.work_coordinator = work_coordinator
         self.model_asset_service = ModelAssetService(runtime_model_assets_dir=runtime_layout.model_assets_dir)
         self.face_model_installer = FaceModelInstaller(self.app_settings)
         self.system_resources = detect_system_resources()
@@ -213,6 +253,7 @@ class ProductionSettingsDialog(QDialog):
         self._data_home_job = None
         self._data_home_thread = None
         self._data_home_recovery_entries: tuple[dict[str, object], ...] = ()
+        self._data_home_backup_recovery_entries: tuple[dict[str, object], ...] = ()
         self._model_job = None
         self._model_thread = None
         self._active_model_download_name: str | None = None
@@ -256,7 +297,16 @@ class ProductionSettingsDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self.settings_search = QLineEdit(self)
+        self.settings_search.setPlaceholderText("Search settings")
+        self.settings_search.setAccessibleName("Search settings")
+        self.settings_search.setClearButtonEnabled(True)
+        self.settings_search.textChanged.connect(self._search_settings)
+        layout.addWidget(self.settings_search)
         self.tabs = QTabWidget(self)
+        self.tabs.setTabBar(KeyboardTabBar(self.tabs))
+        self.tabs.setAccessibleName("Settings categories")
+        self.tabs.tabBar().setAccessibleName("Settings categories")
         layout.addWidget(self.tabs)
         self._build_general_tab()
         self._build_runtime_tab()
@@ -265,6 +315,8 @@ class ProductionSettingsDialog(QDialog):
         self._build_safety_tab()
         self._build_updates_tab()
         self._build_diagnostics_tab()
+        self._build_about_tab()
+        self._reorganize_settings_categories()
 
         self.operation_progress_bar = QProgressBar(self)
         self.operation_progress_bar.setTextVisible(False)
@@ -273,6 +325,7 @@ class ProductionSettingsDialog(QDialog):
         layout.addWidget(self.operation_progress_bar)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=self)
+        self.button_box = buttons
         self.cancel_settings_tasks_button = buttons.addButton(
             "Cancel Active Tasks",
             QDialogButtonBox.ButtonRole.ActionRole,
@@ -284,27 +337,374 @@ class ProductionSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._set_storage_focus_order()
         self._update_settings_cancel_state()
 
     def _build_general_tab(self) -> None:
         tab = QWidget(self)
         form = QFormLayout(tab)
+        self.general_tab = tab
+        self.general_form = form
+        self.application_theme = QComboBox()
+        self.application_theme.addItem("Follow system", "system")
+        self.application_theme.addItem("Light", "light")
+        self.application_theme.addItem("Dark", "dark")
+        self.application_theme.setAccessibleName("Application color theme")
+        self.application_theme.setToolTip(
+            "Follow the desktop light/dark preference, or keep ClusterLens in a fixed theme. "
+            "Appearance changes preview immediately; OK saves them and Cancel restores the prior appearance."
+        )
+        self.viewer_backdrop = QComboBox()
+        self.viewer_backdrop.addItem("Adaptive neutral", "adaptive_neutral")
+        self.viewer_backdrop.addItem("Follow app theme", "theme")
+        self.viewer_backdrop.addItem("Black", "black")
+        self.viewer_backdrop.addItem("Middle gray", "middle_gray")
+        self.viewer_backdrop.addItem("Light gray", "light_gray")
+        self.viewer_backdrop.setAccessibleName("Photo viewer background")
+        self.viewer_backdrop.setToolTip(
+            "Adaptive neutral samples the already-loaded preview border and chooses black, middle gray, or light gray. "
+            "It never changes the rest of the application or rereads the photo."
+        )
+        self.text_scale = QComboBox()
+        for label, value in (("100%", 100), ("125%", 125), ("150%", 150), ("200%", 200)):
+            self.text_scale.addItem(label, value)
+        self.text_scale.setAccessibleName("Application text scale")
+        self.text_scale.setToolTip(
+            "Scale application text independently of compact spacing. Larger text may make secondary panels scroll."
+        )
+        self.appearance_summary = QLabel()
+        self.appearance_summary.setProperty("role", "help")
+        self.appearance_summary.setWordWrap(True)
+        self.application_theme.currentIndexChanged.connect(self._preview_appearance)
+        self.viewer_backdrop.currentIndexChanged.connect(self._preview_appearance)
+        self.text_scale.currentIndexChanged.connect(self._preview_appearance)
         self.thumbnail_size = QSpinBox()
+        self.thumbnail_size.setAccessibleName("Photo thumbnail size")
         self.thumbnail_size.setRange(96, 512)
+        self.ignore_thumbnail_like = QCheckBox("Exclude thumbnail-like file names and folders")
+        self.ignore_thumbnail_like.setToolTip(
+            "Excludes conventional thumbnail names such as IMG_123_thumb.jpg, thumbnail320.jpg, and files in "
+            ".thumbnails folders. This is name/folder matching only; use the dimension controls for small images. "
+            "It never deletes or changes source files."
+        )
+        self.minimum_image_width = QSpinBox()
+        self.minimum_image_width.setRange(0, 100000)
+        self.minimum_image_width.setSpecialValueText("Disabled")
+        self.minimum_image_width.setSuffix(" px")
+        self.minimum_image_width.setToolTip(
+            "Ignore images narrower than this width. Zero disables the dimension rule."
+        )
+        self.minimum_image_height = QSpinBox()
+        self.minimum_image_height.setRange(0, 100000)
+        self.minimum_image_height.setSpecialValueText("Disabled")
+        self.minimum_image_height.setSuffix(" px")
+        self.minimum_image_height.setToolTip(
+            "Ignore images shorter than this height. Zero disables the dimension rule."
+        )
+        self.minimum_file_size_kib = QSpinBox()
+        self.minimum_file_size_kib.setRange(0, 1_073_741_824)
+        self.minimum_file_size_kib.setSpecialValueText("Disabled")
+        self.minimum_file_size_kib.setSuffix(" KiB")
+        self.minimum_file_size_kib.setToolTip(
+            "Ignore files smaller than this size. Zero disables the file-size rule; KiB uses 1,024 bytes."
+        )
+        self.source_filter_summary = QLabel()
+        self.source_filter_summary.setObjectName("sourceFilterSummary")
+        self.source_filter_summary.setProperty("role", "help")
+        self.source_filter_summary.setWordWrap(True)
+        self.source_filter_summary.setAccessibleName("Source filter summary")
+        self.ignore_thumbnail_like.toggled.connect(self._update_source_filter_summary)
+        self.minimum_image_width.valueChanged.connect(self._update_source_filter_summary)
+        self.minimum_image_height.valueChanged.connect(self._update_source_filter_summary)
+        self.minimum_file_size_kib.valueChanged.connect(self._update_source_filter_summary)
         self.runtime_badge = QCheckBox("Show runtime status in the application header")
         self.dense_ui = QCheckBox("Use compact spacing")
         self.power_user_mode = QCheckBox("Power-user mode: show all advanced controls and diagnostics")
+        self.runtime_badge.setAccessibleName("Show runtime status in application header")
+        self.dense_ui.setAccessibleName("Use compact spacing")
+        self.power_user_mode.setAccessibleName("Show advanced controls and diagnostics")
         self.power_user_mode.setToolTip(
             "Shows advanced workspace controls and diagnostics without relaxing confirmations, cancellation, or read-only safety."
         )
+        form.addRow("Application theme", self.application_theme)
+        form.addRow("Photo viewer background", self.viewer_backdrop)
+        form.addRow("Text scale", self.text_scale)
+        form.addRow("Appearance behavior", self.appearance_summary)
         form.addRow("Photo thumbnail size", self.thumbnail_size)
+        form.addRow(self.ignore_thumbnail_like)
+        form.addRow("Minimum image width", self.minimum_image_width)
+        form.addRow("Minimum image height", self.minimum_image_height)
+        form.addRow("Minimum file size", self.minimum_file_size_kib)
+        form.addRow("Active source filters", self.source_filter_summary)
         form.addRow(self.runtime_badge)
         form.addRow(self.dense_ui)
         form.addRow(self.power_user_mode)
-        note = QLabel("Common appearance and workspace preferences apply after you choose OK.")
-        note.setWordWrap(True)
-        form.addRow(note)
+        self.source_filter_note = QLabel(
+            "Source filters apply globally to Library, Organize, People, and similarity scans. Saving changes "
+            "reloads visible photos and refreshes registered Library roots in a visible, cancellable Job. No source file is changed."
+        )
+        self.source_filter_note.setWordWrap(True)
+        form.addRow(self.source_filter_note)
         self.tabs.addTab(tab, "General")
+
+    def _reorganize_settings_categories(self) -> None:
+        """Group technical pages under six stable, task-oriented destinations."""
+
+        pages: dict[str, QWidget] = {}
+        while self.tabs.count():
+            name = self.tabs.tabText(0)
+            page = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            pages[name] = page
+
+        sources_page = QWidget(self.tabs)
+        sources_layout = QVBoxLayout(sources_page)
+        sources_layout.setContentsMargins(12, 12, 12, 12)
+        sources_intro = QLabel(
+            "These admission rules apply to every photo root. Registered Library roots and Data Home remain separate.",
+            sources_page,
+        )
+        sources_intro.setWordWrap(True)
+        sources_layout.addWidget(sources_intro)
+        sources_form = QFormLayout()
+        source_rows = (
+            (self.ignore_thumbnail_like, ""),
+            (self.minimum_image_width, "Minimum image width"),
+            (self.minimum_image_height, "Minimum image height"),
+            (self.minimum_file_size_kib, "Minimum file size"),
+            (self.source_filter_summary, "Active source filters"),
+            (self.source_filter_note, ""),
+        )
+        for field, label in source_rows:
+            old_label = self.general_form.labelForField(field)
+            if old_label is not None:
+                self.general_form.removeWidget(old_label)
+                old_label.deleteLater()
+            self.general_form.removeWidget(field)
+            if label:
+                sources_form.addRow(label, field)
+            else:
+                sources_form.addRow(field)
+        sources_layout.addLayout(sources_form)
+        sources_layout.addStretch(1)
+
+        def scroll_page(page: QWidget, object_name: str) -> QScrollArea:
+            scroll = QScrollArea(self.tabs)
+            scroll.setObjectName(object_name)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(page)
+            return scroll
+
+        general_page = scroll_page(pages["General"], "general_scroll_area")
+        sources_scroll = scroll_page(sources_page, "sources_scroll_area")
+        performance_page = scroll_page(pages["Performance"], "performance_scroll_area")
+        updates_page = scroll_page(pages["Updates"], "updates_scroll_area")
+        support_page = scroll_page(pages["Support"], "support_scroll_area")
+
+        compute_tabs = QTabWidget(self.tabs)
+        compute_tabs.setTabBar(KeyboardTabBar(compute_tabs))
+        compute_tabs.setAccessibleName("Compute and model settings sections")
+        compute_pages = {
+            "Performance": performance_page,
+            "Clustering Models": pages["Clustering Models"],
+            "Face Models": pages["Face Models"],
+        }
+        for name, page in compute_pages.items():
+            compute_tabs.addTab(page, name)
+
+        safety_tabs = QTabWidget(self.tabs)
+        safety_tabs.setTabBar(KeyboardTabBar(safety_tabs))
+        safety_tabs.setAccessibleName("Safety and storage settings sections")
+        for name in ("Storage", "Safety & Recovery"):
+            safety_tabs.addTab(pages[name], name.replace("&", "&&"))
+
+        advanced_tabs = QTabWidget(self.tabs)
+        advanced_tabs.setTabBar(KeyboardTabBar(advanced_tabs))
+        advanced_tabs.setAccessibleName("Advanced settings sections")
+        advanced_pages = {"Updates": updates_page, "Support": support_page}
+        for name, page in advanced_pages.items():
+            advanced_tabs.addTab(page, name)
+
+        self.settings_section_tabs = {
+            "General": (0, None, general_page),
+            "Sources & Library": (1, None, sources_scroll),
+            "Performance": (2, compute_tabs, performance_page),
+            "Clustering Models": (2, compute_tabs, pages["Clustering Models"]),
+            "Face Models": (2, compute_tabs, pages["Face Models"]),
+            "Compute & Models": (2, compute_tabs, performance_page),
+            "Storage": (3, safety_tabs, pages["Storage"]),
+            "Safety & Recovery": (3, safety_tabs, pages["Safety & Recovery"]),
+            "Safety & Storage": (3, safety_tabs, pages["Storage"]),
+            "Updates": (4, advanced_tabs, updates_page),
+            "Support": (4, advanced_tabs, support_page),
+            "Advanced": (4, advanced_tabs, support_page),
+            "About": (5, None, pages["About"]),
+        }
+        top_tabs = (
+            (general_page, "General", "General appearance and source-admission behavior"),
+            (sources_scroll, "Sources", "Sources and Library settings"),
+            (compute_tabs, "Compute", "Compute and model settings"),
+            (safety_tabs, "Storage", "Safety, storage, and recovery settings"),
+            (advanced_tabs, "Advanced", "Updates, diagnostics, and support"),
+            (pages["About"], "About", "About ClusterLens"),
+        )
+        for page, label, tooltip in top_tabs:
+            index = self.tabs.addTab(page, label)
+            self.tabs.setTabToolTip(index, tooltip)
+
+    def _set_storage_focus_order(self) -> None:
+        """Apply the nested Storage traversal after the dialog is complete."""
+
+        _top_index, safety_tabs, _page = self.settings_section_tabs["Storage"]
+        storage_focus_order = (
+            safety_tabs.tabBar(),
+            self.data_home_inventory_text,
+            self.generated_storage_text,
+            self.cache_usage_text,
+            self.refresh_cache_usage_button,
+            self.clear_cache_button,
+            self.clear_runtime_temp_button,
+            self.clear_library_catalog_button,
+            self.clear_face_storage_button,
+            self.clear_model_caches_button,
+            self.clear_logs_button,
+            self.clear_runtime_reports_button,
+            self.clear_model_assets_button,
+            self.backup_data_home_button,
+            self.verify_data_home_backup_button,
+            self.relocate_data_home_button,
+            self.data_home_recovery_combo,
+            self.resume_data_home_button,
+            self.rollback_data_home_button,
+            self.data_home_backup_recovery_combo,
+            self.discard_backup_staging_button,
+            self.button_box.button(QDialogButtonBox.StandardButton.Ok),
+            self.button_box.button(QDialogButtonBox.StandardButton.Cancel),
+        )
+        self._storage_focus_order = tuple(widget for widget in storage_focus_order if widget is not None)
+        self.data_home_inventory_text.set_focus_targets(
+            backward=safety_tabs.tabBar(),
+            forward=self.generated_storage_text,
+        )
+        self.generated_storage_text.set_focus_targets(
+            backward=self.data_home_inventory_text,
+            forward=self.cache_usage_text,
+        )
+        self.cache_usage_text.set_focus_targets(
+            backward=self.generated_storage_text,
+            forward=self._storage_focus_order[4:],
+        )
+        self._storage_focus_watch = {}
+        for current, following in zip(self._storage_focus_order, self._storage_focus_order[1:]):
+            QWidget.setTabOrder(current, following)
+            current.installEventFilter(self)
+            self._storage_focus_watch[current] = current
+            viewport = getattr(current, "viewport", None)
+            if callable(viewport):
+                viewport_widget = viewport()
+                viewport_widget.installEventFilter(self)
+                self._storage_focus_watch[viewport_widget] = current
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API override
+        focus_order = getattr(self, "_storage_focus_order", ())
+        current = getattr(self, "_storage_focus_watch", {}).get(watched)
+        if event.type() == QEvent.Type.KeyPress and current in focus_order:
+            key = event.key()
+            backward = key == Qt.Key.Key_Backtab or (
+                key == Qt.Key.Key_Tab and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            )
+            if key in {Qt.Key.Key_Tab, Qt.Key.Key_Backtab}:
+                step = -1 if backward else 1
+                index = focus_order.index(current) + step
+                while 0 <= index < len(focus_order):
+                    target = focus_order[index]
+                    if target.isEnabled() and target.isVisible():
+                        target.setFocus(
+                            Qt.FocusReason.BacktabFocusReason if backward else Qt.FocusReason.TabFocusReason
+                        )
+                        parent = target.parentWidget()
+                        while parent is not None:
+                            if isinstance(parent, QScrollArea):
+                                parent.ensureWidgetVisible(target)
+                                break
+                            parent = parent.parentWidget()
+                        return True
+                    index += step
+        return super().eventFilter(watched, event)
+
+    def select_section(self, section: str) -> bool:
+        target = str(section or "").strip().casefold()
+        for name, (top_index, nested, page) in self.settings_section_tabs.items():
+            if name.casefold() != target:
+                continue
+            self.tabs.setCurrentIndex(top_index)
+            if nested is not None:
+                nested.setCurrentWidget(page)
+            return True
+        return False
+
+    def _search_settings(self, query: str) -> None:
+        needle = str(query or "").strip().casefold()
+        if not needle:
+            return
+        for name, (_top_index, _nested, page) in self.settings_section_tabs.items():
+            if needle in name.casefold() or needle in self._settings_page_text(page):
+                self.select_section(name)
+                return
+
+    @staticmethod
+    def _settings_page_text(page: QWidget) -> str:
+        values: list[str] = []
+        for widget in page.findChildren(QWidget):
+            if isinstance(widget, QComboBox):
+                values.extend(widget.itemText(index) for index in range(widget.count()))
+            for getter_name in ("text", "title", "placeholderText", "toolTip", "accessibleName"):
+                getter = getattr(widget, getter_name, None)
+                if callable(getter):
+                    try:
+                        value = str(getter() or "").strip()
+                    except (RuntimeError, TypeError):
+                        value = ""
+                    if value:
+                        values.append(value)
+        return "\n".join(values).casefold()
+
+    def _update_appearance_summary(self, *_args) -> None:
+        theme_label = self.application_theme.currentText().lower()
+        backdrop_label = self.viewer_backdrop.currentText().lower()
+        text_scale = int(self.text_scale.currentData() or 100)
+        self.appearance_summary.setText(
+            f"App chrome: {theme_label}. Photo canvas: {backdrop_label}. Text: {text_scale}%. "
+            "Photo analysis never changes app chrome."
+        )
+
+    def _preview_appearance(self, *_args) -> None:
+        self._update_appearance_summary()
+        self.appearance_preview_requested.emit(
+            str(self.application_theme.currentData() or "system"),
+            str(self.viewer_backdrop.currentData() or "adaptive_neutral"),
+            int(self.text_scale.currentData() or 100),
+        )
+
+    def _update_source_filter_summary(self, *_args) -> None:
+        """Make the saved-rule intent explicit before the user closes Settings."""
+
+        thumbnail_state = "on" if self.ignore_thumbnail_like.isChecked() else "off"
+        width = int(self.minimum_image_width.value())
+        height = int(self.minimum_image_height.value())
+        size_kib = int(self.minimum_file_size_kib.value())
+        limits: list[str] = []
+        if width:
+            limits.append(f"width ≥ {width} px")
+        if height:
+            limits.append(f"height ≥ {height} px")
+        if size_kib:
+            limits.append(f"file size ≥ {size_kib} KiB")
+        limits_text = "; ".join(limits) if limits else "no size or dimension limit"
+        self.source_filter_summary.setText(
+            f"Thumbnail-name matching: {thumbnail_state}. {limits_text}. Changes take effect when you choose OK."
+        )
 
     def _build_runtime_tab(self) -> None:
         tab = QWidget(self)
@@ -389,6 +789,7 @@ class ProductionSettingsDialog(QDialog):
         layout.addWidget(self.offline_model_downloads)
 
         self.model_inventory_table = QTableWidget(0, 5, self)
+        self.model_inventory_table.setAccessibleName("Clustering model inventory")
         self.model_inventory_table.setHorizontalHeaderLabels(["Model", "State", "Size", "Checksum", "Source / License"])
         self.model_inventory_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.model_inventory_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -400,23 +801,24 @@ class ProductionSettingsDialog(QDialog):
         self.model_inventory_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.model_inventory_table, stretch=1)
 
-        actions = QGridLayout()
+        self.model_actions = QWidget(clustering_tab)
+        actions = ResponsiveFlowLayout(self.model_actions, spacing=6)
         self.refresh_models_button = QPushButton("Refresh Models")
         self.install_model_button = QPushButton("Download / Install Selected")
         self.cancel_model_download_button = QPushButton("Cancel Download")
         self.delete_model_cache_button = QPushButton("Delete Cached Download")
         self.open_model_assets_button = QPushButton("Open Model Assets")
         self.open_download_cache_button = QPushButton("Open Download Cache")
-        for index, button in enumerate((
+        for button in (
             self.refresh_models_button,
             self.install_model_button,
             self.cancel_model_download_button,
             self.delete_model_cache_button,
             self.open_model_assets_button,
             self.open_download_cache_button,
-        )):
-            actions.addWidget(button, index // 3, index % 3)
-        layout.addLayout(actions)
+        ):
+            actions.addWidget(button)
+        layout.addWidget(self.model_actions)
 
         self.model_status_label = QLabel()
         self.model_status_label.setWordWrap(True)
@@ -431,10 +833,9 @@ class ProductionSettingsDialog(QDialog):
         self.tabs.addTab(models_scroll, "Clustering Models")
 
         face_tab = QWidget(self)
-        face_layout = QGridLayout(face_tab)
-        face_layout.setColumnStretch(0, 1)
-        face_layout.setColumnStretch(1, 1)
+        face_layout = QVBoxLayout(face_tab)
         self.face_model_pack_combo = QComboBox(face_tab)
+        self.face_model_pack_combo.setAccessibleName("Face model bundle")
         for label, profile_id in (
             ("Default GPU — SCRFD 10G + ArcFace R100", "latest_gpu"),
             ("Balanced — SCRFD 2.5G + ArcFace R50", "recommended"),
@@ -450,17 +851,24 @@ class ProductionSettingsDialog(QDialog):
         self.install_face_model_pack_button = QPushButton("Install Selected Face Pack")
         self.open_face_model_cache_button = QPushButton("Open Face Model Cache")
         self.clear_face_download_cache_button = QPushButton("Clear Face Download Cache")
-        face_layout.addWidget(self.face_model_pack_combo, 0, 0)
-        face_layout.addWidget(self.install_face_model_pack_button, 0, 1)
+        face_pack_actions = QWidget(face_tab)
+        face_pack_layout = ResponsiveFlowLayout(face_pack_actions, spacing=6)
+        face_pack_layout.addWidget(self.face_model_pack_combo)
+        face_pack_layout.addWidget(self.install_face_model_pack_button)
+        face_layout.addWidget(face_pack_actions)
         self.external_face_model_root_label = QLabel("External model folder: not selected", face_tab)
         self.external_face_model_root_label.setWordWrap(True)
         self.choose_external_face_model_root_button = QPushButton("Choose Face Model Folder")
         self.open_external_face_model_root_button = QPushButton("Open Face Model Folder")
-        face_layout.addWidget(self.external_face_model_root_label, 1, 0, 1, 2)
-        face_layout.addWidget(self.choose_external_face_model_root_button, 2, 0)
-        face_layout.addWidget(self.open_external_face_model_root_button, 2, 1)
+        face_layout.addWidget(self.external_face_model_root_label)
+        external_face_actions = QWidget(face_tab)
+        external_face_layout = ResponsiveFlowLayout(external_face_actions, spacing=6)
+        external_face_layout.addWidget(self.choose_external_face_model_root_button)
+        external_face_layout.addWidget(self.open_external_face_model_root_button)
+        face_layout.addWidget(external_face_actions)
 
         self.face_model_inventory_table = QTableWidget(0, 5, face_tab)
+        self.face_model_inventory_table.setAccessibleName("Face model inventory")
         self.face_model_inventory_table.setHorizontalHeaderLabels(["Component", "Type", "Hardware", "State", "Location"])
         self.face_model_inventory_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.face_model_inventory_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -468,17 +876,24 @@ class ProductionSettingsDialog(QDialog):
         for column in range(4):
             self.face_model_inventory_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.face_model_inventory_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        face_layout.addWidget(self.face_model_inventory_table, 3, 0, 1, 2)
+        face_layout.addWidget(self.face_model_inventory_table, stretch=1)
 
         self.installed_face_model_combo = QComboBox(face_tab)
+        self.installed_face_model_combo.setAccessibleName("Installed face model component")
         self.delete_face_model_button = QPushButton("Delete Installed Face Component")
-        face_layout.addWidget(self.installed_face_model_combo, 4, 0)
-        face_layout.addWidget(self.delete_face_model_button, 4, 1)
-        face_layout.addWidget(self.open_face_model_cache_button, 5, 0)
-        face_layout.addWidget(self.clear_face_download_cache_button, 5, 1)
+        installed_face_actions = QWidget(face_tab)
+        installed_face_layout = ResponsiveFlowLayout(installed_face_actions, spacing=6)
+        installed_face_layout.addWidget(self.installed_face_model_combo)
+        installed_face_layout.addWidget(self.delete_face_model_button)
+        face_layout.addWidget(installed_face_actions)
+        face_cache_actions = QWidget(face_tab)
+        face_cache_layout = ResponsiveFlowLayout(face_cache_actions, spacing=6)
+        face_cache_layout.addWidget(self.open_face_model_cache_button)
+        face_cache_layout.addWidget(self.clear_face_download_cache_button)
+        face_layout.addWidget(face_cache_actions)
         self.face_model_status_label = QLabel()
         self.face_model_status_label.setWordWrap(True)
-        face_layout.addWidget(self.face_model_status_label, 6, 0, 1, 2)
+        face_layout.addWidget(self.face_model_status_label)
 
         face_scroll = QScrollArea(self)
         face_scroll.setObjectName("face_models_scroll_area")
@@ -513,14 +928,20 @@ class ProductionSettingsDialog(QDialog):
         self.config_location_label.setWordWrap(True)
         self.cache_root_label = QLabel(str(self.app_settings.cache_dir))
         self.cache_root_label.setWordWrap(True)
-        self.data_home_inventory_text = QTextEdit()
+        self.data_home_inventory_text = FocusTargetTextEdit()
+        self.data_home_inventory_text.setAccessibleName("Data Home inventory")
         self.data_home_inventory_text.setReadOnly(True)
+        self.data_home_inventory_text.setTabChangesFocus(True)
         self.data_home_inventory_text.setPlaceholderText("Scanning ClusterLens Data Home categories...")
-        self.generated_storage_text = QTextEdit()
+        self.generated_storage_text = FocusTargetTextEdit()
+        self.generated_storage_text.setAccessibleName("Generated storage inventory")
         self.generated_storage_text.setReadOnly(True)
+        self.generated_storage_text.setTabChangesFocus(True)
         self.generated_storage_text.setPlaceholderText("Scanning generated storage usage...")
-        self.cache_usage_text = QTextEdit()
+        self.cache_usage_text = FocusTargetTextEdit()
+        self.cache_usage_text.setAccessibleName("Cache usage inventory")
         self.cache_usage_text.setReadOnly(True)
+        self.cache_usage_text.setTabChangesFocus(True)
         self.cache_usage_text.setPlaceholderText("Scanning rebuildable cache usage...")
         form.addRow("Runtime root", self.runtime_root_label)
         form.addRow("Config location", self.config_location_label)
@@ -530,7 +951,8 @@ class ProductionSettingsDialog(QDialog):
         form.addRow("Rebuildable cache usage", self.cache_usage_text)
         layout.addLayout(form)
 
-        actions = QGridLayout()
+        self.storage_actions = QWidget(tab)
+        actions = ResponsiveFlowLayout(self.storage_actions, spacing=6)
         self.refresh_cache_usage_button = QPushButton("Refresh Cache Usage")
         self.clear_cache_button = QPushButton("Clear Rebuildable Caches")
         self.clear_library_catalog_button = QPushButton("Clear Library Cache")
@@ -551,6 +973,7 @@ class ProductionSettingsDialog(QDialog):
         apply_icon(self.relocate_data_home_button, "retry")
         self.data_home_recovery_combo = QComboBox()
         self.data_home_recovery_combo.setAccessibleName("Incomplete Data Home migrations")
+        self.data_home_recovery_combo.addItem("Checking incomplete Data Home moves…", "")
         self.data_home_recovery_combo.setToolTip(
             "Interrupted derived-data moves. Source photos and the active Data Home remain unchanged until a move verifies."
         )
@@ -560,22 +983,38 @@ class ProductionSettingsDialog(QDialog):
         self.rollback_data_home_button.setToolTip("Discard only the incomplete staged copy; source photos and the active Data Home stay unchanged.")
         apply_icon(self.resume_data_home_button, "recovery")
         apply_icon(self.rollback_data_home_button, "delete")
-        actions.addWidget(self.refresh_cache_usage_button, 0, 0)
-        actions.addWidget(self.clear_cache_button, 0, 1)
-        actions.addWidget(self.clear_runtime_temp_button, 0, 2)
-        actions.addWidget(self.clear_library_catalog_button, 1, 0)
-        actions.addWidget(self.clear_face_storage_button, 1, 1)
-        actions.addWidget(self.clear_model_caches_button, 1, 2)
-        actions.addWidget(self.clear_logs_button, 2, 0)
-        actions.addWidget(self.clear_runtime_reports_button, 2, 1)
-        actions.addWidget(self.clear_model_assets_button, 2, 2)
-        actions.addWidget(self.backup_data_home_button, 3, 0)
-        actions.addWidget(self.verify_data_home_backup_button, 3, 1)
-        actions.addWidget(self.relocate_data_home_button, 3, 2)
-        actions.addWidget(self.data_home_recovery_combo, 4, 0)
-        actions.addWidget(self.resume_data_home_button, 4, 1)
-        actions.addWidget(self.rollback_data_home_button, 4, 2)
-        layout.addLayout(actions)
+        self.data_home_backup_recovery_combo = QComboBox()
+        self.data_home_backup_recovery_combo.setAccessibleName("Incomplete Data Home backups")
+        self.data_home_backup_recovery_combo.addItem("Checking incomplete Data Home backups…", "")
+        self.data_home_backup_recovery_combo.setToolTip(
+            "Interrupted managed-data backups. Staged copies can be discarded; an already published verified backup is retained."
+        )
+        self.discard_backup_staging_button = QPushButton("Discard Staged Backup")
+        self.discard_backup_staging_button.setToolTip(
+            "Discard only the app-marked incomplete backup staging folder. A published verified backup is never deleted."
+        )
+        apply_icon(self.discard_backup_staging_button, "delete")
+        for widget in (
+            self.refresh_cache_usage_button,
+            self.clear_cache_button,
+            self.clear_runtime_temp_button,
+            self.clear_library_catalog_button,
+            self.clear_face_storage_button,
+            self.clear_model_caches_button,
+            self.clear_logs_button,
+            self.clear_runtime_reports_button,
+            self.clear_model_assets_button,
+            self.backup_data_home_button,
+            self.verify_data_home_backup_button,
+            self.relocate_data_home_button,
+            self.data_home_recovery_combo,
+            self.resume_data_home_button,
+            self.rollback_data_home_button,
+            self.data_home_backup_recovery_combo,
+            self.discard_backup_staging_button,
+        ):
+            actions.addWidget(widget)
+        layout.addWidget(self.storage_actions)
         self.cache_status_label = QLabel(
             "Each clear action affects only the named generated-data category. Source photos, tags, durable face labels, "
             "recovery history, and settings are preserved."
@@ -583,7 +1022,12 @@ class ProductionSettingsDialog(QDialog):
         self.cache_status_label.setWordWrap(True)
         layout.addWidget(self.cache_status_label)
         layout.addStretch(1)
-        self.tabs.addTab(tab, "Storage")
+        storage_scroll = QScrollArea(self)
+        storage_scroll.setObjectName("storage_scroll_area")
+        storage_scroll.setWidgetResizable(True)
+        storage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        storage_scroll.setWidget(tab)
+        self.tabs.addTab(storage_scroll, "Storage")
 
         self.refresh_cache_usage_button.clicked.connect(self.refresh_cache_usage)
         self.clear_cache_button.clicked.connect(self._clear_rebuildable_caches)
@@ -604,7 +1048,7 @@ class ProductionSettingsDialog(QDialog):
         self.clear_face_storage_button.clicked.connect(
             lambda: self._clear_generated_storage(
                 "Clear Face DBs And ANN Files?",
-                "This removes generated face databases and ANN sidecar files. Durable face labels and source images are not changed.",
+                "This removes face databases, including saved labels and identities, plus their WAL/SHM and ANN sidecars. Files move to managed recovery storage; source images and external model folders are not changed.",
                 self.clear_face_storage,
             )
         )
@@ -637,6 +1081,8 @@ class ProductionSettingsDialog(QDialog):
             )
         )
         self.backup_data_home_button.clicked.connect(self._backup_data_home)
+        self.data_home_backup_recovery_combo.currentIndexChanged.connect(self._update_cache_action_state)
+        self.discard_backup_staging_button.clicked.connect(self._discard_backup_staging)
         self.verify_data_home_backup_button.clicked.connect(self._verify_data_home_backup)
         self.relocate_data_home_button.clicked.connect(self._relocate_data_home)
         self.resume_data_home_button.clicked.connect(self._resume_data_home_migration)
@@ -677,6 +1123,7 @@ class ProductionSettingsDialog(QDialog):
 
         self.operation_journal_model = OperationJournalTableModel(self, page_size=50)
         self.operation_journal_table = QTableView(self)
+        self.operation_journal_table.setAccessibleName("Recovery operation journal")
         self.operation_journal_table.setModel(self.operation_journal_model)
         self.operation_journal_model.rowsInserted.connect(
             lambda *_args: self.journal_status_label.setText(
@@ -694,7 +1141,8 @@ class ProductionSettingsDialog(QDialog):
         self.operation_journal_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.operation_journal_table, stretch=1)
 
-        actions = QGridLayout()
+        self.journal_actions = QWidget(tab)
+        actions = ResponsiveFlowLayout(self.journal_actions, spacing=6)
         self.refresh_journal_button = QPushButton("Refresh history")
         self.reveal_journal_target_button = QPushButton("Reveal target")
         self.retry_journal_button = QPushButton("Retry failed files")
@@ -704,22 +1152,29 @@ class ProductionSettingsDialog(QDialog):
         apply_icon(self.retry_journal_button, "retry")
         apply_icon(self.restore_journal_button, "restore")
         apply_icon(self.restore_unique_journal_button, "recovery")
-        actions.addWidget(self.refresh_journal_button, 0, 0)
-        actions.addWidget(self.reveal_journal_target_button, 0, 1)
-        actions.addWidget(self.retry_journal_button, 0, 2)
-        actions.addWidget(self.restore_journal_button, 1, 0)
-        actions.addWidget(self.restore_unique_journal_button, 1, 1, 1, 2)
-        layout.addLayout(actions)
+        actions.addWidget(self.refresh_journal_button)
+        actions.addWidget(self.reveal_journal_target_button)
+        actions.addWidget(self.retry_journal_button)
+        actions.addWidget(self.restore_journal_button)
+        actions.addWidget(self.restore_unique_journal_button)
+        layout.addWidget(self.journal_actions)
 
         self.journal_status_label = QLabel("")
         self.journal_status_label.setWordWrap(True)
         layout.addWidget(self.journal_status_label)
         self.journal_file_results = QTextEdit(self)
+        self.journal_file_results.setAccessibleName("Recovery journal file results")
         self.journal_file_results.setReadOnly(True)
+        self.journal_file_results.setTabChangesFocus(True)
         self.journal_file_results.setMaximumHeight(120)
         self.journal_file_results.setPlaceholderText("Select an operation to see per-file results.")
         layout.addWidget(self.journal_file_results)
-        self.tabs.addTab(tab, "Safety & Recovery")
+        safety_scroll = QScrollArea(self)
+        safety_scroll.setObjectName("safety_scroll_area")
+        safety_scroll.setWidgetResizable(True)
+        safety_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        safety_scroll.setWidget(tab)
+        self.tabs.addTab(safety_scroll, "Safety & Recovery")
 
         self.refresh_journal_button.clicked.connect(self.refresh_operation_journal)
         self.reveal_journal_target_button.clicked.connect(self._reveal_selected_journal_target)
@@ -748,7 +1203,8 @@ class ProductionSettingsDialog(QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
 
-        buttons = QHBoxLayout()
+        self.support_actions_row = QWidget(tab)
+        buttons = ResponsiveFlowLayout(self.support_actions_row, spacing=6)
         open_logs = QPushButton("Open Logs")
         open_cache = QPushButton("Open Cache")
         open_journal = QPushButton("Open operation journal")
@@ -767,22 +1223,27 @@ class ProductionSettingsDialog(QDialog):
         buttons.addWidget(view_crash)
         buttons.addWidget(self.refresh_runtime_button)
         buttons.addWidget(self.verify_runtime_button)
-        layout.addLayout(buttons)
+        layout.addWidget(self.support_actions_row)
 
         self.runtime_text = QTextEdit(self)
+        self.runtime_text.setAccessibleName("Runtime diagnostics")
         self.runtime_text.setReadOnly(True)
+        self.runtime_text.setTabChangesFocus(True)
         self.runtime_text.setMaximumHeight(280)
         self.runtime_text.setPlaceholderText("Runtime diagnostics")
         layout.addWidget(self.runtime_text)
 
-        log_actions = QHBoxLayout()
+        self.support_log_actions_row = QWidget(tab)
+        log_actions = ResponsiveFlowLayout(self.support_log_actions_row, spacing=6)
         self.refresh_log_button = QPushButton("Refresh App Log")
         self.open_app_log_button = QPushButton("Open app.log")
         log_actions.addWidget(self.refresh_log_button)
         log_actions.addWidget(self.open_app_log_button)
-        layout.addLayout(log_actions)
+        layout.addWidget(self.support_log_actions_row)
         self.log_viewer = QTextEdit(self)
+        self.log_viewer.setAccessibleName("Application logs")
         self.log_viewer.setReadOnly(True)
+        self.log_viewer.setTabChangesFocus(True)
         self.log_viewer.setMaximumHeight(180)
         self.log_viewer.setPlaceholderText("Latest app.log lines will appear here.")
         layout.addWidget(self.log_viewer)
@@ -802,15 +1263,18 @@ class ProductionSettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         self.about_text = QTextEdit(self)
+        self.about_text.setAccessibleName("About ClusterLens")
         self.about_text.setReadOnly(True)
+        self.about_text.setTabChangesFocus(True)
         self.about_text.setPlainText(self._about_text())
         layout.addWidget(self.about_text, stretch=1)
-        actions = QHBoxLayout()
+        self.about_actions_row = QWidget(tab)
+        actions = ResponsiveFlowLayout(self.about_actions_row, spacing=6)
         open_runtime = QPushButton("Open Runtime Root")
         open_settings = QPushButton("Open Settings Store Location")
         actions.addWidget(open_runtime)
         actions.addWidget(open_settings)
-        layout.addLayout(actions)
+        layout.addWidget(self.about_actions_row)
         self.tabs.addTab(tab, "About")
 
         open_runtime.clicked.connect(lambda: self._open_path(self.runtime_layout.root))
@@ -818,6 +1282,16 @@ class ProductionSettingsDialog(QDialog):
 
     def _load_values(self) -> None:
         registry = self.settings_registry
+        self._set_combo_data(self.application_theme, registry.get(self.settings_store, "appearance/theme", "system"))
+        self._set_combo_data(
+            self.viewer_backdrop,
+            registry.get(self.settings_store, "appearance/viewer_backdrop", "adaptive_neutral"),
+        )
+        self._set_combo_data(
+            self.text_scale,
+            registry.get(self.settings_store, "appearance/text_scale", 100),
+        )
+        self._update_appearance_summary()
         self._set_combo_data(self.execution_mode, registry.get(self.settings_store, "runtime/preferred_mode", self.app_settings.preferred_execution_mode))
         self._set_combo_data(self.precision_mode, registry.get(self.settings_store, "runtime/precision", "auto"))
         self._set_combo_data(self.performance_profile, registry.get(self.settings_store, "performance/profile", self.app_settings.default_performance_profile))
@@ -827,6 +1301,14 @@ class ProductionSettingsDialog(QDialog):
         self.decode_workers.setValue(int(registry.get(self.settings_store, "performance/decode_workers", self.system_resources.logical_cpu_count)))
         self.vram_headroom_mb.setValue(int(registry.get(self.settings_store, "performance/vram_headroom_mb", 1024)))
         self.thumbnail_size.setValue(int(registry.get(self.settings_store, "gallery/thumbnail_size", self.app_settings.thumbnail_size)))
+        self.ignore_thumbnail_like.setChecked(
+            bool(registry.get(self.settings_store, "source_filters/ignore_thumbnail_like", False))
+        )
+        self.minimum_image_width.setValue(int(registry.get(self.settings_store, "source_filters/min_width", 0)))
+        self.minimum_image_height.setValue(int(registry.get(self.settings_store, "source_filters/min_height", 0)))
+        minimum_size_bytes = int(registry.get(self.settings_store, "source_filters/min_file_size_bytes", 0))
+        self.minimum_file_size_kib.setValue((minimum_size_bytes + 1023) // 1024)
+        self._update_source_filter_summary()
         self.gpu_warmup.setChecked(bool(registry.get(self.settings_store, "runtime/allow_gpu_warmup", self.app_settings.allow_gpu_warmup)))
         self.keep_worker_warm.setChecked(bool(registry.get(self.settings_store, "performance/keep_worker_warm", False)))
         self.runtime_badge.setChecked(bool(registry.get(self.settings_store, "runtime/show_badge", self.app_settings.show_runtime_badge)))
@@ -844,6 +1326,9 @@ class ProductionSettingsDialog(QDialog):
 
     def values(self) -> dict[str, object]:
         return self.settings_registry.validate_values({
+            "appearance/theme": str(self.application_theme.currentData() or "system"),
+            "appearance/viewer_backdrop": str(self.viewer_backdrop.currentData() or "adaptive_neutral"),
+            "appearance/text_scale": int(self.text_scale.currentData() or 100),
             "runtime/preferred_mode": str(self.execution_mode.currentData() or "auto"),
             "runtime/precision": str(self.precision_mode.currentData() or "auto"),
             "performance/profile": str(self.performance_profile.currentData() or "balanced"),
@@ -855,10 +1340,14 @@ class ProductionSettingsDialog(QDialog):
             "performance/decode_workers": int(self.decode_workers.value()),
             "performance/vram_headroom_mb": int(self.vram_headroom_mb.value()),
             "runtime/show_badge": bool(self.runtime_badge.isChecked()),
-            "workspace/default_view": str(self.settings_registry.get(self.settings_store, "workspace/default_view", "gallery")),
+            "workspace/default_view": str(self.settings_registry.get(self.settings_store, "workspace/default_view", "library")),
             "gallery/thumbnail_size": int(self.thumbnail_size.value()),
             "gallery/thumbnail_workers": int(self.thumbnail_workers.value()),
             "gallery/prefetch_rows": int(self.prefetch_rows.value()),
+            "source_filters/ignore_thumbnail_like": bool(self.ignore_thumbnail_like.isChecked()),
+            "source_filters/min_width": int(self.minimum_image_width.value()),
+            "source_filters/min_height": int(self.minimum_image_height.value()),
+            "source_filters/min_file_size_bytes": int(self.minimum_file_size_kib.value()) * 1024,
             "workspace/dense_ui": bool(self.dense_ui.isChecked()),
             "workspace/power_user_mode": bool(self.power_user_mode.isChecked()),
             "models/offline_mode": bool(self.offline_model_downloads.isChecked()),
@@ -875,7 +1364,7 @@ class ProductionSettingsDialog(QDialog):
             combo.setCurrentIndex(index)
 
     def refresh_model_inventory(self) -> None:
-        if self._thread_is_running(self._model_inventory_thread):
+        if self._model_inventory_job is not None:
             return
         self.model_status_label.setText("Loading model inventory...")
         inventory_models = tuple(clustering_model_names(scope="production")) + ("facenet",)
@@ -898,9 +1387,7 @@ class ProductionSettingsDialog(QDialog):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(lambda: self.model_status_label.setText("Model inventory refresh cancelled."))
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="model_inventory")
-        self._model_inventory_thread = thread
+        self._start_settings_job(job, role="model_inventory", thread_attribute="_model_inventory_thread")
         self._update_model_action_state()
 
     def _populate_model_inventory(self, items: list[object]) -> None:
@@ -946,9 +1433,9 @@ class ProductionSettingsDialog(QDialog):
     def _model_actions_busy(self) -> bool:
         return (
             self.model_download_controller.is_running()
-            or self._thread_is_running(self._model_inventory_thread)
-            or self._thread_is_running(self._model_thread)
-            or self._thread_is_running(self._face_model_thread)
+            or self._model_inventory_job is not None
+            or self._model_job is not None
+            or self._face_model_job is not None
         )
 
     def _update_model_action_state(self) -> None:
@@ -1084,9 +1571,7 @@ class ProductionSettingsDialog(QDialog):
         job.cancelled.connect(
             lambda: self.model_status_label.setText("Model cache deletion cancelled. Already removed files remain removed.")
         )
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="model_delete")
-        self._model_thread = thread
+        self._start_settings_job(job, role="model_delete", thread_attribute="_model_thread")
         self._update_model_action_state()
 
     def _refresh_face_model_inventory(self) -> None:
@@ -1185,8 +1670,8 @@ class ProductionSettingsDialog(QDialog):
         if not hasattr(self, "install_face_model_pack_button"):
             return
         busy = (
-            self._thread_is_running(self._face_model_thread)
-            or self._thread_is_running(self._model_thread)
+            self._face_model_job is not None
+            or self._model_job is not None
             or self.model_download_controller.is_running()
         )
         mutation_allowed = bool(self.can_clear_rebuildable_caches())
@@ -1250,7 +1735,7 @@ class ProductionSettingsDialog(QDialog):
         mark_inventory_changed: bool = True,
         job_role: str = "face_model",
     ) -> None:
-        if self._thread_is_running(self._face_model_thread):
+        if self._face_model_job is not None:
             return
         job = AsyncJob(lambda progress, cancel_check: installer(progress, cancel_check))
         self._face_model_job = job
@@ -1282,9 +1767,7 @@ class ProductionSettingsDialog(QDialog):
                 f"{label} cancelled. Completed files and resumable partial downloads were retained."
             )
         )
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role=job_role)
-        self._face_model_thread = thread
+        self._start_settings_job(job, role=job_role, thread_attribute="_face_model_thread")
         self._update_model_action_state()
 
     def _delete_selected_face_model(self) -> None:
@@ -1350,7 +1833,7 @@ class ProductionSettingsDialog(QDialog):
         return bool(self._face_model_inventory_changed)
 
     def refresh_operation_journal(self) -> None:
-        if self._thread_is_running(self._journal_refresh_thread):
+        if self._journal_refresh_job is not None:
             return
         self.journal_status_label.setText("Loading recovery history...")
         job = AsyncJob(lambda _progress, _cancel_check: list(reversed(self.gallery_action_service.read_audit_entries(limit=1000))))
@@ -1375,9 +1858,7 @@ class ProductionSettingsDialog(QDialog):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(lambda: self.journal_status_label.setText("Recovery history refresh cancelled."))
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="journal_refresh")
-        self._journal_refresh_thread = thread
+        self._start_settings_job(job, role="journal_refresh", thread_attribute="_journal_refresh_thread")
 
     def _selected_journal_entry(self) -> dict[str, object] | None:
         current = self.operation_journal_table.selectionModel().currentIndex()
@@ -1412,7 +1893,7 @@ class ProductionSettingsDialog(QDialog):
 
     def _update_journal_action_state(self) -> None:
         restorable = bool(self._selected_restorable_paths())
-        busy = self._thread_is_running(self._journal_restore_thread)
+        busy = self._journal_restore_job is not None or self._journal_refresh_job is not None
         self.refresh_journal_button.setEnabled(not busy)
         self.reveal_journal_target_button.setEnabled((not busy) and restorable)
         self.retry_journal_button.setEnabled((not busy) and bool(self._selected_retryable_paths()) and not bool(self.read_only_mode.isChecked()))
@@ -1495,9 +1976,7 @@ class ProductionSettingsDialog(QDialog):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(lambda: self.journal_status_label.setText(f"{label} cancelled."))
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="journal_restore")
-        self._journal_restore_thread = thread
+        self._start_settings_job(job, role="journal_restore", thread_attribute="_journal_restore_thread")
         self._update_journal_action_state()
 
     def _reveal_selected_journal_target(self) -> None:
@@ -1574,9 +2053,7 @@ class ProductionSettingsDialog(QDialog):
         job.failed.connect(_failed)
         job.cancelled.connect(lambda: self.journal_status_label.setText("Restore cancelled."))
         job.cancelled.connect(self._update_journal_action_state)
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="journal_restore")
-        self._journal_restore_thread = thread
+        self._start_settings_job(job, role="journal_restore", thread_attribute="_journal_restore_thread")
         self._update_journal_action_state()
 
     @staticmethod
@@ -1772,12 +2249,12 @@ class ProductionSettingsDialog(QDialog):
         self.runtime_text.setPlainText("\n".join(text))
 
     def _update_runtime_action_state(self) -> None:
-        busy = self._thread_is_running(self._verify_thread)
+        busy = self._verify_job is not None
         self.refresh_runtime_button.setEnabled(not busy)
         self.verify_runtime_button.setEnabled(not busy)
 
     def _rescan_runtime_resources(self) -> None:
-        if self._thread_is_running(self._verify_thread):
+        if self._verify_job is not None:
             return
 
         preferred_mode = str(self.execution_mode.currentData() or "auto")
@@ -1814,9 +2291,7 @@ class ProductionSettingsDialog(QDialog):
                 "Runtime rescan cancelled. No execution settings were changed."
             )
         )
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="runtime_rescan")
-        self._verify_thread = thread
+        self._start_settings_job(job, role="runtime_rescan", thread_attribute="_verify_thread")
         self._update_runtime_action_state()
 
     def _apply_profile_preview(self, *, update_tuning: bool = True) -> None:
@@ -1857,6 +2332,15 @@ class ProductionSettingsDialog(QDialog):
         self.data_home_recovery_combo.setEnabled((not busy) and has_recovery)
         self.resume_data_home_button.setEnabled((not busy) and has_recovery)
         self.rollback_data_home_button.setEnabled((not busy) and has_recovery)
+        has_backup_recovery = bool(self._data_home_backup_recovery_entries)
+        self.data_home_backup_recovery_combo.setEnabled((not busy) and data_home_available and has_backup_recovery)
+        self.discard_backup_staging_button.setEnabled((not busy) and data_home_available and has_backup_recovery)
+        selected_backup = self._selected_backup_recovery_entry()
+        self.discard_backup_staging_button.setText(
+            "Finalize Published Backup"
+            if str(selected_backup.get("status", "")) == "published"
+            else "Discard Staged Backup"
+        )
         if not allow_clear and not busy:
             self.cache_status_label.setText("Cache clearing is unavailable while clustering or another production background task is running.")
 
@@ -1871,7 +2355,7 @@ class ProductionSettingsDialog(QDialog):
             self.generated_storage_text.setPlainText("Generated storage usage is unavailable.")
             self._update_cache_action_state()
             return
-        if self._thread_is_running(self._cache_usage_thread):
+        if self._cache_usage_job is not None:
             return
         self.cache_status_label.setText("Scanning rebuildable cache usage...")
         self._update_cache_action_state()
@@ -1908,7 +2392,12 @@ class ProductionSettingsDialog(QDialog):
                 )
             raise_if_cancelled(cancel_check)
             recovery_entries = self.data_home_manager.recovery_journals() if self.data_home_manager is not None else ()
-            return result, generated, data_home, recovery_entries
+            backup_recovery_entries = (
+                self.data_home_manager.backup_recovery_journals()
+                if self.data_home_manager is not None
+                else ()
+            )
+            return result, generated, data_home, recovery_entries, backup_recovery_entries
 
         job = AsyncJob(_run_usage)
         self._cache_usage_job = job
@@ -1918,6 +2407,7 @@ class ProductionSettingsDialog(QDialog):
             generated_result = result[1] if isinstance(result, tuple) and len(result) > 1 else None
             data_home_result = result[2] if isinstance(result, tuple) and len(result) > 2 else None
             recovery_entries = result[3] if isinstance(result, tuple) and len(result) > 3 else ()
+            backup_recovery_entries = result[4] if isinstance(result, tuple) and len(result) > 4 else ()
             if isinstance(cache_result, CacheUsageSummary):
                 lines = [f"Runtime cache root: {cache_result.cache_root}", ""]
                 for name, size in cache_result.target_bytes.items():
@@ -1943,6 +2433,7 @@ class ProductionSettingsDialog(QDialog):
             elif self.data_home_manager is not None:
                 self.data_home_inventory_text.setPlainText("Data Home inventory is unavailable.")
             self._set_data_home_recovery_entries(recovery_entries)
+            self._set_data_home_backup_recovery_entries(backup_recovery_entries)
             self._update_cache_action_state()
 
         def _failed(message: str) -> None:
@@ -1962,12 +2453,10 @@ class ProductionSettingsDialog(QDialog):
             self._update_cache_action_state()
 
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="cache_usage")
-        self._cache_usage_thread = thread
+        self._start_settings_job(job, role="cache_usage", thread_attribute="_cache_usage_thread")
 
     def _run_data_home_job(self, label: str, fn, completed_message: Callable[[object], str]) -> None:
-        if self.data_home_manager is None or self._thread_is_running(self._data_home_thread):
+        if self.data_home_manager is None or self._data_home_job is not None:
             return
         self.cache_status_label.setText(label + "...")
         self._update_cache_action_state()
@@ -1996,9 +2485,7 @@ class ProductionSettingsDialog(QDialog):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="data_home")
-        self._data_home_thread = thread
+        self._start_settings_job(job, role="data_home", thread_attribute="_data_home_thread")
 
     def _backup_data_home(self) -> None:
         if self.data_home_manager is None:
@@ -2084,6 +2571,66 @@ class ProductionSettingsDialog(QDialog):
     def _selected_data_home_journal_path(self) -> str:
         return str(self.data_home_recovery_combo.currentData() or "").strip()
 
+    def _set_data_home_backup_recovery_entries(self, entries: object) -> None:
+        normalized = tuple(
+            entry
+            for entry in (entries if isinstance(entries, (tuple, list)) else ())
+            if isinstance(entry, dict)
+            and str(entry.get("status", "")) in {"copying", "failed", "cancelled", "verified", "published"}
+            and str(entry.get("journal_path", ""))
+        )
+        self._data_home_backup_recovery_entries = normalized
+        self.data_home_backup_recovery_combo.blockSignals(True)
+        self.data_home_backup_recovery_combo.clear()
+        for entry in normalized:
+            label = f"{entry.get('status', 'incomplete')}: {entry.get('backup_root', 'unknown backup')}"
+            self.data_home_backup_recovery_combo.addItem(label, str(entry["journal_path"]))
+        if not normalized:
+            self.data_home_backup_recovery_combo.addItem("No incomplete Data Home backups", "")
+        self.data_home_backup_recovery_combo.blockSignals(False)
+        self._update_cache_action_state()
+
+    def _selected_backup_recovery_entry(self) -> dict[str, object]:
+        index = self.data_home_backup_recovery_combo.currentIndex()
+        if 0 <= index < len(self._data_home_backup_recovery_entries):
+            return dict(self._data_home_backup_recovery_entries[index])
+        return {}
+
+    def _discard_backup_staging(self) -> None:
+        if self.data_home_manager is None:
+            return
+        entry = self._selected_backup_recovery_entry()
+        journal_path = str(entry.get("journal_path", "") or "").strip()
+        if not journal_path:
+            return
+        published = str(entry.get("status", "")) == "published"
+        if not confirmBox(
+            "Finalize published Data Home backup?" if published else "Discard staged Data Home backup?",
+            (
+                "The published backup will be checksum-verified and retained; only its interrupted journal will be finalized."
+                if published
+                else "Only the app-marked incomplete backup staging folder will be removed. The active Data Home, source photos, and any published backup remain unchanged."
+            ),
+            parent=self,
+        ):
+            return
+
+        def _message(result: object) -> str:
+            outcome = str(result.get("outcome", "")) if isinstance(result, dict) else ""
+            if outcome == "published":
+                return "Published Data Home backup verified and retained."
+            return "Incomplete Data Home backup staging discarded."
+
+        self._run_data_home_job(
+            "Resolving interrupted Data Home backup",
+            lambda progress, cancel_check: self.data_home_manager.discard_backup_staging(
+                journal_path,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            ),
+            _message,
+        )
+
     def _resume_data_home_migration(self) -> None:
         if self.data_home_manager is None:
             return
@@ -2160,9 +2707,16 @@ class ProductionSettingsDialog(QDialog):
 
         def _done(result: object) -> None:
             if isinstance(result, CacheClearResult):
-                self.cache_status_label.setText(
-                    f"Cleared {len(result.cleared_targets)} targets and freed {self._format_bytes(result.freed_bytes)}."
-                )
+                if result.retry_targets:
+                    self.cache_status_label.setText(
+                        "Cache files were detached safely; cleanup is still pending for "
+                        + ", ".join(result.retry_targets)
+                        + ". Choose Clear Rebuildable Caches again to retry."
+                    )
+                else:
+                    self.cache_status_label.setText(
+                        f"Cleared {len(result.cleared_targets)} targets and freed {self._format_bytes(result.freed_bytes)}."
+                    )
                 if result.failures:
                     errorBox("Cache clear completed with errors", "\n".join(result.failures[:8]))
                 else:
@@ -2182,16 +2736,14 @@ class ProductionSettingsDialog(QDialog):
             self.refresh_cache_usage()
 
         def _cancelled() -> None:
-            self.cache_status_label.setText("Cache clear cancelled. Already removed rebuildable files remain removed.")
+            self.cache_status_label.setText("Cache clear cancelled before another cache target committed.")
             self._update_cache_action_state()
             self.refresh_cache_usage()
 
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="cache_clear")
-        self._cache_clear_thread = thread
+        self._start_settings_job(job, role="cache_clear", thread_attribute="_cache_clear_thread")
 
     def _clear_generated_storage(
         self,
@@ -2257,18 +2809,17 @@ class ProductionSettingsDialog(QDialog):
         job.completed.connect(_done)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="cache_clear")
-        self._cache_clear_thread = thread
+        self._start_settings_job(job, role="cache_clear", thread_attribute="_cache_clear_thread")
 
     def _verify_gpu(self) -> None:
-        if self._thread_is_running(self._verify_thread):
+        if self._verify_job is not None:
             return
+        execution_mode = str(self.execution_mode.currentData() or "auto")
 
         def _run(progress, cancel_check):
             raise_if_cancelled(cancel_check)
             progress(-1, "Probing runtimes...")
-            result = self.runtime_service.verify(str(self.execution_mode.currentData() or "auto"))
+            result = self.runtime_service.verify(execution_mode)
             raise_if_cancelled(cancel_check)
             return result
 
@@ -2286,9 +2837,7 @@ class ProductionSettingsDialog(QDialog):
                 "Runtime verification cancelled. No execution settings were changed."
             )
         )
-        thread = start_job_in_thread(job)
-        self._track_thread(thread, job, role="verify")
-        self._verify_thread = thread
+        self._start_settings_job(job, role="verify", thread_attribute="_verify_thread")
         self._update_runtime_action_state()
 
     def _open_path(self, path: Path) -> None:
@@ -2391,53 +2940,139 @@ class ProductionSettingsDialog(QDialog):
         if thread is None:
             return
         self._thread_roles[thread] = (str(role), job)
-        if self.job_manager is not None and job is not None:
-            label = {
-                "cache_usage": "Scanning cache usage",
-                "cache_clear": "Clearing rebuildable caches",
-                "verify": "Verifying runtime",
-                "runtime_rescan": "Rescanning runtime resources",
-                "model": "Installing model",
-                "model_delete": "Deleting cached model",
-                "model_inventory": "Refreshing model inventory",
-                "face_model": "Installing face inference pack",
-                "face_model_delete": "Deleting installed face component",
-                "face_cache_clear": "Clearing reusable face downloads",
-                "journal_restore": "Recovering files",
-                "journal_refresh": "Refreshing recovery history",
-                "data_home": "Managing Data Home",
-            }.get(str(role), "Settings task")
-            job_id = self.job_manager.register_job(
-                label,
-                cancel_fn=getattr(job, "cancel", None),
-                origin="Settings",
-            )
-            self._settings_job_ids[thread] = job_id
-            progress_signal = getattr(job, "progress", None)
-            if progress_signal is not None:
-                progress_signal.connect(
-                    lambda value, text, job_id=job_id: self.job_manager.update(
-                        job_id,
-                        progress=value,
-                        text=text,
-                    )
-                )
-                progress_signal.connect(self._on_settings_job_progress)
-            getattr(job, "completed").connect(
-                lambda _result, job_id=job_id: self.job_manager.finish(job_id, status="finished")
-            )
-            getattr(job, "failed").connect(
-                lambda message, job_id=job_id: self.job_manager.finish(job_id, status="failed", error=message)
-            )
-            getattr(job, "cancelled").connect(
-                lambda job_id=job_id: self.job_manager.finish(job_id, status="cancelled")
-            )
-            self.operation_progress_bar.setRange(0, 0)
-            self.operation_progress_bar.show()
         thread.finished.connect(
             lambda thread=thread: self._on_async_thread_finished(thread),
             Qt.ConnectionType.QueuedConnection,
         )
+        self._update_settings_cancel_state()
+
+    @staticmethod
+    def _settings_job_label(role: str) -> str:
+        return {
+            "cache_usage": "Scanning cache usage",
+            "cache_clear": "Clearing rebuildable caches",
+            "verify": "Verifying runtime",
+            "runtime_rescan": "Rescanning runtime resources",
+            "model": "Installing model",
+            "model_delete": "Deleting cached model",
+            "model_inventory": "Refreshing model inventory",
+            "face_model": "Installing face inference pack",
+            "face_model_delete": "Deleting installed face component",
+            "face_cache_clear": "Clearing reusable face downloads",
+            "journal_restore": "Recovering files",
+            "journal_refresh": "Refreshing recovery history",
+            "data_home": "Managing Data Home",
+        }.get(str(role), "Settings task")
+
+    def _settings_job_spec(self, role: str) -> JobSpec:
+        role = str(role)
+        model_write = role in {
+            "model",
+            "model_delete",
+            "face_model",
+            "face_model_delete",
+            "face_cache_clear",
+            "data_home",
+        }
+        data_write = role in {"cache_clear", "journal_restore", "data_home"} or model_write
+        return JobSpec(
+            self._settings_job_label(role),
+            origin="Settings",
+            io_bound=role not in {"verify", "runtime_rescan"},
+            source_writes=(
+                tuple(str(path) for path in self.active_source_roots_provider())
+                if role == "journal_restore"
+                else ()
+            ),
+            data_home_read=role in {"cache_usage", "journal_refresh"} and not data_write,
+            data_home_write=data_write,
+            model_cache_read=role in {"model_inventory", "verify", "runtime_rescan"} and not model_write,
+            model_cache_write=model_write,
+        )
+
+    def _start_settings_job(self, job: AsyncJob, *, role: str, thread_attribute: str) -> None:
+        label = self._settings_job_label(role)
+        progress_signal = getattr(job, "progress", None)
+        if progress_signal is not None:
+            progress_signal.connect(self._on_settings_job_progress)
+        self.operation_progress_bar.setRange(0, 0)
+        self.operation_progress_bar.show()
+
+        def _terminal_cleanup(*_args) -> None:
+            self._settings_job_ids.pop(job, None)
+            if getattr(self, thread_attribute, None) is None:
+                job_attribute = thread_attribute.removesuffix("_thread") + "_job"
+                if getattr(self, job_attribute, None) is job:
+                    setattr(self, job_attribute, None)
+                if role in {"cache_usage", "cache_clear", "data_home"}:
+                    self._update_cache_action_state()
+                elif role in {"verify", "runtime_rescan"}:
+                    self._update_runtime_action_state()
+                elif role in {
+                    "model",
+                    "model_delete",
+                    "model_inventory",
+                    "face_model",
+                    "face_model_delete",
+                    "face_cache_clear",
+                }:
+                    self._update_model_action_state()
+                elif role in {"journal_restore", "journal_refresh"}:
+                    self._update_journal_action_state()
+                self._update_settings_cancel_state()
+            if not self._settings_job_ids:
+                self.operation_progress_bar.hide()
+
+        job.completed.connect(_terminal_cleanup)
+        job.failed.connect(_terminal_cleanup)
+        job.cancelled.connect(_terminal_cleanup)
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            setattr(self, thread_attribute, thread)
+            self._track_thread(thread, job, role=role)
+
+        if self.work_coordinator is not None:
+            job_id = self.work_coordinator.submit_async_job(
+                self._settings_job_spec(role),
+                job,
+                _launch,
+            )
+            manager = self.job_manager or self.work_coordinator.job_manager
+            state = manager.get(job_id)
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._settings_job_ids[job] = job_id
+        else:
+            job_id = None
+            if self.job_manager is not None:
+                job_id = self.job_manager.register_job(
+                    label,
+                    cancel_fn=job.cancel,
+                    origin="Settings",
+                )
+                self._settings_job_ids[job] = job_id
+                if progress_signal is not None:
+                    progress_signal.connect(
+                        lambda value, text, job_id=job_id: self.job_manager.update(
+                            job_id,
+                            progress=value,
+                            text=text,
+                        )
+                    )
+                job.completed.connect(
+                    lambda _result, job_id=job_id: self.job_manager.finish(job_id, status="finished")
+                )
+                job.failed.connect(
+                    lambda message, job_id=job_id: self.job_manager.finish(
+                        job_id,
+                        status="failed",
+                        error=message,
+                    )
+                )
+                job.cancelled.connect(
+                    lambda job_id=job_id: self.job_manager.finish(job_id, status="cancelled")
+                )
+            _launch()
         self._update_settings_cancel_state()
 
     def _on_settings_job_progress(self, value: int, _text: str) -> None:
@@ -2451,8 +3086,8 @@ class ProductionSettingsDialog(QDialog):
     def _release_finished_thread(self, thread) -> None:
         if thread is None:
             return
-        self._settings_job_ids.pop(thread, None)
         role, job = self._thread_roles.pop(thread, (None, None))
+        self._settings_job_ids.pop(job, None)
         if role == "cache_usage" and self._cache_usage_thread is thread:
             self._cache_usage_thread = None
             if self._cache_usage_job is job:
@@ -2540,11 +3175,8 @@ class ProductionSettingsDialog(QDialog):
             self.model_download_controller.cancel()
             cancelled_any = True
         for job in self._active_settings_jobs():
-            try:
-                job.cancel()
-                cancelled_any = True
-            except (AttributeError, RuntimeError):
-                continue
+            self._cancel_settings_job(job)
+            cancelled_any = True
         if cancelled_any:
             self.model_status_label.setText("Cancellation requested. Completed cache files remain reusable.")
             if hasattr(self, "face_model_status_label"):
@@ -2552,6 +3184,18 @@ class ProductionSettingsDialog(QDialog):
                     "Cancellation requested. Verified face models and resumable partial downloads remain reusable."
                 )
         self._update_settings_cancel_state()
+
+    def _cancel_settings_job(self, job: object | None) -> None:
+        if job is None:
+            return
+        job_id = self._settings_job_ids.get(job)
+        if job_id is not None and self.work_coordinator is not None:
+            self.work_coordinator.cancel(job_id)
+            return
+        try:
+            job.cancel()
+        except (AttributeError, RuntimeError):
+            pass
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready_to_close = True
@@ -2570,18 +3214,17 @@ class ProductionSettingsDialog(QDialog):
         )
         for job, thread in jobs:
             if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    pass
+                self._cancel_settings_job(job)
             if not wait_for_thread_shutdown(thread, timeout_ms=timeout_ms):
                 ready_to_close = False
         if ready_to_close:
+            if self.work_coordinator is not None:
+                for job_id in tuple(self._settings_job_ids.values()):
+                    self.work_coordinator.finish(job_id, status="cancelled")
             for job, thread in jobs:
-                dispose = getattr(job, "dispose", None)
-                if callable(dispose):
+                if isinstance(job, AsyncJob):
                     try:
-                        dispose()
+                        defer_async_job_dispose(job)
                     except Exception:
                         pass
                 try:

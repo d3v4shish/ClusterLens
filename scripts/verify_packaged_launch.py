@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import stat
 import subprocess
 from pathlib import Path
 
@@ -84,12 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     if verifier_report.exists():
         raise FileExistsError(f"refusing to overwrite existing verifier report: {verifier_report}")
     verification = {
-        "report_version": "1",
+        "report_version": "2",
         "scenario": "packaged-launch-settings-storage-verifier",
         "validation": "PASS",
         "executable": str(executable),
         "artifact_sha256": _sha256_file(executable),
         "artifact_size_bytes": executable.stat().st_size,
+        **_artifact_tree_evidence(executable.parent),
         "runtime_root": str(runtime_root),
         "application_report": str(report_path),
         "application_log": str(app_log),
@@ -139,6 +141,51 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_tree_evidence(root: Path) -> dict[str, object]:
+    """Identify the complete onedir artifact, including links and modes."""
+
+    package_root = root.expanduser().resolve()
+    if not package_root.is_dir():
+        raise NotADirectoryError(f"artifact root does not exist: {package_root}")
+    digest = hashlib.sha256()
+    file_count = 0
+    symlink_count = 0
+    total_bytes = 0
+    entries = sorted(package_root.rglob("*"), key=lambda path: path.relative_to(package_root).as_posix())
+    for path in entries:
+        relative = path.relative_to(package_root).as_posix()
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if stat.S_ISLNK(mode):
+            kind = "symlink"
+            payload = os.readlink(path).encode("utf-8", errors="surrogateescape")
+            payload_sha256 = hashlib.sha256(payload).hexdigest()
+            symlink_count += 1
+            size_bytes = len(payload)
+        elif stat.S_ISREG(mode):
+            kind = "file"
+            payload_sha256 = _sha256_file(path)
+            file_count += 1
+            size_bytes = path.stat().st_size
+        else:
+            raise ValueError(f"unsupported artifact entry: {path}")
+        total_bytes += int(size_bytes)
+        executable = "1" if mode & stat.S_IXUSR else "0"
+        digest.update(
+            f"{relative}\0{kind}\0{executable}\0{size_bytes}\0{payload_sha256}\n".encode(
+                "utf-8", errors="surrogateescape"
+            )
+        )
+    return {
+        "artifact_root": str(package_root),
+        "artifact_tree_sha256": digest.hexdigest(),
+        "artifact_file_count": file_count,
+        "artifact_symlink_count": symlink_count,
+        "artifact_total_bytes": total_bytes,
+    }
 
 
 if __name__ == "__main__":

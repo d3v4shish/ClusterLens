@@ -1,0 +1,475 @@
+{
+  "schema_version": 1,
+  "purpose": "Authoritative inventory of ClusterLens durable commit boundaries and fault evidence.",
+  "coverage_granularity": "operation_fault",
+  "status_values": ["PASS", "PARTIAL", "NOT_RUN"],
+  "fault_classes": [
+    "cancel_before_commit",
+    "cancel_after_commit",
+    "process_exit_before_commit",
+    "process_exit_after_commit",
+    "io_error",
+    "permission_error",
+    "disk_full",
+    "corrupt_or_missing_staging",
+    "vanished_source",
+    "retry_or_restart",
+    "read_only"
+  ],
+  "platforms": {
+    "linux": {
+      "status": "PASS",
+      "reason": "Every declared Linux operation/fault class is covered by a deterministic disposable-fixture regression. Native platform semantics remain separate."
+    },
+    "windows": {
+      "status": "NOT_RUN",
+      "reason": "Native sharing-violation, ACL, rename and locked-file behavior requires a Windows host or VM."
+    },
+    "macos": {
+      "status": "NOT_RUN",
+      "reason": "Native permission, rename, filesystem and package behavior requires a macOS host if macOS remains advertised."
+    }
+  },
+  "actual_process_exit_cases": [
+    {"id": "embedding_index_generation:before_replace:actual_sigkill", "operation": "embedding_index_generation", "boundary": "artifacts_published", "checkpoint": "before_replace", "expected_state": "replacement artifacts are not ready without the manifest; retry publishes one valid generation"},
+    {"id": "embedding_index_generation:after_replace:actual_sigkill", "operation": "embedding_index_generation", "boundary": "manifest_committed", "checkpoint": "after_replace", "expected_state": "the checksummed replacement generation is ready and retry reuses it"},
+    {"id": "embedding_index_generation:manifest_removed:actual_sigkill", "operation": "embedding_index_generation", "boundary": "manifest_removed", "checkpoint": "manifest_removed", "expected_state": "the old artifacts are not treated as ready without their manifest and retry publishes one valid generation"},
+    {"id": "photo_sidecar_save:before_replace:actual_sigkill", "operation": "photo_sidecar_save", "boundary": "temporary_written", "checkpoint": "before_replace", "expected_state": "source and prior sidecar remain byte-identical"},
+    {"id": "photo_sidecar_save:after_replace:actual_sigkill", "operation": "photo_sidecar_save", "boundary": "sidecar_replaced", "checkpoint": "after_replace", "expected_state": "source is unchanged and the complete new sidecar is visible"},
+    {"id": "gallery_file_mutations:before_filesystem_mutation:actual_sigkill", "operation": "gallery_file_mutations", "boundary": "file_intent_committed", "checkpoint": "before_filesystem_mutation", "expected_state": "the original remains and two recovery passes publish no changed path"},
+    {"id": "gallery_file_mutations:after_filesystem_mutation:actual_sigkill", "operation": "gallery_file_mutations", "boundary": "filesystem_mutation_committed", "checkpoint": "after_filesystem_mutation", "expected_state": "the target contains the exact source and two recovery passes retain one committed move"},
+    {"id": "gallery_file_mutations:operation_intent_committed:actual_sigkill", "operation": "gallery_file_mutations", "boundary": "operation_intent_committed", "checkpoint": "operation_intent_committed", "expected_state": "the durable operation scope exists while all source files remain unchanged"},
+    {"id": "gallery_file_mutations:file_terminal_recorded:actual_sigkill", "operation": "gallery_file_mutations", "boundary": "file_terminal_recorded", "checkpoint": "file_terminal_recorded", "expected_state": "the completed journal row and physical move agree across repeated recovery"},
+    {"id": "face_model_promotion:previous_staged:actual_sigkill", "operation": "face_model_promotion", "boundary": "previous_staged", "checkpoint": "previous_staged", "expected_state": "startup promotes the complete staged bundle and removes the retained previous bundle"},
+    {"id": "face_model_promotion:target_published:actual_sigkill", "operation": "face_model_promotion", "boundary": "target_published", "checkpoint": "target_published", "expected_state": "startup retains the verified target and removes the retained previous bundle"},
+    {"id": "face_model_promotion:previous_discarded:actual_sigkill", "operation": "face_model_promotion", "boundary": "previous_discarded", "checkpoint": "previous_discarded", "expected_state": "only the verified new target remains and repeated startup recovery is idempotent"},
+    {"id": "saved_search_mutation:before_replace:actual_sigkill", "operation": "saved_search_mutation", "boundary": "revision_loaded", "checkpoint": "before_replace", "expected_state": "the prior complete saved-search revision remains"},
+    {"id": "saved_search_mutation:after_replace:actual_sigkill", "operation": "saved_search_mutation", "boundary": "json_replaced", "checkpoint": "after_replace", "expected_state": "the complete renamed saved-search revision remains"},
+    {"id": "image_tag_mutation:before_commit:actual_sigkill", "operation": "image_tag_mutation", "boundary": "transaction_open", "checkpoint": "before_commit", "expected_state": "SQLite rolls back to the old tag with integrity intact"},
+    {"id": "image_tag_mutation:after_commit:actual_sigkill", "operation": "image_tag_mutation", "boundary": "transaction_committed", "checkpoint": "after_commit", "expected_state": "SQLite retains the complete new tag with integrity intact"},
+    {"id": "clustering_result_cache:before_replace:actual_sigkill", "operation": "clustering_result_cache", "boundary": "payload_prepared", "checkpoint": "before_replace", "expected_state": "the prior complete cache result remains readable"},
+    {"id": "clustering_result_cache:after_replace:actual_sigkill", "operation": "clustering_result_cache", "boundary": "result_replaced", "checkpoint": "after_replace", "expected_state": "the complete new cache result remains readable"},
+    {"id": "face_index_batch:before_commit:actual_sigkill", "operation": "face_index_batch", "boundary": "before_commit", "checkpoint": "before_commit", "expected_state": "SQLite rolls back the bounded face batch and retry publishes exactly one complete batch"},
+    {"id": "face_index_batch:after_commit:actual_sigkill", "operation": "face_index_batch", "boundary": "after_commit", "checkpoint": "after_commit", "expected_state": "SQLite retains the complete bounded face batch and retry remains idempotent"},
+    {"id": "library_catalog_batch:before_commit:actual_sigkill", "operation": "library_catalog_batch", "boundary": "before_commit", "checkpoint": "before_commit", "expected_state": "SQLite rolls back both asset and FTS rows and retry publishes one complete catalog row"},
+    {"id": "library_catalog_batch:after_commit:actual_sigkill", "operation": "library_catalog_batch", "boundary": "after_commit", "checkpoint": "after_commit", "expected_state": "SQLite retains the complete asset and FTS batch and retry remains idempotent"},
+    {"id": "embedded_metadata_rewrite:before_replace:actual_sigkill", "operation": "embedded_metadata_rewrite", "boundary": "temporary_verified", "checkpoint": "before_replace", "expected_state": "the original remains byte-identical and retry publishes one decodable replacement"},
+    {"id": "embedded_metadata_rewrite:after_replace:actual_sigkill", "operation": "embedded_metadata_rewrite", "boundary": "source_replaced", "checkpoint": "after_replace", "expected_state": "the complete decodable replacement remains and retry is idempotent"},
+    {"id": "embedded_metadata_rewrite:rewrite_intent_committed:actual_sigkill", "operation": "embedded_metadata_rewrite", "boundary": "rewrite_intent_committed", "checkpoint": "rewrite_intent_committed", "expected_state": "the exact rewrite intent is durable while the source remains byte-identical"},
+    {"id": "rebuildable_cache_clear:before_detach:actual_sigkill", "operation": "rebuildable_cache_clear", "boundary": "before_detach", "checkpoint": "before_detach", "expected_state": "the old live cache remains intact and two retries leave one empty live directory"},
+    {"id": "rebuildable_cache_clear:after_detach:actual_sigkill", "operation": "rebuildable_cache_clear", "boundary": "after_detach", "checkpoint": "after_detach", "expected_state": "the old cache is isolated in named staging and two retries leave one empty live directory"},
+    {"id": "rebuildable_cache_clear:after_recreate:actual_sigkill", "operation": "rebuildable_cache_clear", "boundary": "after_recreate", "checkpoint": "after_recreate", "expected_state": "the empty live directory and old staging are coherent and two retries remove staging"},
+    {"id": "sqlite_cache_clear:before_remove_main:actual_sigkill", "operation": "sqlite_cache_clear", "boundary": "before_remove_main", "checkpoint": "before_remove_main", "expected_state": "the checkpointed main database remains usable and two retries remove it"},
+    {"id": "sqlite_cache_clear:after_remove_main:actual_sigkill", "operation": "sqlite_cache_clear", "boundary": "after_remove_main", "checkpoint": "after_remove_main", "expected_state": "the complete rebuildable database bundle is absent and repeated clear is idempotent"},
+    {"id": "data_home_backup:before_publish:actual_sigkill", "operation": "data_home_backup", "boundary": "before_publish", "checkpoint": "before_publish", "expected_state": "verified marked staging is discoverable and two discard attempts preserve the source"},
+    {"id": "data_home_backup:after_publish:actual_sigkill", "operation": "data_home_backup", "boundary": "after_publish", "checkpoint": "after_publish", "expected_state": "the complete backup is visible and two recovery attempts retain and finalize it"},
+    {"id": "data_home_backup:journal_finalized:actual_sigkill", "operation": "data_home_backup", "boundary": "journal_finalized", "checkpoint": "journal_finalized", "expected_state": "the complete checksummed backup and completed journal remain idempotently discoverable"},
+    {"id": "data_home_relocation:staging_verified:actual_sigkill", "operation": "data_home_relocation", "boundary": "staging_verified", "checkpoint": "staging_verified", "expected_state": "the old root remains active and two resumes publish and activate the verified staging tree"},
+    {"id": "data_home_relocation:target_switched:actual_sigkill", "operation": "data_home_relocation", "boundary": "target_switched", "checkpoint": "target_switched", "expected_state": "the complete target is published and two resumes finish the active pointer idempotently"},
+    {"id": "data_home_relocation:active_pointer_committed:actual_sigkill", "operation": "data_home_relocation", "boundary": "active_pointer_committed", "checkpoint": "active_pointer_committed", "expected_state": "the active pointer names the complete target and repeated resume finalizes both journals"},
+    {"id": "face_storage_removal:journal_prepared:actual_sigkill", "operation": "face_storage_removal", "boundary": "journal_prepared", "checkpoint": "journal_prepared", "expected_state": "all managed files remain live and recovery removes the empty incomplete quarantine"},
+    {"id": "face_storage_removal:before_rename:face_search_human.db:actual_sigkill", "operation": "face_storage_removal", "boundary": "before_each_rename", "checkpoint": "before_rename:face_search_human.db", "expected_state": "the next managed file remains live and recovery restores the exact complete family"},
+    {"id": "face_storage_removal:after_rename:face_search_human.db:actual_sigkill", "operation": "face_storage_removal", "boundary": "after_each_rename", "checkpoint": "after_rename:face_search_human.db", "expected_state": "the renamed database is recoverable from quarantine and recovery restores the exact complete family"},
+    {"id": "face_storage_removal:after_commit:actual_sigkill", "operation": "face_storage_removal", "boundary": "after_commit", "checkpoint": "after_commit", "expected_state": "the committed quarantine remains explicitly recoverable and repeated discovery is idempotent"}
+  ],
+  "operations": [
+    {
+      "id": "embedding_index_generation",
+      "implementation": "src/app/services/embedding_index.py#EmbeddingIndexService.save_index",
+      "source_mutation": false,
+      "commit_model": "atomic artifacts followed by a checksum manifest readiness commit",
+      "boundaries": [
+        {"id": "manifest_removed", "phase": "before", "outcome": "An old readiness manifest is absent before replacement artifacts are written."},
+        {"id": "artifacts_published", "phase": "before", "outcome": "Vectors/path map/optional FAISS files may exist but are not a usable index without a valid manifest."},
+        {"id": "manifest_committed", "phase": "commit", "outcome": "Checksummed artifacts become one ready generation."}
+      ],
+      "precommit_cancel": "No replacement generation is ready; ensure_index rebuilds it.",
+      "postcommit_cancel": "The complete checksummed generation remains ready.",
+      "committed_subset": "None: readiness is the complete manifest, never an artifact subset.",
+      "recovery_action": "Reject invalid/missing manifests and rebuild the generation.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart"],
+      "covered_faults": ["process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_embedding_index_rejects_interrupted_generation_until_commit_manifest",
+        "tests/test_durable_fault_injection.py::test_embedding_index_process_exit_before_manifest_is_not_a_ready_generation",
+        "tests/test_durable_killed_process.py::test_embedding_index_actual_sigkill_rebuilds_one_ready_generation"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "face_index_batch",
+      "implementation": "src/app/services/face_search.py#FaceIndexService._persist_face_index_batch",
+      "source_mutation": false,
+      "commit_model": "bounded SQLite transaction",
+      "boundaries": [
+        {"id": "before_commit", "phase": "before", "outcome": "No rows from the current bounded batch are durable."},
+        {"id": "after_commit", "phase": "commit", "outcome": "Every row in the current bounded batch is durable and reported."}
+      ],
+      "precommit_cancel": "Roll back the current batch and report no rows from it.",
+      "postcommit_cancel": "Finish bounded bookkeeping and return the committed metrics.",
+      "committed_subset": "Exactly the completed SQLite batches and their image paths.",
+      "recovery_action": "Reopen SQLite; transaction atomicity exposes either zero or the complete batch.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_face_index_batch_is_atomic_across_process_exit_commit_boundaries",
+        "tests/test_services.py::ServiceTests::test_face_index_finishes_committed_batch_when_cancel_arrives_after_commit",
+        "tests/test_services.py::ServiceTests::test_face_index_batch_rolls_back_sqlite_permission_and_disk_full_faults",
+        "tests/test_durable_killed_process.py::test_face_index_actual_sigkill_has_exact_transaction_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "library_catalog_batch",
+      "implementation": "src/app/services/library_catalog.py#LibraryCatalogService._upsert_assets",
+      "source_mutation": false,
+      "commit_model": "asset and FTS rows in one bounded SQLite transaction",
+      "boundaries": [
+        {"id": "before_commit", "phase": "before", "outcome": "Neither asset nor FTS rows from the batch are visible."},
+        {"id": "after_commit", "phase": "commit", "outcome": "The complete batch and its FTS text are visible."}
+      ],
+      "precommit_cancel": "The open batch rolls back; earlier batches remain and are reported exactly.",
+      "postcommit_cancel": "The committed batch remains and its exact statistics are published.",
+      "committed_subset": "Only fully committed bounded batches.",
+      "recovery_action": "Reopen the catalog and refresh from the active registered root.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "vanished_source", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "vanished_source", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_local_archive_curation.py::LocalArchiveCurationTests::test_catalog_scan_reports_exact_committed_subset_before_cancellation",
+        "tests/test_local_archive_curation.py::LocalArchiveCurationTests::test_catalog_batch_is_atomic_across_process_exit_commit_boundaries",
+        "tests/test_local_archive_curation.py::LocalArchiveCurationTests::test_catalog_batch_rolls_back_sqlite_io_and_disk_full_faults",
+        "tests/test_local_archive_curation.py::LocalArchiveCurationTests::test_catalog_retry_reconciles_a_source_that_vanishes_after_discovery",
+        "tests/test_durable_killed_process.py::test_library_catalog_actual_sigkill_has_exact_transaction_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "photo_sidecar_save",
+      "implementation": "src/app/services/photo_metadata.py#PhotoEditService.save_draft",
+      "source_mutation": true,
+      "commit_model": "sibling temporary file, fsync, atomic replace and directory sync",
+      "boundaries": [
+        {"id": "temporary_written", "phase": "before", "outcome": "The existing sidecar and source photo remain unchanged."},
+        {"id": "sidecar_replaced", "phase": "commit", "outcome": "The complete new JSON sidecar is visible."}
+      ],
+      "precommit_cancel": "No sidecar replacement occurs.",
+      "postcommit_cancel": "The complete sidecar remains committed; source media is unchanged.",
+      "committed_subset": "One complete sidecar per photo.",
+      "recovery_action": "Retry the atomic save; malformed prior sidecars require explicit user repair and are preserved.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["io_error", "disk_full", "permission_error", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "covered_faults": ["io_error", "disk_full", "permission_error", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_photo_edit_sidecar_preserves_prior_or_malformed_data_on_write_failure",
+        "tests/test_durable_fault_injection.py::test_photo_sidecar_faults_preserve_source_and_prior_sidecar",
+        "tests/test_durable_killed_process.py::test_photo_sidecar_actual_sigkill_has_exact_atomic_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "gallery_file_mutations",
+      "implementation": "src/app/services/gallery_actions.py#GalleryActionService",
+      "source_mutation": true,
+      "commit_model": "SQLite operation and per-file intent journal around atomic copy/move/Trash/rename/restore",
+      "boundaries": [
+        {"id": "operation_intent_committed", "phase": "before", "outcome": "Requested scope exists durably; no file mutation has started."},
+        {"id": "file_intent_committed", "phase": "before", "outcome": "The exact original/target pair is durable before mutation."},
+        {"id": "filesystem_mutation_committed", "phase": "commit", "outcome": "One file copy/move/Trash/rename/restore is physically complete."},
+        {"id": "file_terminal_recorded", "phase": "after", "outcome": "Journal state agrees with the physical file pair."}
+      ],
+      "precommit_cancel": "The current file is unchanged; earlier committed files remain reported.",
+      "postcommit_cancel": "The current committed file remains and is reconciled as restorable where applicable.",
+      "committed_subset": "Exactly the per-file completed journal rows; partial batch success is explicit.",
+      "recovery_action": "Compare original/target manifests, reconcile twice idempotently, then explicitly restore eligible changed paths.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "vanished_source", "retry_or_restart", "read_only"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "vanished_source", "retry_or_restart", "read_only"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_gallery_mutation_stops_when_per_file_journal_intent_is_unavailable",
+        "tests/test_services.py::ServiceTests::test_gallery_restart_reconciles_and_restores_committed_file_moves",
+        "tests/test_services.py::ServiceTests::test_gallery_interrupted_copy_is_reconciled_without_deleting_source",
+        "tests/test_production_safety.py::ProductionSafetyTests::test_batch_rename_preview_blocks_collisions_and_journals_recoverable_renames",
+        "tests/test_production_support.py::ProductionSupportTests::test_production_ui_refreshes_recovery_history_after_actual_killed_move",
+        "tests/test_durable_fault_injection.py::test_gallery_cancel_after_commit_reports_the_committed_file",
+        "tests/test_durable_fault_injection.py::test_gallery_process_exit_before_mutation_recovers_without_source_change",
+        "tests/test_durable_fault_injection.py::test_gallery_write_faults_leave_the_source_and_report_failure",
+        "tests/test_durable_killed_process.py::test_gallery_move_actual_sigkill_reconciles_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "embedded_metadata_rewrite",
+      "implementation": "src/app/services/gallery_actions.py#GalleryActionService._safe_rewrite_image_exif",
+      "source_mutation": true,
+      "commit_model": "verified sibling image followed by atomic replace, within the gallery journal",
+      "boundaries": [
+        {"id": "rewrite_intent_committed", "phase": "before", "outcome": "The source image is unchanged and the exact request is journalled."},
+        {"id": "temporary_verified", "phase": "before", "outcome": "A complete decodable temporary image exists beside the source."},
+        {"id": "source_replaced", "phase": "commit", "outcome": "The full rewritten image is visible at the original path."}
+      ],
+      "precommit_cancel": "The original image remains byte-identical.",
+      "postcommit_cancel": "The complete verified replacement remains; outcome is reported rather than rolled back silently.",
+      "committed_subset": "One complete rewritten image per completed journal row.",
+      "recovery_action": "Reconcile the journal and surface unknown commit outcome for explicit review.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "covered_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_exif_rewrite_publish_failure_preserves_original_and_cleans_staging",
+        "tests/test_durable_fault_injection.py::test_embedded_metadata_write_faults_preserve_the_original_image",
+        "tests/test_durable_fault_injection.py::test_embedded_metadata_process_exit_has_an_exact_commit_state",
+        "tests/test_durable_killed_process.py::test_embedded_metadata_actual_sigkill_has_exact_replace_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "face_model_promotion",
+      "implementation": "src/app/services/face_model_installer.py#FaceModelInstaller._promote_bundle_directory",
+      "source_mutation": false,
+      "commit_model": "verified staging directory replaces target while the complete previous directory remains recoverable",
+      "boundaries": [
+        {"id": "previous_staged", "phase": "before", "outcome": "The prior complete target is preserved as previous; staging is still unpublished."},
+        {"id": "target_published", "phase": "commit", "outcome": "The complete verified new bundle occupies the target path."},
+        {"id": "previous_discarded", "phase": "after", "outcome": "Only after publication is the older complete directory removed."}
+      ],
+      "precommit_cancel": "Recover the previous complete bundle or retain the verified staging directory.",
+      "postcommit_cancel": "The newly published complete bundle remains ready.",
+      "committed_subset": "None: only a complete bundle directory is ready.",
+      "recovery_action": "Startup selects a complete target/previous/staging bundle and quarantines incomplete content.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_face_model_promotion_recovers_both_directory_switch_boundaries",
+        "tests/test_services.py::ServiceTests::test_face_model_installer_promotes_complete_interrupted_bundle",
+        "tests/test_durable_fault_injection.py::test_face_model_precommit_fault_restores_the_previous_bundle",
+        "tests/test_durable_killed_process.py::test_face_model_actual_sigkill_recovers_verified_bundle_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "rebuildable_cache_clear",
+      "implementation": "src/app/services/cache_maintenance.py#CacheMaintenanceService._clear_rebuildable_directory",
+      "source_mutation": false,
+      "commit_model": "atomic live-directory detach followed by cancellable staging deletion",
+      "boundaries": [
+        {"id": "before_detach", "phase": "before", "outcome": "The complete old cache remains live."},
+        {"id": "after_detach", "phase": "commit", "outcome": "The old cache is isolated in managed staging and the live path is absent."},
+        {"id": "after_recreate", "phase": "after", "outcome": "A new empty live directory exists while old staging cleanup may remain retryable."}
+      ],
+      "precommit_cancel": "The original cache remains live.",
+      "postcommit_cancel": "An empty live cache plus named managed staging is reported for retry.",
+      "committed_subset": "The clear commits at directory detach; physical staging cleanup is separately retryable.",
+      "recovery_action": "Clear Rebuildable Caches retries only marker-validated managed staging.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "corrupt_or_missing_staging", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "corrupt_or_missing_staging", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_large_cache_directory_clear_recovers_every_atomic_detach_boundary",
+        "tests/test_services.py::ServiceTests::test_large_cache_directory_cancel_and_delete_failure_report_retry_state",
+        "tests/test_services.py::ServiceTests::test_large_cache_directory_clear_refuses_an_unsafe_staging_symlink",
+        "tests/test_durable_killed_process.py::test_rebuildable_cache_actual_sigkill_retries_detached_tree_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "sqlite_cache_clear",
+      "implementation": "src/app/services/cache_maintenance.py#CacheMaintenanceService.clear_sqlite_cache_bundle",
+      "source_mutation": false,
+      "commit_model": "WAL checkpoint followed by ordered managed SQLite sidecar/main removal",
+      "boundaries": [
+        {"id": "before_remove_main", "phase": "before", "outcome": "The main SQLite database remains usable."},
+        {"id": "after_remove_main", "phase": "commit", "outcome": "The rebuildable database is absent and will be recreated lazily."}
+      ],
+      "precommit_cancel": "The usable main database remains.",
+      "postcommit_cancel": "The rebuildable database remains cleared; no durable user/source data is targeted.",
+      "committed_subset": "Only the explicitly selected rebuildable SQLite cache family.",
+      "recovery_action": "Recreate the derived database on next use.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "permission_error", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "permission_error", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_sqlite_cache_clear_is_coherent_across_cancel_and_process_exit_boundaries",
+        "tests/test_services.py::ServiceTests::test_sqlite_cache_clear_permission_failure_preserves_the_main_database",
+        "tests/test_durable_killed_process.py::test_sqlite_cache_actual_sigkill_preserves_or_removes_complete_main"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "data_home_backup",
+      "implementation": "src/app/services/data_home.py#DataHomeManager.create_backup",
+      "source_mutation": false,
+      "commit_model": "marked staging tree with checksummed manifest, then atomic directory publication",
+      "boundaries": [
+        {"id": "before_publish", "phase": "before", "outcome": "Only discoverable marked staging exists; no visible backup is claimed."},
+        {"id": "after_publish", "phase": "commit", "outcome": "A complete checksummed backup is visible and retained."},
+        {"id": "journal_finalized", "phase": "after", "outcome": "The source-side journal records completion."}
+      ],
+      "precommit_cancel": "Discard only marker-matched staging or retry the backup.",
+      "postcommit_cancel": "Verify and retain the published backup, then finalize its journal.",
+      "committed_subset": "None: only a complete verified backup directory is published.",
+      "recovery_action": "Discover the source-side journal; discard staging or finalize the published backup idempotently.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "corrupt_or_missing_staging", "vanished_source", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "corrupt_or_missing_staging", "vanished_source", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_data_home.py::test_backup_publication_is_atomic_across_process_exit_boundaries",
+        "tests/test_data_home.py::test_backup_copy_permission_failure_never_publishes_a_backup",
+        "tests/test_data_home.py::test_backup_cancel_before_commit_is_discardable_and_idempotent",
+        "tests/test_data_home.py::test_backup_cancel_after_publication_retains_and_reports_complete_backup",
+        "tests/test_data_home.py::test_backup_copy_fault_never_publishes_and_recovery_discards_staging",
+        "tests/test_data_home.py::test_incomplete_backup_staging_is_discoverable_and_discard_is_idempotent",
+        "tests/test_data_home.py::test_backup_recovery_retains_and_finalizes_an_already_published_backup",
+        "tests/test_data_home.py::test_backup_discard_refuses_unmarked_or_mismatched_staging",
+        "tests/test_durable_killed_process.py::test_data_home_backup_actual_sigkill_recovers_publication_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "data_home_relocation",
+      "implementation": "src/app/services/data_home.py#DataHomeManager._continue_relocation",
+      "source_mutation": false,
+      "commit_model": "verified marked staging tree, atomic directory publication, then atomic active-root pointer update",
+      "boundaries": [
+        {"id": "staging_verified", "phase": "before", "outcome": "The old Data Home remains active and the staged manifest is reusable."},
+        {"id": "target_switched", "phase": "commit", "outcome": "The complete verified target directory is published; the old root remains available."},
+        {"id": "active_pointer_committed", "phase": "after", "outcome": "The next-launch pointer names the published target."}
+      ],
+      "precommit_cancel": "Resume the verified staging tree or discard it while keeping the old Data Home active.",
+      "postcommit_cancel": "Verify the published target and finish the pointer/journal update.",
+      "committed_subset": "None: a complete verified managed tree is published before activation.",
+      "recovery_action": "Resume/rollback twice idempotently after validating marker, manifest, source availability and target scope.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "corrupt_or_missing_staging", "vanished_source", "retry_or_restart"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "corrupt_or_missing_staging", "vanished_source", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_data_home.py::test_interrupted_relocation_can_resume_or_roll_back_without_source_mutation",
+        "tests/test_data_home.py::test_verified_relocation_resume_rejects_corrupt_staging_and_never_recopies_source",
+        "tests/test_data_home.py::test_incomplete_relocation_resume_refuses_a_vanished_active_data_home",
+        "tests/test_data_home.py::test_relocation_recovers_process_exit_after_directory_switch_idempotently",
+        "tests/test_data_home.py::test_relocation_cancel_after_directory_switch_finishes_the_committed_pointer",
+        "tests/test_data_home.py::test_relocation_publish_fault_preserves_old_home_and_resumes_idempotently",
+        "tests/test_durable_killed_process.py::test_data_home_relocation_actual_sigkill_resumes_switch_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "face_storage_removal",
+      "implementation": "src/app/services/face_storage_recovery.py#FaceStorageRemovalService.remove",
+      "source_mutation": false,
+      "commit_model": "journalled per-file quarantine followed by an explicit committed removal state",
+      "boundaries": [
+        {"id": "journal_prepared", "phase": "before", "outcome": "The exact managed DB/WAL/SHM/ANN set is durable before any rename."},
+        {"id": "before_each_rename", "phase": "before", "outcome": "The next managed file remains live."},
+        {"id": "after_each_rename", "phase": "before", "outcome": "The moved file is recoverable from managed payload staging."},
+        {"id": "after_commit", "phase": "commit", "outcome": "Removal is committed but explicitly restorable/discardable."}
+      ],
+      "precommit_cancel": "Restore every staged file and remove the incomplete operation.",
+      "postcommit_cancel": "Retain committed quarantine and report restore/discard actions.",
+      "committed_subset": "The exact journalled managed storage family; never source photos or external models.",
+      "recovery_action": "Recover incomplete staging twice; explicitly restore or discard a committed quarantine.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart", "read_only"],
+      "covered_faults": ["cancel_before_commit", "cancel_after_commit", "process_exit_before_commit", "process_exit_after_commit", "io_error", "permission_error", "disk_full", "corrupt_or_missing_staging", "retry_or_restart", "read_only"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_face_storage_recovery.py::FaceStorageRecoveryTests::test_cancellation_at_every_boundary_restores_before_commit",
+        "tests/test_face_storage_recovery.py::FaceStorageRecoveryTests::test_process_exit_at_every_boundary_recovers_idempotently",
+        "tests/test_face_storage_recovery.py::FaceStorageRecoveryTests::test_atomic_journal_write_failure_at_every_boundary_restores",
+        "tests/test_face_storage_recovery.py::FaceStorageRecoveryTests::test_permission_and_disk_full_faults_restore_every_precommit_boundary",
+        "tests/test_face_storage_recovery.py::FaceStorageRecoveryTests::test_recovery_rejects_unmanaged_or_conflicting_paths",
+        "tests/test_durable_killed_process.py::test_face_storage_actual_sigkill_restores_or_retains_quarantine_twice"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "saved_search_mutation",
+      "implementation": "src/app/services/saved_searches.py#SavedSearchService._save",
+      "source_mutation": false,
+      "commit_model": "per-path lock plus atomic JSON replace",
+      "boundaries": [
+        {"id": "revision_loaded", "phase": "before", "outcome": "The current complete record set is retained under the path lock."},
+        {"id": "json_replaced", "phase": "commit", "outcome": "One complete valid record set replaces the previous file."}
+      ],
+      "precommit_cancel": "The previous search set remains.",
+      "postcommit_cancel": "The complete new search set remains.",
+      "committed_subset": "None: the saved-search file is one complete record set.",
+      "recovery_action": "Preserve malformed/failed files and retry after explicit repair.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "covered_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_saved_searches_serialize_competing_edits_and_preserve_failed_files",
+        "tests/test_durable_fault_injection.py::test_saved_search_faults_preserve_the_complete_prior_revision",
+        "tests/test_durable_killed_process.py::test_saved_search_actual_sigkill_has_exact_atomic_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "image_tag_mutation",
+      "implementation": "src/app/services/image_tags.py#ImageTagService",
+      "source_mutation": false,
+      "commit_model": "SQLite transactions; optional EXIF mirroring is a separate journalled embedded-metadata operation",
+      "boundaries": [
+        {"id": "transaction_open", "phase": "before", "outcome": "The previous tag rows remain visible to other connections."},
+        {"id": "transaction_committed", "phase": "commit", "outcome": "All rows in the requested tag mutation are durable."}
+      ],
+      "precommit_cancel": "Roll back the current tag transaction.",
+      "postcommit_cancel": "Retain and report the complete committed tag mutation.",
+      "committed_subset": "One complete SQLite transaction; per-photo EXIF results are reported separately.",
+      "recovery_action": "Reopen SQLite; corrupt databases are preserved with a timestamped backup and a new empty managed DB.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart", "read_only"],
+      "covered_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "retry_or_restart", "read_only"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_image_tags_preserves_a_corrupt_database_and_starts_empty",
+        "tests/test_services.py::ServiceTests::test_image_tags_inventory_rename_merge_and_delete",
+        "tests/test_durable_fault_injection.py::test_image_tag_precommit_faults_roll_back_the_complete_transaction",
+        "tests/test_durable_fault_injection.py::test_image_tag_process_exit_after_commit_retains_the_complete_transaction",
+        "tests/test_durable_killed_process.py::test_image_tag_actual_sigkill_has_exact_transaction_state"
+      ],
+      "linux_status": "PASS"
+    },
+    {
+      "id": "clustering_result_cache",
+      "implementation": "src/app/services/result_cache.py#ResultCacheService.save",
+      "source_mutation": false,
+      "commit_model": "atomic JSON result replace keyed by input/model/backend signature",
+      "boundaries": [
+        {"id": "payload_prepared", "phase": "before", "outcome": "The previous compatible result remains readable."},
+        {"id": "result_replaced", "phase": "commit", "outcome": "The complete new result is visible under its exact signature."}
+      ],
+      "precommit_cancel": "The previous result or cache miss remains.",
+      "postcommit_cancel": "The complete new result remains reusable only under the same signature.",
+      "committed_subset": "None: one complete result JSON is the cache unit.",
+      "recovery_action": "Reject malformed/incompatible cache content and recompute.",
+      "idempotent_recovery": true,
+      "applicable_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "corrupt_or_missing_staging", "retry_or_restart"],
+      "covered_faults": ["io_error", "permission_error", "disk_full", "process_exit_before_commit", "process_exit_after_commit", "corrupt_or_missing_staging", "retry_or_restart"],
+      "known_gaps": [],
+      "tests": [
+        "tests/test_services.py::ServiceTests::test_result_cache_roundtrip",
+        "tests/test_services.py::ServiceTests::test_result_cache_key_includes_similarity_space_version",
+        "tests/test_durable_fault_injection.py::test_result_cache_faults_preserve_the_prior_complete_result",
+        "tests/test_durable_killed_process.py::test_result_cache_actual_sigkill_has_exact_atomic_state"
+      ],
+      "linux_status": "PASS"
+    }
+  ]
+}

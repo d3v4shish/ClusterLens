@@ -27,6 +27,11 @@ dependencies = [
   "opencv-python>=4.9,<5.0",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

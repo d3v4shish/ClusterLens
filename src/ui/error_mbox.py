@@ -1,3 +1,5 @@
+import os
+
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -15,8 +17,16 @@ from PyQt6.QtWidgets import (
 )
 
 
-def errorBox(msg_title: str, msg_info: str = "") -> None:
-    msg = QMessageBox()
+def _automated_test_run() -> bool:
+    """Keep validation feedback from entering a nested GUI loop under pytest."""
+
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def errorBox(msg_title: str, msg_info: str = "", *, parent=None) -> None:
+    if _automated_test_run():
+        return
+    msg = QMessageBox(parent)
     msg.setIcon(QMessageBox.Icon.Critical)
     msg.setText(msg_title)
     msg.setInformativeText(msg_info)
@@ -24,8 +34,10 @@ def errorBox(msg_title: str, msg_info: str = "") -> None:
     msg.exec()
 
 
-def infoBox(msg_title: str, msg_info: str = "") -> None:
-    msg = QMessageBox()
+def infoBox(msg_title: str, msg_info: str = "", *, parent=None) -> None:
+    if _automated_test_run():
+        return
+    msg = QMessageBox(parent)
     msg.setIcon(QMessageBox.Icon.Information)
     msg.setText(msg_title)
     msg.setInformativeText(msg_info)
@@ -34,6 +46,8 @@ def infoBox(msg_title: str, msg_info: str = "") -> None:
 
 
 def confirmBox(msg_title: str, msg_info: str = "", *, parent=None) -> bool:
+    if _automated_test_run():
+        return False
     result = QMessageBox.question(
         parent,
         msg_title,

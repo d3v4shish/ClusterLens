@@ -1,10 +1,76 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from typing import Literal, TypeAlias
 
 
 SUPPORTED_SIMILARITY_MODES = ("semantic", "cosine")
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
+
+
+def _nonnegative_count(value: object) -> int | None:
+    number = _finite_number(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _plain_text(value: object, *, limit: int = 256) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[: max(0, int(limit))]
+
+
+def parse_progress_event(payload: object) -> tuple[int, str]:
+    """Normalize one worker payload for the Qt progress contract.
+
+    Negative one is the sole indeterminate sentinel. Zero is preserved,
+    valid percentages are clamped, and malformed/non-finite values never
+    escape into widgets. A worker may alternatively provide a phase-local
+    completed/total pair and optional phase/unit labels.
+    """
+
+    body = dict(payload) if isinstance(payload, dict) else {}
+    raw_value = _finite_number(body.get("value"))
+    if raw_value is None or raw_value == -1:
+        value = -1
+    else:
+        value = max(0, min(100, int(raw_value)))
+
+    completed = _nonnegative_count(body.get("completed"))
+    total = _nonnegative_count(body.get("total"))
+    if value < 0 and completed is not None and total is not None and total > 0:
+        value = max(0, min(100, int((completed * 100.0) / total)))
+
+    status = _plain_text(body.get("status"), limit=1024)
+    phase = _plain_text(body.get("phase"), limit=128)
+    if phase and phase.casefold() not in status.casefold():
+        status = f"{phase}: {status}" if status else phase
+
+    if completed is not None and total is not None:
+        count_text = f"{completed}/{total}"
+        unit = _plain_text(body.get("unit"), limit=64)
+        if unit:
+            count_text = f"{count_text} {unit}"
+        if count_text not in status:
+            status = f"{status} — {count_text}" if status else count_text
+
+    outcomes: list[str] = []
+    for key, label in (("processed", "processed"), ("skipped", "skipped"), ("failed", "failed")):
+        count = _nonnegative_count(body.get(key))
+        if count is not None:
+            outcomes.append(f"{count} {label}")
+    outcome_text = ", ".join(outcomes)
+    if outcome_text and outcome_text.casefold() not in status.casefold():
+        status = f"{status} — {outcome_text}" if status else outcome_text
+    return value, status
 
 
 def _default_runtime_selection():

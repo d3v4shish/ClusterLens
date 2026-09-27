@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import sys
+from contextlib import nullcontext
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
@@ -56,6 +57,7 @@ from app.services.model_assets import ModelAssetService
 from ml.clustering import ClusteringService
 
 from .discovery import ImageDiscoveryService
+from .face_storage_recovery import FaceStorageRemovalService
 from .face_model_installer import face_model_runtime_root_dir
 from .face_types import EditableFaceInput
 
@@ -1684,6 +1686,12 @@ class FaceIndexRecord:
     hidden: bool = False
 
 
+class FaceIndexResult(dict[str, object]):
+    """Completed index metrics whose durable writes survive a late cancel."""
+
+    completion_survives_cancellation = True
+
+
 @dataclass(frozen=True)
 class FaceLabelRequest:
     person_name: str
@@ -1759,6 +1767,14 @@ class NamedPhotoSummary:
 
     person_name: str
     face_count: int
+    photo_count: int
+
+
+@dataclass(frozen=True)
+class NamedPhotoCooccurrence:
+    """A saved person also present in a bounded named-photo sample."""
+
+    person_name: str
     photo_count: int
 
 
@@ -1843,6 +1859,37 @@ class FaceFolderReviewPage:
 
 
 @dataclass(frozen=True)
+class FaceReviewCandidateSnapshot:
+    """Canonical, scoped source-order paths shared by a paged review.
+
+    Preparing this snapshot does the symlink-safe scope check exactly once for
+    a review generation.  Each bounded page can then reuse the canonical keys
+    without resolving every candidate path again.
+    """
+
+    source_paths: tuple[str, ...]
+    normalized_by_path: dict[str, str]
+    scope_roots: tuple[str, ...]
+    normalized_folder_prefix: str
+    uses_root_scope: bool
+
+    def matches_scope(
+        self,
+        *,
+        root_scope: PathScope | None,
+        normalized_folder_prefix: str,
+    ) -> bool:
+        expected_roots = tuple(root_scope.roots) if root_scope is not None else ()
+        return (
+            self.uses_root_scope == (root_scope is not None)
+            and self.scope_roots == expected_roots
+        ) and (
+            self.normalized_folder_prefix
+            == ("" if root_scope is not None else normalized_folder_prefix)
+        )
+
+
+@dataclass(frozen=True)
 class FaceAlbumRecord:
     group_id: str
     group_kind: str
@@ -1887,6 +1934,14 @@ class FaceAlbumMemberPage:
     total_count: int
     offset: int
     next_offset: int | None
+
+
+@dataclass(frozen=True)
+class FaceAlbumInitialPage:
+    """A consistent first album group page and its selected member page."""
+
+    groups: FaceAlbumGroupPage
+    members: FaceAlbumMemberPage | None
 
 
 @dataclass(frozen=True)
@@ -2142,10 +2197,11 @@ def _aligned_face_crop(
     landmarks: tuple[tuple[float, float], ...] = (),
     *,
     output_size: tuple[int, int] = (112, 112),
+    source_rgb: np.ndarray | None = None,
 ) -> Image.Image:
     if len(landmarks) != 5 or cv2 is None:
         return rgb_image.crop(bbox).copy()
-    source = np.asarray(rgb_image.convert("RGB"), dtype=np.uint8)
+    source = source_rgb if source_rgb is not None else _full_rgb_array(rgb_image)
     src = np.asarray(landmarks, dtype=np.float32)
     dst = _CANONICAL_5PT_LANDMARKS.copy()
     if tuple(output_size) != (112, 112):
@@ -2168,6 +2224,32 @@ def _aligned_face_crop(
     except Exception:
         return rgb_image.crop(bbox).copy()
     return Image.fromarray(aligned.astype(np.uint8), mode="RGB")
+
+
+def _full_rgb_array(rgb_image: Image.Image) -> np.ndarray:
+    return np.asarray(rgb_image.convert("RGB"), dtype=np.uint8)
+
+
+class _DetectedFaceCropper:
+    """Reuse one full-frame RGB array while cropping one detector result."""
+
+    def __init__(self, rgb_image: Image.Image) -> None:
+        self._rgb_image = rgb_image
+        self._source_rgb: np.ndarray | None = None
+
+    def crop(
+        self,
+        bbox: tuple[int, int, int, int],
+        landmarks: tuple[tuple[float, float], ...] = (),
+    ) -> Image.Image:
+        if len(landmarks) == 5 and cv2 is not None and self._source_rgb is None:
+            self._source_rgb = _full_rgb_array(self._rgb_image)
+        return _aligned_face_crop(
+            self._rgb_image,
+            bbox,
+            landmarks,
+            source_rgb=self._source_rgb,
+        )
 
 
 def _crop_detected_face(
@@ -2319,6 +2401,7 @@ class FaceDetectionService:
         if boxes is None or probs is None:
             return []
         faces = []
+        cropper = _DetectedFaceCropper(rgb_image)
         for index, (box, prob) in enumerate(zip(boxes, probs)):
             if prob is None:
                 continue
@@ -2345,7 +2428,7 @@ class FaceDetectionService:
                     image_path=image_path,
                     bbox=(x1, y1, x2, y2),
                     confidence=float(prob),
-                    crop=_crop_detected_face(rgb_image, (x1, y1, x2, y2), face_landmarks),
+                    crop=cropper.crop((x1, y1, x2, y2), face_landmarks),
                     landmarks=face_landmarks,
                 )
             )
@@ -2537,6 +2620,7 @@ class AnimalFaceDetectionService:
         boxes = _flatten_detector_boxes(raw_boxes)
         boxes, scores = _flatten_detector_scores(raw_scores, boxes)
         faces: list[DetectedFace] = []
+        cropper = _DetectedFaceCropper(rgb_image)
         width_scale = float(rgb_image.width)
         height_scale = float(rgb_image.height)
         for box, score in zip(boxes, scores):
@@ -2566,7 +2650,7 @@ class AnimalFaceDetectionService:
                     image_path=image_path,
                     bbox=bbox,
                     confidence=confidence,
-                    crop=_crop_detected_face(rgb_image, bbox),
+                    crop=cropper.crop(bbox),
                 )
             )
         faces.sort(key=lambda face: (-float(face.confidence), -((face.bbox[2] - face.bbox[0]) * (face.bbox[3] - face.bbox[1]))))
@@ -2713,6 +2797,7 @@ class AnimalFaceDetectionService:
             keypoints = keypoints[order]
         keep = _nms_xyxy(boxes, scores, 0.4)
         faces: list[DetectedFace] = []
+        cropper = _DetectedFaceCropper(rgb_image)
         for result_index, (bbox_values, confidence) in enumerate(zip(boxes[keep], scores[keep])):
             bbox = (
                 max(0, int(round(float(bbox_values[0])))),
@@ -2736,7 +2821,7 @@ class AnimalFaceDetectionService:
                     image_path=image_path,
                     bbox=bbox,
                     confidence=float(confidence),
-                    crop=_crop_detected_face(rgb_image, bbox, face_landmarks),
+                    crop=cropper.crop(bbox, face_landmarks),
                     landmarks=face_landmarks,
                 )
             )
@@ -2770,6 +2855,7 @@ class AnimalFaceDetectionService:
         scores = scores[keep]
         landmarks = raw_landmarks[keep] if raw_landmarks is not None else None
         faces: list[DetectedFace] = []
+        cropper = _DetectedFaceCropper(rgb_image)
         for index, (bbox_values, confidence) in enumerate(zip(boxes, scores)):
             bbox = (
                 max(0, int(round(float(bbox_values[0])))),
@@ -2798,7 +2884,7 @@ class AnimalFaceDetectionService:
                     image_path=image_path,
                     bbox=bbox,
                     confidence=float(confidence),
-                    crop=_crop_detected_face(rgb_image, bbox, face_landmarks),
+                    crop=cropper.crop(bbox, face_landmarks),
                     landmarks=face_landmarks,
                 )
             )
@@ -3042,6 +3128,7 @@ class YuNetFaceDetectionService:
         if faces_array.ndim != 2 or faces_array.shape[1] < 5:
             return []
         faces: list[DetectedFace] = []
+        cropper = _DetectedFaceCropper(rgb_image)
         for row in faces_array:
             x, y, width, height = [float(value) for value in row[:4]]
             confidence = float(row[-1]) if row.size else 0.0
@@ -3069,7 +3156,7 @@ class YuNetFaceDetectionService:
                     image_path=image_path,
                     bbox=bbox,
                     confidence=confidence,
-                    crop=_crop_detected_face(rgb_image, bbox, face_landmarks),
+                    crop=cropper.crop(bbox, face_landmarks),
                     landmarks=face_landmarks,
                 )
             )
@@ -3919,6 +4006,30 @@ class FaceIndexService:
         connection.execute("PRAGMA journal_mode=WAL;")
         return connection
 
+    def prepare_storage_removal(self) -> None:
+        """Checkpoint SQLite and release retained caches before file staging.
+
+        The WorkCoordinator excludes other in-process data-home work.  The
+        checkpoint additionally refuses removal while an active SQLite reader
+        or writer prevents a complete WAL checkpoint.
+        """
+
+        if getattr(self._face_index_write_context, "connection", None) is not None:
+            raise RuntimeError("Face-library storage is still being written.")
+        FaceStorageRemovalService.checkpoint_database(self.db_path)
+        self.release_storage_caches()
+
+    def release_storage_caches(self) -> None:
+        """Forget every in-memory view derived from the face DB or ANN files."""
+
+        self._cached_person_prototypes = None
+        self._cached_duplicate_warnings = {}
+        self._cached_person_prototype_faces = {}
+        self._face_recognition_enabled_cache = None
+        self._ann_index = None
+        self._ann_records = []
+        self._ann_fingerprint = None
+
     def _ann_index_path(self) -> Path:
         return Path(f"{self.db_path}.faiss")
 
@@ -4050,6 +4161,7 @@ class FaceIndexService:
         root_scope: PathScope | None,
         normalized_folder_prefix: str,
         precomputed_normalized_paths: dict[str, str] | None = None,
+        cancel_check=None,
     ) -> tuple[list[str], dict[str, str], list[str]]:
         """Normalize a candidate snapshot once and retain its source order.
 
@@ -4062,7 +4174,9 @@ class FaceIndexService:
         normalized_by_path: dict[str, str] = {}
         scoped_paths: list[str] = []
         seen_sql_paths: set[str] = set()
-        for value in list(candidate_paths or []):
+        for index, value in enumerate(list(candidate_paths or [])):
+            if index % 128 == 0:
+                raise_if_cancelled(cancel_check)
             path = str(value or "").strip()
             if not path:
                 continue
@@ -4080,6 +4194,39 @@ class FaceIndexService:
             ):
                 scoped_paths.append(path)
         return sql_paths, normalized_by_path, scoped_paths
+
+    def prepare_folder_review_candidate_snapshot(
+        self,
+        directory: str,
+        *,
+        candidate_paths: list[str],
+        scope_roots: list[str] | tuple[str, ...] | None = None,
+        cancel_check=None,
+    ) -> FaceReviewCandidateSnapshot:
+        """Prepare one safe candidate snapshot for a progressive review.
+
+        The caller supplies the already indexed source paths.  This method is
+        intentionally the only place a long candidate list is canonicalized;
+        page reads retain the same ordering and scope guarantees without
+        repeating filesystem path resolution.
+        """
+
+        folder = str(directory or "").strip()
+        root_scope = PathScope.from_paths(scope_roots) if scope_roots is not None else None
+        normalized_folder_prefix = self._normalize_path_for_match(folder) if folder else ""
+        _sql_paths, normalized_by_path, scoped_paths = self._candidate_path_snapshot(
+            candidate_paths,
+            root_scope=root_scope,
+            normalized_folder_prefix="" if root_scope is not None else normalized_folder_prefix,
+            cancel_check=cancel_check,
+        )
+        return FaceReviewCandidateSnapshot(
+            source_paths=tuple(dict.fromkeys(scoped_paths)),
+            normalized_by_path=normalized_by_path,
+            scope_roots=tuple(root_scope.roots) if root_scope is not None else (),
+            normalized_folder_prefix="" if root_scope is not None else normalized_folder_prefix,
+            uses_root_scope=root_scope is not None,
+        )
 
     @staticmethod
     def _face_is_visible(face_bbox: tuple[int, int, int, int], *, include_tiny_faces: bool) -> bool:
@@ -5020,7 +5167,9 @@ class FaceIndexService:
                     image_width=int(work.image_width),
                     image_height=int(work.image_height),
                 )
+            self._face_index_write_checkpoint("before_commit")
             connection.commit()
+            self._face_index_write_checkpoint("after_commit")
         except Exception:
             connection.rollback()
             raise
@@ -5032,9 +5181,16 @@ class FaceIndexService:
         self._invalidate_ann_index()
         named_paths = [work.image_path for work in works if work.records]
         for paths in self._chunked_values(named_paths, size=FACE_INDEX_MAX_WRITE_BATCH_IMAGES):
-            raise_if_cancelled(cancel_check)
+            # SQLite is already committed. Finish this bounded batch's derived
+            # metadata before observing cancellation again so the job cannot
+            # report a no-change cancellation after durable rows were written.
             self.import_face_region_names([str(path) for path in paths])
         return sum(len(work.records) for work in works)
+
+    def _face_index_write_checkpoint(self, name: str) -> None:
+        """Fault-injection seam around the SQLite batch commit point."""
+
+        _ = name
 
     def index_directory(
         self,
@@ -5070,6 +5226,7 @@ class FaceIndexService:
         progress_callback=None,
         cancel_check=None,
         force: bool = False,
+        on_persisted_batch=None,
     ) -> dict[str, object]:
         """Index paths through bounded decode, GPU, quality, and writer stages.
 
@@ -5123,10 +5280,10 @@ class FaceIndexService:
             last_progress_done = done
             last_progress_s = now
 
-        def _result() -> dict[str, object]:
+        def _result() -> FaceIndexResult:
             info = self.face_index_runtime_info()
             elapsed = max(0.0, monotonic() - started_at)
-            return {
+            return FaceIndexResult({
                 "images_done": int(done),
                 "images_total": int(total),
                 "faces_indexed": int(total_faces),
@@ -5148,7 +5305,7 @@ class FaceIndexService:
                 "elapsed_seconds": round(elapsed, 6),
                 "images_per_second": round(float(done) / elapsed, 3) if elapsed else 0.0,
                 "faces_per_second": round(float(total_faces) / elapsed, 3) if elapsed else 0.0,
-            }
+            })
 
         if not self.face_recognition_enabled():
             for _image_path in image_paths:
@@ -5202,6 +5359,16 @@ class FaceIndexService:
                 total_faces += int(indexed)
                 written_count += len(batch)
                 done += len(batch)
+                if on_persisted_batch is not None:
+                    # The callback is deliberately post-commit: consumers may
+                    # safely query these image rows without seeing a partial
+                    # write.  Keep it a notification only; indexing must not
+                    # fail because an observer has gone away.
+                    persisted_paths = list(dict.fromkeys(work.image_path for work in batch if work.image_path))
+                    try:
+                        on_persisted_batch(persisted_paths)
+                    except Exception:
+                        LOGGER.exception("Face index persisted-batch observer failed")
                 _emit_progress(f"{done}/{total} images, indexed {total_faces} face(s), writing durable batches")
 
         def _complete_work(work: _FaceIndexImageWork) -> None:
@@ -5531,7 +5698,6 @@ class FaceIndexService:
                 candidate_paths=candidate_paths,
             )
         album_records: list[FaceAlbumRecord] = []
-        record_by_ref: dict[tuple[str, int], FaceAlbumRecord] = {}
         for row in rows:
             raise_if_cancelled(cancel_check)
             image_path = str(row[0] or "")
@@ -5568,46 +5734,10 @@ class FaceIndexService:
                 hidden=hidden,
                 display_name=person_name or "Unlabeled",
             )
-            record_by_ref[(image_path, face_index)] = album_record
             album_records.append(album_record)
-        for assignment in self.load_pending_face_labels(
-            folder_prefix=folder_prefix,
-            candidate_paths=candidate_paths,
-            include_tiny_faces=include_tiny_faces,
-            include_hidden=True,
-        ):
-            raise_if_cancelled(cancel_check)
-            ref = (str(assignment.image_path), int(assignment.face_index))
-            record = record_by_ref.get(ref)
-            if record is None:
-                continue
-            if (root_scope is not None and not root_scope.contains(str(record.image_path))) or not self._path_in_scope(
-                str(record.image_path),
-                folder_prefix=folder_prefix,
-                candidate_paths=allowed_paths,
-            ):
-                continue
-            if bool(record.hidden):
-                continue
-            album_records.append(
-                FaceAlbumRecord(
-                    group_id=self._face_album_group_id("pending"),
-                    group_kind="pending",
-                    image_path=str(record.image_path),
-                    face_index=int(record.face_index),
-                    face_bbox=tuple(record.face_bbox),
-                    face_confidence=float(record.face_confidence),
-                    person_name=str(assignment.person_name or "").strip(),
-                    label_confidence=float(assignment.confidence),
-                    quality_status=str(record.quality_status or "clean"),
-                    quality_score=float(record.quality_score),
-                    quality_reasons=tuple(str(value) for value in record.quality_reasons or ()),
-                    hidden=False,
-                    display_name=str(assignment.person_name or "").strip() or str(record.person_name or "").strip() or "Pending label",
-                    source=str(assignment.source or ""),
-                    created_at=str(assignment.created_at or ""),
-                )
-            )
+        # Pending labels are review decisions, not a second album membership.
+        # Returning them here used to make one durable face appear under both
+        # its saved person and the Unlabelled-facing pending bucket.
         return album_records
 
     def load_face_album_snapshot(
@@ -5687,6 +5817,7 @@ class FaceIndexService:
         include_tiny_faces: bool = True,
         group_kinds: tuple[str, ...] | list[str] | None = None,
         cancel_check=None,
+        _connection: sqlite3.Connection | None = None,
     ) -> FaceAlbumGroupPage:
         raise_if_cancelled(cancel_check)
         page_offset = max(0, int(offset))
@@ -5698,7 +5829,8 @@ class FaceIndexService:
         invalid_group_kinds = sorted(set(selected_group_kinds) - allowed_group_kinds)
         if invalid_group_kinds:
             raise ValueError(f"Unsupported face album group kind(s): {', '.join(invalid_group_kinds)}")
-        with self._connect() as connection:
+        connection_context = nullcontext(_connection) if _connection is not None else self._connect()
+        with connection_context as connection:
             candidate_scope = self._prepare_face_album_scope_table(connection, candidate_paths)
             base_scope, base_args = self._face_album_scope_sql(
                 "i.image_path",
@@ -5737,24 +5869,29 @@ class FaceIndexService:
                 LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
                 LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
                 WHERE {base_scope}
-
-                UNION ALL
-
-                SELECT
-                    'pending' AS group_kind,
-                    'pending' AS group_id,
-                    '' AS person_name,
-                    p.image_path,
-                    0 AS favorite,
-                    '' AS notes
-                FROM pending_face_labels p
-                JOIN face_index i ON i.image_path=p.image_path AND i.face_index=p.face_index
-                LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
-                LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
-                WHERE {pending_scope}
-                    AND COALESCE(i.hidden, 0)=0
-                    AND COALESCE(pp.hidden, 0)=0
             """
+            # Keep this legacy explicit group available to callers that ask
+            # for it, but never include it in the default album.  A durable
+            # name always wins over a stale pending proposal.
+            if "pending" in selected_group_kinds:
+                member_rows_sql += f"""
+                    UNION ALL
+                    SELECT
+                        'pending' AS group_kind,
+                        'pending' AS group_id,
+                        '' AS person_name,
+                        p.image_path,
+                        0 AS favorite,
+                        '' AS notes
+                    FROM pending_face_labels p
+                    JOIN face_index i ON i.image_path=p.image_path AND i.face_index=p.face_index
+                    LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                    LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                    WHERE {pending_scope}
+                        AND TRIM(COALESCE(l.person_name, ''))=''
+                        AND COALESCE(i.hidden, 0)=0
+                        AND COALESCE(pp.hidden, 0)=0
+                """
             grouped_sql = f"""
                 SELECT
                     group_id,
@@ -5773,7 +5910,7 @@ class FaceIndexService:
                 group_kind_clause = " WHERE group_kind IN (" + ", ".join("?" for _ in selected_group_kinds) + ")"
                 group_kind_args = list(selected_group_kinds)
             filtered_grouped_sql = f"SELECT * FROM ({grouped_sql}) grouped{group_kind_clause}"
-            params = [*base_args, *pending_args, *group_kind_args]
+            params = [*base_args, *(pending_args if "pending" in selected_group_kinds else []), *group_kind_args]
             total_count = int(
                 connection.execute(f"SELECT COUNT(*) FROM ({filtered_grouped_sql}) filtered_groups", params).fetchone()[0] or 0
             )
@@ -5840,12 +5977,14 @@ class FaceIndexService:
         candidate_paths: list[str] | None = None,
         include_tiny_faces: bool = True,
         cancel_check=None,
+        _connection: sqlite3.Connection | None = None,
     ) -> FaceAlbumMemberPage:
         raise_if_cancelled(cancel_check)
         normalized_group_id = str(group_id or "").strip()
         page_offset = max(0, int(offset))
         page_limit = max(1, min(1000, int(limit)))
-        with self._connect() as connection:
+        connection_context = nullcontext(_connection) if _connection is not None else self._connect()
+        with connection_context as connection:
             candidate_scope = self._prepare_face_album_scope_table(connection, candidate_paths)
             path_column = "p.image_path" if normalized_group_id == "pending" else "i.image_path"
             scope_clause, scope_args = self._face_album_scope_sql(
@@ -5863,7 +6002,10 @@ class FaceIndexService:
                     LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
                     LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
                 """
-                condition = f"{scope_clause} AND COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0"
+                condition = (
+                    f"{scope_clause} AND TRIM(COALESCE(l.person_name, ''))='' "
+                    "AND COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0"
+                )
                 select_sql = """
                     SELECT p.image_path, p.face_index, i.bbox_json, i.face_confidence,
                            i.quality_status, i.quality_score, i.quality_reasons_json,
@@ -5930,6 +6072,50 @@ class FaceIndexService:
             offset=page_offset,
             next_offset=next_offset if next_offset < total_count else None,
         )
+
+    def load_face_album_initial_page(
+        self,
+        *,
+        group_limit: int = 100,
+        member_limit: int = 200,
+        folder_prefix: str = "",
+        scope_roots: list[str] | tuple[str, ...] | None = None,
+        candidate_paths: list[str] | None = None,
+        include_tiny_faces: bool = True,
+        group_kinds: tuple[str, ...] | list[str] | None = None,
+        cancel_check=None,
+    ) -> FaceAlbumInitialPage:
+        """Read the first visible album content from one SQLite snapshot."""
+
+        raise_if_cancelled(cancel_check)
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            groups = self.load_face_album_group_page(
+                offset=0,
+                limit=group_limit,
+                folder_prefix=folder_prefix,
+                scope_roots=scope_roots,
+                candidate_paths=candidate_paths,
+                include_tiny_faces=include_tiny_faces,
+                group_kinds=group_kinds,
+                cancel_check=cancel_check,
+                _connection=connection,
+            )
+            members = None
+            if groups.items:
+                members = self.load_face_album_member_page(
+                    str(groups.items[0].group_id),
+                    offset=0,
+                    limit=member_limit,
+                    folder_prefix=folder_prefix,
+                    scope_roots=scope_roots,
+                    candidate_paths=candidate_paths,
+                    include_tiny_faces=include_tiny_faces,
+                    cancel_check=cancel_check,
+                    _connection=connection,
+                )
+        raise_if_cancelled(cancel_check)
+        return FaceAlbumInitialPage(groups=groups, members=members)
 
     def load_face_album_groups(
         self,
@@ -6299,6 +6485,7 @@ class FaceIndexService:
             root_scope=root_scope,
             normalized_folder_prefix="" if root_scope is not None else normalized_directory,
             precomputed_normalized_paths=_normalized_candidate_paths,
+            cancel_check=cancel_check,
         )
         if candidate_paths is not None:
             discovered_paths = scoped_candidate_paths
@@ -6504,6 +6691,7 @@ class FaceIndexService:
         include_tiny_faces: bool = True,
         include_hidden: bool = False,
         cancel_check=None,
+        _candidate_snapshot: FaceReviewCandidateSnapshot | None = None,
     ) -> FaceFolderReviewPage:
         """Load a bounded page without re-querying face rows outside it.
 
@@ -6520,11 +6708,22 @@ class FaceIndexService:
             return FaceFolderReviewPage(items=(), total_count=0, offset=page_offset, next_offset=None)
         if candidate_paths is not None:
             normalized_directory = self._normalize_path_for_match(directory) if directory else ""
-            _candidate_sql_paths, normalized_candidate_paths, source_paths = self._candidate_path_snapshot(
-                candidate_paths,
-                root_scope=root_scope,
-                normalized_folder_prefix="" if root_scope is not None else normalized_directory,
-            )
+            if (
+                isinstance(_candidate_snapshot, FaceReviewCandidateSnapshot)
+                and _candidate_snapshot.matches_scope(
+                    root_scope=root_scope,
+                    normalized_folder_prefix=normalized_directory,
+                )
+            ):
+                source_paths = list(_candidate_snapshot.source_paths)
+                normalized_candidate_paths = _candidate_snapshot.normalized_by_path
+            else:
+                _candidate_sql_paths, normalized_candidate_paths, source_paths = self._candidate_path_snapshot(
+                    candidate_paths,
+                    root_scope=root_scope,
+                    normalized_folder_prefix="" if root_scope is not None else normalized_directory,
+                    cancel_check=cancel_check,
+                )
         elif root_scope is not None:
             source_paths = list(
                 self.discovery_service.discover_roots_result(
@@ -6717,6 +6916,71 @@ class FaceIndexService:
             hidden=hidden,
             image_mtime=float(row[12] or 0.0) / 1_000_000_000.0,
         )
+
+    def load_face_records_many(
+        self,
+        face_refs: list[tuple[str, int]],
+        *,
+        include_hidden: bool = False,
+    ) -> dict[tuple[str, int], IndexedFaceRecord]:
+        """Load explicit face refs in bounded SQLite batches.
+
+        Similarity search used to open a new WAL connection for every ANN
+        candidate.  This keeps the same durable-label and hidden semantics
+        while making candidate hydration proportional to SQL batches.
+        """
+
+        refs = list(
+            dict.fromkeys(
+                (str(image_path), int(face_index))
+                for image_path, face_index in (face_refs or [])
+                if str(image_path or "").strip() and int(face_index) >= 0
+            )
+        )
+        if not refs:
+            return {}
+        self._migrate_legacy_face_coordinate_space([image_path for image_path, _face_index in refs])
+        records: dict[tuple[str, int], IndexedFaceRecord] = {}
+        with self._connect() as connection:
+            for chunk in self._chunked_values(list(refs), size=250):
+                conditions = " OR ".join("(i.image_path=? AND i.face_index=?)" for _item in chunk)
+                params: list[object] = []
+                for image_path, face_index in chunk:
+                    params.extend([image_path, face_index])
+                rows = connection.execute(
+                    f"""
+                    SELECT i.image_path, i.face_index, i.bbox_json, i.face_confidence,
+                           i.embedding, i.quality_status, i.quality_score,
+                           i.quality_reasons_json, COALESCE(l.person_name, ''),
+                           COALESCE(l.confidence, 0.0), COALESCE(i.hidden, 0),
+                           COALESCE(pp.hidden, 0), COALESCE(i.mtime_ns, 0)
+                    FROM face_index i
+                    LEFT JOIN face_labels l ON l.image_path=i.image_path AND l.face_index=i.face_index
+                    LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+                    WHERE {conditions}
+                    """,
+                    params,
+                ).fetchall()
+                for row in rows:
+                    hidden = bool(row[10] or row[11])
+                    if hidden and not include_hidden:
+                        continue
+                    record = IndexedFaceRecord(
+                        image_path=str(row[0]),
+                        face_index=int(row[1]),
+                        face_bbox=tuple(json.loads(row[2])),
+                        face_confidence=float(row[3]),
+                        embedding=np.frombuffer(row[4], dtype=np.float32).copy(),
+                        quality_status=str(row[5] or "clean"),
+                        quality_score=float(row[6] or 1.0),
+                        quality_reasons=tuple(str(value) for value in json.loads(row[7] or "[]")),
+                        person_name=str(row[8] or ""),
+                        label_confidence=float(row[9] or 0.0),
+                        hidden=hidden,
+                        image_mtime=float(row[12] or 0.0) / 1_000_000_000.0,
+                    )
+                    records[(record.image_path, int(record.face_index))] = record
+        return records
 
     def load_face_metadata_many(
         self,
@@ -7053,9 +7317,10 @@ class FaceIndexService:
             raise ValueError("At least one indexed face is required.")
         embeddings: list[np.ndarray] = []
         exclude: set[tuple[str, int]] = set()
+        records_by_ref = self.load_face_records_many(refs)
         for image_path, face_index in refs:
             raise_if_cancelled(cancel_check)
-            record = self.load_face_record(image_path, face_index)
+            record = records_by_ref.get((image_path, int(face_index)))
             if record is None:
                 continue
             embeddings.append(record.embedding)
@@ -7144,6 +7409,7 @@ class FaceIndexService:
                 )
             hits.clear()
             seen: set[tuple[str, int]] = set()
+            ranked_candidates: list[tuple[float, tuple[str, int]]] = []
             for score, raw_index in zip(scores[0], indices[0]):
                 raise_if_cancelled(cancel_check)
                 index_id = int(raw_index)
@@ -7156,17 +7422,21 @@ class FaceIndexService:
                 image_path, face_index = ref
                 if (root_scope is not None and not root_scope.contains(image_path)) or not self._path_in_scope(image_path, folder_prefix=folder_prefix, candidate_paths=allowed_paths):
                     continue
+                ranked_candidates.append((float(score), ref))
+            missing_refs = [ref for _score, ref in ranked_candidates if ref not in cached_records]
+            if missing_refs:
+                loaded_records = self.load_face_records_many(missing_refs)
+                for ref in missing_refs:
+                    cached_records[ref] = loaded_records.get(ref)
+            for similarity, ref in ranked_candidates:
+                raise_if_cancelled(cancel_check)
                 record = cached_records.get(ref)
-                if record is None and ref not in cached_records:
-                    record = self.load_face_record(image_path, face_index)
-                    cached_records[ref] = record
                 if record is None:
                     continue
                 if not self._face_is_visible(record.face_bbox, include_tiny_faces=include_tiny_faces):
                     continue
                 if not self._quality_allows(record.quality_status, self.search_quality_min):
                     continue
-                similarity = float(score)
                 if similarity < min_face_score:
                     continue
                 hits.append(
@@ -10233,6 +10503,53 @@ class FaceIndexService:
         with self._connect() as connection:
             rows = connection.execute(query, args).fetchall()
         return list(dict.fromkeys(str(row[0] or "") for row in rows if str(row[0] or "").strip()))
+
+    def list_named_photo_cooccurrences(
+        self,
+        person_name: str,
+        image_paths: list[str] | tuple[str, ...],
+        *,
+        scope_roots: list[str] | tuple[str, ...] | None = None,
+        include_tiny_faces: bool = True,
+        include_hidden: bool = False,
+        limit: int = 6,
+    ) -> list[NamedPhotoCooccurrence]:
+        """Return other saved names present in the supplied bounded photo sample.
+
+        The Names hover card deliberately supplies at most its contact-sheet
+        paths, so this never turns a pointer hover into a global social-graph
+        query.  It reads only durable visible labels and performs no media I/O.
+        """
+
+        name = str(person_name or "").strip()
+        paths = tuple(dict.fromkeys(str(path) for path in image_paths if str(path)))[:128]
+        if not name or not paths:
+            return []
+        query = f"""
+            SELECT l.person_name, COUNT(DISTINCT l.image_path)
+            FROM face_labels l
+            JOIN face_index i ON i.image_path=l.image_path AND i.face_index=l.face_index
+            LEFT JOIN person_profiles pp ON pp.person_name=l.person_name
+            WHERE l.person_name<>? AND l.image_path IN ({','.join('?' for _ in paths)})
+        """
+        args: list[object] = [name, *paths]
+        if scope_roots is not None:
+            scope_clause, scope_args = roots_scope_sql("l.image_path", scope_roots)
+            query += f" AND {scope_clause}"
+            args.extend(scope_args)
+        if not include_tiny_faces:
+            query += " AND COALESCE(i.is_tiny, 0)=0"
+        if not include_hidden:
+            query += " AND COALESCE(i.hidden, 0)=0 AND COALESCE(pp.hidden, 0)=0"
+        query += " GROUP BY l.person_name ORDER BY COUNT(DISTINCT l.image_path) DESC, lower(l.person_name), l.person_name LIMIT ?"
+        args.append(max(1, min(24, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(query, args).fetchall()
+        return [
+            NamedPhotoCooccurrence(str(row[0] or ""), int(row[1] or 0))
+            for row in rows
+            if str(row[0] or "").strip()
+        ]
 
     def label_unlabeled_faces_in_images(self, person_name: str, image_paths: list[str]) -> int:
         """Save ``person_name`` on visible, currently-unlabeled faces in selected photos.

@@ -18,7 +18,9 @@ from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
 
 from infra.settings import get_settings
 
-THUMBNAIL_CACHE_VERSION = "exif_v2"
+# v3 changes letterbox pixels from opaque white to transparent. The version is
+# part of the cache key, so stale white-backed thumbnails are never reused.
+THUMBNAIL_CACHE_VERSION = "exif_v3_transparent"
 THUMBNAIL_CACHE_INDEX_NAME = ".thumbnail_index.sqlite3"
 _PROCESS_DISK_INDEX_LOCK = RLock()
 _PROCESS_DISK_INDEX_READY: OrderedDict[str, tuple[int, int, int, int, int]] = OrderedDict()
@@ -170,7 +172,7 @@ class ThumbnailService:
         with Image.open(image_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((size, size))
-            canvas = Image.new("RGB", (size, size), (255, 255, 255))
+            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             left = (size - image.width) // 2
             top = (size - image.height) // 2
             canvas.paste(image, (left, top))
@@ -203,8 +205,8 @@ class ThumbnailService:
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        canvas = QImage(size, size, QImage.Format.Format_RGB32)
-        canvas.fill(QColor("#FFFFFF"))
+        canvas = QImage(size, size, QImage.Format.Format_ARGB32)
+        canvas.fill(QColor(0, 0, 0, 0))
         painter = QPainter(canvas)
         try:
             offset_x = max(0, (size - scaled.width()) // 2)

@@ -4,6 +4,9 @@
 # downloads disappear after a regular desktop restart.
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+
 for variable in CLUSTERLENS_RUNTIME_ROOT IMAGE_CLUSTERING_APP_DIR; do
     value="${!variable:-}"
     if [[ "$value" == /tmp/* ]]; then
@@ -11,4 +14,5 @@ for variable in CLUSTERLENS_RUNTIME_ROOT IMAGE_CLUSTERING_APP_DIR; do
     fi
 done
 
+cd "$repo_root"
 exec uv run --locked python -m apps.pyqt_production "$@"

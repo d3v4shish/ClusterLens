@@ -1,0 +1,59 @@
+{
+  "manifest_version": 1,
+  "fixture_id": "replace-with-approved-face-fixture-id",
+  "fixture_source": "Replace with the immutable fixture source or generation recipe.",
+  "fixture_license": "Replace with the fixture license and approval record.",
+  "required_coverage": {
+    "detectors": [
+      "scrfd_2.5g_kps"
+    ],
+    "embedders": [
+      "arcface_r50"
+    ],
+    "clustering_backends": [
+      "cosine-kmeans",
+      "hdbscan",
+      "graph"
+    ]
+  },
+  "images": [
+    {
+      "path": "approved-face-01.jpg",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_min_faces": {
+        "scrfd_2.5g_kps": 1
+      }
+    }
+  ],
+  "model_cases": [
+    {
+      "case_id": "scrfd-2.5g-arcface-r50",
+      "mode": "human",
+      "detector_id": "scrfd_2.5g_kps",
+      "embedder_id": "arcface_r50",
+      "revision": "replace-with-upstream-revision",
+      "embedding_dimension": 512,
+      "embedding_tolerance": 0.00001,
+      "detection_tolerance": 0.001,
+      "clustering_backends": [
+        "cosine-kmeans",
+        "hdbscan",
+        "graph"
+      ],
+      "artifacts": [
+        {
+          "path": "scrfd_2.5g.onnx",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "source": "Replace with the immutable detector source URL.",
+          "license": "Replace with the reviewed detector license."
+        },
+        {
+          "path": "arcface_r50.onnx",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "source": "Replace with the immutable embedder source URL.",
+          "license": "Replace with the reviewed embedder license."
+        }
+      ]
+    }
+  ]
+}

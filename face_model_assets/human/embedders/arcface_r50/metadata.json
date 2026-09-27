@@ -7,7 +7,7 @@
   "hardware_class": "Desktop CPU / GPU",
   "recommended_pair_id": "scrfd_2.5g_kps",
   "source_url": "https://github.com/deepinsight/insightface",
-  "license": "Verify InsightFace model license before distribution.",
+  "license": "InsightFace pretrained-model policy: non-commercial research only; commercial redistribution requires separate permission.",
   "input_name": "input",
   "input_size": [112, 112],
   "output_name": "embedding",

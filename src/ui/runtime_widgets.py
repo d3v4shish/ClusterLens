@@ -13,15 +13,25 @@ class RuntimeBadge(QPushButton):
         self.setProperty("kind", "quiet")
         self._runtime_label = "Runtime"
         self._runtime_tooltip: list[str] = []
+        self._runtime_state = "checking"
         self._cuda_ready = False
         self._health_state = "checking"
         self._health_notes: list[str] = []
+        self._compact = False
         self.update_runtime(None, None)
+
+    def set_compact(self, compact: bool) -> None:
+        normalized = bool(compact)
+        if normalized == self._compact:
+            return
+        self._compact = normalized
+        self._render()
 
     def update_runtime(self, capabilities: RuntimeCapabilities | None, policy: ExecutionPolicy | None) -> None:
         if capabilities is None or policy is None:
             self._runtime_label = "Runtime checking…"
             self._runtime_tooltip = ["Checking CPU and CUDA runtime availability."]
+            self._runtime_state = "checking"
             self._cuda_ready = False
             self._render()
             return
@@ -51,8 +61,27 @@ class RuntimeBadge(QPushButton):
             tooltip.append(policy.error)
 
         self._runtime_tooltip = [item for item in tooltip if item]
-        if policy.preferred_mode == "auto" and policy.effective_mode == "cpu" and policy.reason:
+        if policy.cuda_required_unavailable:
+            self._runtime_label = "CUDA unavailable"
+            self._runtime_state = "unavailable"
+        elif policy.preferred_mode == "auto" and policy.effective_mode == "cpu" and policy.reason:
             self._runtime_label = "CPU fallback"
+            self._runtime_state = "fallback"
+        else:
+            self._runtime_state = "ready"
+        self._render()
+
+    def set_runtime_failure(self, message: str) -> None:
+        """Show a completed local-readiness failure with a concrete retry path."""
+
+        detail = str(message or "Runtime readiness check failed.").strip()
+        self._runtime_label = "Runtime failed"
+        self._runtime_state = "failed"
+        self._cuda_ready = False
+        self._runtime_tooltip = [
+            detail,
+            "Open Settings and choose Rescan GPU Resources to retry the local readiness check.",
+        ]
         self._render()
 
     def set_health(self, state: str, notes: list[str] | tuple[str, ...] | None = None) -> None:
@@ -63,24 +92,34 @@ class RuntimeBadge(QPushButton):
 
     def _render(self) -> None:
         suffix = {
-            "ok": "Ready",
-            "warning": "Attention",
-            "error": "Unavailable",
             "checking": "Checking",
-        }.get(self._health_state, "Attention")
-        # Application-health notes (for example a retained crash report) do
-        # not make an already-verified CUDA runtime unavailable. Keep CUDA's
-        # ready state explicit and retain those notes in the hover tooltip.
-        if self._cuda_ready and self._health_state == "warning":
-            suffix = "Ready"
-        self.setText(f"{self._runtime_label} · {suffix}")
+            "ready": "Ready",
+            "fallback": "Fallback",
+            "unavailable": "Unavailable",
+            "failed": "Failed",
+        }.get(self._runtime_state, "Checking")
+        compact_label = {
+            "checking": "Checking…",
+            "ready": "CUDA ready" if self._cuda_ready else "CPU ready",
+            "fallback": "CPU fallback",
+            "unavailable": "Unavailable",
+            "failed": "Failed",
+        }.get(self._runtime_state, suffix)
+        self.setText(compact_label if self._compact else f"{self._runtime_label} · {suffix}")
+        self.setAccessibleName(f"Runtime status: {self._runtime_label}; {suffix}")
         tooltip = list(self._runtime_tooltip)
-        if self._cuda_ready and self._health_state == "warning":
+        if self._cuda_ready and self._health_state == "warning" and self._runtime_state == "ready":
             tooltip.append("CUDA is ready. The application-health notes below do not affect GPU availability.")
         tooltip.extend(self._health_notes)
         self.setAccessibleDescription(". ".join(tooltip))
         self.setToolTip("\n".join(tooltip))
-        state = "success" if self._health_state == "ok" or (self._cuda_ready and self._health_state == "warning") else "error" if self._health_state == "error" else "warning"
+        state = {
+            "checking": "warning",
+            "ready": "success",
+            "fallback": "warning",
+            "unavailable": "error",
+            "failed": "error",
+        }.get(self._runtime_state, "warning")
         self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)

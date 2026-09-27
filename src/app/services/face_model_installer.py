@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.machinery
 import importlib
 import json
@@ -709,6 +710,10 @@ class FaceModelInstaller:
                                     progress(10, f"{progress_prefix} ({received // (1024 * 1024)} MB)")
                         handle.flush()
                         os.fsync(handle.fileno())
+                    if content_bytes > 0 and received < total_bytes:
+                        raise ConnectionError(
+                            f"incomplete response: received {received - resume_bytes} of {content_bytes} bytes"
+                        )
                 return
             except urllib.error.HTTPError as exc:
                 # A completed partial can receive 416 when the previous run
@@ -716,7 +721,7 @@ class FaceModelInstaller:
                 if int(getattr(exc, "code", 0) or 0) == 416 and partial_path.is_file():
                     return
                 last_error = exc
-            except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+            except (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException) as exc:
                 last_error = exc
 
             if attempt >= DOWNLOAD_RETRY_ATTEMPTS:
@@ -871,17 +876,38 @@ class FaceModelInstaller:
 
     def _promote_bundle_directory(self, staging_dir: Path, target_dir: Path) -> None:
         previous_dir: Path | None = None
-        if target_dir.exists():
-            previous_dir = target_dir.parent / f".{target_dir.name}.{uuid4().hex}.previous"
-            target_dir.replace(previous_dir)
         try:
+            if target_dir.exists():
+                previous_dir = target_dir.parent / f".{target_dir.name}.{uuid4().hex}.previous"
+                target_dir.replace(previous_dir)
+                self._promotion_checkpoint("previous_staged", staging_dir, target_dir, previous_dir)
             staging_dir.replace(target_dir)
+            self._promotion_checkpoint("target_published", staging_dir, target_dir, previous_dir)
         except Exception:
             if previous_dir is not None and previous_dir.exists() and not target_dir.exists():
                 previous_dir.replace(target_dir)
             raise
         if previous_dir is not None:
             shutil.rmtree(previous_dir, ignore_errors=True)
+            self._promotion_checkpoint("previous_discarded", staging_dir, target_dir, previous_dir)
+
+    def _promotion_checkpoint(
+        self,
+        _name: str,
+        _staging_dir: Path,
+        _target_dir: Path,
+        _previous_dir: Path | None,
+    ) -> None:
+        """Deterministic fault-injection seam at durable promotion boundaries."""
+
+        return
+
+    @staticmethod
+    def _discard_previous_bundle_dirs(target_dir: Path) -> None:
+        for previous in target_dir.parent.glob(f".{target_dir.name}.*.previous"):
+            if previous.is_symlink() or not previous.is_dir():
+                continue
+            shutil.rmtree(previous)
 
     def _write_install_record(self, payload_path: Path, *, bundle_id: str = "") -> None:
         stat = payload_path.stat()
@@ -955,6 +981,11 @@ class FaceModelInstaller:
                 continue
             target_dir = self.bundle_dir(bundle_id)
             if self._bundle_dir_is_complete(target_dir, bundle_id, verify_sha=False):
+                if self._bundle_dir_is_complete(target_dir, bundle_id, verify_sha=True):
+                    try:
+                        self._discard_previous_bundle_dirs(target_dir)
+                    except OSError as exc:
+                        failures.append(f"{bundle_id}: unable to clean an interrupted previous bundle: {exc}")
                 continue
             parent = target_dir.parent
             if not parent.is_dir():
@@ -974,6 +1005,8 @@ class FaceModelInstaller:
                     corrupt_dir = parent / f".{bundle_id}.{uuid4().hex}.corrupt"
                     target_dir.replace(corrupt_dir)
                 source_dir.replace(target_dir)
+                if self._bundle_dir_is_complete(target_dir, bundle_id, verify_sha=True):
+                    self._discard_previous_bundle_dirs(target_dir)
                 promoted.append(bundle_id)
             except OSError as exc:
                 failures.append(f"{bundle_id}: unable to promote an interrupted install: {exc}")

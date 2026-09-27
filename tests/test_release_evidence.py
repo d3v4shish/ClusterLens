@@ -53,10 +53,17 @@ def test_synthetic_release_fixture_refuses_unrecognized_overwrite(tmp_path: Path
     assert (unsafe_root / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
-def test_trash_recovery_verifier_uses_only_disposable_paths(tmp_path: Path) -> None:
+def test_trash_recovery_verifier_uses_only_disposable_paths(tmp_path: Path, monkeypatch) -> None:
     verifier = _load_script("verify_trash_recovery")
     fixture_dir = tmp_path / "fixture"
     report_dir = tmp_path / "report"
+    from app.services import gallery_actions
+
+    monkeypatch.setattr(
+        gallery_actions,
+        "get_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit verifier paths must not resolve global settings")),
+    )
 
     assert verifier.main(["--fixture-dir", str(fixture_dir), "--report-dir", str(report_dir)]) == 0
     payload = json.loads((report_dir / "trash_recovery.json").read_text(encoding="utf-8"))
@@ -94,3 +101,27 @@ def test_packaged_launch_report_validation_requires_every_check(tmp_path: Path) 
     )
     with pytest.raises(RuntimeError, match="checks failed"):
         verifier._read_and_validate_report(report)
+
+
+def test_packaged_artifact_tree_digest_covers_files_links_modes_and_content(tmp_path: Path) -> None:
+    verifier = _load_script("verify_packaged_launch")
+    artifact = tmp_path / "ClusterLens"
+    internal = artifact / "_internal"
+    internal.mkdir(parents=True)
+    executable = artifact / "ClusterLens"
+    executable.write_bytes(b"binary")
+    executable.chmod(0o755)
+    payload = internal / "payload.bin"
+    payload.write_bytes(b"payload")
+    (internal / "payload-link").symlink_to("payload.bin")
+
+    first = verifier._artifact_tree_evidence(artifact)
+    second = verifier._artifact_tree_evidence(artifact)
+
+    assert first == second
+    assert first["artifact_file_count"] == 2
+    assert first["artifact_symlink_count"] == 1
+    assert first["artifact_total_bytes"] == len(b"binarypayloadpayload.bin")
+
+    payload.write_bytes(b"changed")
+    assert verifier._artifact_tree_evidence(artifact)["artifact_tree_sha256"] != first["artifact_tree_sha256"]

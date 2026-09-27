@@ -48,17 +48,38 @@ MODEL_SOURCE_URLS = {
     "facenet": "https://github.com/timesler/facenet-pytorch/releases/tag/v2.2.9",
 }
 
+# Hugging Face assets used by the managed snapshot downloader must resolve to
+# one reviewed revision.  Runtime loading consumes the same mapping so a model,
+# processor and tokenizer cannot silently move to different ``main`` commits.
+HF_MODEL_REPOSITORIES = {
+    "mobileclip": "apple/mobileclip_s0_timm",
+    "dino": "timm/vit_small_patch16_224.dino",
+    "dinov2_base": "timm/vit_base_patch14_dinov2.lvd142m",
+    "clip": "openai/clip-vit-base-patch32",
+    "openclip": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+    "siglip": "google/siglip-base-patch16-224",
+}
+
+HF_MODEL_REVISIONS = {
+    "mobileclip": "7628ba98854d84a318027e036c582df9841c556b",
+    "dino": "10e440b8a34dfd657a90f2fcaa988c6b6a2f0da4",
+    "dinov2_base": "4685c99dabffe5affac90bd99dbffd25801ae58d",
+    "clip": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+    "openclip": "1a25a446712ba5ee05982a381eed697ef9b435cf",
+    "siglip": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+}
+
 MODEL_LICENSES = {
-    "fast_preview": "TorchVision model weights license; verify with packaged metadata before distribution.",
-    "resnet": "TorchVision model weights license; verify with packaged metadata before distribution.",
-    "convnext": "TorchVision model weights license; verify with packaged metadata before distribution.",
-    "mobileclip": "Apple MobileCLIP license; verify upstream model card before distribution.",
-    "dino": "timm/Hugging Face model card license; verify upstream before distribution.",
-    "dinov2_base": "Meta DINOv2 license; verify upstream model card before distribution.",
-    "clip": "OpenAI CLIP model card license; verify upstream before distribution.",
-    "openclip": "LAION/OpenCLIP model card license; verify upstream before distribution.",
-    "siglip": "Google SigLIP model card license; verify upstream before distribution.",
-    "facenet": "facenet-pytorch and VGGFace2 model terms; verify upstream before distribution.",
+    "fast_preview": "Unresolved for weight redistribution; TorchVision does not declare a weight-specific license.",
+    "resnet": "Unresolved for weight redistribution; TorchVision does not declare a weight-specific license.",
+    "convnext": "Unresolved for weight redistribution; TorchVision does not declare a weight-specific license.",
+    "mobileclip": "Apple Machine Learning Research License (AMLR), per the upstream model card.",
+    "dino": "Apache-2.0, per the upstream Hugging Face model card.",
+    "dinov2_base": "Apache-2.0, per the upstream Hugging Face model card.",
+    "clip": "Unresolved for weight redistribution; the upstream model card has no license identifier.",
+    "openclip": "MIT, per the upstream Hugging Face model card; usage and dataset caveats still apply.",
+    "siglip": "Apache-2.0, per the upstream Hugging Face model card.",
+    "facenet": "Unresolved; facenet-pytorch code and VGGFace2-trained weight terms require review.",
 }
 
 TORCH_CACHE_PATTERNS = {

@@ -46,6 +46,7 @@ from infra.performance import detect_system_resources, select_performance_profil
 from infra.runtime import RuntimeCapabilityService, available_execution_modes
 from infra.settings import get_settings
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
+from ui.common import ResponsiveFlowLayout
 from ui.error_mbox import confirmBox, errorBox, infoBox
 
 
@@ -123,7 +124,8 @@ class SettingsDialog(QDialog):
         runtime_form.addRow(self.gpu_warmup)
         runtime_form.addRow(self.runtime_badge)
 
-        runtime_actions = QHBoxLayout()
+        self.runtime_actions_row = QWidget(runtime_tab)
+        runtime_actions = ResponsiveFlowLayout(self.runtime_actions_row, spacing=6)
         self.refresh_button = QPushButton("Refresh Diagnostics")
         self.install_cuda_button = QPushButton("Install CUDA (NVIDIA)")
         self.verify_gpu_button = QPushButton("Verify GPU")
@@ -132,7 +134,7 @@ class SettingsDialog(QDialog):
         runtime_actions.addWidget(self.refresh_button)
         runtime_actions.addWidget(self.install_cuda_button)
         runtime_actions.addWidget(self.verify_gpu_button)
-        runtime_form.addRow(runtime_actions)
+        runtime_form.addRow(self.runtime_actions_row)
 
         self.runtime_text = QTextEdit()
         self.runtime_text.setReadOnly(True)
@@ -173,9 +175,8 @@ class SettingsDialog(QDialog):
         model_root_layout.addWidget(self.browse_face_model_root_button)
         self.face_model_cache_label = QLabel(str(face_model_runtime_root_dir(self.app_settings)))
         self.face_model_cache_label.setWordWrap(True)
-        face_model_actions_row = QWidget(self)
-        face_model_actions_layout = QHBoxLayout(face_model_actions_row)
-        face_model_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.face_model_actions_row = QWidget(self)
+        face_model_actions_layout = ResponsiveFlowLayout(self.face_model_actions_row, spacing=6)
         self.refresh_face_models_button = QPushButton("Refresh Face Models")
         self.install_recommended_face_models_button = QPushButton("Install Recommended")
         self.install_edge_face_models_button = QPushButton("Install Edge")
@@ -216,7 +217,7 @@ class SettingsDialog(QDialog):
         ui_form.addRow("Default face mode", self.default_face_mode)
         ui_form.addRow("Face model root", model_root_row)
         ui_form.addRow("Managed face-model cache", self.face_model_cache_label)
-        ui_form.addRow("Face model actions", face_model_actions_row)
+        ui_form.addRow("Face model actions", self.face_model_actions_row)
         ui_form.addRow("Installed face model", face_model_delete_row)
         ui_form.addRow("Default detector", self.default_face_detector)
         ui_form.addRow("Default embedder", self.default_face_embedder)
@@ -254,7 +255,8 @@ class SettingsDialog(QDialog):
         storage_form.addRow("Generated storage usage", self.generated_storage_text)
         storage_form.addRow("Rebuildable cache usage", self.cache_usage_text)
         storage_layout.addLayout(storage_form)
-        storage_actions = QHBoxLayout()
+        self.storage_actions_row = QWidget(storage_tab)
+        storage_actions = ResponsiveFlowLayout(self.storage_actions_row, spacing=6)
         self.refresh_cache_usage_button = QPushButton("Refresh Cache Usage")
         self.clear_cache_button = QPushButton("Clear Rebuildable Caches")
         self.clear_runtime_temp_button = QPushButton("Clear Temp Files")
@@ -267,7 +269,7 @@ class SettingsDialog(QDialog):
         storage_actions.addWidget(self.clear_face_storage_button)
         storage_actions.addWidget(self.clear_model_caches_button)
         storage_actions.addWidget(self.clear_logs_button)
-        storage_layout.addLayout(storage_actions)
+        storage_layout.addWidget(self.storage_actions_row)
         self.cache_status_label = QLabel(
             "Rebuildable caches include embeddings, clustering results, indexes, installed face-model bundles, thumbnails, ONNX exports, and temp files."
         )

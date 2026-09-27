@@ -7,7 +7,7 @@
   "hardware_class": "Desktop GPU",
   "recommended_pair_id": "scrfd_10g_kps",
   "source_url": "https://github.com/mk-minchul/AdaFace",
-  "license": "Verify AdaFace model license before distribution.",
+  "license": "MIT repository; pretrained-weight and training-data redistribution still require release review.",
   "input_name": "input",
   "input_size": [112, 112],
   "output_name": "embedding",

@@ -29,7 +29,9 @@ def atomic_write_with(path: str | Path, writer: Callable[[Path], None]) -> None:
     try:
         writer(temporary)
         _sync_path(temporary)
+        _atomic_write_checkpoint(target, "before_replace")
         os.replace(temporary, target)
+        _atomic_write_checkpoint(target, "after_replace")
         _sync_directory(target.parent)
     finally:
         try:
@@ -55,13 +57,21 @@ def _atomic_replace(
             writer(handle)
             handle.flush()
             os.fsync(handle.fileno())
+        _atomic_write_checkpoint(target, "before_replace")
         os.replace(temporary, target)
+        _atomic_write_checkpoint(target, "after_replace")
         _sync_directory(target.parent)
     finally:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _atomic_write_checkpoint(_target: Path, _phase: str) -> None:
+    """Deterministic fault-injection seam around the atomic commit point."""
+
+    return
 
 
 def _sync_path(path: Path) -> None:

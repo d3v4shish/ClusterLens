@@ -90,9 +90,19 @@ class ImageTagService:
         connection = self._connect()
         try:
             yield connection
+            self._tag_write_checkpoint("before_commit")
             connection.commit()
+            self._tag_write_checkpoint("after_commit")
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
+
+    def _tag_write_checkpoint(self, _name: str) -> None:
+        """Deterministic fault-injection seam around a SQLite transaction."""
+
+        return
 
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

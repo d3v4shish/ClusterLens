@@ -13,10 +13,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex, QPoint, QSize, Qt, QSettings, QThread
+from PyQt6.QtCore import QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex, QPoint, QSize, Qt, QSettings, QThread, QTimer
 from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QDialog, QGridLayout, QMenu, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QDialog, QGridLayout, QLabel, QMenu, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyleOptionViewItem, QTabBar, QToolButton, QVBoxLayout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -29,6 +29,7 @@ from app.services.clustering_pipeline import ClusteringRequest, MultiBackendClus
 from app.services.face_search import BUILTIN_HUMAN_DETECTOR_ID, BUILTIN_HUMAN_EMBEDDER_ID, EditableFaceInput, FaceAlbumGroupPage, FaceAlbumGroupSummary, FaceAlbumMemberPage, FaceAlbumRecord, FaceClusterIdentitySuggestion, FaceClusterMember, FaceClusteringComparisonResult, FaceFolderReviewImage, FaceFolderReviewPage, FaceLabelAcceptanceBatch, FaceLabelAssignment, FaceScanImageRecord, FaceSearchRequest, FaceSearchResult, IndexedFaceRecord, PersonProfile, PersonPrototypeFace
 from app.services.face_search import NamedPhotoSummary
 from app.services.image_tags import ClusterTagSummary, ImageTagService
+from app.services.photo_metadata import PhotoEditDraft, PhotoMetadata
 from app.services.saved_searches import SavedSearchService
 from app.services.similarity_search import SearchResult
 from infra.settings import get_settings
@@ -37,18 +38,19 @@ import main as main_module
 from main import ClusterGalleryApp
 from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
 from ui.cluster_pane import CLUSTER_BASIS_EMPTY_TEXT, ClusterCellDelegate, ClusterPane, ClusterGridModel
-from ui.common import HelpIconButton
+from ui.common import HelpIconButton, ResponsiveFlowLayout
 from ui.gallery_model import GalleryImageModel, GalleryItemDelegate, MAX_FACE_BOXES_PER_TILE
 from ui.gallery_pane import (
     GalleryPane,
     MAX_PENDING_UI_ITEMS_PER_FLUSH,
     MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE,
     MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE,
+    ThumbnailRequestQueue,
 )
 from ui.footer_bar import WorkspaceFooter
 from ui.job_manager import JobManager
 from ui.job_presentation import JobPresentationController
-from ui.job_widgets import JobIndicatorWidget
+from ui.job_widgets import JobIndicatorWidget, JobsDialog
 from ui.list_models import ListEntryModel, SidebarListEntryDelegate
 from ui.mode_panes import SourcePane
 from ui.names_pane import NamesPane
@@ -56,7 +58,7 @@ from ui.photo_inspector_dialog import EditableFaceDraft, PhotoInspectorDialog
 from ui.search_pane import FaceNameDialog, FaceResultGroup, FaceTileItem, FaceTileListModel, SearchPane
 from ui.selection_details_pane import SelectionDetailsPane
 from ui.settings_dialog import SettingsDialog
-from ui.theme import ULTRA_DARK_QSS
+from ui.theme import ULTRA_DARK_QSS, apply_app_text_scale, apply_app_theme, current_theme
 from ui.runtime_widgets import RuntimeBadge
 from ui.zoomable_image import ZoomableImageView
 
@@ -68,6 +70,22 @@ class UiSmokeTests(unittest.TestCase):
     def setUp(self):
         settings = get_settings()
         self._app_settings_store = QSettings(settings.app_name, settings.app_name)
+        self._production_settings_store = QSettings("ClusterLens", "ClusterLens")
+        self._source_filter_keys = (
+            "source_filters/ignore_thumbnail_like",
+            "source_filters/min_width",
+            "source_filters/min_height",
+            "source_filters/min_file_size_bytes",
+        )
+        self._saved_source_filter_settings = {
+            key: self._production_settings_store.value(key, None)
+            for key in self._source_filter_keys
+        }
+        self._production_settings_store.setValue("source_filters/ignore_thumbnail_like", False)
+        self._production_settings_store.setValue("source_filters/min_width", 0)
+        self._production_settings_store.setValue("source_filters/min_height", 0)
+        self._production_settings_store.setValue("source_filters/min_file_size_bytes", 0)
+        self._production_settings_store.sync()
         self._saved_settings = {
             key: self._app_settings_store.value(key, None)
             for key in [
@@ -121,12 +139,16 @@ class UiSmokeTests(unittest.TestCase):
             else:
                 self._app_settings_store.setValue(key, value)
         self._app_settings_store.sync()
-        # UI smoke cases intentionally exercise many independently owned
-        # worker-backed widgets.  Make their Qt deletion/cancellation events
-        # deterministic before the next case changes QSettings/runtime state.
+        for key, value in self._saved_source_filter_settings.items():
+            if value is None:
+                self._production_settings_store.remove(key)
+            else:
+                self._production_settings_store.setValue(key, value)
+        self._production_settings_store.sync()
         for widget in list(APP.topLevelWidgets()):
             try:
-                widget.close()
+                if widget.close():
+                    widget.deleteLater()
             except RuntimeError:
                 continue
         for _ in range(6):
@@ -243,6 +265,18 @@ class UiSmokeTests(unittest.TestCase):
     class _FakeAsyncJob:
         def __init__(self):
             self.cancel_calls = 0
+            self.started = self._FakeSignal()
+            self.progress = self._FakeSignal()
+            self.completed = self._FakeSignal()
+            self.failed = self._FakeSignal()
+            self.cancelled = self._FakeSignal()
+
+        class _FakeSignal:
+            def __init__(self):
+                self.disconnect_calls = 0
+
+            def disconnect(self, *_args):
+                self.disconnect_calls += 1
 
         def cancel(self):
             self.cancel_calls += 1
@@ -334,6 +368,7 @@ class UiSmokeTests(unittest.TestCase):
             self.search_query_faces_calls: list[dict[str, object]] = []
             self.search_similar_face_calls: list[dict[str, object]] = []
             self.search_similar_faces_calls: list[dict[str, object]] = []
+            self.detect_faces_for_image_calls: list[dict[str, object]] = []
             self.search_by_person_name_calls: list[dict[str, object]] = []
             self.label_indexed_faces_calls: list[dict[str, object]] = []
             self.label_indexed_faces_immediately_calls: list[dict[str, object]] = []
@@ -1438,7 +1473,12 @@ class UiSmokeTests(unittest.TestCase):
             return "clean", 0.92, ()
 
         def detect_faces_for_image(self, image_path, *, include_tiny_faces=False):
-            _ = include_tiny_faces
+            self.detect_faces_for_image_calls.append(
+                {
+                    "image_path": str(image_path),
+                    "include_tiny_faces": bool(include_tiny_faces),
+                }
+            )
             faces = []
             for record in self.records:
                 if str(record.image_path) != str(image_path):
@@ -2085,6 +2125,19 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn("Copied 2 path(s)", pane.status_label.text())
         pane.close()
 
+    def test_cluster_pane_late_hide_event_ignores_deleted_hover_popup(self):
+        pane = ClusterPane()
+        try:
+            pane._hover_popup.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            APP.processEvents()
+
+            pane._hide_hover_popup(cancel_preview=True)
+            self.assertIsNone(pane._hover_popup_key)
+            self.assertTrue(pane.shutdown_jobs(timeout_ms=0))
+        finally:
+            pane.close()
+
     def test_gallery_selected_only_tag_target_never_falls_back_to_cluster(self):
         pane = GalleryPane()
         pane.images = ["a.jpg", "b.jpg", "c.jpg"]
@@ -2202,7 +2255,7 @@ class UiSmokeTests(unittest.TestCase):
                 lambda: SelectionTarget(paths=(image_key,), kind="gallery", label="Visible Images")
             )
 
-            def _run_sync(_label, fn, on_completed):
+            def _run_sync(_label, fn, on_completed, **_resources):
                 on_completed(fn(lambda *_args: None, lambda: False))
 
             with patch(
@@ -2246,8 +2299,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(window.clustering_workspace_button.isChecked())
         self.assertFalse(window.faces_workspace_button.isChecked())
         self.assertFalse(window.names_workspace_button.isChecked())
-        self.assertTrue(window.source_pane.basic_action_section.isVisible())
-        self.assertTrue(window.source_pane.basic_run_button.isVisible())
+        self.assertFalse(window.source_pane.basic_action_section.isVisible())
+        self.assertFalse(window.source_pane.basic_run_button.isVisible())
         self.assertFalse(window.source_pane.basic_cancel_button.isVisible())
         self.assertFalse(window.clustering_pane.isVisible())
         self.assertFalse(hasattr(window.gallery_pane, "tags_button"))
@@ -2509,6 +2562,10 @@ class UiSmokeTests(unittest.TestCase):
                 self.path_calls.append(str(person_name))
                 return ["/photos/alice-a.jpg", "/photos/alice-b.jpg"]
 
+            def list_named_photo_cooccurrences(self, person_name, image_paths):
+                self.path_calls.append(f"cooccurring:{person_name}:{len(image_paths)}")
+                return [("Bob", 2), ("Casey", 1)]
+
         service = _NameService()
         pane = NamesPane(lambda: service)
         pane.resize(960, 700)
@@ -2536,14 +2593,16 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertEqual("Alice", pane._hover_popup.title_label.text())
                 self.assertEqual("2 photo(s) · 3 saved face(s)", pane._hover_popup.summary_label.text())
                 self.assertEqual("Alice", pane.names_list.currentIndex().data(ListEntryModel.PayloadRole))
-                self.assertEqual(calls_before_hover + 1, len(service.path_calls))
+                self.assertEqual(calls_before_hover + 2, len(service.path_calls))
+                self.assertEqual("Showing 2 of 2 photo(s)", pane._hover_popup.note_label.text())
+                self.assertEqual("Also in these photos: Bob (2), Casey (1)", pane._hover_popup.people_label.text())
                 self.assertEqual(selected_before, pane.names_list.currentIndex().data(ListEntryModel.PayloadRole))
 
                 pane._hide_name_hover_preview(cancel_preview=True)
                 pane._update_name_hover_preview(index)
                 APP.processEvents()
                 self.assertTrue(pane._hover_popup.isVisible())
-                self.assertEqual(calls_before_hover + 1, len(service.path_calls))
+                self.assertEqual(calls_before_hover + 2, len(service.path_calls))
                 pixmap = pane._hover_popup.image_label.pixmap()
                 self.assertIsNotNone(pixmap)
                 self.assertFalse(pixmap.isNull())
@@ -2631,7 +2690,8 @@ class UiSmokeTests(unittest.TestCase):
                 )
 
             with (
-                patch("ui.names_pane.QInputDialog.getText", return_value=("Cara", True)),
+                patch("ui.names_pane.EntityPickerDialog.exec", return_value=QDialog.DialogCode.Accepted),
+                patch("ui.names_pane.EntityPickerDialog.selected_value", return_value="Cara"),
                 patch("ui.gallery_pane.QMenu.exec", side_effect=choose_rename_action),
             ):
                 pane.gallery.on_context_menu(pane.gallery.list_view.visualRect(pane.gallery.model.index(0, 0)).center())
@@ -2712,6 +2772,35 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertTrue(self._wait_until(lambda: pane._people_name_job is None))
                 self.assertEqual(("Alice", "Bob"), pane.people_name_field.choices)
                 self.assertTrue(callable(service.cancel_check))
+            finally:
+                pane.shutdown_jobs(timeout_ms=500)
+                pane.close()
+
+    def test_library_cancelled_scan_refreshes_the_actual_committed_subset(self):
+        from app.services.library_catalog import LibraryCatalogService
+        from ui.library_pane import LibraryPane
+
+        with TemporaryDirectory() as tmp:
+            pane = LibraryPane(
+                lambda: "",
+                lambda: None,
+                catalog=LibraryCatalogService(db_path=Path(tmp) / "library.sqlite3"),
+            )
+            try:
+                pane._catalog_scan_generation = 7
+                with (
+                    patch.object(pane, "refresh_roots") as refresh_roots,
+                    patch.object(pane, "_reload_active_catalog_view") as reload_view,
+                ):
+                    pane._on_catalog_batch_committed((7, "root-a", {"updated": 48, "removed": 0}))
+                    pane._catalog_scan_cancelled(7)
+
+                self.assertEqual(
+                    "Library refresh cancelled. Showing 48 committed update(s).",
+                    pane.status_label.text(),
+                )
+                refresh_roots.assert_called_once_with()
+                reload_view.assert_called_once_with()
             finally:
                 pane.shutdown_jobs(timeout_ms=500)
                 pane.close()
@@ -2995,7 +3084,7 @@ class UiSmokeTests(unittest.TestCase):
         start_refresh.assert_called_once()
         self.assertTrue(window.clustering_pane.cluster_button.isEnabled())
         self.assertFalse(window.source_pane.basic_run_button.isHidden())
-        self.assertTrue(window.source_pane.basic_cancel_button.isHidden())
+        self.assertFalse(window.source_pane.basic_cancel_button.isVisible())
         self.assertEqual([], window.job_manager.active_jobs())
         window.close()
 
@@ -3125,6 +3214,38 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([True], cancelled)
         job.dispose()
 
+    def test_async_job_reports_committed_result_despite_late_cancellation(self):
+        completed: list[object] = []
+        cancelled: list[bool] = []
+        result = SimpleNamespace(completion_survives_cancellation=True, committed=True)
+        job = AsyncJob(lambda _progress, _cancel_check: result)
+        job.completed.connect(completed.append)
+        job.cancelled.connect(lambda: cancelled.append(True))
+
+        job.cancel()
+        job.run()
+        self.assertTrue(self._wait_until(lambda: bool(completed), timeout_s=1.0))
+
+        self.assertEqual([result], completed)
+        self.assertEqual([], cancelled)
+        job.dispose()
+
+    def test_async_job_relay_ignores_events_after_job_qobject_deletion(self):
+        observed: list[tuple[int, str]] = []
+        job = AsyncJob(lambda _progress, _cancel_check: None)
+        job.progress.connect(lambda value, text: observed.append((value, text)))
+        relay = job._signal_relay
+
+        job.dispose()
+        relay.relay_progress(25, "disposed")
+        job.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        APP.processEvents()
+        relay.relay_progress(50, "late")
+
+        self.assertEqual([], observed)
+        relay.deleteLater()
+
     def test_job_manager_cancels_once_preserves_terminal_state_and_bounds_history(self):
         cancel_calls: list[bool] = []
         manager = JobManager(max_history=10)
@@ -3149,6 +3270,245 @@ class UiSmokeTests(unittest.TestCase):
             manager.finish(history_id)
         self.assertEqual(10, len(manager.history(limit=100)))
 
+    def test_jobs_dialog_uses_terminal_labels_instead_of_zero_percent(self):
+        manager = JobManager()
+        done_id = manager.register_job("Catalog refresh", origin="Library")
+        cancelled_id = manager.register_job("Face scan", cancel_fn=lambda: None, origin="People")
+        manager.finish(done_id)
+        manager.cancel(cancelled_id)
+        manager.finish(cancelled_id, status="cancelled")
+        dialog = JobsDialog(manager)
+        try:
+            dialog.refresh()
+            done_row = dialog._job_ids.index(done_id)
+            cancelled_row = dialog._job_ids.index(cancelled_id)
+            done_progress = dialog.table.cellWidget(done_row, 4)
+            cancelled_progress = dialog.table.cellWidget(cancelled_row, 4)
+
+            self.assertEqual("Done", dialog.table.item(done_row, 3).text())
+            self.assertEqual("Done", done_progress.format())
+            self.assertEqual(100, done_progress.value())
+            self.assertEqual("Cancelled", dialog.table.item(cancelled_row, 3).text())
+            self.assertEqual("Cancelled", cancelled_progress.format())
+            dialog.table.selectRow(done_row)
+            self.assertFalse(dialog.cancel_selected_btn.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_jobs_dialog_renders_every_lifecycle_state_and_keyboard_cancel_selection(self):
+        manager = JobManager()
+        unknown_id = manager.register_job("Discovering active roots", origin="Library")
+        partial_id = manager.register_job("Caching metadata", cancel_fn=lambda: None, origin="Library")
+        queued_id = manager.register_job("Queued model install", cancel_fn=lambda: None, origin="Models")
+        done_id = manager.register_job("Catalog refresh", origin="Library")
+        cancelled_id = manager.register_job("Face scan", cancel_fn=lambda: None, origin="People")
+        failed_id = manager.register_job("Backup", origin="Tools")
+        manager.update(partial_id, progress=37, text="37/100 assets")
+        manager.set_queued(queued_id)
+        manager.finish(done_id)
+        manager.cancel(cancelled_id)
+        manager.finish(cancelled_id, status="cancelled")
+        manager.finish(failed_id, status="failed", error="Destination is read-only")
+        dialog = JobsDialog(manager)
+        dialog.show()
+        try:
+            dialog.refresh()
+            rows = {job_id: dialog._job_ids.index(job_id) for job_id in dialog._job_ids}
+
+            unknown = dialog.table.cellWidget(rows[unknown_id], 4)
+            partial = dialog.table.cellWidget(rows[partial_id], 4)
+            queued = dialog.table.cellWidget(rows[queued_id], 4)
+            done = dialog.table.cellWidget(rows[done_id], 4)
+            cancelled = dialog.table.cellWidget(rows[cancelled_id], 4)
+            failed = dialog.table.cellWidget(rows[failed_id], 4)
+            self.assertEqual((0, 0), (unknown.minimum(), unknown.maximum()))
+            self.assertIn("total is not known", unknown.accessibleDescription())
+            self.assertEqual("%p%", partial.format())
+            self.assertEqual(37, partial.value())
+            self.assertEqual("Queued", dialog.table.item(rows[queued_id], 3).text())
+            self.assertIn("waiting to start", queued.accessibleDescription())
+            self.assertEqual("Done", done.format())
+            self.assertEqual("Cancelled", cancelled.format())
+            self.assertEqual("Failed", failed.format())
+            self.assertEqual("running", partial.property("state"))
+            self.assertEqual("queued", queued.property("state"))
+            self.assertEqual("finished", done.property("state"))
+            self.assertEqual("cancelled", cancelled.property("state"))
+            self.assertEqual("failed", failed.property("state"))
+            self.assertIn("Destination is read-only", failed.accessibleDescription())
+            self.assertGreaterEqual(dialog.table.columnWidth(6), 260)
+            self.assertEqual("Jobs history", dialog.table.accessibleName())
+
+            dialog.table.setFocus()
+            dialog.table.setCurrentCell(rows[partial_id], 1)
+            QTest.keyClick(dialog.table, Qt.Key.Key_Space)
+            APP.processEvents()
+            self.assertTrue(dialog.cancel_selected_btn.isEnabled())
+            dialog.table.setCurrentCell(rows[done_id], 1)
+            QTest.keyClick(dialog.table, Qt.Key.Key_Space)
+            APP.processEvents()
+            self.assertFalse(dialog.cancel_selected_btn.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_jobs_progress_transitions_keep_zero_unknown_cancel_and_failure_distinct(self):
+        manager = JobManager()
+        progress_id = manager.register_job("Import records", cancel_fn=lambda: None, origin="Library")
+        queued_id = manager.register_job("Queued scan", cancel_fn=lambda: None, origin="People")
+        empty_id = manager.register_job("Empty catalog", origin="Library")
+        failed_id = manager.register_job("Metadata batch", origin="Tools")
+        manager.update(progress_id, progress=0, text="Import — 0/10 records")
+        manager.set_queued(queued_id)
+        manager.update(empty_id, progress=0, text="Empty — 0/0 photos")
+        manager.finish(empty_id)
+        manager.update(failed_id, progress=80, text="8 processed, 1 skipped, 1 failed")
+        manager.finish(failed_id, status="failed", error="One record could not be written")
+        dialog = JobsDialog(manager)
+        indicator = JobIndicatorWidget(manager)
+        try:
+            rows = {job_id: dialog._job_ids.index(job_id) for job_id in dialog._job_ids}
+            progress_bar = dialog.table.cellWidget(rows[progress_id], 4)
+            self.assertEqual((0, 100, 0), (progress_bar.minimum(), progress_bar.maximum(), progress_bar.value()))
+
+            manager.update(progress_id, progress=-1, text="Import total changed")
+            APP.processEvents()
+            progress_bar = dialog.table.cellWidget(rows[progress_id], 4)
+            self.assertEqual((0, 0), (progress_bar.minimum(), progress_bar.maximum()))
+            manager.update(progress_id, progress=40, text="Import — 4/10 records")
+
+            manager.cancel(queued_id)
+            APP.processEvents()
+            queued_bar = dialog.table.cellWidget(rows[queued_id], 4)
+            self.assertEqual("Cancelling", dialog.table.item(rows[queued_id], 3).text())
+            self.assertEqual((0, 0), (queued_bar.minimum(), queued_bar.maximum()))
+            self.assertIn("Cancelling", queued_bar.accessibleDescription())
+            indicator.set_compact(True)
+            indicator._refresh()
+            self.assertIn("cancelling", indicator.label.text().lower())
+
+            empty_bar = dialog.table.cellWidget(rows[empty_id], 4)
+            failed_bar = dialog.table.cellWidget(rows[failed_id], 4)
+            self.assertEqual(("Done", 100), (empty_bar.format(), empty_bar.value()))
+            self.assertEqual("Failed", failed_bar.format())
+            self.assertNotEqual(100, failed_bar.value())
+            self.assertIn("8 processed, 1 skipped, 1 failed", dialog.table.item(rows[failed_id], 6).text())
+        finally:
+            dialog.close()
+            indicator.close()
+
+    def test_jobs_indicator_reuses_a_modeless_monitor_and_compact_mode_keeps_context(self):
+        manager = JobManager()
+        indicator = JobIndicatorWidget(manager)
+        job_id = manager.register_job(
+            "Index active roots",
+            cancel_fn=lambda: None,
+            origin="People",
+        )
+        manager.update(job_id, progress=12, text="Embedding faces")
+        indicator.show()
+        try:
+            indicator.set_compact(True)
+            APP.processEvents()
+            self.assertTrue(indicator.label.isVisible())
+            self.assertEqual("People: 12%", indicator.label.text())
+            self.assertEqual("Cancel People", indicator.cancel_btn.text())
+            self.assertIn("Index active roots", indicator.cancel_btn.toolTip())
+            self.assertIn("12 percent complete", indicator.progress.accessibleDescription())
+            self.assertIn("Embedding faces", indicator.progress.accessibleDescription())
+
+            indicator.jobs_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+            indicator._open_jobs_dialog()
+            first = indicator._jobs_dialog
+            self.assertIsNotNone(first)
+            self.assertTrue(first.isVisible())
+            self.assertFalse(first.isModal())
+            first.close()
+            APP.processEvents()
+            self.assertFalse(first.isVisible())
+            self.assertIs(indicator.jobs_btn, APP.focusWidget())
+
+            indicator._open_jobs_dialog()
+            self.assertIs(first, indicator._jobs_dialog)
+            self.assertTrue(first.isVisible())
+            QTest.keyClick(first, Qt.Key.Key_Escape)
+            APP.processEvents()
+            self.assertFalse(first.isVisible())
+            self.assertIs(indicator.jobs_btn, APP.focusWidget())
+        finally:
+            if indicator._jobs_dialog is not None:
+                indicator._jobs_dialog.close()
+            indicator.close()
+
+    def test_jobs_monitor_preserves_default_and_compact_contract_in_theme_order(self):
+        from ui.theme import apply_app_theme, current_theme
+
+        original_theme = current_theme()
+        manager = JobManager()
+        indicator = JobIndicatorWidget(manager)
+        job_id = manager.register_job("Index active roots", cancel_fn=lambda: None, origin="People")
+        manager.update(job_id, progress=37, text="Loading metadata 37/100 photos")
+        try:
+            for theme in ("dark", "light", "dark"):
+                apply_app_theme(APP, theme)
+                indicator.set_compact(False)
+                indicator._open_jobs_dialog()
+                APP.processEvents()
+                dialog = indicator._jobs_dialog
+                self.assertIsNotNone(dialog)
+                self.assertFalse(dialog.isModal())
+                self.assertGreaterEqual(dialog.table.columnWidth(6), 260)
+                self.assertEqual("People: Index active roots | Loading metadata 37/100 photos", indicator.label.toolTip())
+
+                indicator.set_compact(True)
+                APP.processEvents()
+                self.assertEqual("People: 37%", indicator.label.text())
+                self.assertEqual("Cancel People", indicator.cancel_btn.text())
+                self.assertIn("Index active roots", indicator.cancel_btn.accessibleName())
+                dialog.close()
+        finally:
+            indicator.shutdown()
+            indicator.close()
+            apply_app_theme(APP, original_theme)
+
+    def test_jobs_dialog_keeps_selection_across_500_rows_and_ignores_finish_cancel_race(self):
+        manager = JobManager(max_history=500)
+        cancellable: list[int] = []
+        job_ids: list[int] = []
+        for index in range(500):
+            job_id = manager.register_job(
+                f"Fixture job {index}",
+                cancel_fn=(lambda job_id=index: cancellable.append(job_id)),
+                origin="People" if index % 2 else "Library",
+            )
+            manager.update(job_id, progress=index % 101, text=f"Phase {index}")
+            job_ids.append(job_id)
+
+        dialog = JobsDialog(manager)
+        try:
+            self.assertEqual(500, dialog.table.rowCount())
+            target_id = job_ids[249]
+            target_row = dialog._job_ids.index(target_id)
+            stable_id = job_ids[100]
+            stable_row = dialog._job_ids.index(stable_id)
+            stable_item = dialog.table.item(stable_row, 1)
+            dialog.table.selectRow(target_row)
+
+            manager.update(target_id, progress=73, text="Updated phase")
+            APP.processEvents()
+
+            self.assertEqual(target_id, dialog._selected_job().job_id)
+            self.assertIs(stable_item, dialog.table.item(stable_row, 1))
+            self.assertEqual(73, dialog.table.cellWidget(target_row, 4).value())
+
+            manager.finish(target_id)
+            APP.processEvents()
+            self.assertFalse(dialog.cancel_selected_btn.isEnabled())
+            dialog._cancel_selected()
+            self.assertEqual([], cancellable)
+            self.assertEqual("Done", dialog.table.item(target_row, 3).text())
+        finally:
+            dialog.close()
+
     def test_job_presentation_keeps_foreground_progress_visible_with_background_work(self):
         manager = JobManager()
         footer = WorkspaceFooter()
@@ -3172,8 +3532,106 @@ class UiSmokeTests(unittest.TestCase):
 
         manager.finish(foreground)
         self.assertTrue(self._wait_until(lambda: not footer.progress_bar.isVisible()))
+        self.assertEqual("Faces: Writing EXIF — Done", footer.status_label.toolTip())
         self.assertIn("background job", indicator.label.text())
         self.assertEqual("Jobs (1)", indicator.jobs_btn.text())
+
+    def test_job_presentation_replaces_running_copy_with_each_terminal_outcome(self):
+        for status, expected, error in (
+            ("finished", "People: Loading faces — Done", ""),
+            ("cancelled", "People: Loading faces — Cancelled", ""),
+            ("failed", "People: Loading faces — Failed: fixture error", "fixture error"),
+        ):
+            with self.subTest(status=status):
+                manager = JobManager()
+                footer = WorkspaceFooter()
+                presentation = JobPresentationController(manager, footer)
+                job_id = manager.register_job("Loading faces", origin="People", foreground=True)
+                manager.update(job_id, progress=37, text="Loading 37/100 faces")
+                presentation.refresh()
+                self.assertIn("Loading 37/100 faces", footer.status_label.toolTip())
+
+                manager.finish(job_id, status=status, error=error)
+                presentation.refresh()
+
+                self.assertFalse(footer.progress_bar.isVisible())
+                self.assertEqual(expected, footer.status_label.toolTip())
+                presentation.shutdown()
+                footer.close()
+
+    def test_job_presentation_has_stable_owner_and_discards_cross_workspace_stale_updates(self):
+        manager = JobManager()
+        footer = WorkspaceFooter()
+        presentation = JobPresentationController(manager, footer)
+        footer.show()
+        APP.processEvents()
+        older = manager.register_job("Generation one", cancel_fn=lambda: None, origin="Library")
+        manager.update(older, progress=10, text="Loading old scope")
+        newer = manager.register_job("Generation two", cancel_fn=lambda: None, origin="People")
+        manager.update(newer, progress=20, text="Loading current scope")
+        background = manager.register_job("Thumbnail look-ahead", origin="Photos", foreground=False)
+        manager.update(background, progress=90, text="Background update")
+        presentation.refresh()
+
+        self.assertEqual(20, footer.progress_bar.value())
+        self.assertIn("People: Generation two", footer.status_label.toolTip())
+
+        manager.update(older, progress=99, text="Late old-scope progress")
+        footer.set_status("Unrelated completion must wait")
+        presentation.refresh()
+        self.assertEqual(20, footer.progress_bar.value())
+        self.assertIn("People: Generation two", footer.status_label.toolTip())
+        self.assertNotIn("Unrelated completion", footer.status_label.toolTip())
+
+        manager.finish(older)
+        presentation.refresh()
+        self.assertTrue(footer.progress_bar.isVisible())
+        self.assertIn("People: Generation two", footer.status_label.toolTip())
+
+        manager.cancel(newer)
+        presentation.refresh()
+        self.assertEqual((0, 0), (footer.progress_bar.minimum(), footer.progress_bar.maximum()))
+        self.assertIn("cancelling", footer.status_label.toolTip().lower())
+        manager.finish(newer, status="cancelled")
+        presentation.refresh()
+        self.assertFalse(footer.progress_bar.isVisible())
+        self.assertEqual("People: Generation two — Cancelled", footer.status_label.toolTip())
+
+        coalesced = manager.register_job("Fast failing task", origin="Tools")
+        manager.finish(coalesced, status="failed", error="fixture failure")
+        presentation.refresh()
+        self.assertEqual("Tools: Fast failing task — Failed: fixture failure", footer.status_label.toolTip())
+
+        footer.set_status("Idle action complete")
+        self.assertEqual("Idle action complete", footer.status_label.toolTip())
+        presentation.shutdown()
+        footer.close()
+
+    def test_job_presentation_resumes_previous_owner_when_newer_job_finishes_first(self):
+        manager = JobManager()
+        footer = WorkspaceFooter()
+        presentation = JobPresentationController(manager, footer)
+        footer.show()
+        older = manager.register_job("Older operation", origin="Library")
+        manager.update(older, progress=31, text="Older phase")
+        newer = manager.register_job("Newer operation", origin="People")
+        manager.update(newer, progress=62, text="Newer phase")
+        presentation.refresh()
+        self.assertIn("People: Newer operation", footer.status_label.toolTip())
+
+        manager.finish(newer)
+        presentation.refresh()
+        self.assertTrue(footer.progress_bar.isVisible())
+        self.assertEqual(31, footer.progress_bar.value())
+        self.assertIn("Library: Older operation", footer.status_label.toolTip())
+        self.assertNotIn("Newer operation — Done", footer.status_label.toolTip())
+
+        manager.finish(older)
+        presentation.refresh()
+        self.assertFalse(footer.progress_bar.isVisible())
+        self.assertEqual("Library: Older operation — Done", footer.status_label.toolTip())
+        presentation.shutdown()
+        footer.close()
 
     def test_source_pane_keeps_managed_data_home_separate_from_photo_sources(self):
         pane = SourcePane()
@@ -3269,16 +3727,20 @@ class UiSmokeTests(unittest.TestCase):
         faces_shutdown_jobs.assert_called_once_with(timeout_ms=25)
         window.close()
 
-    def test_visible_clustering_ui_exposes_tooltips_without_help_icons(self):
+    def test_visible_clustering_ui_exposes_tooltips_and_contextual_help(self):
         window = ClusterGalleryApp()
         window.set_clustering_mode("advanced")
         window.show()
         APP.processEvents()
         self.assertTrue(window.clustering_pane.cluster_button.isEnabled())
         self.assertFalse(window.clustering_pane.cancel_button.isEnabled())
-        self.assertEqual([], window.clustering_pane.findChildren(QToolButton))
-        self.assertEqual([], window.cluster_pane.findChildren(QToolButton))
-        self.assertEqual([], window.gallery_pane.findChildren(QToolButton))
+        help_buttons = (
+            window.clustering_pane.findChildren(QToolButton)
+            + window.cluster_pane.findChildren(QToolButton)
+            + window.gallery_pane.findChildren(QToolButton)
+        )
+        self.assertTrue(help_buttons)
+        self.assertTrue(all(button.toolTip() or button.accessibleName() for button in help_buttons))
         self.assertTrue(window.clustering_pane.tag_filter_field.toolTip())
         self.assertTrue(window.gallery_pane.selected_tags_button.toolTip())
         self.assertTrue(window.gallery_pane.tags_checked_group_action.toolTip())
@@ -3310,7 +3772,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn("copy paths", window.gallery_pane.actions_menu_button.toolTip())
 
         recluster_tooltip = window.cluster_pane.recluster_button.toolTip()
-        self.assertIn("selected cluster", recluster_tooltip)
+        self.assertIn("selected group's photos", recluster_tooltip)
         self.assertIn("main clustering settings", recluster_tooltip)
 
         window.close()
@@ -3474,27 +3936,13 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(
             [
                 (list(range(MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE)), 0),
-                (
-                    list(
-                        range(
-                            100,
-                            100 + MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE,
-                        )
-                    ),
-                    1,
-                ),
             ],
             enqueue_calls,
         )
-        self.assertEqual(
-            set(range(MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE)).union(
-                range(100, 100 + MAX_PREFETCH_THUMBNAIL_REQUESTS_PER_CYCLE)
-            ),
-            pane.pending_indexes,
-        )
+        self.assertEqual(set(range(MAX_VISIBLE_THUMBNAIL_REQUESTS_PER_CYCLE)), pane.pending_indexes)
         pane.close()
 
-    def test_gallery_load_visible_images_skips_already_pending_indexes(self):
+    def test_gallery_load_visible_images_promotes_pending_visible_indexes(self):
         pane = GalleryPane()
         pane.images = [f"/photos/{index}.jpg" for index in range(40)]
         visible_indexes = list(range(20))
@@ -3513,12 +3961,25 @@ class UiSmokeTests(unittest.TestCase):
         ):
             pane.load_visible_images()
 
-        self.assertNotIn(2, enqueue_calls[0][0])
-        self.assertNotIn(3, enqueue_calls[0][0])
+        self.assertIn(2, enqueue_calls[0][0])
+        self.assertIn(3, enqueue_calls[0][0])
         self.assertNotIn(21, enqueue_calls[1][0])
         self.assertNotIn(22, enqueue_calls[1][0])
         self.assertEqual({2, 3, 21, 22}.union(enqueue_calls[0][0]).union(enqueue_calls[1][0]), pane.pending_indexes)
         pane.close()
+
+    def test_thumbnail_queue_discards_stale_prefetch_before_new_visible_work(self):
+        queue = ThumbnailRequestQueue()
+        queue.configure(7, [f"/photos/{index}.jpg" for index in range(8)], 128)
+        queue.enqueue([0, 1], priority=1)
+        self.assertEqual({0}, queue.retain_indexes({1}))
+        queue.enqueue([1], priority=0)
+
+        item = queue.get_next(timeout_s=0.01)
+
+        self.assertIsNotNone(item)
+        self.assertEqual((7, 1, "/photos/1.jpg", 128), item)
+        queue.complete(7, 1)
 
     def test_settings_dialog_exposes_storage_tab_and_cache_actions(self):
         store = QSettings("ClusterLensTests", "SettingsDialogStorage")
@@ -3683,6 +4144,16 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("Storage", dialog.tabs.tabText(2))
         for index in range(3):
             self.assertEqual("QScrollArea", dialog.tabs.widget(index).__class__.__name__)
+        for action_row in (
+            dialog.runtime_actions_row,
+            dialog.face_model_actions_row,
+            dialog.storage_actions_row,
+        ):
+            self.assertIsInstance(action_row.layout(), ResponsiveFlowLayout)
+        self.assertGreater(
+            dialog.face_model_actions_row.layout().heightForWidth(280),
+            dialog.face_model_actions_row.layout().heightForWidth(1800),
+        )
 
         dialog.shutdown_jobs(timeout_ms=50)
         dialog.close()
@@ -3784,6 +4255,152 @@ class UiSmokeTests(unittest.TestCase):
         )
         pane.close()
 
+    def test_people_detect_route_opens_folder_review(self):
+        pane = SearchPane(enabled_tabs=["All Faces", "Folder Review", "Face Search"], external_results=False)
+        calls: list[dict[str, object]] = []
+        pane.ensure_face_library_loaded = lambda **kwargs: calls.append(dict(kwargs))  # type: ignore[method-assign]
+
+        pane.activate_people_section("detect")
+
+        self.assertEqual("Folder Review", pane.tabs.tabText(pane.tabs.currentIndex()))
+        self.assertEqual([{}], calls)
+        pane.close()
+
+    def test_people_detect_initial_route_skips_default_all_faces_tab(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search"],
+            external_results=False,
+            initial_people_section="detect",
+        )
+        try:
+            self.assertEqual("Folder Review", pane.tabs.tabText(pane.tabs.currentIndex()))
+        finally:
+            pane.close()
+
+    def test_people_review_name_and_manage_routes_are_supported(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        try:
+            library_calls: list[dict[str, object]] = []
+            pane.ensure_face_library_loaded = lambda **kwargs: library_calls.append(dict(kwargs))  # type: ignore[method-assign]
+
+            pane.activate_people_section("review_name")
+
+            self.assertEqual("Folder Review", pane.tabs.tabText(pane.tabs.currentIndex()))
+            self.assertEqual("Review && Name", pane.face_library_tabs.tabText(pane.face_library_tabs.currentIndex()))
+            self.assertTrue(pane.face_library_tabs.tabBar().isTabVisible(1))
+            self.assertEqual([{}], library_calls)
+
+            pane.activate_people_section("identities")
+
+            self.assertEqual("Identities", pane.tabs.tabText(pane.tabs.currentIndex()))
+            self.assertIn("Manage", [pane.task_navigation.tabText(index) for index in range(pane.task_navigation.count())])
+        finally:
+            pane.close()
+
+    def test_people_album_routes_apply_durable_filter_and_nested_routes_emit_stable_ids(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        emitted: list[str] = []
+        pane.people_section_changed.connect(emitted.append)
+        pane.refresh_face_album = lambda **_kwargs: None  # type: ignore[method-assign]
+        try:
+            pane.activate_people_section("unnamed")
+            self.assertEqual("All Faces", pane.tabs.tabText(pane.tabs.currentIndex()))
+            self.assertEqual("unlabeled", pane.face_album_label_filter_combo.currentData())
+            self.assertEqual("unnamed", emitted[-1])
+
+            pane.face_album_label_filter_combo.setCurrentIndex(
+                pane.face_album_label_filter_combo.findData("all")
+            )
+            self.assertEqual("all_faces", emitted[-1])
+
+            pane.activate_people_section("review_name")
+            self.assertEqual("Review && Name", pane.face_library_tabs.tabText(pane.face_library_tabs.currentIndex()))
+            self.assertEqual("review_name", emitted[-1])
+            pane.face_library_tabs.setCurrentIndex(0)
+            self.assertEqual("detect", emitted[-1])
+        finally:
+            pane.close()
+
+    def test_people_route_aliases_resolve_to_stable_ids_and_unknown_routes_do_nothing(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        pane.ensure_face_album_loaded = lambda **_kwargs: None  # type: ignore[method-assign]
+        pane.ensure_face_library_loaded = lambda **_kwargs: None  # type: ignore[method-assign]
+        pane.refresh_face_album = lambda **_kwargs: None  # type: ignore[method-assign]
+        cases = (
+            ("faces", "all_faces"),
+            ("unlabelled", "unnamed"),
+            ("folder-review", "detect"),
+            ("review & name", "review_name"),
+            ("search", "find"),
+            ("manage", "identities"),
+        )
+        try:
+            for alias, expected in cases:
+                pane.activate_people_section(alias)
+                self.assertEqual(expected, pane._current_people_section(), alias)
+
+            current_tab = pane.tabs.currentIndex()
+            pane.activate_people_section("removed-route")
+            self.assertEqual(current_tab, pane.tabs.currentIndex())
+            self.assertEqual("identities", pane._current_people_section())
+        finally:
+            pane.close()
+
+    def test_people_route_navigation_uses_cached_reads_and_never_starts_detection(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        album_refreshes: list[str] = []
+        scan_calls: list[bool] = []
+        pane._request_face_album_refresh = lambda **kwargs: album_refreshes.append(str(kwargs.get("reason", "")))  # type: ignore[method-assign]
+        pane._scan_face_folder = lambda: scan_calls.append(True)  # type: ignore[method-assign]
+        try:
+            pane._face_album_loaded = True
+            pane._face_album_loaded_key = pane._face_album_cache_key(label_filter="all")
+            pane.activate_people_section("all_faces")
+            pane.activate_people_section("all_faces")
+            pane.activate_people_section("detect")
+            pane.activate_people_section("detect")
+
+            self.assertEqual([], album_refreshes)
+            self.assertEqual([], scan_calls)
+        finally:
+            pane.close()
+
+    def test_audit_people_fixture_contains_seeded_named_unnamed_ignored_and_pending_rows(self):
+        named = self._face_record("/photos/named.jpg", 0, person_name="Alice")
+        unnamed = self._face_record("/photos/unnamed.jpg", 0)
+        ignored = replace(self._face_record("/photos/ignored.jpg", 0), hidden=True)
+        pending = FaceLabelAssignment(
+            proposal_id=17,
+            person_name="Bob",
+            image_path="/photos/pending.jpg",
+            face_index=0,
+            face_bbox=(10, 12, 42, 54),
+            confidence=0.82,
+            pending=True,
+        )
+        service = self._FakeFaceLibraryService(
+            profiles=[self._person_profile("Alice", visible_face_count=1)],
+            records=[named, unnamed, ignored],
+            pending_assignments=[pending],
+        )
+
+        self.assertEqual(["Alice"], [record.person_name for record in service.records if record.person_name])
+        self.assertEqual(["/photos/unnamed.jpg"], [record.image_path for record in service.records if not record.person_name and not record.hidden])
+        self.assertEqual(["/photos/ignored.jpg"], [record.image_path for record in service.records if record.hidden])
+        self.assertEqual([17], [assignment.proposal_id for assignment in service.pending_assignments if assignment.pending])
+
     def test_all_faces_tab_is_the_default_faces_home_and_loads_album_groups(self):
         pane = SearchPane(enabled_tabs=["All Faces", "Faces In Folder", "Face Search"], external_results=False)
         service = self._FakeFaceLibraryService(
@@ -3822,6 +4439,11 @@ class UiSmokeTests(unittest.TestCase):
             )
             self.assertGreaterEqual(self._list_view_count(pane.face_results_groups_list), 2)
             self.assertIn("saved face library", pane._face_album_summary_text.lower())
+            self.assertEqual(
+                {"named", "unlabeled"},
+                {group.group_kind for group in pane._face_album_groups},
+            )
+            self.assertNotIn("pending", {group.group_kind for group in pane._face_album_groups})
         finally:
             pane.close()
 
@@ -3873,6 +4495,7 @@ class UiSmokeTests(unittest.TestCase):
                     and pane.face_results_model.item_at(0).image_path == "/photos/unknown.jpg"
                 )
             )
+            self.assertEqual({"unlabeled"}, {group.group_kind for group in pane._face_album_groups})
         finally:
             pane.close()
 
@@ -3941,7 +4564,7 @@ class UiSmokeTests(unittest.TestCase):
                     and pane._face_album_member_stream_in_progress
                 )
             )
-            self.assertEqual("Loading selected faces…", pane.face_album_load_more_faces_button.text())
+            self.assertEqual("Loading faces…", pane.face_album_load_more_faces_button.text())
 
             service.release_later_pages.set()
             self.assertTrue(
@@ -4060,7 +4683,7 @@ class UiSmokeTests(unittest.TestCase):
         window.show()
         APP.processEvents()
         self.assertEqual("basic", window._clustering_mode)
-        self.assertTrue(window.source_pane.basic_action_section.isVisible())
+        self.assertFalse(window.source_pane.basic_action_section.isVisible())
         self.assertFalse(window.clustering_pane.isVisible())
         self.assertFalse(hasattr(window.gallery_pane, "tags_button"))
         self.assertFalse(window.gallery_pane.metadata_menu.menuAction().isVisible())
@@ -4078,14 +4701,26 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(window.source_toggle.isVisible())
         self.assertTrue(window.controls_toggle.isVisible())
         self.assertTrue(window.details_toggle.isVisible())
+        for option_layout in (
+            window.clustering_pane.embedding_options_layout,
+            window.clustering_pane.backend_options_layout,
+            window.clustering_pane.similarity_options_layout,
+            window.clustering_pane.hdbscan_options_layout,
+        ):
+            self.assertIsInstance(option_layout, ResponsiveFlowLayout)
+        self.assertGreater(
+            window.clustering_pane.hdbscan_options_layout.heightForWidth(180),
+            window.clustering_pane.hdbscan_options_layout.heightForWidth(900),
+        )
         window.close()
 
-    def test_basic_source_actions_track_running_state_across_mode_switch(self):
+    def test_basic_mode_keeps_roots_editor_free_of_organize_actions(self):
         window = ClusterGalleryApp()
         window.show()
         APP.processEvents()
 
-        self.assertTrue(window.source_pane.basic_run_button.isVisible())
+        self.assertFalse(window.source_pane.basic_action_section.isVisible())
+        self.assertFalse(window.source_pane.basic_run_button.isVisible())
         self.assertFalse(window.source_pane.basic_cancel_button.isVisible())
 
         class _RunningWorker:
@@ -4103,9 +4738,12 @@ class UiSmokeTests(unittest.TestCase):
 
         window.set_clustering_mode("basic")
         APP.processEvents()
-        self.assertTrue(window.source_pane.basic_action_section.isVisible())
+        self.assertFalse(window.source_pane.basic_action_section.isVisible())
         self.assertFalse(window.source_pane.basic_run_button.isVisible())
-        self.assertTrue(window.source_pane.basic_cancel_button.isVisible())
+        self.assertFalse(window.source_pane.basic_cancel_button.isVisible())
+        window.worker = None
+        window.clustering_pane.set_running(False)
+        window.source_pane.set_running(False)
         window.close()
 
     def test_source_pane_keeps_complete_browse_tree_when_selecting_nested_folder(self):
@@ -4126,12 +4764,18 @@ class UiSmokeTests(unittest.TestCase):
             parent_index = pane.file_model.index(str(nested.parent))
             self.assertEqual(str(root), pane.file_model.filePath(root_index))
             self.assertEqual(str(nested), pane.selected_directory)
-            self.assertEqual(f"Selected: {nested}", pane.selected_folder_label.text())
+            self.assertEqual("Browse: trip", pane.selected_folder_label.text())
+            self.assertIn(str(nested), pane.selected_folder_label.toolTip())
+            self.assertIsInstance(pane.draft_actions.layout(), ResponsiveFlowLayout)
+            self.assertGreater(
+                pane.draft_actions.layout().heightForWidth(140),
+                pane.draft_actions.layout().heightForWidth(700),
+            )
             self.assertEqual(str(nested), pane.file_model.filePath(pane.file_tree.currentIndex()))
             self.assertTrue(pane.file_tree.isExpanded(parent_index))
             pane.close()
 
-    def test_source_pane_active_roots_are_explicit_collapsed_and_clearable(self):
+    def test_source_pane_stages_multi_root_edits_until_apply_and_can_discard(self):
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = base / "photos"
@@ -4143,22 +4787,37 @@ class UiSmokeTests(unittest.TestCase):
             changes = []
             pane.scope_changed.connect(lambda scope: changes.append(tuple(scope.roots)))
 
+            pane.begin_edit()
             pane.set_selected_directory(str(nested), activate_scope=False)
-            pane.add_browsed_root_button.click()
+            pane.add_active_root(str(nested))
             pane.add_active_root(str(root))
             pane.add_active_root(str(second))
             APP.processEvents()
 
+            self.assertEqual((), pane.active_roots)
+            self.assertEqual({str(root), str(second)}, set(pane.draft_scope.roots))
+            self.assertTrue(pane.has_dirty_draft)
+            self.assertFalse(changes)
+
+            pane.apply_draft_button.click()
+            APP.processEvents()
             self.assertEqual({str(root), str(second)}, set(pane.active_roots))
             self.assertEqual(2, pane.active_roots_list.count())
-            self.assertTrue(pane.clear_active_roots_button.isEnabled())
             self.assertTrue(changes)
 
-            pane.clear_active_roots_button.click()
+            pane.begin_edit()
+            pane.clear_active_roots()
+            APP.processEvents()
+            self.assertEqual({str(root), str(second)}, set(pane.active_roots))
+            pane.discard_draft_button.click()
+            self.assertEqual({str(root), str(second)}, set(pane.active_roots))
+
+            pane.begin_edit()
+            pane.clear_active_roots()
+            pane.apply_draft_button.click()
             APP.processEvents()
             self.assertEqual((), pane.active_roots)
             self.assertEqual(0, pane.active_roots_list.count())
-            self.assertFalse(pane.clear_active_roots_button.isEnabled())
             pane.close()
 
     def test_active_root_change_reloads_visible_all_faces_album(self):
@@ -4260,7 +4919,8 @@ class UiSmokeTests(unittest.TestCase):
         window = ClusterGalleryApp()
 
         self.assertIsNone(window.faces_pane.current_scope_paths_provider)
-        self.assertEqual("Limit search to current folder", window.faces_pane.search_only_current_folder.text())
+        self.assertEqual("Current folder only", window.faces_pane.search_only_current_folder.text())
+        self.assertEqual("Limit search to current folder", window.faces_pane.search_only_current_folder.accessibleName())
 
         window.close()
 
@@ -4274,38 +4934,26 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
-        # The production shell now uses the shared active-root provider.  A
-        # missing active root must remain a harmless, source-read-only scan
-        # input rather than falling back to the old hidden candidate list.
+        # The production shell now uses the shared active-root provider. A
+        # stale hidden candidate must not make the old folder field an
+        # implicit scan target.
         pane.current_scope_roots_provider = lambda: ("/hidden/selected.jpg",)
         pane.face_folder_path.setText("/photos")
         pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
 
         pane._scan_face_folder()
 
-        self.assertTrue(
-            self._wait_until(
-                lambda: bool(service.load_folder_review_images_calls)
-                and bool(service.load_person_profiles_calls)
-                and pane.face_named_people_list.count() + pane.face_unlabeled_groups_list.count() == 2
-            )
-        )
+        self.assertTrue(self._wait_until(lambda: "Indexed 0 faces" in pane.status_label.text()))
         self.assertEqual([], service.index_directory_calls)
         self.assertEqual([], service.index_paths_calls)
-        self.assertEqual("/photos", service.load_folder_review_images_calls[-1]["directory"])
-        self.assertEqual([], service.load_folder_review_images_calls[-1]["candidate_paths"])
-        self.assertEqual("/photos", service.load_person_profiles_calls[-1]["folder_prefix"])
-        self.assertIsNone(service.load_person_profiles_calls[-1]["candidate_paths"])
+        self.assertEqual([], service.load_folder_review_images_calls)
+        self.assertEqual([], service.load_person_profiles_calls)
         self.assertEqual([], service.load_indexed_faces_calls)
         self.assertEqual([], service.count_indexed_faces_calls)
-        self.assertEqual(1, pane.face_named_people_list.count())
-        self.assertEqual(1, pane.face_unlabeled_groups_list.count())
+        self.assertEqual(0, pane.face_named_people_list.count())
+        self.assertEqual(0, pane.face_unlabeled_groups_list.count())
         self.assertTrue(pane.face_named_people_list.property("sidebarList"))
         self.assertIsInstance(pane.face_named_people_list.itemDelegate(), SidebarListEntryDelegate)
-        self.assertEqual("Alice", pane.face_named_people_list.item(0).text())
-        self.assertIn("visible", pane.face_named_people_list.item(0).data(ListEntryModel.SubtitleRole))
-        self.assertEqual("a.jpg", pane.face_unlabeled_groups_list.item(0).text())
-        self.assertIn("unlabeled face", pane.face_unlabeled_groups_list.item(0).data(ListEntryModel.SubtitleRole))
         selected_photo_help = pane.findChild(HelpIconButton, "helpIcon_selected_photo_faces")
         self.assertIsNotNone(selected_photo_help)
         self.assertTrue(selected_photo_help.toolTip())
@@ -4330,6 +4978,7 @@ class UiSmokeTests(unittest.TestCase):
 
         pane._refresh_scanned_faces()
         pane._refresh_face_people()
+        pane.face_library_tabs.setCurrentIndex(1)
         pane.face_label_name.setText("stale")
         pane.face_profile_notes.setText("stale")
 
@@ -4341,6 +4990,7 @@ class UiSmokeTests(unittest.TestCase):
 
         pane._on_person_clicked(unlabeled_item)
 
+        self.assertEqual(1, pane.face_library_tabs.currentIndex())
         self.assertEqual(2, self._selected_list_view_count(pane.face_scanned_list))
         self.assertEqual(["/photos/a.jpg", "/photos/b.jpg"], list(pane.results_gallery.images))
         self.assertEqual("/photos/a.jpg", pane._face_review_selected_path)
@@ -4348,7 +4998,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("", pane.face_label_name.text())
         self.assertEqual("", pane.face_profile_notes.text())
         self.assertIn("Selected 2 unlabeled face(s)", pane.face_scanned_summary.text())
-        self.assertIn("Loaded unlabeled group", pane.face_people_summary.text())
+        self.assertIn("Selected unlabeled group", pane.face_people_summary.text())
 
         pane.close()
 
@@ -4362,13 +5012,15 @@ class UiSmokeTests(unittest.TestCase):
         pane.face_folder_path.setText("/photos")
 
         pane._refresh_face_people()
+        pane.face_library_tabs.setCurrentIndex(1)
         pane._on_person_clicked(pane.face_named_people_list.item(0))
 
+        self.assertEqual(1, pane.face_library_tabs.currentIndex())
         self.assertEqual("Alice", pane.face_name_query.text())
         self.assertEqual("Alice", pane.face_label_name.text())
         self.assertEqual("saved note", pane.face_profile_notes.text())
         self.assertEqual("friend", pane.face_profile_tags.text())
-        self.assertIn("Loaded saved identity 'Alice'", pane.face_people_summary.text())
+        self.assertIn("Selected saved identity 'Alice'", pane.face_people_summary.text())
 
         pane.close()
 
@@ -4441,19 +5093,19 @@ class UiSmokeTests(unittest.TestCase):
 
         self.assertEqual("Detect Faces", pane.face_scan_button.text())
         self.assertEqual("Reload People List", pane.face_refresh_people_button.text())
-        self.assertEqual("Refresh Folder Review", pane.face_refresh_faces_button.text())
+        self.assertEqual("Refresh review", pane.face_refresh_faces_button.text())
         self.assertEqual("Name", pane.face_review_sort.itemText(0))
         self.assertEqual("Detected Faces", pane.face_review_sort.itemText(1))
         self.assertEqual("Best Detected Face", pane.face_review_sort.itemText(2))
-        self.assertEqual("Name Selected Face(s)", pane.face_save_name_button.text())
+        self.assertEqual("Name faces", pane.face_save_name_button.text())
         self.assertEqual("Save/Update Profile", pane.face_save_profile_button.text())
-        self.assertEqual("Find Photos of Selected Face", pane.face_search_selected_button.text())
-        self.assertEqual("Find Photos by Saved Name", pane.face_search_by_name_button.text())
+        self.assertEqual("Find this face", pane.face_search_selected_button.text())
+        self.assertEqual("Find saved person", pane.face_search_by_name_button.text())
         self.assertEqual("Find Similar", pane.face_detected_find_button.text())
         self.assertEqual("Cluster Selected", pane.face_detected_cluster_selected_button.text())
         self.assertEqual("Cluster Visible", pane.face_detected_cluster_visible_button.text())
         self.assertEqual("Name Selected", pane.face_detected_name_button.text())
-        self.assertEqual("Index Active Roots", pane.face_index_button.text())
+        self.assertEqual("Index", pane.face_index_button.text())
         self.assertEqual("Reindex", pane.face_reindex_button.text())
         self.assertEqual("Name Selected Faces", pane.face_results_name_button.text())
         self.assertEqual("Name Selected Clusters", pane.face_results_name_clusters_button.text())
@@ -4490,9 +5142,9 @@ class UiSmokeTests(unittest.TestCase):
         )
         self.assertTrue(pane.face_results_actions_menu_button.toolTip())
         self.assertTrue(pane.face_results_name_button.toolTip())
-        self.assertEqual("Find Similar From Selection", pane.face_search_selected_card_button.text())
-        self.assertEqual("Find by Face", pane.face_search_button.text())
-        self.assertEqual("Find by Name + Similar", pane.face_find_name_button.text())
+        self.assertEqual("Similar", pane.face_search_selected_card_button.text())
+        self.assertEqual("Find", pane.face_search_button.text())
+        self.assertEqual("Similar", pane.face_find_name_button.text())
 
         self.assertEqual("Find Photos by Saved Name", pane.face_search_by_name_card_button.text())
         self.assertEqual("Save Named Examples", pane.face_label_button.text())
@@ -4500,7 +5152,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual("Show Named Faces", pane.face_list_button.text())
         self.assertEqual("Merge Two Names", pane.face_merge_button.text())
         self.assertEqual("Remove Name From Faces", pane.face_clear_button.text())
-        self.assertEqual(["cosine-kmeans"], pane.current_face_cluster_backends())
+        self.assertEqual([pane._default_face_cluster_backend()], pane.current_face_cluster_backends())
         self.assertEqual("isolate", pane.current_face_cluster_outlier_policy())
         self.assertEqual("Advanced backend override", pane.face_cluster_backend_override_checkbox.text())
         self.assertEqual("Run Current Backend Again", pane.face_results_compare_again_button.text())
@@ -4523,8 +5175,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(pane.show_tiny_detections_checkbox.toolTip())
         self.assertTrue(pane.face_mode_status_label.text())
         self.assertTrue(pane.face_model_summary_label.text())
-        self.assertEqual("Advanced Pipeline…", pane.face_choose_pipeline_button.text())
-        self.assertEqual("Install / Manage Face Models", pane.face_model_settings_button.text())
+        self.assertEqual("Pipeline…", pane.face_choose_pipeline_button.text())
+        self.assertEqual("Models…", pane.face_model_settings_button.text())
         self.assertEqual("primary", pane.face_scan_button.property("kind"))
         self.assertEqual("primary", pane.face_detected_name_button.property("kind"))
         self.assertEqual("primary", pane.face_results_name_button.property("kind"))
@@ -4553,9 +5205,14 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(0, pane.face_source_fields_grid.count())
         self.assertTrue(pane.face_db_scope.isHidden())
         self.assertTrue(pane.face_folder_override_row.isHidden())
-        self.assertIsInstance(pane.face_scan_actions_grid, QGridLayout)
-        self.assertIs(pane.face_scan_actions_grid.itemAtPosition(0, 0).widget(), pane.face_scan_button)
-        self.assertIs(pane.face_scan_actions_grid.itemAtPosition(0, 1).widget(), pane.face_refresh_faces_button)
+        self.assertIsInstance(pane.face_scan_actions_grid, ResponsiveFlowLayout)
+        self.assertEqual(8, pane.face_scan_actions_grid.count())
+        self.assertIs(pane.face_scan_actions_grid.itemAt(0).widget(), pane.face_scan_button)
+        self.assertIs(pane.face_scan_actions_grid.itemAt(1).widget(), pane.face_refresh_faces_button)
+        self.assertGreater(
+            pane.face_scan_actions_grid.heightForWidth(280),
+            pane.face_scan_actions_grid.heightForWidth(1200),
+        )
         self.assertGreater(len(pane.findChildren(HelpIconButton)), 0)
         self.assertNotEqual(-1, pane.face_quality_page_layout.indexOf(pane.face_review_quality_field))
         self.assertNotEqual(-1, pane.face_quality_page_layout.indexOf(pane.face_review_reason_field))
@@ -4563,11 +5220,13 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsInstance(pane.face_find_fields_grid, QGridLayout)
         self.assertIsInstance(pane.face_find_name_fields_grid, QGridLayout)
         self.assertIs(pane.face_find_fields_grid.itemAtPosition(1, 0).widget(), pane.face_query_detect_button)
-        index_actions = pane.face_find_fields_grid.itemAtPosition(1, 1).widget()
+        index_actions_row, index_actions_column = (1, 1) if pane._face_search_layout_mode == "wide" else (2, 0)
+        index_actions = pane.face_find_fields_grid.itemAtPosition(index_actions_row, index_actions_column).widget()
         self.assertIsNotNone(index_actions)
         self.assertIn(pane.face_index_button, index_actions.findChildren(QPushButton))
         self.assertIn(pane.face_reindex_button, index_actions.findChildren(QPushButton))
-        self.assertIs(pane.face_find_fields_grid.itemAtPosition(4, 0).widget(), pane.face_search_button)
+        search_row = 4 if pane._face_search_layout_mode == "wide" else 5
+        self.assertIs(pane.face_find_fields_grid.itemAtPosition(search_row, 0).widget(), pane.face_search_button)
         self.assertIs(pane.face_find_name_fields_grid.itemAtPosition(0, 1).widget(), pane.face_find_name_button)
         self.assertIsInstance(pane.face_save_fields_grid, QVBoxLayout)
         self.assertIsInstance(pane.face_manage_fields_grid, QVBoxLayout)
@@ -4576,12 +5235,16 @@ class UiSmokeTests(unittest.TestCase):
         self.assertNotEqual(-1, pane.face_library_selection_grid.indexOf(pane.face_profile_group))
         self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_people_group))
         self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_profile_group))
-        self.assertTrue(pane.face_search_quick_group.isHidden())
-        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
+        self.assertEqual(0, pane.face_find_task_selector.currentIndex())
+        self.assertEqual(["Photo", "Saved person"], [pane.face_find_task_selector.itemText(index) for index in range(2)])
+        self.assertFalse(pane.face_find_group.isHidden())
+        self.assertTrue(pane.face_find_name_group.isHidden())
+        self.assertFalse(pane.face_search_quick_group.isHidden())
+        self.assertNotEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
         self.assertNotEqual(-1, pane.face_search_grid.indexOf(pane.face_search_selected_group))
         self.assertNotEqual(-1, pane.face_search_grid.indexOf(pane.face_people_query_group))
-        self.assertEqual(["Detect Faces", "Review & Name"], [pane.face_library_tabs.tabText(index) for index in range(pane.face_library_tabs.count())])
-        self.assertFalse(pane.face_library_tabs.tabBar().isTabVisible(1))
+        self.assertEqual(["Detect Faces", "Review && Name"], [pane.face_library_tabs.tabText(index) for index in range(pane.face_library_tabs.count())])
+        self.assertTrue(pane.face_library_tabs.tabBar().isTabVisible(1))
         self.assertIs(pane.face_library_grid.itemAtPosition(0, 0).widget(), pane.face_source_group)
         self.assertIs(pane.face_library_selection_grid.itemAtPosition(0, 0).widget(), pane.face_scanned_group)
         self.assertIs(pane.face_library_selection_grid.itemAtPosition(1, 0).widget(), pane.face_people_group)
@@ -4628,8 +5291,58 @@ class UiSmokeTests(unittest.TestCase):
 
             self.assertIn("CUDA | NVIDIA GeForce RTX 4090", badge.text())
             self.assertTrue(badge.text().endswith("· Ready"))
+            self.assertEqual("Runtime status: CUDA | NVIDIA GeForce RTX 4090; Ready", badge.accessibleName())
             self.assertIn("do not affect GPU availability", badge.toolTip())
             self.assertIn("Crash report present", badge.toolTip())
+        finally:
+            badge.deleteLater()
+
+    def test_runtime_badge_never_reports_ready_while_runtime_is_checking(self):
+        badge = RuntimeBadge()
+        try:
+            badge.set_health("ok", ["Local storage is ready"])
+            badge.update_runtime(None, None)
+
+            self.assertEqual("Runtime checking… · Checking", badge.text())
+            self.assertEqual("Runtime status: Runtime checking…; Checking", badge.accessibleName())
+            self.assertEqual("warning", badge.property("state"))
+            self.assertIn("Local storage is ready", badge.toolTip())
+        finally:
+            badge.deleteLater()
+
+    def test_runtime_badge_has_exclusive_fallback_unavailable_and_failed_states(self):
+        badge = RuntimeBadge()
+        capabilities = RuntimeCapabilities(torch_version="2.2.2", onnx_version="1.18.0")
+        try:
+            badge.update_runtime(
+                capabilities,
+                ExecutionPolicy(
+                    preferred_mode="auto",
+                    effective_mode="cpu",
+                    reason="CUDA is not available; using CPU.",
+                ),
+            )
+            self.assertEqual("CPU fallback · Fallback", badge.text())
+            self.assertEqual("Runtime status: CPU fallback; Fallback", badge.accessibleName())
+            self.assertEqual("warning", badge.property("state"))
+
+            badge.update_runtime(
+                capabilities,
+                ExecutionPolicy(
+                    preferred_mode="cuda",
+                    effective_mode="cpu",
+                    error="CUDA provider is unavailable.",
+                ),
+            )
+            self.assertEqual("CUDA unavailable · Unavailable", badge.text())
+            self.assertEqual("Runtime status: CUDA unavailable; Unavailable", badge.accessibleName())
+            self.assertEqual("error", badge.property("state"))
+
+            badge.set_runtime_failure("Local runtime probe exited unexpectedly.")
+            self.assertEqual("Runtime failed · Failed", badge.text())
+            self.assertEqual("Runtime status: Runtime failed; Failed", badge.accessibleName())
+            self.assertIn("Rescan GPU Resources", badge.toolTip())
+            self.assertEqual("error", badge.property("state"))
         finally:
             badge.deleteLater()
 
@@ -4643,6 +5356,7 @@ class UiSmokeTests(unittest.TestCase):
             face_service_global=service,
             face_service_session=service,
         )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.show()
         try:
             pane.face_find_name_query.setText("Alice")
@@ -4670,6 +5384,7 @@ class UiSmokeTests(unittest.TestCase):
             enabled_tabs=["Face Library", "Face Search"],
             external_results=False,
         )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         original_label_tooltip = pane.face_label_button.toolTip()
 
         pane.set_read_only_mode(True)
@@ -4709,6 +5424,7 @@ class UiSmokeTests(unittest.TestCase):
             external_results=False,
         )
         pane.face_folder_path.setText("/photos")
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         install_requests: list[str] = []
         pane.install_face_model_requested.connect(install_requests.append)
 
@@ -5241,7 +5957,14 @@ class UiSmokeTests(unittest.TestCase):
             pane.close()
 
     def test_face_result_tile_context_menu_preserves_multi_selection_and_exposes_batch_naming(self):
-        pane = SearchPane(enabled_tabs=["Face Library", "Face Search"], external_results=False)
+        service = self._FakeFaceLibraryService()
+        pane = SearchPane(
+            enabled_tabs=["Face Library", "Face Search"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.show()
         try:
             result = FaceClusteringComparisonResult(
@@ -5288,7 +6011,28 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(action_map["Find Similar to Selected Faces"].isEnabled())
             self.assertTrue(action_map["Ignore Selected Faces"].isEnabled())
             self.assertTrue(action_map["Ignore Similar Faces"].isEnabled())
+
+            # A queued primary People job is busy even before its worker
+            # thread exists, and menus use the same reason as toolbar actions.
+            pane._active_job = object()
+            pane._active_thread = None
+            busy_menu = pane._build_face_results_context_menu()
+            busy_actions = {action.text(): action for action in busy_menu.actions() if not action.isSeparator()}
+            for action in busy_actions.values():
+                self.assertFalse(action.isEnabled())
+                self.assertIn("active People operation", action.statusTip())
+            pane._active_job = None
+
+            # A menu opened from a valid selection cannot act on stale rows
+            # after the model selection changes.
+            started: list[str] = []
+            pane._start_job = lambda label, *_args: started.append(label)  # type: ignore[method-assign]
+            selection_model.clearSelection()
+            action_map["Find Similar to Selected Faces"].trigger()
+            self.assertEqual([], started)
+            self.assertIn("Select one or more saved face tiles", pane.status_label.text())
             menu.deleteLater()
+            busy_menu.deleteLater()
         finally:
             pane.close()
 
@@ -5855,7 +6599,9 @@ class UiSmokeTests(unittest.TestCase):
             face_service_global=service,
             face_service_session=service,
         )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
+        pane._validate_query_image_path = lambda _path: None  # type: ignore[method-assign]
         try:
             pane.face_query_path.setText("/photos/query.jpg")
             pane.face_recognition_mode_combo.setCurrentIndex(pane.face_recognition_mode_combo.findData("strict"))
@@ -5890,6 +6636,7 @@ class UiSmokeTests(unittest.TestCase):
             face_service_global=service,
             face_service_session=service,
         )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
         try:
             pane.face_folder_path.setText("/photos")
@@ -6084,6 +6831,7 @@ class UiSmokeTests(unittest.TestCase):
                 saved_search_service=saved_service,
             )
             pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
+            pane._start_saved_search_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
             cluster_payloads: list[dict[str, object]] = []
             pane.saved_clustering_filter_requested.connect(lambda payload: cluster_payloads.append(dict(payload)))
             pane.clustering_filter_state_provider = lambda: {"tags": ["family", "selfie"], "tag_match": "All"}
@@ -6147,10 +6895,92 @@ class UiSmokeTests(unittest.TestCase):
                 saved_search_service=SavedSearchService(store_path),
             )
             try:
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: restored.saved_searches_list.count() == persisted_count
+                    )
+                )
                 self.assertEqual(persisted_count, restored.saved_searches_list.count())
                 self.assertTrue(any("Family tags" in restored.saved_searches_list.item(row).text() for row in range(restored.saved_searches_list.count())))
             finally:
                 restored.close()
+
+    def test_saved_search_load_is_nonblocking_and_cancelled_identity_count_never_mutates(self):
+        with TemporaryDirectory() as tmp:
+            saved_started = Event()
+            saved_release = Event()
+
+            class _BlockingSavedSearchService(SavedSearchService):
+                def list_searches(self, search_type=None):
+                    saved_started.set()
+                    if not saved_release.wait(2.0):
+                        raise RuntimeError("saved-search fixture release timed out")
+                    return super().list_searches(search_type)
+
+            identity_service = self._FakeFacePipelineService(
+                profiles=[
+                    self._person_profile("Alice", visible_face_count=1),
+                    self._person_profile("Bob", visible_face_count=1),
+                ]
+            )
+            pane = SearchPane(
+                enabled_tabs=["Face Library", "Face Search", "Identities"],
+                external_results=False,
+                face_service_global=identity_service,
+                face_service_session=identity_service,
+                saved_search_service=_BlockingSavedSearchService(Path(tmp) / "saved.json"),
+            )
+            try:
+                self.assertTrue(self._wait_until(saved_started.is_set))
+                ui_acknowledged: list[bool] = []
+                QTimer.singleShot(0, lambda: ui_acknowledged.append(True))
+                self.assertTrue(self._wait_until(lambda: bool(ui_acknowledged)))
+                saved_release.set()
+                self.assertTrue(
+                    self._wait_until(lambda: pane._saved_search_job is None)
+                )
+
+                pane._refresh_face_identities(
+                    profiles=list(identity_service.profiles),
+                    duplicate_warnings={},
+                )
+                self._select_list_view_row(pane.face_identity_list, 0)
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: pane._active_job is None
+                        and pane._active_thread is None
+                    )
+                )
+                pane.face_identity_merge_target.setText("Bob")
+                count_started = Event()
+                count_release = Event()
+
+                def _blocked_counts():
+                    count_started.set()
+                    if not count_release.wait(2.0):
+                        raise RuntimeError("identity-count fixture release timed out")
+                    return {"Alice": 1}
+
+                identity_service.label_counts = _blocked_counts
+                with patch("ui.search_pane.confirmBox") as confirm:
+                    pane._merge_selected_identity_into_target()
+                    self.assertTrue(self._wait_until(count_started.is_set))
+                    ui_acknowledged.clear()
+                    QTimer.singleShot(0, lambda: ui_acknowledged.append(True))
+                    self.assertTrue(self._wait_until(lambda: bool(ui_acknowledged)))
+                    pane._active_job.cancel()
+                    count_release.set()
+                    self.assertTrue(
+                        self._wait_until(
+                            lambda: pane._active_job is None
+                            and pane._active_thread is None
+                        )
+                    )
+                    confirm.assert_not_called()
+                self.assertEqual([], identity_service.merge_person_identities_calls)
+            finally:
+                saved_release.set()
+                pane.close()
 
     def test_duplicate_review_records_and_exports_decisions_without_moving_files(self):
         with TemporaryDirectory() as tmp:
@@ -6197,6 +7027,11 @@ class UiSmokeTests(unittest.TestCase):
             pane.show()
             APP.processEvents()
             self.assertFalse(pane.face_walkthrough_panel.isHidden())
+            pane.hide()
+            APP.processEvents()
+            self.assertFalse(pane.export_state()["face_walkthrough_dismissed"])
+            pane.show()
+            APP.processEvents()
             pane._set_face_walkthrough_visible(False)
             self.assertTrue(pane.face_walkthrough_panel.isHidden())
             state = pane.export_state()
@@ -6214,12 +7049,66 @@ class UiSmokeTests(unittest.TestCase):
         finally:
             restored.close()
 
+    def test_people_lightweight_workspace_state_restores_route_filters_and_disclosures(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        pane.refresh_face_album = lambda **_kwargs: None  # type: ignore[method-assign]
+        try:
+            pane.activate_people_section("find")
+            pane.face_find_options_toggle.setChecked(True)
+            pane._set_expander_state(
+                pane.face_find_options_toggle,
+                pane.face_find_options_panel,
+                True,
+            )
+            pane._set_face_walkthrough_visible(False)
+            pane.face_identity_management_toggle.setChecked(True)
+            pane.face_identity_danger_toggle.setChecked(False)
+            state = pane.export_workspace_state()
+            self.assertEqual(1, state["state_version"])
+            self.assertEqual("find", state["active_route"])
+            self.assertTrue(state["face_identity_management_expanded"])
+            self.assertFalse(state["face_identity_danger_expanded"])
+            self.assertNotIn("face_pipeline_by_mode", state)
+        finally:
+            pane.close()
+
+        restored = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search", "Identities"],
+            external_results=False,
+        )
+        restored.refresh_face_album = lambda **_kwargs: None  # type: ignore[method-assign]
+        try:
+            restored.apply_workspace_state(state)
+            self.assertEqual("find", restored._current_people_section())
+            self.assertTrue(restored.face_find_options_toggle.isChecked())
+            self.assertFalse(restored.face_find_options_panel.isHidden())
+            self.assertTrue(restored.face_walkthrough_panel.isHidden())
+            self.assertTrue(restored.face_identity_management_toggle.isChecked())
+            self.assertFalse(restored.face_identity_management_body.isHidden())
+            self.assertFalse(restored.face_identity_danger_toggle.isChecked())
+            self.assertTrue(restored.face_identity_danger_body.isHidden())
+
+            before = restored.export_workspace_state()
+            restored.apply_workspace_state({"state_version": 99, "active_route": "identities"})
+            self.assertEqual(before, restored.export_workspace_state())
+            restored.apply_workspace_state({"state_version": "malformed", "active_route": "identities"})
+            self.assertEqual(before, restored.export_workspace_state())
+        finally:
+            restored.close()
+
     def test_face_db_usage_and_delete_actions_are_wired(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "faces.sqlite3"
+            wal_path = Path(f"{db_path}-wal")
+            shm_path = Path(f"{db_path}-shm")
             faiss_path = Path(f"{db_path}.faiss")
             meta_path = Path(f"{db_path}.faiss.json")
             db_path.write_bytes(b"db")
+            wal_path.write_bytes(b"wal")
+            shm_path.write_bytes(b"shm")
             faiss_path.write_bytes(b"index")
             meta_path.write_text("{}", encoding="utf-8")
             audit_path = Path(tmp) / "face_action_audit.jsonl"
@@ -6232,6 +7121,11 @@ class UiSmokeTests(unittest.TestCase):
                 face_service_session=service,
             )
             try:
+                pane._face_album_groups = [object()]
+                pane._face_album_records = [object()]
+                pane._pending_face_assignments = [object()]
+                pane._face_identity_entries = [object()]
+                pane._face_identity_prototypes_by_name = {"stale": [object()]}
                 pane._face_ui_action_audit_path = lambda: audit_path  # type: ignore[method-assign]
                 pane._refresh_face_db_usage_label()
                 self.assertIn("Face data usage", pane.face_db_usage_label.text())
@@ -6241,14 +7135,97 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertEqual(["rebuild"], rebuild_calls)
                 with patch("ui.search_pane.confirmBox", return_value=True):
                     pane._delete_active_face_db()
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: not db_path.exists()
+                        and audit_path.exists()
+                        and not pane._face_album_groups
+                    ),
+                    "the cancellable face-library deletion did not complete",
+                )
                 self.assertFalse(db_path.exists())
+                self.assertFalse(wal_path.exists())
+                self.assertFalse(shm_path.exists())
                 self.assertFalse(faiss_path.exists())
                 self.assertFalse(meta_path.exists())
+                self.assertEqual([], pane._face_album_groups)
+                self.assertEqual([], pane._face_album_records)
+                self.assertEqual([], pane._pending_face_assignments)
+                self.assertEqual([], pane._face_identity_entries)
+                self.assertEqual({}, pane._face_identity_prototypes_by_name)
                 audit = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[-1])
                 self.assertEqual("delete_active_face_db", audit["action"])
                 self.assertEqual(str(db_path), audit["target"])
+                self.assertTrue(audit["reversible"])
+                self.assertTrue(audit["details"]["operation_id"])
+                self.assertEqual(
+                    {str(db_path), str(wal_path), str(shm_path), str(faiss_path), str(meta_path)},
+                    set(audit["details"]["staged_files"]),
+                )
             finally:
                 pane.close()
+
+    def test_face_db_removal_confirmation_and_read_only_guards_change_nothing(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "faces.sqlite3"
+            targets = [
+                db_path,
+                Path(f"{db_path}-wal"),
+                Path(f"{db_path}-shm"),
+                Path(f"{db_path}.faiss"),
+                Path(f"{db_path}.faiss.json"),
+            ]
+            for index, path in enumerate(targets):
+                path.write_bytes(f"payload-{index}".encode("utf-8"))
+            before = {path: path.read_bytes() for path in targets}
+            service = self._FakeFacePipelineService()
+            service.db_path = db_path
+            pane = SearchPane(
+                enabled_tabs=["Face Library", "Face Search", "Identities"],
+                external_results=False,
+                face_service_global=service,
+                face_service_session=service,
+            )
+            try:
+                with patch("ui.search_pane.confirmBox", return_value=False), patch.object(
+                    pane, "_start_job"
+                ) as start_job:
+                    pane._delete_active_face_db()
+                start_job.assert_not_called()
+                self.assertIn("No files were changed", pane.status_label.text())
+                self.assertEqual(before, {path: path.read_bytes() for path in targets})
+
+                pane.set_read_only_mode(True)
+                with patch("ui.search_pane.infoBox") as info, patch(
+                    "ui.search_pane.confirmBox"
+                ) as confirm:
+                    pane._delete_active_face_db()
+                info.assert_called_once()
+                confirm.assert_not_called()
+                self.assertIn("Read-only mode", pane.status_label.text())
+                self.assertEqual(before, {path: path.read_bytes() for path in targets})
+            finally:
+                pane.close()
+
+    def test_face_review_source_fallback_never_probes_storage_on_the_ui_thread(self):
+        pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
+        try:
+            pane.face_folder_path.setText("/photos")
+            pane._invalidate_face_review_source()
+            probes: list[object] = []
+            pane._face_review_db_metrics = lambda *args: probes.append(args)  # type: ignore[method-assign]
+
+            source = pane._resolve_face_review_source()
+
+            self.assertIsNotNone(source)
+            self.assertEqual([], probes)
+            self.assertEqual(
+                "Resolving the saved review DB in the background.",
+                source.selection_reason,
+            )
+            self.assertIs(source.service, pane._face_service_for_scope(pane._current_face_scope_key()))
+        finally:
+            pane.close()
 
     def test_face_identity_import_recognition_and_purge_actions_are_wired(self):
         with TemporaryDirectory() as tmp:
@@ -6284,6 +7261,7 @@ class UiSmokeTests(unittest.TestCase):
                         self._wait_until(lambda: bool(service.import_identity_payloads)),
                         "the asynchronous identity import did not complete",
                     )
+                    self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 self.assertEqual([import_payload], service.preview_identity_payloads)
                 self.assertEqual(import_payload, service.import_identity_payloads[-1])
                 self.assertEqual(["merge"], service.import_identity_modes)
@@ -6297,6 +7275,7 @@ class UiSmokeTests(unittest.TestCase):
                         self._wait_until(lambda: "cancelled" in pane.status_label.text().lower()),
                         "the asynchronous identity import cancellation was not reported",
                     )
+                    self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 self.assertEqual(["merge"], service.import_identity_modes)
                 self.assertIn("cancelled", pane.status_label.text().lower())
 
@@ -6309,23 +7288,75 @@ class UiSmokeTests(unittest.TestCase):
                         self._wait_until(lambda: service.import_identity_modes == ["merge", "replace"]),
                         "the asynchronous replace import did not complete",
                     )
+                    self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 self.assertEqual(["merge", "replace"], service.import_identity_modes)
 
                 with patch("ui.search_pane.confirmBox", return_value=True):
                     pane._set_face_recognition_enabled(False)
+                    self.assertTrue(
+                        self._wait_until(lambda: service.set_face_recognition_enabled_calls == [False]),
+                        "the asynchronous recognition disable did not complete",
+                    )
+                    self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                     pane._set_face_recognition_enabled(True)
+                    self.assertTrue(
+                        self._wait_until(lambda: service.set_face_recognition_enabled_calls == [False, True]),
+                        "the asynchronous recognition enable did not complete",
+                    )
+                    self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 self.assertEqual([False, True], service.set_face_recognition_enabled_calls)
 
                 with patch("ui.search_pane.confirmBox", return_value=True), patch(
                     "ui.search_pane.QInputDialog.getText", return_value=("PURGE", True)
                 ):
                     pane._purge_face_data()
+                    self.assertTrue(
+                        self._wait_until(
+                            lambda: service.purge_face_data_calls == [True]
+                            and "Purged face data" in pane.status_label.text()
+                        ),
+                        "the asynchronous face-data purge did not complete",
+                    )
                 self.assertEqual(1, service.prepare_face_data_purge_calls)
                 self.assertEqual([True], service.purge_face_data_calls)
                 self.assertEqual([], service.records)
                 self.assertIn("Purged face data", pane.status_label.text())
             finally:
                 pane.close()
+
+    def test_face_purge_preview_is_cancellable_and_does_not_block_qt(self):
+        entered = Event()
+        release = Event()
+        qt_acknowledged: list[bool] = []
+        service = self._FakeFacePipelineService()
+
+        def _blocked_preview():
+            entered.set()
+            release.wait(timeout=3.0)
+            return {"table_counts": {"faces": 1}}
+
+        service.prepare_face_data_purge = _blocked_preview  # type: ignore[method-assign]
+        pane = SearchPane(
+            enabled_tabs=["Face Library", "Identities"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        try:
+            with patch("ui.search_pane.confirmBox") as confirm:
+                pane._purge_face_data()
+                self.assertTrue(entered.wait(timeout=3.0))
+                QTimer.singleShot(0, lambda: qt_acknowledged.append(True))
+                self.assertTrue(self._wait_until(lambda: bool(qt_acknowledged)))
+                self.assertFalse(confirm.called)
+                pane._cancel_job(pane._active_job)
+                release.set()
+                self.assertTrue(self._wait_until(lambda: pane._active_job is None))
+                self.assertFalse(confirm.called)
+                self.assertEqual([], service.purge_face_data_calls)
+        finally:
+            release.set()
+            pane.close()
 
     def test_face_action_audit_renders_recent_events_and_supported_undo_hint(self):
         service = self._FakeFacePipelineService(
@@ -6467,12 +7498,14 @@ class UiSmokeTests(unittest.TestCase):
                 )
                 with patch("ui.search_pane.QFileDialog.getSaveFileName", return_value=(str(export_clusters), "JSON Files (*.json)")):
                     pane._export_face_cluster_results()
+                self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 cluster_payload = json.loads(export_clusters.read_text(encoding="utf-8"))
                 self.assertEqual("hdbscan", cluster_payload["groups"][0]["comparison_key"])
                 self.assertEqual("/photos/a.jpg", cluster_payload["groups"][0]["items"][0]["image_path"])
 
                 with patch("ui.search_pane.QFileDialog.getSaveFileName", return_value=(str(export_identities), "JSON Files (*.json)")):
                     pane._export_face_identities()
+                self.assertTrue(self._wait_until(lambda: pane._active_job is None))
                 identity_payload = json.loads(export_identities.read_text(encoding="utf-8"))
                 self.assertEqual("Alice", identity_payload["identities"][0]["person_name"])
                 self.assertEqual("/photos/a.jpg", identity_payload["identities"][0]["prototype_refs"][0]["image_path"])
@@ -6523,9 +7556,19 @@ class UiSmokeTests(unittest.TestCase):
         )
         try:
             pane._refresh_face_identities(force_reload=True)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: self._list_view_count(pane.face_identity_list) == 1
+                )
+            )
             self.assertEqual(1, self._list_view_count(pane.face_identity_list))
             self._select_list_view_row(pane.face_identity_list, 0)
             pane._refresh_selected_face_identity()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: pane.face_identity_prototype_model.rowCount() == 2
+                )
+            )
             self.assertIn("Alice", pane.face_identity_summary.text())
             self.assertIn("Alicia", pane.face_identity_duplicate_warning.text())
             self.assertEqual(2, pane.face_identity_prototype_model.rowCount())
@@ -6563,6 +7606,13 @@ class UiSmokeTests(unittest.TestCase):
         )
         try:
             pane._refresh_face_identities(force_reload=True)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(service.load_person_prototype_faces_calls) == 1
+                    and pane._active_job is None
+                    and pane._active_thread is None
+                )
+            )
             self.assertEqual(1, len(service.load_person_prototype_faces_calls))
 
             pane._refresh_selected_face_identity()
@@ -6570,6 +7620,11 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(1, len(service.load_person_prototype_faces_calls))
 
             pane._refresh_face_identities(force_reload=True)
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(service.load_person_prototype_faces_calls) == 2
+                )
+            )
             self.assertEqual(2, len(service.load_person_prototype_faces_calls))
         finally:
             pane.close()
@@ -6663,6 +7718,9 @@ class UiSmokeTests(unittest.TestCase):
             face_service_session=service,
         )
         try:
+            pane._refresh_face_db_usage_label()
+            self.assertIn("managed database path", pane.face_db_usage_label.text())
+            pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))
             pane.refresh_face_library = lambda *args, **kwargs: None
             pane._refresh_face_identities(force_reload=True)
             self._select_list_view_row(pane.face_identity_list, 0)
@@ -6691,6 +7749,10 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(("Alice", "/photos/a.jpg", 0), service.remove_person_prototype_face_calls[-1])
 
             pane.face_identity_merge_target.setText("Bob")
+            with patch("ui.search_pane.confirmBox", return_value=False):
+                pane._merge_selected_identity_into_target()
+            self.assertEqual([], service.merge_person_identities_calls)
+            self.assertIn("cancelled", pane.status_label.text().casefold())
             with patch("ui.search_pane.confirmBox", return_value=True):
                 pane._merge_selected_identity_into_target()
             self.assertEqual(("Alice", "Bob"), service.merge_person_identities_calls[-1])
@@ -6745,9 +7807,19 @@ class UiSmokeTests(unittest.TestCase):
 
         self.assertEqual("dog", pane.current_face_mode())
         self.assertIs(dog_service, pane._active_face_service())
+        self.assertFalse(pane.face_scan_button.isEnabled())
+        self.assertFalse(pane.face_index_button.isEnabled())
+        self.assertFalse(pane.face_reindex_button.isEnabled())
+        self.assertIn("active Roots", pane.face_scan_button.toolTip())
+
+        pane.current_scope_roots_provider = lambda: ("/photos",)
+        pane._update_face_mode_status()
+
         self.assertTrue(pane.face_scan_button.isEnabled())
         self.assertTrue(pane.face_index_button.isEnabled())
         self.assertTrue(pane.face_reindex_button.isEnabled())
+        self.assertTrue(pane.face_choose_pipeline_button.isEnabled())
+        self.assertTrue(pane.face_model_settings_button.isEnabled())
         self.assertFalse(pane.face_search_button.isEnabled())
         self.assertFalse(pane.face_label_button.isEnabled())
         self.assertIn("Missing Dog model bundle", pane.face_scan_button.toolTip())
@@ -6782,19 +7854,22 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual((2, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(profile_index))
 
         selected_index = pane.face_search_grid.indexOf(pane.face_search_selected_group)
-        find_index = pane.face_search_grid.indexOf(pane.face_find_group)
+        find_index = pane.face_search_grid.indexOf(pane.face_primary_find_widget)
         manage_index = pane.face_search_grid.indexOf(pane.face_manage_group)
         save_index = pane.face_search_grid.indexOf(pane.face_save_group)
         pending_index = pane.face_search_grid.indexOf(pane.face_pending_group)
         people_query_index = pane.face_search_grid.indexOf(pane.face_people_query_group)
         self.assertEqual("compact", pane._face_search_layout_mode)
-        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
-        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
-        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
-        self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
-        self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
-        self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
-        self.assertEqual((6, 0, 1, 2), pane.face_search_grid.getItemPosition(people_query_index))
+        quick_index = pane.face_search_grid.indexOf(pane.face_search_quick_group)
+        self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(quick_index))
+        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
+        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_find_group))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_find_name_group))
+        self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
+        self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
+        self.assertEqual((6, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
+        self.assertEqual((2, 0, 1, 2), pane.face_search_grid.getItemPosition(people_query_index))
         selected_actions = pane.face_search_selected_actions_grid
         self.assertEqual((0, 0, 1, 2), selected_actions.getItemPosition(0))
         self.assertEqual((1, 0, 1, 2), selected_actions.getItemPosition(1))
@@ -6812,7 +7887,7 @@ class UiSmokeTests(unittest.TestCase):
         scanned_index = pane.face_library_selection_grid.indexOf(pane.face_scanned_group)
         profile_index = pane.face_library_selection_grid.indexOf(pane.face_profile_group)
         selected_index = pane.face_search_grid.indexOf(pane.face_search_selected_group)
-        find_index = pane.face_search_grid.indexOf(pane.face_find_group)
+        find_index = pane.face_search_grid.indexOf(pane.face_primary_find_widget)
         manage_index = pane.face_search_grid.indexOf(pane.face_manage_group)
         save_index = pane.face_search_grid.indexOf(pane.face_save_group)
         pending_index = pane.face_search_grid.indexOf(pane.face_pending_group)
@@ -6821,15 +7896,180 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual((0, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(scanned_index))
         self.assertEqual((1, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(people_index))
         self.assertEqual((2, 0, 1, 2), pane.face_library_selection_grid.getItemPosition(profile_index))
-        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_search_quick_group))
-        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
-        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
-        self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
-        self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
-        self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
-        self.assertEqual((6, 0, 1, 2), pane.face_search_grid.getItemPosition(people_query_index))
+        quick_index = pane.face_search_grid.indexOf(pane.face_search_quick_group)
+        self.assertEqual((3, 0, 1, 2), pane.face_search_grid.getItemPosition(quick_index))
+        self.assertEqual((1, 0, 1, 2), pane.face_search_grid.getItemPosition(selected_index))
+        self.assertEqual((0, 0, 1, 2), pane.face_search_grid.getItemPosition(find_index))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_find_group))
+        self.assertEqual(-1, pane.face_search_grid.indexOf(pane.face_find_name_group))
+        self.assertEqual((4, 0, 1, 2), pane.face_search_grid.getItemPosition(manage_index))
+        self.assertEqual((5, 0, 1, 2), pane.face_search_grid.getItemPosition(save_index))
+        self.assertEqual((6, 0, 1, 2), pane.face_search_grid.getItemPosition(pending_index))
+        self.assertEqual((2, 0, 1, 2), pane.face_search_grid.getItemPosition(people_query_index))
 
         pane.close()
+
+    def test_face_find_primary_queries_stay_in_view_and_detection_reveals_find_action(self):
+        pane = SearchPane(enabled_tabs=["Face Library", "Face Search"], external_results=False)
+        pane.set_ui_mode("basic")
+        pane.tabs.setCurrentIndex(pane.tab_labels().index("Face Search"))
+        pane.resize(1280, 620)
+        pane.workspace_splitter.setSizes([360, 920])
+        pane.show()
+        APP.processEvents()
+
+        viewport = pane.sidebar_scroll.viewport()
+
+        def fully_visible(widget) -> bool:
+            top_left = widget.mapTo(viewport, QPoint(0, 0))
+            return viewport.rect().contains(widget.rect().translated(top_left))
+
+        self.assertTrue(pane.face_query_faces_list.isHidden())
+        self.assertTrue(fully_visible(pane.face_find_task_selector))
+        self.assertTrue(fully_visible(pane.face_query_path))
+        self.assertTrue(fully_visible(pane.face_query_detect_button))
+        self.assertTrue(fully_visible(pane.face_search_button))
+        self.assertTrue(pane.face_find_name_group.isHidden())
+
+        pane.face_query_path.setText("/photos/query.jpg")
+        face = SimpleNamespace(
+            crop=Image.new("RGB", (40, 40), color=(120, 80, 40)),
+            bbox=(1, 2, 30, 36),
+            confidence=0.9,
+        )
+        pane._populate_query_face_candidates("/photos/query.jpg", [face])
+        APP.processEvents()
+        APP.processEvents()
+
+        self.assertTrue(pane.face_query_faces_list.isHidden())
+        self.assertEqual(1, self._selected_list_view_count(pane.face_query_faces_list))
+        self.assertLessEqual(pane.face_query_faces_list.height(), 128)
+        self.assertTrue(fully_visible(pane.face_search_button))
+        self.assertEqual("/photos/query.jpg", pane.face_query_path.text())
+
+        pane.face_find_name_query.setText("Alice")
+        pane.face_find_task_selector.setCurrentIndex(1)
+        APP.processEvents()
+        APP.processEvents()
+        self.assertTrue(pane.face_find_group.isHidden())
+        self.assertFalse(pane.face_find_name_group.isHidden())
+        self.assertTrue(fully_visible(pane.face_find_task_selector))
+        self.assertTrue(fully_visible(pane.face_find_name_query))
+        self.assertTrue(fully_visible(pane.face_find_name_button))
+
+        with patch.object(pane, "_search_by_name") as search_by_name:
+            pane.face_find_name_query.setFocus()
+            QTest.keyClick(pane.face_find_name_query, Qt.Key.Key_Return)
+            self.assertEqual(1, search_by_name.call_count)
+
+        pane.face_find_task_selector.setCurrentIndex(0)
+        APP.processEvents()
+        with patch.object(pane, "_search_faces") as search_faces:
+            pane.face_query_path.setFocus()
+            QTest.keyClick(pane.face_query_path, Qt.Key.Key_Return)
+            self.assertEqual(1, search_faces.call_count)
+
+        pane.refresh_face_library = lambda **_kwargs: None  # type: ignore[method-assign]
+        pane.tabs.setCurrentIndex(0)
+        pane.tabs.setCurrentIndex(pane.tab_labels().index("Face Search"))
+        pane.set_ui_mode("advanced")
+        pane.set_ui_mode("basic")
+        APP.processEvents()
+        self.assertEqual("/photos/query.jpg", pane.face_query_path.text())
+        self.assertEqual("Alice", pane.face_find_name_query.text())
+        pane.close()
+        pane.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        APP.processEvents()
+
+    def test_face_find_viewport_matrix_covers_themes_scales_and_operation_states(self):
+        original_theme = current_theme()
+        original_scale = int(APP.property("clusterlens_text_scale") or 100)
+        face = SimpleNamespace(
+            crop=Image.new("RGB", (40, 40), color=(120, 80, 40)),
+            bbox=(1, 2, 30, 36),
+            confidence=0.9,
+        )
+        try:
+            for theme in ("dark", "light"):
+                for scale in (100, 125, 150, 200):
+                    with self.subTest(theme=theme, scale=scale):
+                        apply_app_theme(APP, theme)
+                        apply_app_text_scale(APP, scale)
+                        with patch.object(SearchPane, "_refresh_saved_searches", lambda *_args, **_kwargs: None):
+                            pane = SearchPane(enabled_tabs=["Face Library", "Face Search"], external_results=False)
+                        try:
+                            pane.set_ui_mode("basic")
+                            pane.tabs.setCurrentIndex(pane.tab_labels().index("Face Search"))
+                            pane.resize(1280, 620)
+                            pane.workspace_splitter.setSizes([360, 920])
+                            pane.show()
+                            APP.processEvents()
+                            viewport = pane.sidebar_scroll.viewport()
+
+                            def fully_visible(widget) -> bool:
+                                top_left = widget.mapTo(viewport, QPoint(0, 0))
+                                return viewport.rect().contains(widget.rect().translated(top_left))
+
+                            for state in ("empty", "busy", "error"):
+                                pane.face_find_task_selector.setCurrentIndex(0)
+                                pane.face_query_path.setText("" if state == "empty" else "/photos/missing.jpg")
+                                pane._populate_query_face_candidates(pane.face_query_path.text(), [])
+                                pane._set_busy(state == "busy", "Detecting query faces…" if state == "busy" else "")
+                                APP.processEvents()
+                                pane._ensure_query_find_visible()
+                                APP.processEvents()
+                                if state == "error":
+                                    self.assertIn("No faces found", pane.face_query_faces_summary.text())
+                                for widget in (
+                                    pane.face_find_task_selector,
+                                    pane.face_query_path,
+                                    pane.face_query_detect_button,
+                                ):
+                                    self.assertTrue(fully_visible(widget), f"{state} photo task clipped: {widget}")
+
+                            pane._set_busy(False)
+                            pane.face_query_path.setText("/photos/query.jpg")
+                            pane._populate_query_face_candidates("/photos/query.jpg", [face])
+                            for _ in range(3):
+                                APP.processEvents()
+                            pane._ensure_query_find_visible()
+                            APP.processEvents()
+                            for widget in (
+                                pane.face_find_task_selector,
+                                pane.face_query_path,
+                                pane.face_search_button,
+                            ):
+                                self.assertTrue(fully_visible(widget), f"populated photo task clipped: {widget}")
+
+                            pane.face_find_task_selector.setCurrentIndex(1)
+                            for state in ("empty", "populated", "busy", "error"):
+                                pane.face_find_name_query.setText("" if state == "empty" else "Alice")
+                                pane._set_busy(state == "busy", "Finding Alice…" if state == "busy" else "")
+                                if state == "error":
+                                    pane.status_label.setText("Saved-person search failed: fixture error")
+                                for _ in range(2):
+                                    APP.processEvents()
+                                for widget in (
+                                    pane.face_find_task_selector,
+                                    pane.face_find_name_query,
+                                    pane.face_find_name_button,
+                                ):
+                                    self.assertTrue(fully_visible(widget), f"{state} name task clipped: {widget}")
+
+                            pane.sidebar_scroll.ensureWidgetVisible(pane.saved_search_delete_button, 0, 12)
+                            APP.processEvents()
+                            self.assertTrue(fully_visible(pane.saved_search_delete_button))
+                        finally:
+                            pane._set_busy(False)
+                            pane.close()
+                            pane.deleteLater()
+                            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                            APP.processEvents()
+        finally:
+            apply_app_text_scale(APP, original_scale)
+            apply_app_theme(APP, original_theme)
+            APP.processEvents()
 
     def test_face_library_review_sort_orders_detected_before_no_faces_and_not_scanned(self):
         service = self._FakeFaceLibraryService()
@@ -6936,23 +8176,42 @@ class UiSmokeTests(unittest.TestCase):
         pane.close()
 
     def test_face_library_folder_review_gallery_uses_full_folder_and_face_boxes(self):
-        pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
         service = self._FakeFaceLibraryService(
             records=[self._face_record("/photos/a.jpg", 0, bbox=(10, 10, 50, 60))],
             review_paths=["/photos/not_scanned.jpg"],
         )
-        pane.face_service_global = service
+        pane = SearchPane(
+            enabled_tabs=["Face Library"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
         pane.face_folder_path.setText("/photos")
 
         pane._refresh_scanned_faces()
 
         self.assertEqual(["/photos/a.jpg"], list(pane.results_gallery.images))
-        self.assertIn("Loaded 2 image(s)", pane.face_library_review_summary.text())
+        self.assertIn("Loaded 2 photos", pane.face_library_review_summary.text())
+        self.assertIn(
+            "Loaded 2 photos · Showing 1 photo (With Faces)",
+            pane.face_results_context_label.text(),
+        )
         first_index = pane.results_gallery.model.index(0, 0)
         self.assertTrue(first_index.data(GalleryImageModel.FaceBoxesRole))
+        pane.face_photo_filter.setCurrentIndex(pane.face_photo_filter.findData("needs_review"))
+        APP.processEvents()
+        self.assertEqual([], list(pane.results_gallery.images))
+        self.assertIn(
+            "Loaded 2 photos · Showing 0 photos (Needs Review)",
+            pane.face_results_context_label.text(),
+        )
         pane.face_photo_filter.setCurrentIndex(pane.face_photo_filter.findData("all"))
         APP.processEvents()
         self.assertEqual(["/photos/a.jpg", "/photos/not_scanned.jpg"], list(pane.results_gallery.images))
+        self.assertIn(
+            "Loaded 2 photos · Showing 2 photos (All)",
+            pane.face_results_context_label.text(),
+        )
         second_index = pane.results_gallery.model.index(1, 0)
         self.assertEqual("Not scanned", second_index.data(GalleryImageModel.OverlayRole))
         self.assertEqual("a.jpg", pane.face_selected_photo_label.text())
@@ -7473,6 +8732,9 @@ class UiSmokeTests(unittest.TestCase):
                 return_value=[("detected_faces", pane.face_detected_faces_list, pane.face_detected_faces_model)],
             ), patch.object(
                 pane,
+                "_start_face_tile_loader_threads",
+            ), patch.object(
+                pane,
                 "_visible_and_prefetch_face_tile_rows",
                 return_value=(list(range(len(items))), []),
             ), patch.object(
@@ -7731,7 +8993,8 @@ class UiSmokeTests(unittest.TestCase):
             pane._sync_face_review_result_groups()
 
             self.assertEqual(0, pane.face_detected_faces_model.rowCount())
-            self.assertIn("deferred for large reviews", pane.face_detected_faces_summary.text().lower())
+            self.assertIn("deferred", pane.face_detected_faces_summary.text().lower())
+            self.assertIn("open this tab", pane.face_detected_faces_summary.text().lower())
             self.assertEqual(0, self._list_view_count(pane.face_results_groups_list))
             self.assertIn("no groups or matches yet", pane.face_results_summary.text().lower())
 
@@ -7745,7 +9008,13 @@ class UiSmokeTests(unittest.TestCase):
             pane.close()
 
     def test_face_photo_filter_defaults_to_faces_and_group_navigation_is_explicit(self):
-        pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
+        service = self._FakeFaceLibraryService()
+        pane = SearchPane(
+            enabled_tabs=["Face Library"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
         pane.show()
         try:
             review_images = [
@@ -7815,6 +9084,8 @@ class UiSmokeTests(unittest.TestCase):
             APP.processEvents()
             self.assertEqual(["/photos/a.jpg"], pane.results_gallery.images)
             self.assertTrue(pane.face_photos_back_button.isVisible())
+            self.assertIn("Showing 1 photo", pane.face_results_context_label.text())
+            self.assertNotIn("Loaded", pane.face_results_context_label.text())
 
             pane._restore_folder_photos()
             APP.processEvents()
@@ -7841,6 +9112,15 @@ class UiSmokeTests(unittest.TestCase):
 
             pane._apply_face_folder_review(review_images, folder="/photos")
             APP.processEvents()
+            action_refreshes = 0
+            original_action_refresh = pane._update_detected_face_actions
+
+            def counted_action_refresh():
+                nonlocal action_refreshes
+                action_refreshes += 1
+                return original_action_refresh()
+
+            pane._update_detected_face_actions = counted_action_refresh
             pane.face_review_results_tabs.setCurrentWidget(pane.face_detected_faces_panel)
 
             initial_count = pane.face_detected_faces_model.rowCount()
@@ -7852,15 +9132,31 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(self._wait_until(lambda: pane.face_detected_faces_model.rowCount() == 257))
             self.assertFalse(pane._face_detected_publish_in_progress)
             self.assertIn("showing 257 face tile(s)", pane.face_detected_faces_summary.text().lower())
+            self.assertGreaterEqual(action_refreshes, 2)
+            self.assertLessEqual(action_refreshes, 3)
         finally:
             pane.close()
 
-    def test_folder_review_stream_publishes_first_page_before_later_pages_finish(self):
+    def test_folder_review_caches_pages_in_background_and_appends_only_at_viewport_tail(self):
         class _PagedService(self._FakeFaceLibraryService):
             def __init__(self, records):
                 super().__init__(records=records)
                 self.page_calls: list[int] = []
+                self.prepared_candidate_paths: list[tuple[str, ...]] = []
                 self.release_later_pages = Event()
+
+            def prepare_folder_review_candidate_snapshot(
+                self,
+                directory,
+                *,
+                candidate_paths,
+                scope_roots=None,
+                cancel_check=None,
+            ):
+                _ = (directory, scope_roots, cancel_check)
+                paths = tuple(str(path) for path in candidate_paths)
+                self.prepared_candidate_paths.append(paths)
+                return SimpleNamespace(source_paths=paths)
 
             def load_scan_image_records(self, *, folder_prefix="", scope_roots=None, candidate_paths=None):
                 _ = (scope_roots, candidate_paths)
@@ -7932,33 +9228,72 @@ class UiSmokeTests(unittest.TestCase):
         try:
             pane._request_face_library_refresh(
                 refresh_people=False,
-                reason="test progressive review",
+                reason="test background review cache",
                 force_refresh=True,
             )
             self.assertTrue(
                 self._wait_until(
-                    lambda: service.page_calls == [0]
-                    and len(pane._face_review_all_images) == 500
+                    lambda: service.page_calls == [0, 500]
+                    and len(pane.results_gallery.images) == 500
                     and pane._face_review_stream_in_progress
                 )
             )
-            self.assertIn("Loading face review", pane.face_library_review_summary.text())
-            self.assertTrue(
-                self._wait_until(lambda: pane.face_detected_faces_model.rowCount() > 0)
-            )
+            initial_gallery_paths = list(pane.results_gallery.images)
+            self.assertEqual(0, pane.face_detected_faces_model.rowCount())
+            self.assertIsNotNone(pane._face_review_stream_candidate_snapshot)
 
-            pane.face_review_results_tabs.setCurrentWidget(pane.face_detected_faces_panel)
+            # A durable live-index batch replaces the source list.  The old
+            # snapshot must be discarded before the replacement cache worker
+            # receives any page from the updated review.
+            live_path = "/photos/1001.jpg"
+            service.records.append(self._face_record(live_path, 0, bbox=(10, 10, 50, 60)))
+            pane._face_review_live_scan_generation = 17
+            pane._face_review_live_scan_active = True
+            pane._face_review_live_scan_folder = "/photos"
+            pane._on_face_index_batch_committed((17, [live_path]))
+            APP.processEvents()
+            self.assertIn(live_path, pane._face_review_stream_paths)
+            self.assertIsNone(pane._face_review_stream_candidate_snapshot)
+
+            # Reaching the tail while the worker is still reading data does
+            # not rebuild or extend the gallery.  It records one demand.
+            pane._on_results_gallery_visible_paths_changed([pane.results_gallery.images[-1]])
+            APP.processEvents()
+            self.assertEqual(initial_gallery_paths, pane.results_gallery.images)
             service.release_later_pages.set()
             self.assertTrue(
                 self._wait_until(
-                    lambda: len(pane._face_review_all_images) == 1001
+                    lambda: len(pane._face_review_all_images) == 1002
+                    and len(pane.results_gallery.images) == 1000
+                    and pane._face_review_stream_in_progress
+                )
+            )
+            self.assertEqual(0, pane.face_detected_faces_model.rowCount())
+
+            # Faces is intentionally deferred while Photos is active. Opening
+            # it after cache completion builds its virtual rows from the
+            # prepared metadata, without touching the Photos viewport or
+            # querying review pages again.
+            gallery_paths_before_faces = list(pane.results_gallery.images)
+            pane.face_review_results_tabs.setCurrentWidget(pane.face_detected_faces_panel)
+            self.assertTrue(self._wait_until(lambda: pane.face_detected_faces_model.rowCount() == 1002))
+            self.assertEqual(gallery_paths_before_faces, pane.results_gallery.images)
+            self.assertGreaterEqual(service.page_calls.count(500), 2)
+            self.assertEqual(1000, service.page_calls[-1])
+            pane.face_review_results_tabs.setCurrentWidget(pane.results_gallery)
+
+            pane._on_results_gallery_visible_paths_changed([pane.results_gallery.images[-1]])
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(pane.results_gallery.images) == 1002
                     and not pane._face_review_stream_in_progress
                 )
             )
-            self.assertEqual([0, 500, 1000], service.page_calls)
-            self.assertTrue(
-                self._wait_until(lambda: pane.face_detected_faces_model.rowCount() == 1001)
-            )
+            self.assertGreaterEqual(service.page_calls.count(500), 2)
+            self.assertEqual(1000, service.page_calls[-1])
+            self.assertEqual(1002, len(pane.results_gallery.images))
+            self.assertEqual("/photos/0000.jpg", pane.results_gallery.images[0])
+            self.assertEqual("/photos/0000.jpg", pane._face_review_selected_path)
         finally:
             service.release_later_pages.set()
             pane.close()
@@ -8194,7 +9529,15 @@ class UiSmokeTests(unittest.TestCase):
             pane.close()
 
     def test_cluster_visible_uses_full_visible_scope_while_detected_faces_publish_is_in_progress(self):
-        pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
+        service = self._FakeFaceLibraryService()
+        pane = SearchPane(
+            enabled_tabs=["Face Library"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
+        pane.set_startup_readiness(True, "Fixture face models are ready.")
         pane.show()
         try:
             review_images = [
@@ -8464,6 +9807,7 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.face_folder_path.setText("/photos")
         pane.show()
         pane._refresh_scanned_faces()
@@ -8534,6 +9878,7 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.face_folder_path.setText("/photos")
         pane.show()
         pane._refresh_scanned_faces()
@@ -8603,6 +9948,7 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.face_folder_path.setText("/photos")
         pane.show()
         pane._refresh_scanned_faces()
@@ -8638,6 +9984,32 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn("Ignored 1 similar face(s)", pane.status_label.text())
         pane.close()
 
+    def test_face_find_all_indexed_override_drops_active_working_set(self):
+        service = self._FakeFaceLibraryService(
+            records=[
+                self._face_record("/active/a.jpg", 0, bbox=(10, 10, 50, 60)),
+                self._face_record("/outside/b.jpg", 0, bbox=(15, 15, 55, 65)),
+            ],
+        )
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Folder Review", "Face Search"],
+            external_results=False,
+            face_service_global=service,
+        )
+        pane.current_scope_roots_provider = lambda: ("/active",)
+        pane.current_scope_paths_provider = lambda: ["/active/a.jpg"]
+        pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))  # type: ignore[method-assign]
+        pane.face_search_all_indexed_checkbox.setChecked(True)
+        pane._search_face_ref("/active/a.jpg", 0, source_label="test")
+
+        self.assertIsNone(service.search_similar_face_calls[-1]["candidate_paths"])
+        self.assertEqual("", service.search_similar_face_calls[-1]["folder_prefix"])
+
+        pane.face_search_all_indexed_checkbox.setChecked(False)
+        pane._search_face_ref("/active/a.jpg", 0, source_label="test")
+        self.assertEqual(["/active/a.jpg"], service.search_similar_face_calls[-1]["candidate_paths"])
+        pane.close()
+
     def test_detected_faces_context_menu_ignores_only_similar_faces_from_single_selection(self):
         pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
         service = self._FakeFaceLibraryService(
@@ -8647,6 +10019,7 @@ class UiSmokeTests(unittest.TestCase):
             ],
         )
         pane.face_service_global = service
+        pane.current_scope_roots_provider = lambda: ("/photos",)
         pane.face_folder_path.setText("/photos")
         pane._refresh_scanned_faces()
         pane._start_job = lambda _label, run, done: done(run(lambda *_args: None, lambda: False))  # type: ignore[method-assign]
@@ -8668,6 +10041,598 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(0, service.search_similar_face_calls[-1]["face_index"])
         self.assertEqual([[('/photos/b.jpg', 0)]], service.hide_faces_calls)
         pane.close()
+
+    def test_detected_faces_similarity_actions_explain_missing_active_root(self):
+        pane = SearchPane(enabled_tabs=["Face Library"], external_results=False)
+        service = self._FakeFaceLibraryService(
+            records=[self._face_record("/photos/a.jpg", 0, bbox=(10, 10, 50, 60))],
+        )
+        pane.face_service_global = service
+        pane.face_folder_path.setText("/photos")
+        pane._refresh_scanned_faces()
+        index = pane.face_detected_faces_model.index(0, 0)
+        pane.face_detected_faces_list.selectionModel().select(
+            index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+        menu = pane._build_detected_faces_context_menu()
+        actions = {action.text(): action for action in menu.actions() if not action.isSeparator()}
+
+        self.assertFalse(actions["Find Similar"].isEnabled())
+        self.assertFalse(actions["Ignore Similar Faces"].isEnabled())
+        self.assertIn("Choose an active Root", actions["Find Similar"].toolTip())
+        self.assertIn("Choose an active Root", actions["Find Similar"].statusTip())
+        self.assertIn("Choose an active Root", actions["Find Similar"].whatsThis())
+        pane.close()
+
+    def test_people_action_eligibility_uses_one_scope_readiness_selection_and_safety_contract(self):
+        service = self._FakeFaceLibraryService()
+        pane = SearchPane(
+            enabled_tabs=["Face Library", "Face Search"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        roots: tuple[str, ...] = ()
+        refs = [("/photos/a.jpg", 0), ("/photos/b.jpg", 0)]
+        pane.current_scope_roots_provider = lambda: roots
+        try:
+            # A user cannot start root-bound work that the handler would
+            # reject. The visible buttons follow the identical predicate.
+            pane._update_face_mode_status()
+            for action in ("detect", "index", "reindex"):
+                allowed, reason = pane._face_action_eligibility(action)
+                self.assertFalse(allowed)
+                self.assertIn("active Roots", reason)
+            self.assertFalse(pane.face_scan_button.isEnabled())
+            self.assertFalse(pane.face_index_button.isEnabled())
+            self.assertFalse(pane.face_reindex_button.isEnabled())
+            started: list[str] = []
+            pane._start_job = lambda label, *_args: started.append(label)  # type: ignore[method-assign]
+            pane._scan_face_folder()
+            pane._index_faces()
+            pane._reindex_faces()
+            self.assertEqual([], started)
+
+            roots = ("/photos",)
+            pane._update_face_mode_status()
+            for action in ("detect", "index", "reindex"):
+                self.assertTrue(pane._face_action_eligibility(action)[0])
+            self.assertTrue(pane.face_scan_button.isEnabled())
+            self.assertTrue(pane.face_index_button.isEnabled())
+            self.assertTrue(pane.face_reindex_button.isEnabled())
+
+            # Similarity remains scoped unless the explicit all-indexed
+            # override is selected. Clustering needs two refs; naming and
+            # ignore mutations remain unavailable in read-only mode.
+            roots = ()
+            self.assertFalse(pane._face_action_eligibility("find_similar", indexed_refs=refs)[0])
+            pane.face_search_all_indexed_checkbox.setChecked(True)
+            self.assertTrue(pane._face_action_eligibility("find_similar", indexed_refs=refs)[0])
+            self.assertFalse(pane._face_action_eligibility("cluster_selected", indexed_refs=refs[:1])[0])
+            self.assertTrue(pane._face_action_eligibility("cluster_selected", indexed_refs=refs)[0])
+            self.assertFalse(pane._face_action_eligibility("find_similar", indexed_refs=refs, ignored_view=True)[0])
+            pane.set_read_only_mode(True)
+            self.assertFalse(pane._face_action_eligibility("name", indexed_refs=refs)[0])
+            self.assertFalse(pane._face_action_eligibility("ignore_similar", indexed_refs=refs)[0])
+
+            # While the shell readiness job is checking, every model-backed
+            # action stays disabled even if fixture records already exist.
+            roots = ("/photos",)
+            pane.set_read_only_mode(False)
+            pane.set_startup_readiness(False, "Checking fixture face models.")
+            self.assertFalse(pane._face_action_eligibility("detect")[0])
+            self.assertFalse(pane._face_action_eligibility("find_similar", indexed_refs=refs)[0])
+            self.assertFalse(pane.face_scan_button.isEnabled())
+        finally:
+            pane.close()
+
+    def test_query_photo_and_saved_search_actions_share_visible_and_handler_guards(self):
+        service = self._FakeFaceLibraryService()
+        with TemporaryDirectory() as tmp:
+            pane = SearchPane(
+                enabled_tabs=["Face Library", "Face Search"],
+                external_results=False,
+                face_service_global=service,
+                face_service_session=service,
+                saved_search_service=SavedSearchService(Path(tmp) / "saved-searches.json"),
+            )
+            started: list[str] = []
+            pane._start_job = lambda label, *_args: started.append(label)  # type: ignore[method-assign]
+            try:
+                self.assertFalse(pane.face_query_detect_button.isEnabled())
+                self.assertIn("Choose a query photo", pane.face_query_detect_button.accessibleDescription())
+                pane._detect_query_photo_faces()
+                self.assertEqual([], started)
+                self.assertIn("Choose a query photo", pane.status_label.text())
+
+                pane.face_query_path.setText(str(Path(tmp) / "query.jpg"))
+                self.assertTrue(pane.face_query_detect_button.isEnabled())
+
+                for button in (
+                    pane.saved_search_run_button,
+                    pane.saved_search_rename_button,
+                    pane.saved_search_delete_button,
+                ):
+                    self.assertFalse(button.isEnabled())
+                    self.assertIn("Select a saved search", button.accessibleDescription())
+                pane._run_selected_saved_search()
+                pane._rename_selected_saved_search()
+                pane._delete_selected_saved_search()
+                self.assertIn("Select a saved search", pane.status_label.text())
+
+                record = pane.saved_search_service.save_search("Unknown", "unknown_people", {"mode": "unknown"})
+                pane._apply_saved_searches(
+                    pane.saved_search_service.list_searches(),
+                    record.search_id,
+                )
+                self.assertTrue(pane.saved_search_run_button.isEnabled())
+                self.assertTrue(pane.saved_search_rename_button.isEnabled())
+                self.assertTrue(pane.saved_search_delete_button.isEnabled())
+
+                # Queued primary work blocks People searches before a thread
+                # starts, but independent saved-search file edits remain
+                # available and a clustering-filter handoff stays concurrent.
+                pane._active_job = object()
+                pane._active_thread = None
+                pane._update_query_and_saved_search_actions()
+                self.assertFalse(pane.saved_search_run_button.isEnabled())
+                self.assertTrue(pane.saved_search_rename_button.isEnabled())
+                self.assertTrue(pane.saved_search_delete_button.isEnabled())
+
+                handoffs: list[dict[str, object]] = []
+                pane.saved_clustering_filter_requested.connect(handoffs.append)
+                filter_record = pane.saved_search_service.save_search(
+                    "Cluster filter",
+                    "clustering_filter",
+                    {"tags": ["family"]},
+                )
+                pane._apply_saved_searches(
+                    pane.saved_search_service.list_searches(),
+                    filter_record.search_id,
+                )
+                self.assertTrue(pane.saved_search_run_button.isEnabled())
+                pane._run_selected_saved_search()
+                self.assertEqual([{"tags": ["family"]}], handoffs)
+
+                # A list item whose backing record disappeared is stale and
+                # every visible/direct entry point rejects it.
+                pane._saved_search_records.pop(filter_record.search_id)
+                pane._update_query_and_saved_search_actions()
+                self.assertFalse(pane.saved_search_run_button.isEnabled())
+                self.assertFalse(pane.saved_search_rename_button.isEnabled())
+                self.assertFalse(pane.saved_search_delete_button.isEnabled())
+                pane._run_selected_saved_search()
+                self.assertIn("Select a saved search", pane.status_label.text())
+                pane._active_job = None
+                pane._apply_saved_searches(
+                    pane.saved_search_service.list_searches(),
+                    record.search_id,
+                )
+
+                pane.set_read_only_mode(True)
+                self.assertTrue(pane.saved_search_run_button.isEnabled())
+                self.assertFalse(pane.saved_search_rename_button.isEnabled())
+                self.assertFalse(pane.saved_search_delete_button.isEnabled())
+
+                pane.set_read_only_mode(False)
+                pane.set_startup_readiness(False, "Checking fixture face models.")
+                self.assertFalse(pane.face_query_detect_button.isEnabled())
+                self.assertIn("Checking fixture face models", pane.face_query_detect_button.accessibleDescription())
+                self.assertTrue(pane.saved_search_run_button.isEnabled())
+            finally:
+                pane.close()
+
+    def test_query_photo_validation_rejects_missing_and_corrupt_files_off_the_ui_thread(self):
+        service = self._FakeFacePipelineService()
+        pane = SearchPane(
+            enabled_tabs=["Face Library", "Face Search"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        captured: list[tuple[object, object]] = []
+        pane._start_job = lambda _label, run, done: captured.append((run, done))  # type: ignore[method-assign]
+        try:
+            with TemporaryDirectory() as tmp:
+                missing = Path(tmp) / "missing.jpg"
+                pane.face_query_path.setText(str(missing))
+                pane._detect_query_photo_faces()
+                missing_run, _missing_done = captured.pop(0)
+                with self.assertRaisesRegex(ValueError, "does not exist"):
+                    missing_run(lambda *_args: None, lambda: False)
+
+                corrupt = Path(tmp) / "corrupt.jpg"
+                corrupt.write_bytes(b"not an image")
+                pane.face_query_path.setText(str(corrupt))
+                pane._detect_query_photo_faces()
+                corrupt_run, _corrupt_done = captured.pop(0)
+                with self.assertRaisesRegex(ValueError, "cannot be read|cannot be decoded"):
+                    corrupt_run(lambda *_args: None, lambda: False)
+
+                valid = Path(tmp) / "valid.png"
+                Image.new("RGB", (24, 24), color=(10, 20, 30)).save(valid)
+                pane.face_query_path.setText(str(valid))
+                pane._detect_query_photo_faces()
+                valid_run, valid_done = captured.pop(0)
+                progress_messages: list[str] = []
+                faces = valid_run(
+                    lambda _value, message: progress_messages.append(str(message)),
+                    lambda: False,
+                )
+                valid_done(faces)
+
+                self.assertEqual(
+                    {"image_path": str(valid), "include_tiny_faces": False},
+                    service.detect_faces_for_image_calls[-1],
+                )
+                self.assertEqual(
+                    ["Validating query photo...", "Detecting query faces..."],
+                    progress_messages,
+                )
+                self.assertEqual(1, len(service.detect_faces_for_image_calls))
+        finally:
+            pane.close()
+
+    def test_query_photo_action_queues_only_for_conflicting_coordinated_work(self):
+        from ui.work_coordinator import JobSpec, WorkCoordinator
+
+        service = self._FakeFacePipelineService()
+        manager = JobManager()
+        coordinator = WorkCoordinator(manager, gpu_policy="queue", io_capacity=2)
+        with TemporaryDirectory() as tmp:
+            query_path = Path(tmp) / "query.png"
+            Image.new("RGB", (32, 32), color=(80, 120, 160)).save(query_path)
+            pane = SearchPane(
+                enabled_tabs=["Face Library", "Face Search"],
+                external_results=False,
+                face_service_global=service,
+                face_service_session=service,
+            )
+            pane.configure_jobs(manager, coordinator)
+            pane.current_scope_roots_provider = lambda: (tmp,)
+            pane.face_query_path.setText(str(query_path))
+            try:
+                independent = coordinator.submit(
+                    JobSpec(
+                        "Library browse",
+                        origin="Library",
+                        io_bound=True,
+                        source_reads=(str(Path(tmp) / "other"),),
+                    ),
+                    lambda _job_id, _fallback: None,
+                )
+                self.assertEqual("running", manager.get(independent).status)
+                self.assertTrue(pane.face_query_detect_button.isEnabled())
+                coordinator.finish(independent)
+
+                gpu_owner = coordinator.submit(
+                    JobSpec("Organize embeddings", origin="Organize", uses_gpu=True),
+                    lambda _job_id, _fallback: None,
+                )
+                pane._detect_query_photo_faces()
+                query_job = pane._active_job
+                self.assertIsNotNone(query_job)
+                query_job_id = pane._coordinated_job_ids[query_job]
+                self.assertEqual("queued", manager.get(query_job_id).status)
+                self.assertEqual([], service.detect_faces_for_image_calls)
+                self.assertFalse(pane.face_query_detect_button.isEnabled())
+                self.assertIn("active People operation", pane.face_query_detect_button.accessibleDescription())
+
+                coordinator.finish(gpu_owner)
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: bool(service.detect_faces_for_image_calls)
+                        and manager.get(query_job_id).status == "finished"
+                        and pane._active_job is None,
+                        timeout_s=3.0,
+                    )
+                )
+                self.assertTrue(pane.face_query_detect_button.isEnabled())
+            finally:
+                pane.shutdown_jobs(timeout_ms=1_000)
+                pane.close()
+
+    def test_query_detect_and_search_workers_use_immutable_ui_thread_snapshots(self):
+        service = self._FakeFacePipelineService(
+            records=[self._face_record("/photos/query.jpg", 0)],
+        )
+        pane = SearchPane(
+            enabled_tabs=["Face Library", "Face Search"],
+            external_results=False,
+            face_service_global=service,
+            face_service_session=service,
+        )
+        pane.current_scope_roots_provider = lambda: ("/photos",)
+        pane.current_scope_paths_provider = lambda: ["/photos/query.jpg"]
+        captured: list[tuple[str, object, object]] = []
+        pane._start_job = (  # type: ignore[method-assign]
+            lambda label, run, done: captured.append((str(label), run, done))
+        )
+        pane._validate_query_image_path = lambda _path: None  # type: ignore[method-assign]
+        try:
+            pane.face_query_path.setText("/photos/query.jpg")
+            pane.show_tiny_detections_checkbox.setChecked(False)
+            pane._detect_query_photo_faces()
+            detect_label, detect_run, detect_done = captured.pop(0)
+            self.assertEqual("Detecting query faces", detect_label)
+
+            pane.show_tiny_detections_checkbox.setChecked(True)
+            pane._active_face_service = lambda: self.fail("worker read the active service")  # type: ignore[method-assign]
+            detected = detect_run(lambda *_args: None, lambda: False)
+            self.assertEqual(
+                {"image_path": "/photos/query.jpg", "include_tiny_faces": False},
+                service.detect_faces_for_image_calls[-1],
+            )
+            detect_done(detected)
+            pane._populate_query_face_candidates("/photos/query.jpg", [])
+
+            pane._active_face_service = lambda: service  # type: ignore[method-assign]
+            pane.face_top_k.setValue(7)
+            pane.show_tiny_detections_checkbox.setChecked(False)
+            pane._search_faces()
+            search_label, search_run, search_done = captured.pop(0)
+            self.assertEqual("Searching faces", search_label)
+
+            pane.face_top_k.setValue(99)
+            pane.show_tiny_detections_checkbox.setChecked(True)
+            pane._active_face_service = lambda: self.fail("worker read the active service")  # type: ignore[method-assign]
+            results = search_run(lambda *_args: None, lambda: False)
+            request = service.search_faces_calls[-1]["request"]
+            self.assertEqual(7, request.top_k)
+            self.assertFalse(request.include_tiny_faces)
+
+            pane._active_face_service = lambda: service  # type: ignore[method-assign]
+            pane.face_query_path.setText("/photos/new-query.jpg")
+            pane.status_label.setText("New request retained")
+            search_done(results)
+            self.assertEqual("New request retained", pane.status_label.text())
+
+            pane.face_browser_top_k.setValue(11)
+            pane.show_tiny_detections_checkbox.setChecked(False)
+            pane._search_face_refs(
+                [("/photos/query.jpg", 0), ("/photos/second.jpg", 1)],
+                source_label="Selected photo",
+            )
+            selected_label, selected_run, selected_done = captured.pop(0)
+            self.assertEqual("Searching selected faces", selected_label)
+            pane.face_browser_top_k.setValue(88)
+            pane.show_tiny_detections_checkbox.setChecked(True)
+            pane._active_face_service = lambda: self.fail("worker read the active service")  # type: ignore[method-assign]
+            selected_results = selected_run(lambda *_args: None, lambda: False)
+            selected_call = service.search_similar_faces_calls[-1]
+            self.assertEqual(11, selected_call["top_k"])
+            self.assertFalse(selected_call["include_tiny_faces"])
+
+            pane._active_face_service = lambda: service  # type: ignore[method-assign]
+            pane._on_face_similarity_scope_changed(False)
+            pane.status_label.setText("Changed scope retained")
+            selected_done(selected_results)
+            self.assertEqual("Changed scope retained", pane.status_label.text())
+        finally:
+            pane.close()
+
+    def test_generic_people_workers_reject_late_ui_events_after_scope_change(self):
+        for outcome in ("success", "failure", "cancel"):
+            with self.subTest(outcome=outcome):
+                pane = SearchPane(enabled_tabs=["Image Search"], external_results=False)
+                started = Event()
+                release = Event()
+                published: list[object] = []
+
+                def _run(progress, _cancel_check):
+                    started.set()
+                    if not release.wait(2.0):
+                        raise RuntimeError("test worker release timed out")
+                    progress(65, "late progress")
+                    if outcome == "failure":
+                        raise RuntimeError("late failure")
+                    return "late result"
+
+                try:
+                    with patch("ui.search_pane.errorBox") as error_box:
+                        job = pane._start_job("Context-bound work", _run, published.append)
+                        self.assertIsNotNone(job)
+                        self.assertTrue(self._wait_until(started.is_set))
+
+                        pane.active_scope_changed()
+                        pane.status_label.setText("New scope retained")
+                        if outcome == "cancel":
+                            job.cancel()
+                        release.set()
+
+                        self.assertTrue(
+                            self._wait_until(
+                                lambda: pane._active_thread is None
+                                and pane._active_job is None
+                            )
+                        )
+                        self.assertEqual([], published)
+                        self.assertEqual("New scope retained", pane.status_label.text())
+                        self.assertFalse(pane.progress_bar.isVisible())
+                        error_box.assert_not_called()
+                finally:
+                    release.set()
+                    pane.close()
+
+    def test_manage_disclosures_hide_bodies_and_do_not_override_action_guards(self):
+        pane = SearchPane(enabled_tabs=["Identities"], external_results=False)
+        try:
+            pane.show()
+            APP.processEvents()
+            collapsed_management_height = pane.face_identity_management_group.sizeHint().height()
+            collapsed_danger_height = pane.face_identity_danger_group.sizeHint().height()
+            self.assertTrue(pane.face_identity_management_body.isHidden())
+            self.assertTrue(pane.face_identity_danger_body.isHidden())
+            self.assertFalse(pane.face_identity_remove_button.isVisibleTo(pane))
+            self.assertFalse(pane.face_delete_db_button.isVisibleTo(pane))
+            self.assertFalse(pane.face_identity_remove_button.isEnabled())
+            self.assertFalse(pane.face_identity_merge_button.isEnabled())
+            self.assertFalse(pane.face_identity_clear_button.isEnabled())
+
+            pane.face_identity_management_toggle.setFocus()
+            QTest.keyClick(pane.face_identity_management_toggle, Qt.Key.Key_Space)
+            APP.processEvents()
+            self.assertFalse(pane.face_identity_management_body.isHidden())
+            QTest.keyClick(pane.face_identity_management_toggle, Qt.Key.Key_Space)
+            APP.processEvents()
+            self.assertTrue(pane.face_identity_management_body.isHidden())
+
+            pane.face_identity_management_toggle.setFocus()
+            for _ in range(12):
+                QTest.keyClick(pane, Qt.Key.Key_Tab)
+                focused = APP.focusWidget()
+                self.assertFalse(
+                    focused is not None
+                    and pane.face_identity_management_body.isAncestorOf(focused)
+                )
+                self.assertFalse(
+                    focused is not None
+                    and pane.face_identity_danger_body.isAncestorOf(focused)
+                )
+
+            pane.set_read_only_mode(True)
+            pane.face_identity_management_toggle.setChecked(True)
+            pane.face_identity_danger_toggle.setChecked(True)
+            APP.processEvents()
+
+            self.assertFalse(pane.face_identity_management_body.isHidden())
+            self.assertFalse(pane.face_identity_danger_body.isHidden())
+            self.assertGreater(pane.face_identity_management_group.sizeHint().height(), collapsed_management_height)
+            self.assertGreater(pane.face_identity_danger_group.sizeHint().height(), collapsed_danger_height)
+            self.assertFalse(pane.face_identity_remove_button.isEnabled())
+            self.assertFalse(pane.face_delete_db_button.isEnabled())
+
+            pane.set_read_only_mode(False)
+            pane._face_identity_selected_name = "Alice"
+            pane._face_identity_prototypes_by_name["Alice"] = []
+            pane._update_face_identity_prototype_actions()
+            self.assertTrue(pane.face_identity_merge_button.isEnabled())
+            self.assertTrue(pane.face_identity_clear_button.isEnabled())
+            for button in (
+                pane.face_identity_remove_button,
+                pane.face_identity_merge_button,
+                pane.face_identity_clear_button,
+                pane.face_disable_recognition_button,
+                pane.face_delete_db_button,
+                pane.face_purge_data_button,
+            ):
+                self.assertFalse(button.autoDefault())
+                self.assertFalse(button.isDefault())
+
+            pane._set_busy(True, "Fixture operation running")
+            pane.face_identity_management_toggle.setChecked(False)
+            pane.face_identity_management_toggle.setChecked(True)
+            pane.face_identity_danger_toggle.setChecked(False)
+            pane.face_identity_danger_toggle.setChecked(True)
+            APP.processEvents()
+            self.assertFalse(pane.face_identity_merge_button.isEnabled())
+            self.assertFalse(pane.face_identity_clear_button.isEnabled())
+            self.assertFalse(pane.face_delete_db_button.isEnabled())
+            pane._set_busy(False)
+            self.assertTrue(pane.face_identity_merge_button.isEnabled())
+            self.assertTrue(pane.face_identity_clear_button.isEnabled())
+
+            pane.face_identity_management_toggle.setChecked(False)
+            pane.face_identity_danger_toggle.setChecked(False)
+            APP.processEvents()
+            self.assertTrue(pane.face_identity_management_body.isHidden())
+            self.assertTrue(pane.face_identity_danger_body.isHidden())
+        finally:
+            pane.close()
+
+    def test_manage_disclosures_remain_reachable_in_both_themes_at_large_text(self):
+        original_theme = current_theme()
+        original_scale = int(APP.property("clusterlens_text_scale") or 100)
+        try:
+            for theme in ("dark", "light"):
+                with self.subTest(theme=theme, scale=200):
+                    apply_app_theme(APP, theme)
+                    apply_app_text_scale(APP, 200)
+                    pane = SearchPane(enabled_tabs=["Identities"], external_results=False)
+                    try:
+                        pane.resize(1280, 720)
+                        pane.workspace_splitter.setSizes([560, 720])
+                        pane.show()
+                        APP.processEvents()
+                        viewport = pane.sidebar_scroll.viewport()
+                        identity_layout = pane.face_identity_management_group.parentWidget().layout()
+                        self.assertLess(
+                            identity_layout.indexOf(pane.face_identity_list),
+                            identity_layout.indexOf(pane.face_identity_management_group),
+                        )
+                        self.assertLess(
+                            identity_layout.indexOf(pane.face_identity_management_group),
+                            identity_layout.indexOf(pane.face_identity_danger_group),
+                        )
+
+                        for toggle, target in (
+                            (pane.face_identity_management_toggle, pane.face_identity_merge_button),
+                            (pane.face_identity_danger_toggle, pane.face_purge_data_button),
+                        ):
+                            toggle.setChecked(True)
+                            APP.processEvents()
+                            APP.processEvents()
+                            pane.sidebar_scroll.ensureWidgetVisible(target, 0, 12)
+                            APP.processEvents()
+                            pane.sidebar_scroll.ensureWidgetVisible(target, 0, 12)
+                            APP.processEvents()
+                            mapped = target.rect().translated(target.mapTo(viewport, QPoint(0, 0)))
+                            self.assertTrue(target.isVisibleTo(pane))
+                            self.assertTrue(viewport.rect().contains(mapped), target.objectName() or target.__class__.__name__)
+                            toggle.setChecked(False)
+                            APP.processEvents()
+                            self.assertTrue(target.isHidden() or not target.isVisibleTo(pane))
+                    finally:
+                        pane.close()
+                        pane.deleteLater()
+                        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                        APP.processEvents()
+        finally:
+            apply_app_text_scale(APP, original_scale)
+            apply_app_theme(APP, original_theme)
+            APP.processEvents()
+
+    def test_people_fields_have_label_buddies_and_lists_have_meaningful_names(self):
+        pane = SearchPane(
+            enabled_tabs=["All Faces", "Face Library", "Face Search", "Identities"],
+            external_results=False,
+        )
+        try:
+            photo_cell = pane.face_query_photo_cell
+            labels = photo_cell.findChildren(QLabel)
+            self.assertTrue(labels)
+            self.assertIs(pane.face_query_path, labels[0].buddy())
+            self.assertEqual("Photo", pane.face_query_path.accessibleName())
+
+            for control in (
+                pane.face_album_label_filter_combo,
+                pane.face_named_people_list,
+                pane.face_unlabeled_groups_list,
+                pane.face_scanned_list,
+                pane.saved_search_name,
+                pane.saved_search_kind,
+                pane.saved_searches_list,
+                pane.face_query_detect_button,
+                pane.face_query_faces_list,
+                pane.face_pending_list,
+                pane.face_pending_preview_list,
+                pane.face_identity_list,
+                pane.face_identity_prototype_list,
+            ):
+                self.assertTrue(control.accessibleName(), control.__class__.__name__)
+
+            self.assertEqual("People workspace status", pane.status_label.accessibleName())
+            pane._set_busy(True, "Preparing face models")
+            self.assertIn("completion total is not known", pane.progress_bar.accessibleDescription())
+            self.assertIn("Preparing face models", pane.progress_bar.accessibleDescription())
+            pane._on_job_progress(42, "Embedded 42 of 100 faces")
+            self.assertIn("42 percent complete", pane.progress_bar.accessibleDescription())
+            self.assertIn("Embedded 42 of 100 faces", pane.progress_bar.accessibleDescription())
+            pane._set_busy(False, "Face indexing cancelled")
+            self.assertIn("no longer running", pane.progress_bar.accessibleDescription())
+            self.assertIn("cancelled", pane.progress_bar.accessibleDescription())
+        finally:
+            pane.close()
 
     def test_face_library_auto_clean_folder_review_removes_obvious_junk(self):
         service = self._FakeFaceLibraryService(
@@ -8846,13 +10811,13 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(
             self._wait_until(
                 lambda: self._list_view_count(pane.face_scanned_list) == 1
-                and "Loaded 0 saved identities and 1 unlabeled group(s)." in pane.face_people_summary.text(),
+                and "Showing 0 saved identities and 1 unlabeled group." in pane.face_people_summary.text(),
                 timeout_s=2.0,
             )
         )
 
         self.assertEqual(1, self._list_view_count(pane.face_scanned_list))
-        self.assertIn("Loaded 0 saved identities and 1 unlabeled group(s).", pane.face_people_summary.text())
+        self.assertIn("Showing 0 saved identities and 1 unlabeled group.", pane.face_people_summary.text())
 
         pane.close()
 
@@ -8954,7 +10919,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(state["show_tiny_detections"])
         self.assertEqual("dog", state["face_mode"])
         self.assertEqual("advanced", state["face_ui_mode"])
-        self.assertEqual(0, state["face_library_tab"])
+        self.assertEqual(1, state["face_library_tab"])
         self.assertEqual("best_detected_face", state["face_review_sort"])
         self.assertEqual("hdbscan", state["face_cluster_backend"])
         self.assertEqual(["hdbscan"], state["face_cluster_backends"])
@@ -8973,7 +10938,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(restored.show_tiny_detections_checkbox.isChecked())
         self.assertEqual("dog", restored.current_face_mode())
         self.assertEqual("advanced", restored.current_ui_mode())
-        self.assertEqual(0, restored.face_library_tabs.currentIndex())
+        self.assertEqual(1, restored.face_library_tabs.currentIndex())
         self.assertEqual("best_detected_face", restored.face_review_sort.currentData())
         self.assertTrue(restored.face_cluster_backend_override_checkbox.isChecked())
         self.assertEqual("hdbscan", restored.face_cluster_backend.currentData())
@@ -9009,7 +10974,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(1, restored.face_advanced_tabs.currentIndex())
         self.assertTrue(restored.face_quality_manual_toggle.isChecked())
         self.assertFalse(hasattr(restored, "face_scanned_details_toggle"))
-        self.assertFalse(restored.face_scanned_list.isVisible())
+        self.assertTrue(restored.face_scanned_list.isVisible())
         self.assertTrue(restored.face_search_selected_options_toggle.isChecked())
         self.assertTrue(restored.face_find_options_toggle.isChecked())
         self.assertTrue(restored.face_save_options_toggle.isChecked())
@@ -9091,7 +11056,7 @@ class UiSmokeTests(unittest.TestCase):
         try:
             self.assertIsInstance(pane.task_navigation, QTabBar)
             self.assertEqual(
-                ["All Faces", "Detect", "Find"],
+                ["All Faces", "Detect", "Find", "Manage"],
                 [pane.task_navigation.tabText(index) for index in range(pane.task_navigation.count())],
             )
             self.assertLessEqual(pane.task_navigation.height(), 40)
@@ -9149,8 +11114,8 @@ class UiSmokeTests(unittest.TestCase):
             pane.task_navigation.setCurrentIndex(2)
             APP.processEvents()
             self.assertEqual("Face Search", pane.tabs.tabText(pane.tabs.currentIndex()))
-            self.assertFalse(pane.face_library_tabs.tabBar().isTabVisible(1))
-            self.assertNotIn("Identities", [pane.task_navigation.tabText(index) for index in range(pane.task_navigation.count())])
+            self.assertTrue(pane.face_library_tabs.tabBar().isTabVisible(1))
+            self.assertIn("Manage", [pane.task_navigation.tabText(index) for index in range(pane.task_navigation.count())])
         finally:
             pane.close()
 
@@ -9440,7 +11405,30 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([], pane._retained_face_refresh_refs)
         pane.close()
 
-    def test_shutdown_jobs_detaches_stuck_face_refresh_thread(self):
+    def test_shutdown_jobs_cancels_face_result_filter_threads(self):
+        pane = SearchPane(enabled_tabs=["Face Library", "Face Search"], external_results=False)
+        job = self._FakeAsyncJob()
+        thread = self._FakeAsyncThread(running=True, wait_result=True)
+        retained_job = self._FakeAsyncJob()
+        retained_thread = self._FakeAsyncThread(running=True, wait_result=True)
+        pane._face_result_filter_job = job
+        pane._face_result_filter_thread = thread
+        pane._retained_face_result_filter_refs = [(retained_job, retained_thread)]
+        generation = pane._face_result_filter_request_id
+
+        ready = pane.shutdown_jobs(timeout_ms=75)
+
+        self.assertTrue(ready)
+        self.assertEqual(generation + 1, pane._face_result_filter_request_id)
+        self.assertEqual(1, job.cancel_calls)
+        self.assertEqual(1, retained_job.cancel_calls)
+        self.assertEqual(1, thread.quit_calls)
+        self.assertEqual(1, retained_thread.quit_calls)
+        self.assertIsNone(pane._face_result_filter_thread)
+        self.assertEqual([], pane._retained_face_result_filter_refs)
+        pane.close()
+
+    def test_shutdown_jobs_retains_stuck_face_refresh_thread_until_it_drains(self):
         pane = SearchPane(enabled_tabs=["Face Library", "Face Search"], external_results=False)
         job = self._FakeAsyncJob()
         thread = self._StickyLoaderThread()
@@ -9448,16 +11436,14 @@ class UiSmokeTests(unittest.TestCase):
         pane._face_refresh_thread = thread
         pane._retained_face_refresh_refs = [(job, thread)]
 
-        with patch("ui.search_pane.detach_running_async_job", return_value=True) as detach:
-            ready = pane.shutdown_jobs(timeout_ms=75)
+        ready = pane.shutdown_jobs(timeout_ms=75)
 
-        self.assertTrue(ready)
+        self.assertFalse(ready)
         self.assertEqual(1, job.cancel_calls)
         self.assertEqual(1, thread.quit_calls)
         self.assertEqual([75], thread.wait_calls)
-        detach.assert_called_once_with(job, thread)
-        self.assertIsNone(pane._face_refresh_thread)
-        self.assertEqual([], pane._retained_face_refresh_refs)
+        self.assertIs(thread, pane._face_refresh_thread)
+        self.assertEqual([(job, thread)], pane._retained_face_refresh_refs)
         pane.close()
 
     def test_shutdown_jobs_cancels_face_review_publish_threads(self):
@@ -9680,10 +11666,14 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual([15], preview_thread.wait_calls)
         self.assertEqual([15], face_edit_thread.wait_calls)
         self.assertEqual([15], retained_thread.wait_calls)
+        for job in (active_job, preview_job, face_edit_job, retained_job):
+            self.assertEqual(1, job.progress.disconnect_calls)
+            self.assertEqual(1, job.completed.disconnect_calls)
+            self.assertEqual(1, job.cancelled.disconnect_calls)
         self.assertEqual([], dialog._retained_async_refs)
         dialog.close()
 
-    def test_photo_inspector_basic_mode_hides_metadata_and_shows_path_summary(self):
+    def test_photo_inspector_basic_mode_keeps_curated_metadata_editing_and_hides_raw_details(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "sample-photo.jpg"
             image_path.write_bytes(b"stub")
@@ -9700,11 +11690,72 @@ class UiSmokeTests(unittest.TestCase):
                 self.assertEqual(str(image_path.parent), dialog.folder_label.toolTip())
                 self.assertEqual(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, dialog.name_label.alignment())
                 self.assertEqual(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, dialog.folder_label.alignment())
-                self.assertIn("Metadata is hidden", dialog.state_label.text())
-                self.assertFalse(dialog.metadata_summary_label.isVisible())
+                self.assertTrue(dialog.metadata_summary_label.isVisible())
+                dialog.inspector_tabs.setCurrentWidget(dialog.metadata_page)
+                APP.processEvents()
+                self.assertTrue(dialog.metadata_editor_group.isVisible())
                 self.assertFalse(dialog.info_text.isVisible())
+                self.assertTrue(dialog.face_regions_button.isVisible())
+                self.assertTrue(dialog.capture_time_button.isVisible())
+                self.assertEqual("YYYY-MM-DD HH:MM:SS", dialog.metadata_captured_at_input.placeholderText())
+                self.assertTrue(dialog.metadata_help_button.toolTip())
+
+                dialog.capture_time_button.click()
+                APP.processEvents()
+                self.assertIs(dialog.metadata_captured_at_input, dialog.focusWidget())
+                self.assertIn("Refresh dates", dialog.state_label.text())
 
                 dialog.close()
+
+    def test_photo_inspector_basic_summary_shows_all_photo_date_fields_and_sidecar_correction(self):
+        metadata = PhotoMetadata(
+            image_path="/photos/example.jpg",
+            width=80,
+            height=60,
+            file_size=1_024,
+            modified_at="2026-09-17 08:00:00",
+            camera="Fixture Camera",
+            exif={
+                "DateTimeOriginal": "2024:05:06 12:34:56",
+                "DateTimeDigitized": "2024:05:06 12:35:00",
+                "DateTime": "2024:05:07 08:00:00",
+                "GPSDateStamp": "2024:05:06",
+                "GPSTimeStamp": "12:34:56",
+                "OffsetTimeOriginal": "+05:30",
+                "SubsecTimeOriginal": "123",
+                "GPSLatitude": "12.34",
+            },
+        )
+
+        summary = PhotoInspectorDialog._render_metadata_summary(
+            metadata,
+            PhotoEditDraft(captured_at="2024-05-06 12:34:56"),
+        )
+        empty_summary = PhotoInspectorDialog._render_metadata_summary(
+            PhotoMetadata(
+                image_path="/photos/no-exif.jpg",
+                width=80,
+                height=60,
+                file_size=1,
+                modified_at="2026-09-17 08:00:00",
+                camera="",
+            )
+        )
+
+        self.assertIn("File modified", summary)
+        for field in (
+            "DateTimeOriginal",
+            "DateTimeDigitized",
+            "DateTime",
+            "GPSDateStamp",
+            "GPSTimeStamp",
+            "OffsetTimeOriginal",
+            "SubsecTimeOriginal",
+            "Timeline correction (sidecar)",
+        ):
+            self.assertIn(field, summary)
+        self.assertNotIn("GPSLatitude", summary)
+        self.assertIn("No EXIF date/time fields found", empty_summary)
 
     def test_photo_inspector_uses_horizontal_splitter_with_details_on_right(self):
         with TemporaryDirectory() as tmp:
@@ -9742,7 +11793,28 @@ class UiSmokeTests(unittest.TestCase):
                 dialog.show()
                 APP.processEvents()
 
+                self.assertEqual(
+                    ["Info", "People", "Metadata", "EXIF"],
+                    [dialog.inspector_tabs.tabText(index) for index in range(dialog.inspector_tabs.count())],
+                )
                 self.assertTrue(dialog.metadata_summary_label.isVisible())
+                self.assertIsInstance(dialog.people_page, QScrollArea)
+                self.assertIsInstance(dialog.metadata_page, QScrollArea)
+                self.assertEqual(Qt.ScrollBarPolicy.ScrollBarAlwaysOff, dialog.people_page.horizontalScrollBarPolicy())
+                self.assertEqual(Qt.ScrollBarPolicy.ScrollBarAlwaysOff, dialog.metadata_page.horizontalScrollBarPolicy())
+                for action_surface in (
+                    dialog.viewer_actions,
+                    dialog.face_actions,
+                    dialog.face_name_actions,
+                    dialog.metadata_actions,
+                ):
+                    self.assertIsInstance(action_surface.layout(), ResponsiveFlowLayout)
+                self.assertGreater(
+                    dialog.viewer_actions.layout().heightForWidth(320),
+                    dialog.viewer_actions.layout().heightForWidth(1400),
+                )
+                dialog.inspector_tabs.setCurrentWidget(dialog.exif_page)
+                APP.processEvents()
                 self.assertTrue(dialog.info_text.isVisible())
                 self.assertEqual(1, dialog.content_splitter.indexOf(dialog.details_panel))
                 self.assertIn("Loading metadata", dialog.metadata_summary_label.text())
@@ -9799,6 +11871,7 @@ class UiSmokeTests(unittest.TestCase):
                 )
                 dialog._start_face_edit_job = _sync_face_job  # type: ignore[method-assign]
                 dialog.show()
+                dialog.inspector_tabs.setCurrentWidget(dialog.people_page)
                 APP.processEvents()
 
                 self.assertTrue(dialog.face_editor_panel.isVisible())
@@ -9865,6 +11938,7 @@ class UiSmokeTests(unittest.TestCase):
 
                 self._select_list_view_row(dialog.image_faces_list, 0)
                 dialog._on_face_draft_selection_changed()
+                dialog.inspector_tabs.setCurrentWidget(dialog.people_page)
                 APP.processEvents()
 
                 self.assertTrue(dialog.face_name_group.isVisible())
@@ -10034,6 +12108,36 @@ class UiSmokeTests(unittest.TestCase):
                 APP.processEvents()
                 self.assertEqual(before_nudge, dialog._face_drafts_by_path[str(image_path)][0].bbox)
 
+                dialog._discard_face_changes()
+                dialog.close()
+
+    def test_photo_inspector_requires_explicit_choice_before_leaving_dirty_face_edits(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "dirty-face-photo.jpg"
+            Image.new("RGB", (96, 96), (20, 30, 40)).save(image_path)
+            with patch.object(PhotoInspectorDialog, "_load_preview"), patch.object(
+                PhotoInspectorDialog, "_load_metadata_async"
+            ), patch.object(PhotoInspectorDialog, "_prefetch_neighbors"):
+                dialog = PhotoInspectorDialog(
+                    image_paths=[str(image_path)],
+                    display_mode="basic",
+                    face_service=self._FakeFaceLibraryService(records=[]),
+                    allow_face_edit=True,
+                )
+                dialog._face_original_drafts_by_path[str(image_path)] = []
+                dialog._face_drafts_by_path[str(image_path)] = [
+                    EditableFaceDraft((8, 10, 44, 52), 1.0, "manual")
+                ]
+                dialog._face_editor_dirty_paths.add(str(image_path))
+
+                with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Cancel):
+                    self.assertFalse(dialog._confirm_leave_face_changes())
+                self.assertIn(str(image_path), dialog._face_editor_dirty_paths)
+
+                with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Discard):
+                    self.assertTrue(dialog._confirm_leave_face_changes())
+                self.assertNotIn(str(image_path), dialog._face_editor_dirty_paths)
+                self.assertEqual([], dialog._face_drafts_by_path[str(image_path)])
                 dialog.close()
 
     def test_photo_inspector_arrow_shortcuts_navigate_when_details_has_focus(self):
@@ -10144,6 +12248,9 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(ready_to_close)
         self.assertEqual(1, active_job.cancel_calls)
         self.assertEqual([15], active_thread.wait_calls)
+        self.assertEqual(1, active_job.progress.disconnect_calls)
+        self.assertEqual(1, active_job.completed.disconnect_calls)
+        self.assertEqual(1, active_job.cancelled.disconnect_calls)
         self.assertIsNone(pane._active_job)
         self.assertIsNone(pane._active_thread)
         pane.close()

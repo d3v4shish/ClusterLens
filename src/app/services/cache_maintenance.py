@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from infra.settings import AppSettings, get_settings
-from infra.cancel import raise_if_cancelled
+from infra.cancel import Cancelled, raise_if_cancelled
+from app.services.face_storage_recovery import FaceStorageRemovalService
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class CacheClearResult:
     cleared_targets: tuple[str, ...]
     freed_bytes: int
     failures: tuple[str, ...]
+    completion_survives_cancellation: bool = False
+    retry_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,20 @@ class GeneratedStorageSummary:
     target_bytes: dict[str, int]
     target_paths: dict[str, tuple[str, ...]]
     total_bytes: int
+
+
+class _CacheDirectoryClearInterrupted(Cancelled):
+    def __init__(self, target: str, *, committed: bool) -> None:
+        super().__init__(target)
+        self.target = str(target)
+        self.committed = bool(committed)
+
+
+class _CacheDirectoryClearFailed(OSError):
+    def __init__(self, target: str, message: str, *, committed: bool) -> None:
+        super().__init__(message)
+        self.target = str(target)
+        self.committed = bool(committed)
 
 
 class CacheMaintenanceService:
@@ -184,9 +202,10 @@ class CacheMaintenanceService:
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Remove one explicitly selected generated-data category.
 
-        User-authored data (tags, durable face labels, recovery history, and
-        settings) is intentionally not a category here. Full user-data removal
-        remains a separate, high-friction lifecycle operation.
+        User-authored source files, tags, recovery history, and settings are
+        intentionally not a category here. Face databases are an explicit
+        high-friction exception because they also contain saved labels and
+        identities; their clear path is recoverable.
         """
         category = str(category or "").strip()
         if progress_callback:
@@ -213,7 +232,10 @@ class CacheMaintenanceService:
             )
             result = self._clear_named_paths(paths, recreate_dirs=paths[1:], cancel_check=cancel_check)
         elif category == "face_databases":
-            result = self._clear_named_paths(self._face_database_paths(), recreate_dirs=(), cancel_check=cancel_check)
+            result = self.clear_face_storage_targets(cancel_check=cancel_check)
+            # This batch has a durable commit point. A Cancel click arriving
+            # after it must not be reported as if no files changed.
+            return result
         elif category == "ann_files":
             result = self._clear_named_paths(self._ann_file_paths(), recreate_dirs=(), cancel_check=cancel_check)
         elif category == "model_caches":
@@ -251,19 +273,99 @@ class CacheMaintenanceService:
         failures: list[str] = []
         targets = [(name, path) for name, path in self.rebuildable_targets().items() if name not in exclude]
         total = max(1, len(targets))
+        committed_any = False
         for index, (name, path) in enumerate(targets):
-            raise_if_cancelled(cancel_check)
+            try:
+                raise_if_cancelled(cancel_check)
+            except Cancelled:
+                if not committed_any:
+                    raise
+                failures.append("Cancellation acknowledged after committed cache targets; choose Clear Rebuildable Caches again if cleanup remains pending.")
+                break
             if progress_callback:
                 progress_callback(int(index * 100 / total), f"Clearing {name}")
             try:
-                self._remove_target(path, cancel_check=cancel_check)
+                if name.endswith("/"):
+                    committed = self._clear_rebuildable_directory(name, path, cancel_check=cancel_check)
+                    committed_any = committed_any or committed
+                else:
+                    self._remove_target(path, cancel_check=cancel_check)
+                    committed_any = committed_any or not path.exists()
                 cleared.append(name)
+            except _CacheDirectoryClearInterrupted as exc:
+                if not (committed_any or exc.committed):
+                    raise Cancelled() from exc
+                committed_any = True
+                cleared.append(name)
+                failures.append(
+                    f"{name}: cleanup paused after the cache was detached; choose Clear Rebuildable Caches again to retry."
+                )
+                break
+            except _CacheDirectoryClearFailed as exc:
+                if exc.committed:
+                    committed_any = True
+                    cleared.append(name)
+                failures.append(f"{name}: {exc}")
             except OSError as exc:
                 failures.append(f"{name}: {exc}")
-        self._recreate_directories(exclude=exclude, cancel_check=cancel_check)
+        self._recreate_directories(exclude=exclude, cancel_check=None if committed_any else cancel_check)
         if progress_callback:
-            progress_callback(100, "Rebuildable cache clear complete")
+            try:
+                progress_callback(100, "Rebuildable cache clear complete")
+            except Cancelled:
+                if not committed_any:
+                    raise
         return tuple(cleared), tuple(failures)
+
+    def pending_rebuildable_cleanup_targets(self) -> tuple[str, ...]:
+        pending: list[str] = []
+        targets = self.rebuildable_targets()
+        for name in self.DIRECTORY_TARGETS:
+            path = targets[name]
+            staging = self._cache_clear_staging_path(path)
+            if staging.exists() or staging.is_symlink():
+                pending.append(name)
+        return tuple(pending)
+
+    def _clear_rebuildable_directory(self, name: str, path: Path, *, cancel_check=None) -> bool:
+        """Atomically detach one cache tree before cancellable physical cleanup."""
+
+        staging = self._cache_clear_staging_path(path)
+        committed = bool(staging.exists() and staging.is_dir() and not staging.is_symlink())
+        try:
+            raise_if_cancelled(cancel_check)
+            if staging.is_symlink() or (staging.exists() and not staging.is_dir()):
+                raise OSError(f"unsafe pending cache cleanup path: {staging}")
+            if staging.exists():
+                self._remove_target(staging, cancel_check=cancel_check)
+            raise_if_cancelled(cancel_check)
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+                return committed
+            if path.is_symlink() or not path.is_dir():
+                self._remove_target(path, cancel_check=cancel_check)
+                return True
+            self._cache_directory_clear_checkpoint("before_detach", path, staging)
+            os.replace(path, staging)
+            committed = True
+            self._cache_directory_clear_checkpoint("after_detach", path, staging)
+            path.mkdir(parents=True, exist_ok=True)
+            self._cache_directory_clear_checkpoint("after_recreate", path, staging)
+            self._remove_target(staging, cancel_check=cancel_check)
+            return True
+        except Cancelled as exc:
+            raise _CacheDirectoryClearInterrupted(name, committed=committed) from exc
+        except OSError as exc:
+            raise _CacheDirectoryClearFailed(name, str(exc), committed=committed) from exc
+
+    @staticmethod
+    def _cache_clear_staging_path(path: Path) -> Path:
+        return path.parent / f".{path.name}.clusterlens-clear-staging"
+
+    def _cache_directory_clear_checkpoint(self, name: str, source: Path, staging: Path) -> None:
+        """Fault-injection seam around the atomic directory detach boundary."""
+
+        _ = (name, source, staging)
 
     def clear_runtime_cleanup_targets(
         self,
@@ -310,12 +412,79 @@ class CacheMaintenanceService:
         # not disposable runtime temp files. Preserve them across app restarts.
         return tuple(cleared), tuple(failures)
 
+    def clear_sqlite_cache_bundle(
+        self,
+        database: str | Path,
+        *,
+        cancel_check=None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Remove a rebuildable SQLite cache without exposing a torn bundle.
+
+        A best-effort WAL checkpoint makes the main database independently
+        usable. WAL/SHM sidecars are removed first; the main file is the commit
+        point, so cancellation or process exit before it leaves a usable cache.
+        """
+
+        path = Path(database)
+        failures: list[str] = []
+        raise_if_cancelled(cancel_check)
+        if path.exists():
+            try:
+                connection = sqlite3.connect(str(path), timeout=1.0)
+                try:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.DatabaseError:
+                # A corrupt derived cache is still safe to clear. It was not a
+                # usable pre-state, so deletion remains the recovery action.
+                pass
+        for suffix in ("-wal", "-shm"):
+            raise_if_cancelled(cancel_check)
+            sidecar = path.with_name(path.name + suffix)
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(f"{sidecar.name}: {exc}")
+        raise_if_cancelled(cancel_check)
+        self._sqlite_cache_clear_checkpoint("before_remove_main", path)
+        removed = False
+        try:
+            if path.exists():
+                path.unlink()
+                removed = True
+        except OSError as exc:
+            failures.append(f"{path.name}: {exc}")
+        if removed:
+            self._sqlite_cache_clear_checkpoint("after_remove_main", path)
+        return removed, tuple(failures)
+
+    def _sqlite_cache_clear_checkpoint(self, name: str, database: Path) -> None:
+        """Fault-injection seam around the rebuildable SQLite commit point."""
+
+        _ = (name, database)
+
     def clear_face_storage_targets(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self._clear_named_paths(
-            [*self._face_database_paths(), *self._ann_file_paths()],
-            recreate_dirs=(),
-            cancel_check=cancel_check,
-        )
+        cleared: list[str] = []
+        failures: list[str] = []
+        removal_service = FaceStorageRemovalService(self.settings.cache_dir)
+        batch_committed = False
+        for database in self._face_database_roots():
+            if not batch_committed:
+                raise_if_cancelled(cancel_check)
+            try:
+                removal_service.checkpoint_database(database)
+                result = removal_service.remove(
+                    database,
+                    cancel_check=None if batch_committed else cancel_check,
+                )
+                batch_committed = True
+                cleared.extend(self._display_target_name(Path(path)) for path in result.staged_paths)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                failures.append(f"{self._display_target_name(database)}: {exc}")
+        return tuple(cleared), tuple(failures)
 
     def clear_model_cache_targets(self, *, cancel_check=None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         cache_dir = self.settings.cache_dir
@@ -384,6 +553,16 @@ class CacheMaintenanceService:
     def _face_database_paths(self) -> tuple[Path, ...]:
         cache_dir = self.settings.cache_dir
         return tuple(sorted(cache_dir.glob("face_search*.db*")))
+
+    def _face_database_roots(self) -> tuple[Path, ...]:
+        candidates = [*self._face_database_paths(), *self._ann_file_paths()]
+        roots: set[Path] = set()
+        for path in candidates:
+            marker = path.name.find(".db")
+            if marker < 0:
+                continue
+            roots.add(path.with_name(path.name[: marker + len(".db")]))
+        return tuple(sorted(roots))
 
     def _library_catalog_paths(self) -> tuple[Path, ...]:
         catalog = self.settings.cache_dir / "library_catalog.sqlite3"

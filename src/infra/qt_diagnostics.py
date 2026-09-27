@@ -14,17 +14,24 @@ _APPEND_LOCK = Lock()
 
 def _diagnostic_path() -> Path:
     settings = get_settings()
-    path = Path(settings.log_file).with_name("qt_diagnostics.log")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    return Path(settings.log_file).with_name("qt_diagnostics.log")
 
 
 def append_qt_diagnostic(message: str) -> None:
     line = f"{datetime.now().isoformat(timespec='milliseconds')} {message}\n"
     with _APPEND_LOCK:
-        with _diagnostic_path().open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
+        path = _diagnostic_path()
+        # The runtime layout creates its logs directory. Do not recreate an
+        # intentionally removed disposable/relocated runtime from a late Qt
+        # or worker callback during shutdown.
+        if not path.parent.is_dir():
+            return
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+        except OSError:
+            return
 
 
 def install_qt_message_handler() -> None:

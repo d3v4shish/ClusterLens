@@ -25,9 +25,14 @@ class PathScope:
     roots: tuple[str, ...] = ()
 
     @classmethod
-    def from_paths(cls, paths: Iterable[str] | None) -> "PathScope":
+    def from_paths(
+        cls,
+        paths: Iterable[str] | None,
+        *,
+        resolve_symlinks: bool = True,
+    ) -> "PathScope":
         candidates = {
-            normalize_scoped_path(str(path))
+            normalize_scoped_path(str(path), resolve_symlinks=resolve_symlinks)
             for path in (paths or ())
             if str(path or "").strip()
         }

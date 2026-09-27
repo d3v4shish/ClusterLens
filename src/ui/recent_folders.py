@@ -17,19 +17,13 @@ class RecentFolderHistory:
         self.key = str(key)
         self.limit = max(1, int(limit))
         self._paths = self._load()
-        # Rewriting the small payload also prunes missing folders and upgrades
-        # malformed/older values without needing a separate migration.
-        self._save()
 
     @staticmethod
     def _canonical_path(path: str) -> str:
         value = str(path or "").strip()
         if not value:
             return ""
-        try:
-            return str(Path(value).expanduser().resolve(strict=False))
-        except (OSError, RuntimeError):
-            return str(Path(value).expanduser().absolute())
+        return os.path.abspath(os.path.expanduser(value))
 
     @staticmethod
     def _comparison_key(path: str) -> str:
@@ -55,7 +49,9 @@ class RecentFolderHistory:
         valid: list[str] = []
         seen: set[str] = set()
         for candidate in source_paths:
-            path = self._valid_directory(str(candidate or ""))
+            # Avoid probing saved paths during Qt construction. A disconnected
+            # disk or network mount must not delay application startup.
+            path = self._canonical_path(str(candidate or ""))
             key = self._comparison_key(path)
             if not path or key in seen:
                 continue
@@ -74,6 +70,14 @@ class RecentFolderHistory:
 
     def record(self, path: str) -> bool:
         canonical = self._valid_directory(path)
+        if not canonical:
+            return False
+        return self.record_verified(canonical)
+
+    def record_verified(self, path: str) -> bool:
+        """Record a path whose owning workflow already established validity."""
+
+        canonical = self._canonical_path(path)
         if not canonical:
             return False
         key = self._comparison_key(canonical)

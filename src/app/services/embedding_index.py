@@ -55,6 +55,9 @@ class EmbeddingIndexService:
         prefix = self._prefix(snapshot_key, model_name, embedding_signature)
         vector_path = prefix.with_suffix(".npy")
         path_map_path = prefix.with_suffix(".json")
+        manifest_path = prefix.with_suffix(".manifest.json")
+        manifest_path.unlink(missing_ok=True)
+        self._index_generation_checkpoint("manifest_removed", manifest_path)
         matrix = _embedding_matrix(ordered_embeddings)
         atomic_write_with(vector_path, lambda temporary: _save_numpy(temporary, matrix))
         atomic_write_text(path_map_path, json.dumps([path for path, _ in ordered_embeddings], indent=2))
@@ -66,12 +69,32 @@ class EmbeddingIndexService:
             faiss_path = prefix.with_suffix(".faiss")
             atomic_write_with(faiss_path, lambda temporary: faiss.write_index(index, str(temporary)))
             index_path = str(faiss_path)
+        manifest = {
+            "schema": 1,
+            "snapshot_key": str(snapshot_key),
+            "model_name": str(model_name),
+            "embedding_signature": str(embedding_signature),
+            "rows": int(matrix.shape[0]),
+            "dimension": int(matrix.shape[1]) if matrix.ndim == 2 else 0,
+            "artifacts": {
+                vector_path.name: _sha256_file(vector_path),
+                path_map_path.name: _sha256_file(path_map_path),
+                **({Path(index_path).name: _sha256_file(Path(index_path))} if index_path else {}),
+            },
+        }
+        atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True))
         return {
             "snapshot_key": snapshot_key,
             "vector_path": str(vector_path),
             "path_map_path": str(path_map_path),
             "faiss_index_path": index_path,
+            "manifest_path": str(manifest_path),
         }
+
+    def _index_generation_checkpoint(self, _name: str, _manifest_path: Path) -> None:
+        """Fault-injection seam around index-generation readiness boundaries."""
+
+        return
 
     def ensure_index(
         self,
@@ -85,12 +108,14 @@ class EmbeddingIndexService:
         vector_path = prefix.with_suffix(".npy")
         path_map_path = prefix.with_suffix(".json")
         faiss_index_path = prefix.with_suffix(".faiss")
+        manifest_path = prefix.with_suffix(".manifest.json")
         expects_faiss = faiss is not None and len(ordered_embeddings) > 0
         expected_dimension = _embedding_dimension(ordered_embeddings)
         if self._index_is_valid(
             vector_path,
             path_map_path,
             faiss_index_path if expects_faiss else None,
+            manifest_path,
             expected_paths=[str(path) for path, _vector in ordered_embeddings],
             expected_dimension=expected_dimension,
         ):
@@ -100,6 +125,7 @@ class EmbeddingIndexService:
                     "vector_path": str(vector_path),
                     "path_map_path": str(path_map_path),
                     "faiss_index_path": str(faiss_index_path) if expects_faiss else "",
+                    "manifest_path": str(manifest_path),
                 },
                 True,
             )
@@ -121,11 +147,19 @@ class EmbeddingIndexService:
         vector_path: Path,
         path_map_path: Path,
         faiss_index_path: Path | None,
+        manifest_path: Path,
         *,
         expected_paths: list[str],
         expected_dimension: int,
     ) -> bool:
         try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            artifacts = dict(manifest.get("artifacts", {}) or {})
+            required = [vector_path, path_map_path, *([faiss_index_path] if faiss_index_path is not None else [])]
+            if int(manifest.get("schema", 0) or 0) != 1:
+                return False
+            if any(str(artifacts.get(path.name, "")) != _sha256_file(path) for path in required):
+                return False
             matrix = np.load(vector_path, mmap_mode="r", allow_pickle=False)
             paths = json.loads(path_map_path.read_text(encoding="utf-8"))
             expected_rows = len(expected_paths)
@@ -146,6 +180,14 @@ class EmbeddingIndexService:
             return True
         except (OSError, ValueError, TypeError, IndexError, RuntimeError, json.JSONDecodeError):
             return False
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _save_numpy(path: Path, matrix: np.ndarray) -> None:

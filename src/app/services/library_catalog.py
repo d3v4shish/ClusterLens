@@ -5,8 +5,9 @@ import json
 import os
 import re
 import sqlite3
+from threading import Lock
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 from uuid import uuid4
@@ -14,6 +15,7 @@ from uuid import uuid4
 from PIL import ExifTags, Image
 
 from app.path_scope import roots_scope_sql
+from app.services.source_admission import SourceAdmissionPolicy
 from infra.cancel import Cancelled, raise_if_cancelled
 from infra.logging_config import get_logger
 from infra.settings import get_settings
@@ -22,7 +24,42 @@ from infra.settings import get_settings
 LOGGER = get_logger(__name__)
 CATALOG_SCHEMA_VERSION = 2
 CATALOG_WRITE_BATCH_SIZE = 48
-FILENAME_DATE_POLICIES = ("metadata_only", "metadata_or_filename", "prefer_filename", "filename_only")
+FILENAME_DATE_POLICIES = (
+    "metadata_only",
+    "metadata_or_filename",
+    "datetime_original_then_metadata",
+    "prefer_filename",
+    "filename_only",
+)
+DEFAULT_FILENAME_DATE_PATTERNS = (
+    "%Y%m%d_%H%M%S",
+    "%Y-%m-%d_%H%M%S",
+    "%Y-%m-%d-%H%M%S",
+    "%Y%m%d",
+    "%Y-%m-%d",
+)
+_FILENAME_DATE_DIRECTIVES = {
+    "Y": r"\d{4}",
+    "m": r"0[1-9]|1[0-2]",
+    "d": r"0[1-9]|[12]\d|3[01]",
+    "H": r"[01]\d|2[0-3]",
+    "M": r"[0-5]\d",
+    "S": r"[0-5]\d",
+}
+_NAMED_FILENAME_RULE_TOKEN = re.compile(r"\{(?P<kind>date|sequence|epoch):(?P<value>[^{}]+)\}")
+_NAMED_FILENAME_DATE_FORMATS = {
+    "YYYYMMDD": "%Y%m%d",
+    "DDMMYYYY": "%d%m%Y",
+    "YYYY-MM-DD": "%Y-%m-%d",
+    "DD-MM-YYYY": "%d-%m-%Y",
+}
+_NAMED_FILENAME_DATE_REGEXES = {
+    "YYYYMMDD": r"\d{8}",
+    "DDMMYYYY": r"\d{8}",
+    "YYYY-MM-DD": r"\d{4}-\d{2}-\d{2}",
+    "DD-MM-YYYY": r"\d{2}-\d{2}-\d{4}",
+}
+_TIMELINE_CAPTURE_MIN_YEAR = 1991
 
 
 @dataclass(frozen=True)
@@ -53,6 +90,26 @@ class CatalogAsset:
     mtime_ns: int = 0
     metadata_mtime_ns: int = 0
     metadata_size: int = 0
+    capture_sequence: int = 0
+    capture_strategy: str = ""
+
+
+@dataclass(frozen=True)
+class FilenameCapture:
+    """One source-safe timestamp candidate derived from a filename."""
+
+    captured_at: str = ""
+    sequence: int = 0
+    strategy: str = ""
+
+
+@dataclass(frozen=True)
+class _FilenameRule:
+    raw: str
+    matcher: re.Pattern[str]
+    kind: str
+    strptime_pattern: str = ""
+    epoch_unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -62,6 +119,23 @@ class CatalogPage:
     next_offset: int | None = None
 
 
+class CatalogScanResult(dict[str, int]):
+    """Completed scan totals whose bounded transactions are already durable."""
+
+    completion_survives_cancellation = True
+
+
+@dataclass(frozen=True)
+class TimelineDay:
+    """One capture-day bucket retained for Timeline's optional nested views."""
+
+    year: int
+    month: int
+    day: int
+    iso_week: int
+    image_paths: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class TimelineMonth:
     """One capture-month bucket from the lightweight Library timeline query."""
@@ -69,6 +143,7 @@ class TimelineMonth:
     year: int
     month: int
     image_paths: tuple[str, ...] = ()
+    days: tuple[TimelineDay, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,12 +230,41 @@ class LibraryCatalogService:
     XMP sidecars, tags, or face labels.
     """
 
-    def __init__(self, *, db_path: str | Path | None = None, filename_date_policy: str = "metadata_or_filename") -> None:
+    def __init__(
+        self,
+        *,
+        db_path: str | Path | None = None,
+        filename_date_policy: str = "metadata_or_filename",
+        filename_date_patterns: Iterable[str] | str | None = None,
+        filename_epoch_heuristic: bool = False,
+        source_admission_policy: SourceAdmissionPolicy | None = None,
+        source_admission_policy_provider: Callable[[], SourceAdmissionPolicy] | None = None,
+    ) -> None:
         settings = get_settings()
         self.db_path = Path(db_path) if db_path is not None else settings.cache_dir / "library_catalog.sqlite3"
         self._fts_available = True
         self._filename_date_policy = self.normalize_filename_date_policy(filename_date_policy)
-        self._init_db()
+        self._filename_epoch_heuristic = bool(filename_epoch_heuristic)
+        self._source_admission_policy = source_admission_policy
+        self._source_admission_policy_provider = source_admission_policy_provider
+        self._init_lock = Lock()
+        self._initialized = False
+        self._set_filename_date_patterns(
+            DEFAULT_FILENAME_DATE_PATTERNS if filename_date_patterns is None else filename_date_patterns
+        )
+
+    def source_admission_policy(self) -> SourceAdmissionPolicy:
+        """Return one stable policy for the current source scan."""
+
+        if self._source_admission_policy_provider is not None:
+            return self._source_admission_policy_provider()
+        return self._source_admission_policy or SourceAdmissionPolicy.from_global_settings()
+
+    def set_source_admission_policy(self, policy: SourceAdmissionPolicy) -> None:
+        """Use this policy for later explicit catalog scans."""
+
+        self._source_admission_policy = policy
+        self._source_admission_policy_provider = None
 
     @staticmethod
     def normalize_filename_date_policy(value: str) -> str:
@@ -175,7 +279,98 @@ class LibraryCatalogService:
         """Set the source-safe capture-time policy used on the next catalog scan."""
         self._filename_date_policy = self.normalize_filename_date_policy(value)
 
+    @property
+    def filename_date_patterns(self) -> tuple[str, ...]:
+        """Ordered safe legacy patterns and named filename-time rules."""
+
+        return self._filename_date_patterns
+
+    @property
+    def filename_epoch_heuristic(self) -> bool:
+        """Whether raw 10/13-digit Unix epochs may be read from ID-like names."""
+
+        return self._filename_epoch_heuristic
+
+    def set_filename_epoch_heuristic(self, enabled: bool) -> None:
+        """Set the explicit opt-in raw numeric epoch fallback."""
+
+        self._filename_epoch_heuristic = bool(enabled)
+
+    @classmethod
+    def normalize_filename_date_patterns(cls, values: Iterable[str] | str) -> tuple[str, ...]:
+        """Validate a bounded, unambiguous list of filename timestamp formats.
+
+        Rules are intentionally fixed ``strptime`` formats or a small named
+        token grammar rather than arbitrary regular expressions. Named rules
+        support ``{date:DDMMYYYY}``, ``{date:YYYYMMDD}``, an optional
+        ``{sequence:3}`` style same-day counter, and explicit
+        ``{epoch:s}``/``{epoch:ms}`` values.
+        """
+
+        raw_values = str(values).splitlines() if isinstance(values, str) else values
+        patterns: list[str] = []
+        seen: set[str] = set()
+        for value in raw_values:
+            pattern = str(value or "").strip()
+            if not pattern or pattern in seen:
+                continue
+            if "{" in pattern or "}" in pattern:
+                cls._compile_named_filename_rule(pattern)
+            else:
+                cls._validate_filename_date_pattern(pattern)
+            patterns.append(pattern)
+            seen.add(pattern)
+        if not patterns:
+            raise ValueError("Add at least one filename time rule.")
+        return tuple(patterns)
+
+    @classmethod
+    def _validate_filename_date_pattern(cls, pattern: str) -> None:
+        if len(pattern) > 160:
+            raise ValueError("Filename date patterns must be 160 characters or fewer.")
+        directives: list[str] = []
+        index = 0
+        while index < len(pattern):
+            if pattern[index] != "%":
+                index += 1
+                continue
+            if index + 1 >= len(pattern):
+                raise ValueError(f"{pattern!r} ends with an incomplete % directive.")
+            directive = pattern[index + 1]
+            if directive == "%":
+                index += 2
+                continue
+            if directive not in _FILENAME_DATE_DIRECTIVES:
+                supported = ", ".join(f"%{key}" for key in _FILENAME_DATE_DIRECTIVES)
+                raise ValueError(f"{pattern!r} uses %{directive}; supported directives are {supported}.")
+            directives.append(directive)
+            index += 2
+        date_directives = [directive for directive in directives if directive in {"Y", "m", "d"}]
+        if date_directives != ["Y", "m", "d"]:
+            raise ValueError(f"{pattern!r} must contain one unambiguous year-first %Y%m%d date.")
+        time_directives = [directive for directive in directives if directive in {"H", "M", "S"}]
+        if time_directives not in ([], ["H", "M"], ["H", "M", "S"]):
+            raise ValueError(f"{pattern!r} can use no time, %H%M, or %H%M%S after the date.")
+        if directives != ["Y", "m", "d", *time_directives]:
+            raise ValueError(f"{pattern!r} must put its optional time after the year-first date.")
+
+    def set_filename_date_patterns(self, values: Iterable[str] | str) -> None:
+        """Set filename-date formats for the next forced catalog refresh."""
+
+        self._set_filename_date_patterns(values)
+
+    def _set_filename_date_patterns(self, values: Iterable[str] | str) -> None:
+        patterns = self.normalize_filename_date_patterns(values)
+        self._filename_date_patterns = patterns
+        self._filename_date_matchers = tuple(
+            self._compile_filename_rule(pattern) for pattern in patterns
+        )
+
     def _connect(self) -> sqlite3.Connection:
+        self._ensure_initialized()
+        return self._connect_raw()
+
+    def _connect_raw(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(str(self.db_path))
         connection.execute("PRAGMA journal_mode=WAL")
@@ -186,8 +381,17 @@ class LibraryCatalogService:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._init_db()
+            self._initialized = True
+
     def _init_db(self) -> None:
-        with self._connect() as connection:
+        with self._connect_raw() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS library_roots (
@@ -213,6 +417,7 @@ class LibraryCatalogService:
                     file_size INTEGER NOT NULL,
                     captured_at TEXT NOT NULL DEFAULT '',
                     capture_source TEXT NOT NULL DEFAULT 'modified',
+                    capture_sequence INTEGER NOT NULL DEFAULT 0,
                     modified_at TEXT NOT NULL,
                     camera TEXT NOT NULL DEFAULT '',
                     width INTEGER NOT NULL DEFAULT 0,
@@ -229,7 +434,13 @@ class LibraryCatalogService:
                 connection.execute("ALTER TABLE catalog_assets ADD COLUMN metadata_mtime_ns INTEGER NOT NULL DEFAULT 0")
             if "metadata_size" not in columns:
                 connection.execute("ALTER TABLE catalog_assets ADD COLUMN metadata_size INTEGER NOT NULL DEFAULT 0")
+            if "capture_sequence" not in columns:
+                connection.execute("ALTER TABLE catalog_assets ADD COLUMN capture_sequence INTEGER NOT NULL DEFAULT 0")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_catalog_assets_root_capture ON catalog_assets(root_id, captured_at DESC, image_path)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_catalog_assets_root_capture_sequence "
+                "ON catalog_assets(root_id, captured_at DESC, capture_sequence DESC, image_path)"
+            )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_catalog_assets_parent ON catalog_assets(parent_path)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_catalog_assets_camera ON catalog_assets(camera)")
             connection.execute(
@@ -374,6 +585,15 @@ class LibraryCatalogService:
             rows = connection.execute(query).fetchall()
         return [self._root_from_row(row) for row in rows]
 
+    def root_asset_counts(self) -> dict[str, int]:
+        """Return bounded catalog counts without reading any source root."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT root_id, COUNT(*) AS asset_count FROM catalog_assets GROUP BY root_id"
+            ).fetchall()
+        return {str(row["root_id"]): int(row["asset_count"] or 0) for row in rows}
+
     def get_root(self, root_id: str) -> LibraryRoot:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM library_roots WHERE root_id=?", (str(root_id),)).fetchone()
@@ -401,10 +621,23 @@ class LibraryCatalogService:
         force: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        on_committed_batch: Callable[[str, dict[str, int]], None] | None = None,
     ) -> dict[str, int]:
         wanted = {str(root_id) for root_id in root_ids or () if str(root_id)}
         roots = [root for root in self.list_roots(include_disabled=False) if not wanted or root.root_id in wanted]
-        totals = {"roots": len(roots), "discovered": 0, "updated": 0, "unchanged": 0, "removed": 0, "failures": 0}
+        totals = {
+            "roots": len(roots),
+            "discovered": 0,
+            "filtered": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "removed": 0,
+            "filename_dates": 0,
+            "filename_epochs": 0,
+            "raw_epochs": 0,
+            "ambiguous_epochs": 0,
+            "failures": 0,
+        }
         for index, root in enumerate(roots, start=1):
             raise_if_cancelled(cancel_check)
             if progress_callback:
@@ -415,8 +648,19 @@ class LibraryCatalogService:
                     force=force,
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
+                    on_committed_batch=on_committed_batch,
                 )
-                for key in ("discovered", "updated", "unchanged", "removed"):
+                for key in (
+                    "discovered",
+                    "filtered",
+                    "updated",
+                    "unchanged",
+                    "removed",
+                    "filename_dates",
+                    "filename_epochs",
+                    "raw_epochs",
+                    "ambiguous_epochs",
+                ):
                     totals[key] += int(stats.get(key, 0))
             except Cancelled:
                 raise
@@ -426,7 +670,7 @@ class LibraryCatalogService:
                 LOGGER.warning("Library root scan failed for %s: %s", root.path, exc)
         if progress_callback:
             progress_callback(100, "Library catalog scan complete")
-        return totals
+        return CatalogScanResult(totals)
 
     def scan_root(
         self,
@@ -435,40 +679,75 @@ class LibraryCatalogService:
         force: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        on_committed_batch: Callable[[str, dict[str, int]], None] | None = None,
     ) -> dict[str, int]:
         root = self.get_root(root_id)
         if not root.enabled:
-            return {"discovered": 0, "updated": 0, "unchanged": 0, "removed": 0}
+            return self._empty_scan_stats()
         directory = Path(root.path)
         if not directory.is_dir():
             raise FileNotFoundError(f"Library root is unavailable: {root.path}")
         extensions = {str(ext).casefold() for ext in get_settings().image_extensions}
-        paths: list[Path] = []
+        admission_policy = self.source_admission_policy()
+        paths: list[tuple[Path, os.stat_result]] = []
+        filtered = 0
         for path in directory.rglob("*"):
             raise_if_cancelled(cancel_check)
-            if path.is_file() and path.suffix.casefold() in extensions:
-                paths.append(path)
-        paths.sort(key=lambda value: self.canonical_path(value))
+            if not path.is_file() or path.suffix.casefold() not in extensions:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if not admission_policy.decide(path, stat_result=stat).admitted:
+                filtered += 1
+                continue
+            paths.append((path, stat))
+        paths.sort(key=lambda item: self.canonical_path(item[0]))
         known = self._asset_fingerprints_for_root(root.root_id)
         current_paths: set[str] = set()
         updated = 0
         unchanged = 0
+        filename_dates = 0
+        filename_epochs = 0
+        raw_epochs = 0
+        ambiguous_epochs = 0
         total = len(paths)
         pending_upserts: list[tuple[CatalogAsset, int]] = []
+        committed_updated = 0
+
+        def _notify_committed(*, removed: int = 0) -> None:
+            if on_committed_batch is None:
+                return
+            stats = {
+                "discovered": total,
+                "filtered": filtered,
+                "updated": committed_updated,
+                "unchanged": unchanged,
+                "removed": int(removed),
+                "filename_dates": filename_dates,
+                "filename_epochs": filename_epochs,
+                "raw_epochs": raw_epochs,
+                "ambiguous_epochs": ambiguous_epochs,
+            }
+            try:
+                on_committed_batch(root.root_id, stats)
+            except Exception:
+                LOGGER.exception("Library catalog committed-batch observer failed")
 
         def _flush_pending() -> None:
+            nonlocal committed_updated
             if pending_upserts:
+                batch_count = len(pending_upserts)
                 self._upsert_assets(pending_upserts)
                 pending_upserts.clear()
+                committed_updated += batch_count
+                _notify_committed()
 
-        for index, path in enumerate(paths, start=1):
+        for index, (path, stat) in enumerate(paths, start=1):
             raise_if_cancelled(cancel_check)
             canonical = self.canonical_path(path)
             current_paths.add(canonical)
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
             metadata_mtime_ns, metadata_size = self._metadata_sidecar_fingerprint(path)
             fingerprint = (int(stat.st_mtime_ns), int(stat.st_size), metadata_mtime_ns, metadata_size)
             if not force and known.get(canonical) == fingerprint:
@@ -481,27 +760,64 @@ class LibraryCatalogService:
                 metadata_mtime_ns=metadata_mtime_ns,
                 metadata_size=metadata_size,
             )
+            if asset.capture_source == "filename" and asset.capture_strategy == "filename_date":
+                filename_dates += 1
+            elif asset.capture_source == "filename" and asset.capture_strategy == "filename_epoch":
+                filename_epochs += 1
+            elif asset.capture_source == "filename" and asset.capture_strategy == "filename_epoch_heuristic":
+                raw_epochs += 1
+            elif asset.capture_strategy == "filename_epoch_ambiguous":
+                ambiguous_epochs += 1
             pending_upserts.append((asset, int(stat.st_mtime_ns)))
+            updated += 1
             if len(pending_upserts) >= CATALOG_WRITE_BATCH_SIZE:
                 _flush_pending()
-            updated += 1
             if progress_callback and (index == total or index % 24 == 0):
                 progress_callback(int(index * 100 / max(1, total)), f"Cataloging {index}/{total} photos in {root.display_name}")
         _flush_pending()
         stale = sorted(set(known) - current_paths)
         if stale:
             self._delete_assets(stale)
+            _notify_committed(removed=len(stale))
         with self._connect() as connection:
             connection.execute(
                 "UPDATE library_roots SET last_scan_at=?, last_error='' WHERE root_id=?",
                 (self._now(), root.root_id),
             )
-        return {"discovered": total, "updated": updated, "unchanged": unchanged, "removed": len(stale)}
+        return {
+            "discovered": total,
+            "filtered": filtered,
+            "updated": updated,
+            "unchanged": unchanged,
+            "removed": len(stale),
+            "filename_dates": filename_dates,
+            "filename_epochs": filename_epochs,
+            "raw_epochs": raw_epochs,
+            "ambiguous_epochs": ambiguous_epochs,
+        }
+
+    @staticmethod
+    def _empty_scan_stats() -> dict[str, int]:
+        return {
+            "discovered": 0,
+            "filtered": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "removed": 0,
+            "filename_dates": 0,
+            "filename_epochs": 0,
+            "raw_epochs": 0,
+            "ambiguous_epochs": 0,
+        }
 
     def query_assets(self, query: CatalogQuery | None = None) -> CatalogPage:
         query = query or CatalogQuery()
         where, args = self._asset_where(query)
-        order = "captured_at DESC, image_path" if str(query.order) != "captured_asc" else "captured_at ASC, image_path"
+        order = (
+            "captured_at DESC, capture_sequence DESC, image_path"
+            if str(query.order) != "captured_asc"
+            else "captured_at ASC, capture_sequence ASC, image_path"
+        )
         limit = max(1, min(1000, int(query.limit)))
         offset = max(0, int(query.offset))
         with self._connect() as connection:
@@ -545,7 +861,8 @@ class LibraryCatalogService:
         if progress_callback is not None:
             progress_callback(0, "Reading catalogued capture dates…")
 
-        buckets: dict[tuple[int, int], list[str]] = {}
+        day_buckets: dict[tuple[int, int, int], list[str]] = {}
+        timeline_current_year = datetime.now(timezone.utc).year
         with self._connect() as connection:
             total = int(
                 connection.execute(
@@ -557,7 +874,7 @@ class LibraryCatalogService:
             cursor = connection.execute(
                 f"SELECT asset.image_path, asset.captured_at FROM catalog_assets asset "
                 f"JOIN library_roots root ON asset.root_id=root.root_id "
-                f"WHERE {where} ORDER BY asset.captured_at DESC, asset.image_path",
+                f"WHERE {where} ORDER BY asset.captured_at DESC, asset.capture_sequence DESC, asset.image_path",
                 args,
             )
             processed = 0
@@ -568,8 +885,11 @@ class LibraryCatalogService:
                     image_path = str(row["image_path"] or "")
                     if not image_path:
                         continue
-                    bucket = self._timeline_bucket(str(row["captured_at"] or ""))
-                    buckets.setdefault(bucket, []).append(image_path)
+                    bucket = self._timeline_day_bucket(
+                        str(row["captured_at"] or ""),
+                        current_year=timeline_current_year,
+                    )
+                    day_buckets.setdefault(bucket, []).append(image_path)
                 processed += len(rows)
                 if progress_callback is not None and (processed == total or processed - last_progress_at >= 1024):
                     progress_callback(
@@ -582,11 +902,25 @@ class LibraryCatalogService:
             progress_callback(100, f"Prepared {total} timeline photos")
 
         years: list[TimelineYear] = []
+        days_by_month: dict[tuple[int, int], list[TimelineDay]] = {}
+        for (year, month, day), image_paths in day_buckets.items():
+            iso_week = datetime(year, month, day).isocalendar().week if year > 0 else 0
+            days_by_month.setdefault((year, month), []).append(
+                TimelineDay(year, month, day, iso_week, tuple(image_paths))
+            )
         months_by_year: dict[int, list[TimelineMonth]] = {}
-        for (year, month), image_paths in buckets.items():
-            months_by_year.setdefault(year, []).append(TimelineMonth(year, month, tuple(image_paths)))
-        for year, months in months_by_year.items():
-            years.append(TimelineYear(year, tuple(months)))
+        for (year, month), days in days_by_month.items():
+            ordered_days = tuple(sorted(days, key=lambda item: item.day, reverse=True))
+            image_paths = tuple(path for day in ordered_days for path in day.image_paths)
+            months_by_year.setdefault(year, []).append(TimelineMonth(year, month, image_paths, ordered_days))
+        for year in sorted(months_by_year, reverse=True):
+            months = months_by_year[year]
+            years.append(
+                TimelineYear(
+                    year,
+                    tuple(sorted(months, key=lambda month: month.month, reverse=True)),
+                )
+            )
         return CatalogTimeline(tuple(years), total)
 
     def get_asset(self, image_path: str | Path) -> CatalogAsset | None:
@@ -1003,27 +1337,53 @@ class LibraryCatalogService:
         width = height = 0
         camera = ""
         exif: dict[str, str] = {}
+        exif_original_at = ""
         exif_captured_at = ""
         embedded_xmp = ""
         try:
             with Image.open(path) as image:
                 width, height = image.size
-                for tag, value in dict(image.getexif() or {}).items():
+                image_exif = image.getexif()
+                for tag, value in dict(image_exif or {}).items():
                     label = str(ExifTags.TAGS.get(tag, tag))
                     rendered = self._scalar_text(value)
                     if rendered:
                         exif[label] = rendered
+                # Camera JPEGs commonly store DateTimeOriginal in the nested
+                # Exif IFD. Keep this extraction aligned with the standard
+                # photo inspector, which already exposes those values.
+                for ifd_tag, tag_names in ((34665, ExifTags.TAGS), (34853, ExifTags.GPSTAGS)):
+                    try:
+                        nested = image_exif.get_ifd(ifd_tag)
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        nested = {}
+                    for tag, value in dict(nested or {}).items():
+                        label = str(tag_names.get(tag, tag))
+                        rendered = self._scalar_text(value)
+                        if rendered and not exif.get(label):
+                            exif[label] = rendered
                 camera = " ".join(part for part in (exif.get("Make", ""), exif.get("Model", "")) if part).strip()
-                raw_date = exif.get("DateTimeOriginal") or exif.get("DateTimeDigitized") or exif.get("DateTime") or ""
-                exif_captured_at = self._normalize_exif_datetime(raw_date)
+                exif_original_at = self._normalize_exif_datetime(exif.get("DateTimeOriginal", ""))
+                raw_date = exif_original_at or exif.get("DateTimeDigitized") or exif.get("DateTime") or ""
+                exif_captured_at = raw_date if raw_date == exif_original_at else self._normalize_exif_datetime(raw_date)
                 xmp_candidate = image.info.get("XML:com.adobe.xmp") or image.info.get("xmp") or ""
                 embedded_xmp = self._scalar_text(xmp_candidate, max_length=32768)
         except Exception as exc:
             LOGGER.debug("Catalog metadata read failed for %s: %s", image_path, exc)
-        captured_at, capture_source = self._resolve_capture_time(
+        try:
+            modified_at = self._normalize_capture_datetime(
+                datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
+            )
+        except (OSError, OverflowError, ValueError):
+            modified_at = ""
+        manual_captured_at = self._read_manual_captured_at(path)
+        filename_capture = self._configured_filename_capture(path.name)
+        captured_at, capture_source, capture_sequence = self._resolve_capture_time(
+            manual_captured_at=manual_captured_at,
+            exif_original_at=exif_original_at,
             exif_captured_at=exif_captured_at,
-            filename_captured_at=self.filename_capture_datetime(path.name),
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+            filename_capture=filename_capture,
+            modified_at=modified_at,
         )
         xmp_text = self._read_xmp_text(path, embedded_xmp)
         return CatalogAsset(
@@ -1031,7 +1391,7 @@ class LibraryCatalogService:
             root_id=str(root_id),
             captured_at=captured_at,
             capture_source=capture_source,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+            modified_at=modified_at,
             camera=camera,
             width=width,
             height=height,
@@ -1042,34 +1402,77 @@ class LibraryCatalogService:
             mtime_ns=int(stat.st_mtime_ns),
             metadata_mtime_ns=int(metadata_mtime_ns),
             metadata_size=int(metadata_size),
+            capture_sequence=capture_sequence,
+            capture_strategy=filename_capture.strategy,
         )
 
     def _upsert_asset(self, asset: CatalogAsset, *, mtime_ns: int) -> None:
         self._upsert_assets(((asset, int(mtime_ns)),))
 
     def _upsert_assets(self, assets: Iterable[tuple[CatalogAsset, int]]) -> None:
-        pending = tuple(assets)
+        # Root scans publish a bounded batch.  Keep the asset UPSERT and its
+        # derived FTS replacement batched as well: one SQLite transaction per
+        # scan batch, not one statement round-trip per catalog row.
+        pending: dict[str, tuple[CatalogAsset, int]] = {}
+        for asset, mtime_ns in assets:
+            pending[self.canonical_path(asset.image_path)] = (asset, int(mtime_ns))
         if not pending:
             return
+        rows = [self._asset_storage_row(image_path, asset, mtime_ns) for image_path, (asset, mtime_ns) in pending.items()]
         with self._connect() as connection:
-            for asset, mtime_ns in pending:
-                self._upsert_asset_on_connection(connection, asset, mtime_ns=int(mtime_ns))
+            connection.executemany(
+                """
+                INSERT INTO catalog_assets(image_path, root_id, parent_path, file_name, file_ext, mtime_ns, file_size,
+                captured_at, capture_source, capture_sequence, modified_at, camera, width, height, exif_json, xmp_text, metadata_mtime_ns, metadata_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_path) DO UPDATE SET
+                root_id=excluded.root_id, parent_path=excluded.parent_path, file_name=excluded.file_name,
+                file_ext=excluded.file_ext, mtime_ns=excluded.mtime_ns, file_size=excluded.file_size,
+                captured_at=excluded.captured_at, capture_source=excluded.capture_source, capture_sequence=excluded.capture_sequence, modified_at=excluded.modified_at,
+                camera=excluded.camera, width=excluded.width, height=excluded.height, exif_json=excluded.exif_json,
+                xmp_text=excluded.xmp_text, metadata_mtime_ns=excluded.metadata_mtime_ns, metadata_size=excluded.metadata_size
+                """,
+                rows,
+            )
+            if self._fts_available:
+                paths = list(pending)
+                for start in range(0, len(paths), 900):
+                    chunk = paths[start : start + 900]
+                    connection.execute(
+                        f"DELETE FROM catalog_asset_fts WHERE image_path IN ({','.join('?' for _ in chunk)})",
+                        chunk,
+                    )
+                connection.executemany(
+                    "INSERT INTO catalog_asset_fts(image_path, file_name, camera, exif_text, xmp_text) VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (row[0], row[3], row[11], " ".join(f"{key} {value}" for key, value in asset.exif.items()), row[15])
+                        for row, (_asset_path, (asset, _mtime_ns)) in zip(rows, pending.items(), strict=True)
+                    ],
+                )
+            self._catalog_write_checkpoint("before_commit")
+        self._catalog_write_checkpoint("after_commit")
+
+    def _catalog_write_checkpoint(self, name: str) -> None:
+        """Fault-injection seam around one catalog/FTS batch commit."""
+
+        _ = name
 
     def _upsert_asset_on_connection(self, connection: sqlite3.Connection, asset: CatalogAsset, *, mtime_ns: int) -> None:
         image_path = self.canonical_path(asset.image_path)
+        row = self._asset_storage_row(image_path, asset, mtime_ns)
         connection.execute(
             """
             INSERT INTO catalog_assets(image_path, root_id, parent_path, file_name, file_ext, mtime_ns, file_size,
-            captured_at, capture_source, modified_at, camera, width, height, exif_json, xmp_text, metadata_mtime_ns, metadata_size)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            captured_at, capture_source, capture_sequence, modified_at, camera, width, height, exif_json, xmp_text, metadata_mtime_ns, metadata_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_path) DO UPDATE SET
             root_id=excluded.root_id, parent_path=excluded.parent_path, file_name=excluded.file_name,
             file_ext=excluded.file_ext, mtime_ns=excluded.mtime_ns, file_size=excluded.file_size,
-            captured_at=excluded.captured_at, capture_source=excluded.capture_source, modified_at=excluded.modified_at,
+            captured_at=excluded.captured_at, capture_source=excluded.capture_source, capture_sequence=excluded.capture_sequence, modified_at=excluded.modified_at,
             camera=excluded.camera, width=excluded.width, height=excluded.height, exif_json=excluded.exif_json,
             xmp_text=excluded.xmp_text, metadata_mtime_ns=excluded.metadata_mtime_ns, metadata_size=excluded.metadata_size
             """,
-            (image_path, asset.root_id, str(Path(image_path).parent), Path(image_path).name, asset.file_ext, int(mtime_ns), asset.file_size, asset.captured_at, asset.capture_source, asset.modified_at, asset.camera, asset.width, asset.height, json.dumps(asset.exif, sort_keys=True), asset.xmp_text, asset.metadata_mtime_ns, asset.metadata_size),
+            row,
         )
         if self._fts_available:
             connection.execute("DELETE FROM catalog_asset_fts WHERE image_path=?", (image_path,))
@@ -1077,6 +1480,29 @@ class LibraryCatalogService:
                 "INSERT INTO catalog_asset_fts(image_path, file_name, camera, exif_text, xmp_text) VALUES (?, ?, ?, ?, ?)",
                 (image_path, Path(image_path).name, asset.camera, " ".join(f"{key} {value}" for key, value in asset.exif.items()), asset.xmp_text),
             )
+
+    @staticmethod
+    def _asset_storage_row(image_path: str, asset: CatalogAsset, mtime_ns: int) -> tuple[object, ...]:
+        return (
+            image_path,
+            asset.root_id,
+            str(Path(image_path).parent),
+            Path(image_path).name,
+            asset.file_ext,
+            int(mtime_ns),
+            asset.file_size,
+            asset.captured_at,
+            asset.capture_source,
+            asset.capture_sequence,
+            asset.modified_at,
+            asset.camera,
+            asset.width,
+            asset.height,
+            json.dumps(asset.exif, sort_keys=True),
+            asset.xmp_text,
+            asset.metadata_mtime_ns,
+            asset.metadata_size,
+        )
 
     def _delete_assets(self, image_paths: Iterable[str]) -> None:
         paths = [self.canonical_path(path) for path in image_paths if str(path or "").strip()]
@@ -1115,7 +1541,7 @@ class LibraryCatalogService:
             str(row["image_path"]), str(row["root_id"]), str(row["captured_at"]), str(row["capture_source"]),
             str(row["modified_at"]), str(row["camera"]), int(row["width"]), int(row["height"]),
             int(row["file_size"]), str(row["file_ext"]), exif, str(row["xmp_text"]), int(row["mtime_ns"]),
-            int(row["metadata_mtime_ns"]), int(row["metadata_size"]),
+            int(row["metadata_mtime_ns"]), int(row["metadata_size"]), int(row["capture_sequence"] or 0),
         )
 
     @staticmethod
@@ -1139,31 +1565,238 @@ class LibraryCatalogService:
         return text[:max_length]
 
     @staticmethod
-    def _normalize_exif_datetime(value: str) -> str:
+    def _capture_time_in_timeline_range(captured: datetime, *, current_year: int | None = None) -> bool:
+        upper_year = datetime.now(timezone.utc).year if current_year is None else int(current_year)
+        return _TIMELINE_CAPTURE_MIN_YEAR <= captured.year <= upper_year
+
+    @classmethod
+    def _normalize_capture_datetime(cls, value: str) -> str:
         raw = str(value or "").strip()
         if not raw:
             return ""
-        for pattern in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            for pattern in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(raw[:19], pattern)
+                    break
+                except ValueError:
+                    pass
+        if parsed is None:
+            return ""
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        if not cls._capture_time_in_timeline_range(parsed):
+            return ""
+        return parsed.isoformat(timespec="seconds")
+
+    @classmethod
+    def _normalize_exif_datetime(cls, value: str) -> str:
+        return cls._normalize_capture_datetime(value)
+
+    @classmethod
+    def _read_manual_captured_at(cls, path: Path) -> str:
+        """Read only the user-entered capture time from a reversible sidecar."""
+
+        sidecar = cls._photo_edit_sidecar_path(path)
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        except (OSError, TypeError, ValueError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        edits = payload.get("photo_edits", {})
+        if not isinstance(edits, dict):
+            return ""
+        return cls._normalize_capture_datetime(str(edits.get("captured_at", "") or ""))
+
+    @classmethod
+    def filename_capture_datetime(
+        cls,
+        file_name: str,
+        patterns: Iterable[str] | str | None = None,
+        *,
+        epoch_heuristic: bool = False,
+    ) -> str:
+        """Return a source-safe filename timestamp for callers needing only time."""
+
+        return cls.filename_capture(file_name, patterns, epoch_heuristic=epoch_heuristic).captured_at
+
+    @classmethod
+    def filename_capture(
+        cls,
+        file_name: str,
+        patterns: Iterable[str] | str | None = None,
+        *,
+        epoch_heuristic: bool = False,
+    ) -> FilenameCapture:
+        """Parse legacy patterns, named rules, and an opt-in raw epoch fallback."""
+
+        try:
+            active_patterns = cls.normalize_filename_date_patterns(
+                DEFAULT_FILENAME_DATE_PATTERNS if patterns is None else patterns
+            )
+        except ValueError:
+            return FilenameCapture()
+        rules = tuple(cls._compile_filename_rule(pattern) for pattern in active_patterns)
+        return cls._parse_filename_capture(file_name, rules, epoch_heuristic=epoch_heuristic)
+
+    @classmethod
+    def _parse_filename_capture(
+        cls,
+        file_name: str,
+        rules: tuple[_FilenameRule, ...],
+        *,
+        epoch_heuristic: bool,
+    ) -> FilenameCapture:
+        stem = Path(str(file_name or "")).stem
+        if not re.search(r"(?<!\d)\d{4}", stem):
+            return FilenameCapture()
+        for rule in rules:
+            capture = cls._capture_from_rule(stem, rule)
+            if capture.captured_at:
+                return capture
+        builtin = cls._builtin_filename_capture(stem)
+        if builtin.captured_at:
+            return builtin
+        return cls._heuristic_epoch_capture(stem) if epoch_heuristic else FilenameCapture()
+
+    def _configured_filename_capture(self, file_name: str) -> FilenameCapture:
+        """Use compiled configured rules in the catalog's per-asset hot path."""
+
+        return self._parse_filename_capture(
+            file_name,
+            self._filename_date_matchers,
+            epoch_heuristic=self._filename_epoch_heuristic,
+        )
+
+    @classmethod
+    def _compile_filename_rule(cls, pattern: str) -> _FilenameRule:
+        if "{" in pattern or "}" in pattern:
+            return cls._compile_named_filename_rule(pattern)
+        cls._validate_filename_date_pattern(pattern)
+        return _FilenameRule(pattern, cls._filename_date_regex(pattern), "legacy", strptime_pattern=pattern)
+
+    @classmethod
+    def _compile_named_filename_rule(cls, pattern: str) -> _FilenameRule:
+        if len(pattern) > 160:
+            raise ValueError("Filename time rules must be 160 characters or fewer.")
+        matches = tuple(_NAMED_FILENAME_RULE_TOKEN.finditer(pattern))
+        if not matches:
+            raise ValueError(f"{pattern!r} must use a supported named token.")
+        cursor = 0
+        parts: list[str] = []
+        token_values: dict[str, str] = {}
+        for match in matches:
+            literal = pattern[cursor : match.start()]
+            if "{" in literal or "}" in literal:
+                raise ValueError(f"{pattern!r} has an invalid named token.")
+            parts.append(re.escape(literal))
+            kind = str(match.group("kind"))
+            value = str(match.group("value")).strip()
+            if kind in token_values:
+                raise ValueError(f"{pattern!r} repeats {{{kind}:…}}; each token may appear once.")
+            token_values[kind] = value
+            if kind == "date":
+                if value not in _NAMED_FILENAME_DATE_FORMATS:
+                    supported = ", ".join(_NAMED_FILENAME_DATE_FORMATS)
+                    raise ValueError(f"{pattern!r} uses unsupported date format {value!r}; use {supported}.")
+                parts.append(rf"(?P<date>{_NAMED_FILENAME_DATE_REGEXES[value]})")
+            elif kind == "sequence":
+                if not value.isdecimal() or not 1 <= int(value) <= 18:
+                    raise ValueError(f"{pattern!r} sequence width must be an integer from 1 to 18.")
+                parts.append(rf"(?P<sequence>\d{{{int(value)}}})")
+            else:
+                if value == "s":
+                    parts.append(r"(?P<epoch>\d{10})")
+                elif value == "ms":
+                    parts.append(r"(?P<epoch>\d{13})")
+                else:
+                    raise ValueError(f"{pattern!r} epoch unit must be s or ms.")
+            cursor = match.end()
+        tail = pattern[cursor:]
+        if "{" in tail or "}" in tail:
+            raise ValueError(f"{pattern!r} has an invalid named token.")
+        parts.append(re.escape(tail))
+        has_date = "date" in token_values
+        has_epoch = "epoch" in token_values
+        if has_date == has_epoch:
+            raise ValueError(f"{pattern!r} must contain exactly one date or epoch token.")
+        if "sequence" in token_values and not has_date:
+            raise ValueError(f"{pattern!r} may use a sequence only with a date token.")
+        if has_epoch and len(token_values) != 1:
+            raise ValueError(f"{pattern!r} epoch rules cannot combine date or sequence tokens.")
+        return _FilenameRule(
+            pattern,
+            re.compile(r"(?<!\d)" + "".join(parts) + r"(?!\d)"),
+            "named_date" if has_date else "named_epoch",
+            strptime_pattern=_NAMED_FILENAME_DATE_FORMATS.get(token_values.get("date", ""), ""),
+            epoch_unit=token_values.get("epoch", ""),
+        )
+
+    @classmethod
+    def _capture_from_rule(cls, stem: str, rule: _FilenameRule) -> FilenameCapture:
+        match = rule.matcher.search(stem)
+        if match is None:
+            return FilenameCapture()
+        if rule.kind == "legacy":
             try:
-                return datetime.strptime(raw[:19], pattern).replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
+                captured = datetime.strptime(match.group(0), rule.strptime_pattern).replace(tzinfo=timezone.utc)
             except ValueError:
-                pass
-        return ""
+                return FilenameCapture()
+            if not cls._capture_time_in_timeline_range(captured):
+                return FilenameCapture()
+            return FilenameCapture(captured.isoformat(timespec="seconds"), strategy="filename_date")
+        if rule.kind == "named_date":
+            try:
+                captured = datetime.strptime(str(match.group("date") or ""), rule.strptime_pattern).replace(tzinfo=timezone.utc)
+            except ValueError:
+                return FilenameCapture()
+            if not cls._capture_time_in_timeline_range(captured):
+                return FilenameCapture()
+            return FilenameCapture(
+                captured.isoformat(timespec="seconds"),
+                int(match.group("sequence") or 0),
+                "filename_date",
+            )
+        return cls._epoch_capture(str(match.group("epoch") or ""), rule.epoch_unit, strategy="filename_epoch")
 
     @staticmethod
-    def filename_capture_datetime(file_name: str) -> str:
-        """Extract an unambiguous year-first date/time from a camera filename.
+    def _filename_date_regex(pattern: str) -> re.Pattern[str]:
+        """Compile one validated strptime pattern to a bounded matcher."""
 
-        Ambiguous locale formats are deliberately ignored.  The result is
-        derived catalog data only; choosing it never changes EXIF/XMP.
-        """
+        parts: list[str] = []
+        index = 0
+        while index < len(pattern):
+            character = pattern[index]
+            if character != "%":
+                parts.append(re.escape(character))
+                index += 1
+                continue
+            directive = pattern[index + 1]
+            if directive == "%":
+                parts.append(re.escape("%"))
+            else:
+                parts.append(f"(?:{_FILENAME_DATE_DIRECTIVES[directive]})")
+            index += 2
+        return re.compile(r"(?<!\d)" + "".join(parts) + r"(?!\d)")
+
+    @classmethod
+    def _builtin_filename_capture(cls, stem: str) -> FilenameCapture:
+        """Keep the historic safe separator variants behind custom patterns."""
+
         match = re.search(
             r"(?<!\d)(?P<year>19\d{2}|20\d{2})[-_.]?(?P<month>0[1-9]|1[0-2])[-_.]?(?P<day>0[1-9]|[12]\d|3[01])"
             r"(?:[T _.-]?(?P<hour>[01]\d|2[0-3])[:._-]?(?P<minute>[0-5]\d)(?:[:._-]?(?P<second>[0-5]\d))?)?(?!\d)",
-            str(file_name or ""),
+            stem,
         )
         if match is None:
-            return ""
+            return FilenameCapture()
         try:
             captured = datetime(
                 int(match.group("year")),
@@ -1175,46 +1808,97 @@ class LibraryCatalogService:
                 tzinfo=timezone.utc,
             )
         except ValueError:
-            return ""
-        return captured.isoformat(timespec="seconds")
+            return FilenameCapture()
+        if not cls._capture_time_in_timeline_range(captured):
+            return FilenameCapture()
+        return FilenameCapture(captured.isoformat(timespec="seconds"), strategy="filename_date")
+
+    @classmethod
+    def _heuristic_epoch_capture(cls, stem: str) -> FilenameCapture:
+        candidates = [
+            cls._epoch_capture(match.group(0), "s" if len(match.group(0)) == 10 else "ms", strategy="filename_epoch_heuristic")
+            for match in re.finditer(r"(?<!\d)(?:\d{10}|\d{13})(?!\d)", stem)
+        ]
+        valid = [candidate for candidate in candidates if candidate.captured_at]
+        if len(valid) == 1:
+            return valid[0]
+        if len(valid) > 1:
+            return FilenameCapture(strategy="filename_epoch_ambiguous")
+        return FilenameCapture()
+
+    @classmethod
+    def _epoch_capture(cls, raw: str, unit: str, *, strategy: str) -> FilenameCapture:
+        try:
+            value = int(raw)
+            if unit == "s":
+                captured = datetime.fromtimestamp(value, timezone.utc)
+            else:
+                seconds, milliseconds = divmod(value, 1000)
+                captured = datetime.fromtimestamp(seconds, timezone.utc) + timedelta(milliseconds=milliseconds)
+        except (OSError, OverflowError, ValueError):
+            return FilenameCapture()
+        if not cls._capture_time_in_timeline_range(captured):
+            return FilenameCapture()
+        precision = "seconds" if unit == "s" else "milliseconds"
+        return FilenameCapture(captured.isoformat(timespec=precision), strategy=strategy)
 
     def _resolve_capture_time(
         self,
         *,
+        manual_captured_at: str,
+        exif_original_at: str,
         exif_captured_at: str,
-        filename_captured_at: str,
+        filename_capture: FilenameCapture,
         modified_at: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, int]:
         values = {
-            "exif": str(exif_captured_at or ""),
-            "filename": str(filename_captured_at or ""),
-            "modified": str(modified_at or ""),
+            "manual": (str(manual_captured_at or ""), 0),
+            "exif_original": (str(exif_original_at or ""), 0),
+            "exif": (str(exif_captured_at or ""), 0),
+            "filename": (str(filename_capture.captured_at or ""), int(filename_capture.sequence or 0)),
+            "modified": (str(modified_at or ""), 0),
         }
         priorities = {
             "metadata_only": ("exif", "modified"),
             "metadata_or_filename": ("exif", "filename", "modified"),
+            "datetime_original_then_metadata": ("exif_original", "exif", "filename", "modified"),
             "prefer_filename": ("filename", "exif", "modified"),
-            "filename_only": ("filename", "modified"),
+            # Filename-only is intentionally strict for valid filename dates.
+            # When a name cannot yield one, DateTimeOriginal is the camera's
+            # capture-time authority and keeps the photo out of Unparsed.
+            "filename_only": ("filename", "exif_original"),
         }[self._filename_date_policy]
+        manual_at, manual_sequence = values["manual"]
+        if manual_at:
+            return manual_at, "manual", manual_sequence
         for source in priorities:
-            if values[source]:
-                return values[source], source
-        return "", "modified"
+            captured_at, sequence = values[source]
+            if captured_at:
+                return captured_at, source, sequence
+        return "", "unparsed", 0
 
-    @staticmethod
-    def _timeline_bucket(captured_at: str) -> tuple[int, int]:
+    @classmethod
+    def _timeline_bucket(cls, captured_at: str, *, current_year: int | None = None) -> tuple[int, int]:
         """Return a stable year/month bucket without consulting source media."""
+
+        year, month, _day = cls._timeline_day_bucket(captured_at, current_year=current_year)
+        return year, month
+
+    @classmethod
+    def _timeline_day_bucket(cls, captured_at: str, *, current_year: int | None = None) -> tuple[int, int, int]:
+        """Return a stable year/month/day bucket without consulting source media."""
 
         raw = str(captured_at or "").strip()
         try:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            return parsed.year, parsed.month
+            if cls._capture_time_in_timeline_range(parsed, current_year=current_year) and 1 <= parsed.month <= 12:
+                return parsed.year, parsed.month, parsed.day
         except ValueError:
-            # Cataloging normally falls back to the file modification time,
-            # but older/hand-edited databases can contain an empty timestamp.
-            # Keep these rows visible in one explicit, chronologically-last
-            # group instead of dropping them or touching the source file.
-            return 0, 0
+            pass
+        # Older/hand-edited databases can contain an empty or unsupported
+        # timestamp. Keep these rows visible in one explicit, last group
+        # instead of dropping them or touching the source file.
+        return 0, 0, 0
 
     @staticmethod
     def _read_xmp_text(path: Path, embedded_xmp: str) -> str:
@@ -1232,14 +1916,22 @@ class LibraryCatalogService:
         adjacent = path.with_suffix(f"{path.suffix}.xmp")
         return adjacent if adjacent.exists() else path.with_suffix(".xmp")
 
+    @staticmethod
+    def _photo_edit_sidecar_path(path: Path) -> Path:
+        return path.parent / f"{path.name}.clusterlens.json"
+
     @classmethod
     def _metadata_sidecar_fingerprint(cls, path: Path) -> tuple[int, int]:
-        sidecar = cls._metadata_sidecar_path(path)
-        try:
-            stat = sidecar.stat()
-            return int(stat.st_mtime_ns), int(stat.st_size)
-        except OSError:
+        fingerprints: list[tuple[int, int]] = []
+        for sidecar in (cls._metadata_sidecar_path(path), cls._photo_edit_sidecar_path(path)):
+            try:
+                stat = sidecar.stat()
+                fingerprints.append((int(stat.st_mtime_ns), int(stat.st_size)))
+            except OSError:
+                pass
+        if not fingerprints:
             return 0, 0
+        return max(mtime_ns for mtime_ns, _size in fingerprints), sum(size for _mtime_ns, size in fingerprints)
 
     @staticmethod
     def _fts_query(text: str) -> str:

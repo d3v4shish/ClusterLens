@@ -160,9 +160,6 @@ class PagedListEntryModel(ListEntryModel):
 class SidebarListEntryDelegate(QStyledItemDelegate):
     """Draw dense sidebar rows with separate label and supporting metadata."""
 
-    _title_color = QColor(COLORS["text"])
-    _subtitle_color = QColor(COLORS["text_muted"])
-
     @staticmethod
     def _text_parts(index) -> tuple[str, str]:
         title = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
@@ -201,8 +198,8 @@ class SidebarListEntryDelegate(QStyledItemDelegate):
         subtitle_font.setPointSize(max(9, subtitle_font.pointSize() - 1))
         subtitle_metrics = QFontMetrics(subtitle_font)
         selected = bool(style_option.state & QStyle.StateFlag.State_Selected)
-        title_color = style_option.palette.highlightedText().color() if selected else self._title_color
-        subtitle_color = style_option.palette.highlightedText().color() if selected else self._subtitle_color
+        title_color = style_option.palette.highlightedText().color() if selected else QColor(COLORS["text"])
+        subtitle_color = style_option.palette.highlightedText().color() if selected else QColor(COLORS["text_muted"])
         painter.save()
         painter.setFont(title_font)
         painter.setPen(title_color)

@@ -13,7 +13,7 @@ class JobState:
     label: str
     progress: int | None = None  # None => indeterminate
     text: str = ""
-    status: str = "running"  # running|cancelling|finished|failed|cancelled
+    status: str = "running"  # queued|running|cancelling|finished|failed|cancelled
     started_at_s: float = 0.0
     finished_at_s: float | None = None
     error: str = ""
@@ -25,7 +25,7 @@ class JobState:
 
     @property
     def cancellable(self) -> bool:
-        return self.cancel_fn is not None and self.status == "running"
+        return self.cancel_fn is not None and self.status in {"queued", "running"}
 
 
 class JobManager(QObject):
@@ -43,6 +43,14 @@ class JobManager(QObject):
         self._jobs: dict[int, JobState] = {}
         self._history: list[int] = []
         self._max_history = max(10, int(max_history))
+
+    def _emit_safely(self, signal_name: str, *args) -> None:
+        """Ignore queued lifecycle delivery after the owning window is gone."""
+
+        try:
+            getattr(self, signal_name).emit(*args)
+        except RuntimeError:
+            pass
 
     def register_job(
         self,
@@ -67,7 +75,7 @@ class JobManager(QObject):
         )
         self._history.append(job_id)
         self._prune_history()
-        self.job_added.emit(job_id)
+        self._emit_safely("job_added", job_id)
         return job_id
 
     def update(
@@ -78,7 +86,7 @@ class JobManager(QObject):
         cache_status: str | None = None,
     ) -> None:
         job = self._jobs.get(int(job_id))
-        if job is None or job.status not in {"running", "cancelling"}:
+        if job is None or job.status not in {"queued", "running", "cancelling"}:
             return
         if progress is not None:
             job.progress = None if progress < 0 else int(progress)
@@ -87,11 +95,32 @@ class JobManager(QObject):
         if cache_status is not None:
             job.cache_status = str(cache_status)
         job.updated_at_s = time()
-        self.job_updated.emit(job.job_id)
+        self._emit_safely("job_updated", job.job_id)
+
+    def set_queued(self, job_id: int, *, text: str = "Waiting to schedule.", cache_status: str = "queued") -> None:
+        job = self._jobs.get(int(job_id))
+        if job is None or job.status not in {"queued", "running"}:
+            return
+        job.status = "queued"
+        job.progress = None
+        job.text = str(text)
+        job.cache_status = str(cache_status)
+        job.updated_at_s = time()
+        self._emit_safely("job_updated", job.job_id)
+
+    def start(self, job_id: int, *, text: str = "Running.", cache_status: str = "") -> None:
+        job = self._jobs.get(int(job_id))
+        if job is None or job.status not in {"queued", "running"}:
+            return
+        job.status = "running"
+        job.text = str(text)
+        job.cache_status = str(cache_status)
+        job.updated_at_s = time()
+        self._emit_safely("job_updated", job.job_id)
 
     def finish(self, job_id: int, status: str = "finished", error: str = "", cache_status: str = "") -> None:
         job = self._jobs.get(int(job_id))
-        if job is None or job.status not in {"running", "cancelling"}:
+        if job is None or job.status not in {"queued", "running", "cancelling"}:
             return
         normalized_status = str(status)
         if normalized_status not in {"finished", "failed", "cancelled"}:
@@ -103,7 +132,7 @@ class JobManager(QObject):
         job.finished_at_s = time()
         job.updated_at_s = job.finished_at_s
         job.cancel_fn = None
-        self.job_finished.emit(job.job_id)
+        self._emit_safely("job_finished", job.job_id)
         self._prune_history()
 
     def cancel(self, job_id: int) -> None:
@@ -112,7 +141,8 @@ class JobManager(QObject):
             return
         try:
             job.status = "cancelling"
-            self.job_updated.emit(job.job_id)
+            job.updated_at_s = time()
+            self._emit_safely("job_updated", job.job_id)
             job.cancel_fn()
         except Exception as exc:
             self.finish(job_id, status="failed", error=str(exc))
@@ -121,7 +151,7 @@ class JobManager(QObject):
         return self._jobs.get(int(job_id))
 
     def active_jobs(self) -> list[JobState]:
-        return [job for job in self._jobs.values() if job.status in {"running", "cancelling"}]
+        return [job for job in self._jobs.values() if job.status in {"queued", "running", "cancelling"}]
 
     def history(self, limit: int = 100) -> list[JobState]:
         ids = list(self._history)[-max(1, int(limit)) :]
@@ -133,19 +163,26 @@ class JobManager(QObject):
         return out
 
     def most_recent_active(self, *, foreground_only: bool = False) -> JobState | None:
+        """Return the newest active job, independent of progress frequency.
+
+        ``updated_at_s`` is deliberately excluded: otherwise two concurrent
+        workers can steal footer/cancellation ownership on every progress
+        callback. Registration order is the deterministic tie-breaker.
+        """
+
         active = [
             job
             for job in self._jobs.values()
-            if job.status in {"running", "cancelling"} and (not foreground_only or job.foreground)
+            if job.status in {"queued", "running", "cancelling"} and (not foreground_only or job.foreground)
         ]
-        return max(active, key=lambda job: (job.updated_at_s, job.job_id), default=None)
+        return max(active, key=lambda job: (job.started_at_s, job.job_id), default=None)
 
     def active_count(self, *, foreground_only: bool = False) -> int:
         return len(
             [
                 job
                 for job in self._jobs.values()
-                if job.status in {"running", "cancelling"} and (not foreground_only or job.foreground)
+                if job.status in {"queued", "running", "cancelling"} and (not foreground_only or job.foreground)
             ]
         )
 
@@ -190,7 +227,7 @@ class JobManager(QObject):
         removable = len(self._history) - self._max_history
         for job_id in self._history:
             job = self._jobs.get(job_id)
-            if removable > 0 and job is not None and job.status not in {"running", "cancelling"}:
+            if removable > 0 and job is not None and job.status not in {"queued", "running", "cancelling"}:
                 self._jobs.pop(job_id, None)
                 removable -= 1
             else:

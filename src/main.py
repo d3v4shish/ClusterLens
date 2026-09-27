@@ -315,7 +315,6 @@ class ClusterGalleryApp(QMainWindow):
         self.faces_pane.set_face_service_provider(self._face_service_for_pipeline)
         self.faces_pane.current_directory_provider = lambda: self.source_pane.selected_directory
         self.faces_pane.clustering_filter_state_provider = self._current_clustering_filter_state
-        self.faces_pane.search_only_current_folder.setText("Limit search to current folder")
         self.faces_pane.use_onnx_provider = lambda: bool(self.clustering_pane.onnx_checkbox.isChecked())
         self.faces_pane.job_manager = self.job_manager
         self.faces_pane.results_gallery.job_manager = self.job_manager

@@ -31,8 +31,10 @@ from app.services.cluster_meanings import ClusterMeaning
 from app.services.image_tags import ClusterTagSummary
 from app.services.thumbnails import ThumbnailService
 from .async_job import AsyncJob, raise_if_cancelled, start_job_in_thread, wait_for_thread_shutdown
-from .common import build_help_inline
-from .theme import COLORS
+from .common import ResponsiveFlowLayout, build_help_inline
+from .job_manager import JobManager
+from .theme import COLORS, get_theme_manager
+from .work_coordinator import JobSpec, WorkCoordinator
 
 
 CLUSTER_PANE_HELP = {
@@ -73,7 +75,7 @@ CLUSTER_PANE_HELP = {
         "Use this to compare where one image lands across different runs."
     ),
     "recluster": (
-        "Run clustering again using only the selected cluster's images.\n"
+        "Organize again using only the selected group's photos.\n"
         "It reuses the main clustering settings from the left controls.\n"
         "The source folder is not rediscovered for this run.\n"
         "Small subsets can still fail if Clusters is higher than the selected image count."
@@ -525,6 +527,20 @@ class ClusterHoverPreviewPopup(QFrame):
         layout.addWidget(self.note_label)
 
         self.setFixedWidth(320)
+        manager = get_theme_manager()
+        if manager is not None:
+            manager.theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, *_args) -> None:
+        self.setStyleSheet(
+            f"QFrame#clusterHoverPreviewPopup {{ background: {COLORS['surface_raised']}; "
+            f"border: 1px solid {COLORS['border_strong']}; border-radius: 8px; }} "
+            f"QLabel {{ color: {COLORS['text']}; }}"
+        )
+        self.image_label.setStyleSheet(
+            f"background: {COLORS['surface_sunken']}; border: 1px solid {COLORS['border']};"
+        )
+        self.note_label.setStyleSheet(f"color: {COLORS['text_muted']};")
 
     def set_cluster_details(
         self,
@@ -706,7 +722,7 @@ class ClusterGridModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole and self._selected == key:
             return QColor(COLORS["surface_selected"])
         if role == Qt.ItemDataRole.BackgroundRole and key in self._highlighted:
-            return QColor("#33270C")
+            return QColor(COLORS["surface_checked"])
         if role == Qt.ItemDataRole.FontRole and key in self._highlighted:
             font = QFont()
             font.setBold(True)
@@ -789,16 +805,16 @@ class ClusterCellDelegate(QStyledItemDelegate):
         model_background = index.data(Qt.ItemDataRole.BackgroundRole)
         if is_selected:
             background = QColor(COLORS["surface_selected"])
-            border = QColor("#3C6FB6")
+            border = QColor(COLORS["accent"])
         elif isinstance(model_background, QColor):
             background = model_background
             border = QColor(COLORS["border_strong"])
         elif is_hovered:
-            background = QColor("#16202C")
+            background = QColor(COLORS["surface_raised"])
             border = QColor(COLORS["border"])
         else:
             background = QColor(COLORS["surface"])
-            border = QColor("#202933")
+            border = QColor(COLORS["border"])
 
         rect = option.rect
         painter.save()
@@ -857,10 +873,21 @@ class ClusterPane(QWidget):
         self._hover_preview_job = None
         self._hover_preview_thread = None
         self._thread_jobs: dict[object, object | None] = {}
+        self.job_manager: JobManager | None = None
+        self.work_coordinator: WorkCoordinator | None = None
+        self._coordinated_job_ids: dict[AsyncJob, int] = {}
         self._retained_async_refs: list[tuple[object | None, object | None]] = []
         self._hover_preview_cache: OrderedDict[tuple[object, ...], QImage] = OrderedDict()
         self.init_ui()
         self._install_hover_preview()
+
+    def configure_jobs(
+        self,
+        job_manager: JobManager | None,
+        work_coordinator: WorkCoordinator | None = None,
+    ) -> None:
+        self.job_manager = job_manager
+        self.work_coordinator = work_coordinator
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -881,34 +908,36 @@ class ClusterPane(QWidget):
             target.addLayout(row)
             return label
 
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(6)
-
         title_label = QLabel("Cluster Comparisons")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setWordWrap(True)
+        title_label.setMinimumWidth(0)
+        title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         title_label.setToolTip(CLUSTER_PANE_HELP["cluster_comparisons"])
         self.title_label = title_label
         self.recluster_button = QPushButton("Recluster")
         self.recluster_button.setEnabled(False)
         self.recluster_button.clicked.connect(self.recluster_requested.emit)
-        self.open_gallery_button = QPushButton("Open in Gallery")
-        self.open_gallery_button.setToolTip("Open the selected cluster's photo set in the top-level Gallery.")
-        self.open_gallery_button.setAccessibleName("Open selected cluster in Gallery")
+        self.open_gallery_button = QPushButton("View photos")
+        self.open_gallery_button.setToolTip("Open the selected cluster as the current photo set in Organize.")
+        self.open_gallery_button.setAccessibleName("View selected cluster photos")
         self.open_gallery_button.setEnabled(False)
         self.open_gallery_button.clicked.connect(self._open_selected_cluster_in_gallery)
         self.hide_button = QPushButton("Hide")
         self.hide_button.setProperty("paneToggle", True)
         self.hide_button.setFixedHeight(24)
         self.hide_button.clicked.connect(self.hide_requested.emit)
-        header_row.addWidget(title_label, stretch=1)
-        header_row.addWidget(build_help_inline(self.recluster_button, CLUSTER_PANE_HELP["recluster"], help_key="recluster"))
-        header_row.addWidget(self.open_gallery_button)
-        header_row.addWidget(self.hide_button)
-        layout.addLayout(header_row)
+        layout.addWidget(title_label)
+        self.header_actions_row = QWidget(self)
+        header_actions = ResponsiveFlowLayout(self.header_actions_row, spacing=6)
+        header_actions.addWidget(build_help_inline(self.recluster_button, CLUSTER_PANE_HELP["recluster"], help_key="recluster"))
+        header_actions.addWidget(self.open_gallery_button)
+        header_actions.addWidget(self.hide_button)
+        layout.addWidget(self.header_actions_row)
 
         self.cluster_table = QTableView()
+        self.cluster_table.setAccessibleName("Cluster comparison table")
         self.cluster_table.setProperty("clusterComparisonTable", True)
         self.cluster_table.setModel(self._grid_model)
         self.cluster_table.setItemDelegate(ClusterCellDelegate(self.cluster_table))
@@ -988,6 +1017,7 @@ class ClusterPane(QWidget):
         self.details_layout.addWidget(self.basis_label)
 
         self.preview_list = QListWidget()
+        self.preview_list.setAccessibleName("Selected cluster preview")
         self.preview_list.setToolTip(CLUSTER_PANE_HELP["preview"])
         self.preview_list.setMaximumHeight(140)
         self.details_layout.addWidget(self.preview_list)
@@ -1000,6 +1030,7 @@ class ClusterPane(QWidget):
         )
 
         self.membership_table = QTableWidget()
+        self.membership_table.setAccessibleName("Selected image cluster membership")
         self.membership_table.setColumnCount(7)
         self.membership_table.setHorizontalHeaderLabels([
             "Embedding",
@@ -1024,6 +1055,11 @@ class ClusterPane(QWidget):
         self.cluster_table.verticalScrollBar().valueChanged.connect(lambda _value: self._hide_hover_popup(cancel_preview=True))
         self.cluster_table.horizontalScrollBar().valueChanged.connect(lambda _value: self._hide_hover_popup(cancel_preview=True))
         self._grid_model.modelReset.connect(lambda: self._hide_hover_popup(cancel_preview=True))
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if hasattr(self, "title_label"):
+            self.title_label.setText("Groups" if self.width() < 500 else "Cluster Comparisons")
 
     def eventFilter(self, watched, event):
         if watched is self.cluster_table.viewport():
@@ -1300,14 +1336,37 @@ class ClusterPane(QWidget):
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
+        for signal in (job.completed, job.failed, job.cancelled):
+            signal.connect(lambda *_args, job=job: self._coordinated_job_ids.pop(job, None))
         self._hover_preview_job = job
-        thread = start_job_in_thread(job)
-        self._thread_jobs[thread] = job
-        thread.finished.connect(
-            lambda thread=thread: self._on_async_thread_finished(thread),
-            Qt.ConnectionType.QueuedConnection,
+
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._thread_jobs[thread] = job
+            thread.finished.connect(
+                lambda thread=thread: self._on_async_thread_finished(thread),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._hover_preview_thread = thread
+
+        if self.work_coordinator is None:
+            _launch()
+            return
+        coordinated_job_id = self.work_coordinator.submit_async_job(
+            JobSpec(
+                "Loading cluster preview",
+                origin="Organize",
+                foreground=False,
+                io_bound=True,
+                source_reads=preview_paths,
+            ),
+            job,
+            _launch,
         )
-        self._hover_preview_thread = thread
+        manager = self.job_manager or self.work_coordinator.job_manager
+        state = manager.get(coordinated_job_id)
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._coordinated_job_ids[job] = coordinated_job_id
 
     def _apply_hover_preview_image(self, image: QImage, generation: int) -> None:
         if generation != self._hover_preview_generation or self._hover_popup_key is None:
@@ -1350,7 +1409,12 @@ class ClusterPane(QWidget):
         if cancel_preview:
             self._cancel_hover_preview_job()
             self._hover_preview_generation += 1
-        self._hover_popup.hide()
+        try:
+            self._hover_popup.hide()
+        except RuntimeError:
+            # A deferred parent teardown may delete the C++ popup before a
+            # queued viewport/hide event reaches this Python wrapper.
+            pass
         self._hover_popup_key = None
         self._hover_popup_index = QModelIndex()
 
@@ -1359,12 +1423,21 @@ class ClusterPane(QWidget):
         thread = self._hover_preview_thread
         if job is not None:
             self._retain_async_refs(job, thread)
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_hover_job(job)
         self._hover_preview_job = None
         self._hover_preview_thread = None
+
+    def _cancel_hover_job(self, job: AsyncJob | None) -> None:
+        if job is None:
+            return
+        coordinated_job_id = self._coordinated_job_ids.get(job)
+        if coordinated_job_id is not None and self.work_coordinator is not None:
+            self.work_coordinator.cancel(coordinated_job_id)
+            return
+        try:
+            job.cancel()
+        except Exception:
+            pass
 
     @staticmethod
     def _thread_is_running(thread) -> bool:
@@ -1404,10 +1477,7 @@ class ClusterPane(QWidget):
         active_pairs = [(self._hover_preview_job, self._hover_preview_thread), *self._retained_async_refs]
         for job, thread in active_pairs:
             if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    pass
+                self._cancel_hover_job(job)
             thread_finished = True
             if thread is not None:
                 try:
@@ -1418,9 +1488,13 @@ class ClusterPane(QWidget):
         self._hover_preview_job = None
         self._hover_preview_thread = None
         if ready_to_close:
+            if self.work_coordinator is not None:
+                for coordinated_job_id in tuple(self._coordinated_job_ids.values()):
+                    self.work_coordinator.finish(coordinated_job_id, status="cancelled")
+            self._coordinated_job_ids.clear()
             self._retained_async_refs = []
             self._thread_jobs = {}
-        self._hover_popup.hide()
+        self._hide_hover_popup(cancel_preview=False)
         return ready_to_close
 
     def hideEvent(self, event) -> None:

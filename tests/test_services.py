@@ -11,12 +11,14 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 from PyQt6.QtGui import QColor
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -26,8 +28,10 @@ from app.services import face_model_installer as face_model_installer_module
 from app.services.cluster_meanings import ClusterMeaningCacheService, ClusterMeaningService
 from app.services.clustering_pipeline import ClusteringPipelineService, ClusteringRequest
 from app.services.discovery import DiscoveryResult, ImageDiscoveryService
+from app.services.source_admission import SourceAdmissionPolicy, is_thumbnail_like_path
 from app.services import face_search as face_search_module
 from app.services.embedding_index import EmbeddingIndexService
+from app.services import embedding_index as embedding_index_module
 from app.services.face_search import (
     BUILTIN_HUMAN_DETECTOR_ID,
     BUILTIN_HUMAN_EMBEDDER_ID,
@@ -47,13 +51,15 @@ from app.services.face_search import (
     resolve_face_embedder_bundle,
 )
 from app.services.gallery_actions import GalleryActionService
+from app.services import gallery_actions as gallery_actions_module
 from app.services.image_tags import ImageTagService
-from app.services.model_assets import ModelAssetService, sha256_file
+from app.services.model_assets import HF_MODEL_REVISIONS, ModelAssetService, sha256_file
 from app.services.model_downloads import ModelDownloadItem, ModelDownloadService, normalize_model_download_items
 from app.services.onnx_models import OnnxModelService
 from app.services.perceptual_hash import PerceptualHashIndexService
 from app.services.performance_dashboard import PerformanceDashboardService
-from app.services.photo_metadata import MetadataSidecarService
+from app.services.photo_metadata import MetadataSidecarService, PhotoEditDraft, PhotoEditService, PhotoMetadataService
+from app.services import photo_metadata as photo_metadata_module
 from app.services.result_cache import ResultCacheService
 from app.services.saved_searches import SavedSearchService
 from app.services.similarity_graph import SimilarityGraphService
@@ -298,6 +304,36 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("Scanning folder", events[0][1])
             self.assertIn("Folder scan complete: 2 image(s) discovered.", events[-1][1])
 
+    def test_discovery_source_filters_exclude_thumbnail_names_small_files_and_small_dimensions(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "photo.jpg").write_bytes(b"x" * 4096)
+            (root / "photo_thumb.jpg").write_bytes(b"x" * 4096)
+            (root / "tiny.jpg").write_bytes(b"x")
+
+            size_filtered = ImageDiscoveryService(
+                admission_policy=SourceAdmissionPolicy(ignore_thumbnail_like=True, minimum_file_size_bytes=1024)
+            ).discover_result(str(root))
+
+            self.assertEqual((str(root / "photo.jpg"),), size_filtered.paths)
+            self.assertEqual(2, size_filtered.filtered_count)
+
+            Image.new("RGB", (120, 80), (30, 70, 120)).save(root / "large.png")
+            Image.new("RGB", (40, 80), (30, 70, 120)).save(root / "small.png")
+            dimension_filtered = ImageDiscoveryService(
+                admission_policy=SourceAdmissionPolicy(minimum_width=100, minimum_height=60)
+            ).discover_result(str(root))
+
+            self.assertIn(str(root / "large.png"), dimension_filtered.paths)
+            self.assertNotIn(str(root / "small.png"), dimension_filtered.paths)
+            self.assertGreaterEqual(dimension_filtered.filtered_count, 1)
+
+    def test_thumbnail_filter_accepts_compact_dimension_names_without_false_positive_substrings(self):
+        self.assertTrue(is_thumbnail_like_path("/photos/thumbnail320.jpg"))
+        self.assertTrue(is_thumbnail_like_path("/photos/thumb300x200.png"))
+        self.assertFalse(is_thumbnail_like_path("/photos/thumbprint.jpg"))
+        self.assertFalse(is_thumbnail_like_path("/photos/thumbnailist.jpg"))
+
     def test_discovery_honors_cancel_check(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -422,6 +458,47 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual("Alice review", final_records[face_query.search_id].name)
             self.assertNotIn(people.search_id, final_records)
 
+    def test_saved_searches_serialize_competing_edits_and_preserve_failed_files(self):
+        with TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "saved_searches.json"
+            first = SavedSearchService(store_path)
+            second = SavedSearchService(store_path)
+            gate = Barrier(3)
+
+            def _save(service, name):
+                gate.wait()
+                return service.save_search(name, "unknown_people", {"mode": "unknown"})
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                left = pool.submit(_save, first, "Left")
+                right = pool.submit(_save, second, "Right")
+                gate.wait()
+                left.result()
+                right.result()
+
+            self.assertEqual(
+                {"Left", "Right"},
+                {record.name for record in SavedSearchService(store_path).list_searches()},
+            )
+
+            before = store_path.read_bytes()
+            record = first.list_searches()[0]
+            with patch(
+                "app.services.saved_searches.atomic_write_text",
+                side_effect=OSError("disk full"),
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    first.rename_search(record.search_id, "Not committed")
+            self.assertEqual(before, store_path.read_bytes())
+
+            store_path.write_text("{not json", encoding="utf-8")
+            malformed = store_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "unreadable"):
+                first.list_searches()
+            with self.assertRaisesRegex(ValueError, "unreadable"):
+                first.save_search("Must not overwrite", "unknown_people", {})
+            self.assertEqual(malformed, store_path.read_bytes())
+
     def test_thumbnail_service_clear_memory_cache_empties_qimage_cache(self):
         service = ThumbnailService()
         service._qimage_cache[("a.jpg", 128)] = service._qimage_cache.get(("a.jpg", 128)) or None
@@ -468,9 +545,10 @@ class ServiceTests(unittest.TestCase):
 
             with Image.open(thumb_path) as thumb:
                 self.assertEqual((80, 80), thumb.size)
-                non_white = thumb.convert("RGB").point(lambda value: 255 if value < 250 else 0).getbbox()
+                alpha_bounds = thumb.getchannel("A").getbbox()
+                self.assertEqual(0, thumb.getpixel((5, 40))[3])
 
-            self.assertEqual((15, 0, 65, 80), non_white)
+            self.assertEqual((16, 0, 64, 80), alpha_bounds)
 
     def test_thumbnail_service_load_qimage_fallback_respects_exif_orientation(self):
         with TemporaryDirectory() as tmp:
@@ -491,7 +569,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(80, thumb.width())
             self.assertEqual(80, thumb.height())
             self.assertNotEqual(QColor("#FFFFFF"), thumb.pixelColor(40, 5))
-            self.assertEqual(QColor("#FFFFFF"), thumb.pixelColor(5, 40))
+            self.assertEqual(0, thumb.pixelColor(5, 40).alpha())
 
     def test_thumbnail_service_load_qimage_cache_miss_avoids_disk_thumbnail_generation(self):
         with TemporaryDirectory() as tmp:
@@ -1120,6 +1198,132 @@ class ServiceTests(unittest.TestCase):
             entries = action_service.read_audit_entries(limit=10)
             self.assertEqual(1, entries[-1]["failure_count"])
 
+    def test_gallery_mutation_stops_when_per_file_journal_intent_is_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.jpg"
+            source.write_bytes(b"original")
+            service = GalleryActionService(
+                audit_log_path=root / "logs" / "operations.jsonl",
+                journal_path=root / "logs" / "operations.sqlite3",
+                temp_dir=root / "tmp",
+            )
+
+            with patch.object(service, "_record_journal_file", return_value=None):
+                result = service.move_to_directory([str(source)], str(root / "target"))
+
+            self.assertTrue(source.exists())
+            self.assertEqual(b"original", source.read_bytes())
+            self.assertEqual([], result.changed_paths)
+            self.assertEqual([], list((root / "target").glob("*")))
+
+    def test_gallery_restart_reconciles_and_restores_committed_file_moves(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        for operation in ("move", "trash", "rename"):
+            with self.subTest(operation=operation), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source.jpg"
+                source.write_bytes(b"original")
+                audit = root / "logs" / "operations.jsonl"
+                journal = root / "logs" / "operations.sqlite3"
+                service = GalleryActionService(audit_log_path=audit, journal_path=journal, temp_dir=root / "tmp")
+                original_update = service._update_journal_file
+
+                def _crash_after_move(file_entry_id, result, *, status, target_path="", error=""):
+                    if status == "completed":
+                        raise _ProcessExit(operation)
+                    return original_update(
+                        file_entry_id,
+                        result,
+                        status=status,
+                        target_path=target_path,
+                        error=error,
+                    )
+
+                with patch.object(service, "_update_journal_file", side_effect=_crash_after_move):
+                    with self.assertRaises(_ProcessExit):
+                        if operation == "move":
+                            service.move_to_directory([str(source)], str(root / "destination"))
+                        elif operation == "trash":
+                            service.move_to_trash([str(source)])
+                        else:
+                            preview = service.preview_renames([str(source)], "renamed_{index}")
+                            service.rename_files(preview)
+
+                self.assertFalse(source.exists())
+                restarted = GalleryActionService(audit_log_path=audit, journal_path=journal, temp_dir=root / "tmp")
+                first = restarted.recover_incomplete_operations()
+                second = restarted.recover_incomplete_operations()
+                self.assertEqual(1, len(first["recovered_operations"]))
+                self.assertEqual((), first["ambiguous_files"])
+                self.assertEqual((), second["recovered_operations"])
+                entry = restarted.read_audit_entries(limit=10)[-1]
+                self.assertTrue(entry["completed"])
+                self.assertEqual("restorable", entry["recovery_status"])
+                changed_paths = [tuple(pair) for pair in entry["changed_paths"]]
+                self.assertEqual(1, len(changed_paths))
+                current = Path(changed_paths[0][1])
+                self.assertEqual(b"original", current.read_bytes())
+
+                restored = restarted.restore_changed_paths(changed_paths)
+                self.assertFalse(restored.failures)
+                self.assertEqual(b"original", source.read_bytes())
+                self.assertFalse(current.exists())
+
+    def test_gallery_interrupted_copy_is_reconciled_without_deleting_source(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.jpg"
+            source.write_bytes(b"original")
+            audit = root / "logs" / "operations.jsonl"
+            journal = root / "logs" / "operations.sqlite3"
+            service = GalleryActionService(audit_log_path=audit, journal_path=journal, temp_dir=root / "tmp")
+            original_update = service._update_journal_file
+
+            def _crash_after_copy(file_entry_id, result, *, status, target_path="", error=""):
+                if status == "completed":
+                    raise _ProcessExit()
+                return original_update(
+                    file_entry_id,
+                    result,
+                    status=status,
+                    target_path=target_path,
+                    error=error,
+                )
+
+            with patch.object(service, "_update_journal_file", side_effect=_crash_after_copy):
+                with self.assertRaises(_ProcessExit):
+                    service.copy_to_directory([str(source)], str(root / "destination"))
+
+            restarted = GalleryActionService(audit_log_path=audit, journal_path=journal, temp_dir=root / "tmp")
+            report = restarted.recover_incomplete_operations()
+            entry = restarted.read_audit_entries(limit=10)[-1]
+            self.assertEqual(1, len(report["recovered_operations"]))
+            self.assertTrue(source.exists())
+            copied = Path(entry["changed_paths"][0][1])
+            self.assertEqual(source.read_bytes(), copied.read_bytes())
+            self.assertEqual("not_applicable", entry["recovery_status"])
+
+    def test_exif_rewrite_publish_failure_preserves_original_and_cleans_staging(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "photo.jpg"
+            Image.new("RGB", (32, 32), (100, 120, 140)).save(image_path)
+            original = image_path.read_bytes()
+            service = GalleryActionService(temp_dir=root / "tmp")
+
+            with patch.object(gallery_actions_module.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    service.write_exif_comment(str(image_path), "new comment")
+
+            self.assertEqual(original, image_path.read_bytes())
+            self.assertEqual([], list(root.glob("*.ic_tmp*")))
+
     def test_exif_metadata_pair_writes_and_replaces_user_comment_key(self):
         with TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "photo.jpg"
@@ -1138,6 +1342,107 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("plain text", merged)
         self.assertIn("alpha: one", merged)
         self.assertIn("xyz: test", merged)
+
+    def test_photo_edit_draft_is_reversible_and_does_not_rewrite_source(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "photo.jpg"
+            Image.new("RGB", (32, 32), (100, 120, 140)).save(image_path)
+            original = image_path.read_bytes()
+            service = PhotoEditService()
+            draft = PhotoEditDraft(
+                title="Summer trip",
+                description="At the lake",
+                rating=5,
+                tags=("family", "travel"),
+                creator="Ada",
+                custom_fields={"event": "holiday"},
+            )
+
+            sidecar = service.save_draft(image_path, draft)
+
+            self.assertTrue(Path(sidecar).is_file())
+            self.assertEqual(original, image_path.read_bytes())
+            self.assertEqual(draft, service.load_draft(image_path))
+
+            class _TagService:
+                def load_tags_for_paths(self, paths, import_missing_exif=False):
+                    _ = import_missing_exif
+                    return {str(path): ("family",) for path in paths}
+
+            MetadataSidecarService(tag_service=_TagService()).export_sidecars([str(image_path)])
+            self.assertEqual(draft, service.load_draft(image_path))
+
+    def test_photo_edit_sidecar_preserves_prior_or_malformed_data_on_write_failure(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "photo.jpg"
+            image_path.write_bytes(b"source-photo")
+            sidecar = root / "photo.jpg.clusterlens.json"
+            service = PhotoEditService()
+            draft = PhotoEditDraft(title="New title")
+
+            sidecar.write_text('{"version": 2, "keep": true}', encoding="utf-8")
+            before = sidecar.read_bytes()
+            with patch.object(photo_metadata_module, "atomic_write_text", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    service.save_draft(image_path, draft)
+            self.assertEqual(before, sidecar.read_bytes())
+            self.assertEqual(b"source-photo", image_path.read_bytes())
+
+            sidecar.write_text("{malformed", encoding="utf-8")
+            malformed = sidecar.read_bytes()
+            with self.assertRaisesRegex(ValueError, "not overwritten"):
+                service.save_draft(image_path, draft)
+            self.assertEqual(malformed, sidecar.read_bytes())
+
+    def test_photo_metadata_reads_standard_exif_date_and_time_fields(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "dated-photo.jpg"
+            exif = Image.Exif()
+            exif[306] = "2024:05:07 08:00:00"  # DateTime
+            exif[36867] = "2024:05:06 12:34:56"  # DateTimeOriginal
+            exif[36868] = "2024:05:06 12:35:00"  # DateTimeDigitized
+            exif[36881] = "+05:30"  # OffsetTimeOriginal
+            Image.new("RGB", (32, 32), (100, 120, 140)).save(image_path, exif=exif)
+
+            metadata = PhotoMetadataService().get_metadata(str(image_path), include_hashes=False)
+
+            self.assertEqual("2024:05:07 08:00:00", metadata.exif["DateTime"])
+            self.assertEqual("2024:05:06 12:34:56", metadata.exif["DateTimeOriginal"])
+            self.assertEqual("2024:05:06 12:35:00", metadata.exif["DateTimeDigitized"])
+            self.assertEqual("+05:30", metadata.exif["OffsetTimeOriginal"])
+
+    def test_exif_draft_embeds_supported_fields_and_preserves_custom_comment_data(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "photo.jpg"
+            Image.new("RGB", (32, 32), (100, 120, 140)).save(image_path)
+            service = GalleryActionService(
+                audit_log_path=root / "logs" / "operations.jsonl",
+                journal_path=root / "logs" / "operations.sqlite3",
+                temp_dir=root / "tmp",
+            )
+
+            result = service.write_exif_drafts(
+                [str(image_path)],
+                PhotoEditDraft(
+                    title="Lake",
+                    description="Sunset",
+                    creator="Ada",
+                    captured_at="2026-09-16T14:30:00",
+                    tags=("travel",),
+                    custom_fields={"event": "holiday"},
+                ).as_payload(),
+            )
+
+            self.assertFalse(result.failures)
+            self.assertEqual([str(image_path)], result.affected_paths)
+            with Image.open(image_path) as image:
+                exif = image.getexif()
+                self.assertEqual("Sunset", exif.get(270))
+                self.assertEqual("Ada", exif.get(315))
+                self.assertEqual("2026:09:16 14:30:00", exif.get(36867))
+                self.assertIn("ic_event: holiday", str(exif.get(37510, "")))
 
     def test_image_tags_add_remove_and_match_case_insensitively(self):
         with TemporaryDirectory() as tmp:
@@ -1441,43 +1746,60 @@ class ServiceTests(unittest.TestCase):
             )
             self.assertFalse(reused)
             _same_paths, reused = index.ensure_index(
-                snapshot,
-                "clip",
-                embeddings,
-                embedding_signature="clip:revision-one",
+                snapshot, "clip", embeddings, embedding_signature="clip:revision-one"
             )
             self.assertTrue(reused)
-
             revision_two_paths, reused = index.ensure_index(
-                snapshot,
-                "clip",
-                embeddings,
-                embedding_signature="clip:revision-two",
+                snapshot, "clip", embeddings, embedding_signature="clip:revision-two"
             )
             self.assertFalse(reused)
             self.assertNotEqual(revision_one_paths["vector_path"], revision_two_paths["vector_path"])
-
             Path(revision_one_paths["path_map_path"]).write_text("{broken", encoding="utf-8")
             _repaired_paths, reused = index.ensure_index(
-                snapshot,
-                "clip",
-                embeddings,
-                embedding_signature="clip:revision-one",
+                snapshot, "clip", embeddings, embedding_signature="clip:revision-one"
             )
             self.assertFalse(reused)
             self.assertEqual([str(image_path)], json.loads(Path(revision_one_paths["path_map_path"]).read_text(encoding="utf-8")))
-
             with Path(revision_one_paths["vector_path"]).open("wb") as handle:
                 np.save(handle, np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32), allow_pickle=False)
             _dimension_repaired_paths, reused = index.ensure_index(
-                snapshot,
-                "clip",
-                embeddings,
-                embedding_signature="clip:revision-one",
+                snapshot, "clip", embeddings, embedding_signature="clip:revision-one"
             )
             self.assertFalse(reused)
             repaired = np.load(revision_one_paths["vector_path"], allow_pickle=False)
             self.assertEqual((1, 2), repaired.shape)
+
+    def test_embedding_index_rejects_interrupted_generation_until_commit_manifest(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.jpg"
+            image_path.write_bytes(b"123")
+            index = EmbeddingIndexService()
+            index.index_dir = root / "embedding_indexes"
+            index.index_dir.mkdir(parents=True)
+            snapshot = EmbeddingIndexService.build_snapshot_key([str(image_path)])
+            original = [(str(image_path), np.asarray([0.1, 0.2], dtype=np.float32))]
+            replacement = [(str(image_path), np.asarray([0.8, 0.9], dtype=np.float32))]
+            paths, reused = index.ensure_index(snapshot, "clip", original)
+            self.assertFalse(reused)
+            original_atomic_write = embedding_index_module.atomic_write_text
+
+            def _fail_manifest(path, payload, **kwargs):
+                if Path(path).name.endswith(".manifest.json"):
+                    raise OSError("disk full at commit manifest")
+                return original_atomic_write(path, payload, **kwargs)
+
+            with patch.object(embedding_index_module, "atomic_write_text", side_effect=_fail_manifest):
+                with self.assertRaisesRegex(OSError, "commit manifest"):
+                    index.save_index(snapshot, "clip", replacement)
+            self.assertFalse(Path(paths["manifest_path"]).exists())
+
+            repaired, reused = index.ensure_index(snapshot, "clip", replacement)
+            self.assertFalse(reused)
+            _same, reused = index.ensure_index(snapshot, "clip", replacement)
+            self.assertTrue(reused)
+            matrix = np.load(repaired["vector_path"], allow_pickle=False)
+            np.testing.assert_allclose(matrix, np.asarray([[0.8, 0.9]], dtype=np.float32))
 
     def test_result_cache_roundtrip(self):
         with TemporaryDirectory() as tmp:
@@ -1598,6 +1920,222 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(path.exists())
             for path in excluded_dirs:
                 self.assertTrue((path / "keep.bin").exists())
+
+    def test_large_cache_directory_clear_recovers_every_atomic_detach_boundary(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        for boundary, source_exists in (
+            ("before_detach", True),
+            ("after_detach", False),
+            ("after_recreate", True),
+        ):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as tmp:
+                cache_root = Path(tmp) / "cache"
+                target = cache_root / "cluster_results"
+                target.mkdir(parents=True)
+                (target / "payload.bin").write_bytes(b"derived")
+                settings = SimpleNamespace(
+                    cache_dir=cache_root,
+                    embedding_cache_db=cache_root / "embeddings.sqlite3",
+                    thumbnail_cache_dir=cache_root / "thumbnails",
+                )
+                service = CacheMaintenanceService(settings=settings)
+                excluded = set(service.rebuildable_targets()) - {"cluster_results/"}
+
+                def _exit_at_checkpoint(name: str, _source: Path, _staging: Path) -> None:
+                    if name == boundary:
+                        raise _ProcessExit(name)
+
+                service._cache_directory_clear_checkpoint = _exit_at_checkpoint  # type: ignore[method-assign]
+                with self.assertRaises(_ProcessExit):
+                    service.clear_rebuildable_disk_targets(exclude=excluded)
+
+                staging = service._cache_clear_staging_path(target)
+                self.assertEqual(source_exists, target.exists())
+                self.assertEqual(boundary != "before_detach", staging.exists())
+                if boundary == "before_detach":
+                    self.assertEqual(b"derived", (target / "payload.bin").read_bytes())
+                    continue
+
+                recovered = CacheMaintenanceService(settings=settings)
+                self.assertEqual(("cluster_results/",), recovered.pending_rebuildable_cleanup_targets())
+                cleared, failures = recovered.clear_rebuildable_disk_targets(exclude=excluded)
+                self.assertEqual(("cluster_results/",), cleared)
+                self.assertEqual((), failures)
+                self.assertTrue(target.is_dir())
+                self.assertEqual([], list(target.iterdir()))
+                self.assertFalse(staging.exists())
+                self.assertEqual((), recovered.pending_rebuildable_cleanup_targets())
+
+    def test_large_cache_directory_cancel_and_delete_failure_report_retry_state(self):
+        for failure_kind in ("cancel", "permission"):
+            with self.subTest(failure_kind=failure_kind), TemporaryDirectory() as tmp:
+                cache_root = Path(tmp) / "cache"
+                target = cache_root / "cluster_results"
+                target.mkdir(parents=True)
+                for index in range(8):
+                    (target / f"payload-{index}.bin").write_bytes(b"derived")
+                settings = SimpleNamespace(
+                    cache_dir=cache_root,
+                    embedding_cache_db=cache_root / "embeddings.sqlite3",
+                    thumbnail_cache_dir=cache_root / "thumbnails",
+                )
+                service = CacheMaintenanceService(settings=settings)
+                excluded = set(service.rebuildable_targets()) - {"cluster_results/"}
+                detached = False
+
+                def _checkpoint(name: str, _source: Path, _staging: Path) -> None:
+                    nonlocal detached
+                    if name == "after_recreate":
+                        detached = True
+
+                service._cache_directory_clear_checkpoint = _checkpoint  # type: ignore[method-assign]
+                if failure_kind == "cancel":
+                    cancel_check = lambda: detached
+                    patcher = patch.object(service, "_remove_target", wraps=service._remove_target)
+                else:
+                    cancel_check = None
+                    original_remove = service._remove_target
+
+                    def _deny_staging(path: Path, *, cancel_check=None):
+                        if path == service._cache_clear_staging_path(target):
+                            raise PermissionError("locked staging fixture")
+                        return original_remove(path, cancel_check=cancel_check)
+
+                    patcher = patch.object(service, "_remove_target", side_effect=_deny_staging)
+
+                with patcher:
+                    cleared, failures = service.clear_rebuildable_disk_targets(
+                        exclude=excluded,
+                        cancel_check=cancel_check,
+                    )
+
+                self.assertEqual(("cluster_results/",), cleared)
+                self.assertTrue(failures)
+                self.assertEqual(("cluster_results/",), service.pending_rebuildable_cleanup_targets())
+                self.assertTrue(target.is_dir())
+                self.assertEqual([], list(target.iterdir()))
+
+                retry_service = CacheMaintenanceService(settings=settings)
+                retry_cleared, retry_failures = retry_service.clear_rebuildable_disk_targets(exclude=excluded)
+                self.assertEqual(("cluster_results/",), retry_cleared)
+                self.assertEqual((), retry_failures)
+                self.assertEqual((), retry_service.pending_rebuildable_cleanup_targets())
+
+    def test_large_cache_directory_clear_refuses_an_unsafe_staging_symlink(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_root = root / "cache"
+            target = cache_root / "cluster_results"
+            outside = root / "outside"
+            target.mkdir(parents=True)
+            outside.mkdir()
+            (target / "payload.bin").write_bytes(b"derived")
+            (outside / "keep.bin").write_bytes(b"unrelated")
+            settings = SimpleNamespace(
+                cache_dir=cache_root,
+                embedding_cache_db=cache_root / "embeddings.sqlite3",
+                thumbnail_cache_dir=cache_root / "thumbnails",
+            )
+            service = CacheMaintenanceService(settings=settings)
+            service._cache_clear_staging_path(target).symlink_to(outside, target_is_directory=True)
+            excluded = set(service.rebuildable_targets()) - {"cluster_results/"}
+
+            cleared, failures = service.clear_rebuildable_disk_targets(exclude=excluded)
+
+            self.assertEqual((), cleared)
+            self.assertTrue(any("unsafe pending cache cleanup path" in failure for failure in failures))
+            self.assertEqual(b"derived", (target / "payload.bin").read_bytes())
+            self.assertEqual(b"unrelated", (outside / "keep.bin").read_bytes())
+
+    def test_sqlite_cache_clear_is_coherent_across_cancel_and_process_exit_boundaries(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        for boundary, main_exists in (("before_remove_main", True), ("after_remove_main", False)):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                database = root / "embeddings.sqlite3"
+                connection = sqlite3.connect(database)
+                connection.execute("PRAGMA journal_mode=WAL;")
+                connection.execute("CREATE TABLE cached(value TEXT)")
+                connection.execute("INSERT INTO cached(value) VALUES ('ready')")
+                connection.commit()
+                connection.close()
+                settings = SimpleNamespace(cache_dir=root, base_dir=root)
+                service = CacheMaintenanceService(settings=settings)
+
+                def _exit_at_checkpoint(name: str, _database: Path) -> None:
+                    if name == boundary:
+                        raise _ProcessExit(name)
+
+                service._sqlite_cache_clear_checkpoint = _exit_at_checkpoint  # type: ignore[method-assign]
+                with self.assertRaises(_ProcessExit):
+                    service.clear_sqlite_cache_bundle(database)
+
+                self.assertEqual(main_exists, database.exists())
+                if main_exists:
+                    reopened = sqlite3.connect(database)
+                    try:
+                        self.assertEqual("ready", reopened.execute("SELECT value FROM cached").fetchone()[0])
+                    finally:
+                        reopened.close()
+                self.assertFalse(database.with_name(database.name + "-wal").exists())
+                self.assertFalse(database.with_name(database.name + "-shm").exists())
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "embeddings.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE cached(value TEXT)")
+            connection.execute("INSERT INTO cached(value) VALUES ('ready')")
+            connection.commit()
+            connection.close()
+            service = CacheMaintenanceService(settings=SimpleNamespace(cache_dir=root, base_dir=root))
+            checks = 0
+
+            def _cancel_before_main() -> bool:
+                nonlocal checks
+                checks += 1
+                return checks >= 4
+
+            with self.assertRaises(Cancelled):
+                service.clear_sqlite_cache_bundle(database, cancel_check=_cancel_before_main)
+            reopened = sqlite3.connect(database)
+            try:
+                self.assertEqual("ready", reopened.execute("SELECT value FROM cached").fetchone()[0])
+            finally:
+                reopened.close()
+
+    def test_sqlite_cache_clear_permission_failure_preserves_the_main_database(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "embeddings.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE cached(value TEXT)")
+            connection.execute("INSERT INTO cached(value) VALUES ('ready')")
+            connection.commit()
+            connection.close()
+            service = CacheMaintenanceService(settings=SimpleNamespace(cache_dir=root, base_dir=root))
+            original_unlink = Path.unlink
+
+            def _deny_main(path: Path, *args, **kwargs):
+                if path == database:
+                    raise PermissionError("read-only fixture")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", _deny_main):
+                removed, failures = service.clear_sqlite_cache_bundle(database)
+
+            self.assertFalse(removed)
+            self.assertTrue(database.exists())
+            self.assertTrue(any("read-only fixture" in failure for failure in failures))
+            reopened = sqlite3.connect(database)
+            try:
+                self.assertEqual("ready", reopened.execute("SELECT value FROM cached").fetchone()[0])
+            finally:
+                reopened.close()
 
     def test_cache_maintenance_reports_runtime_temp_files_separately(self):
         with TemporaryDirectory() as tmp:
@@ -2113,6 +2651,7 @@ class ServiceTests(unittest.TestCase):
 
             download.assert_called_once_with(
                 repo_id="openai/clip-vit-base-patch32",
+                revision=HF_MODEL_REVISIONS["clip"],
                 cache_dir=str(root / "cache" / "huggingface" / "hub"),
                 allow_patterns=("*.json", "*.txt", "*.model", "*.safetensors"),
             )
@@ -2663,13 +3202,111 @@ class ServiceTests(unittest.TestCase):
                 ),
             )
 
-            metrics = service.index_paths(image_paths)
+            persisted_batches: list[list[str]] = []
+
+            def _on_persisted(paths: list[str]) -> None:
+                # The observer runs after the batch transaction commits.
+                self.assertGreaterEqual(service.count_indexed_faces(include_tiny_faces=True), len(paths))
+                persisted_batches.append(list(paths))
+
+            metrics = service.index_paths(image_paths, on_persisted_batch=_on_persisted)
 
             self.assertEqual([3, 2], embedder.batch_sizes)
             self.assertEqual(5, metrics["embedded_faces"])
             self.assertEqual(5, metrics["written_images"])
             self.assertEqual(2, metrics["decode_queue_peak"])
             self.assertEqual(5, service.count_indexed_faces(include_tiny_faces=True))
+            self.assertEqual(set(image_paths), set(path for batch in persisted_batches for path in batch))
+            self.assertTrue(all(1 <= len(batch) <= 2 for batch in persisted_batches))
+
+    def test_face_index_batch_is_atomic_across_process_exit_commit_boundaries(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        for boundary, expected_faces in (("before_commit", 0), ("after_commit", 1)):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                image_path = root / f"{boundary}.jpg"
+                Image.new("RGB", (48, 48), (20, 30, 40)).save(image_path)
+                database = root / "faces.sqlite3"
+                service = FaceIndexService(
+                    detection_service=FakeFaceDetectionService(),
+                    embedding_service=FakeFaceEmbeddingService(),
+                    db_path=database,
+                )
+
+                def _exit_at_checkpoint(name: str) -> None:
+                    if name == boundary:
+                        raise _ProcessExit(name)
+
+                service._face_index_write_checkpoint = _exit_at_checkpoint  # type: ignore[method-assign]
+                with self.assertRaises(_ProcessExit):
+                    service.index_paths([str(image_path)])
+
+                reopened = FaceIndexService(
+                    detection_service=FakeFaceDetectionService(),
+                    embedding_service=FakeFaceEmbeddingService(),
+                    db_path=database,
+                )
+                self.assertEqual(expected_faces, reopened.count_indexed_faces(include_tiny_faces=True))
+
+    def test_face_index_batch_rolls_back_sqlite_permission_and_disk_full_faults(self):
+        faults = (
+            sqlite3.OperationalError("attempt to write a readonly database"),
+            sqlite3.OperationalError("database or disk is full"),
+        )
+        for fault in faults:
+            with self.subTest(fault=str(fault)), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                image_path = root / "fault.jpg"
+                Image.new("RGB", (48, 48), (20, 30, 40)).save(image_path)
+                database = root / "faces.sqlite3"
+                service = FaceIndexService(
+                    detection_service=FakeFaceDetectionService(),
+                    embedding_service=FakeFaceEmbeddingService(),
+                    db_path=database,
+                )
+
+                def _fail_before_commit(name: str) -> None:
+                    if name == "before_commit":
+                        raise fault
+
+                service._face_index_write_checkpoint = _fail_before_commit  # type: ignore[method-assign]
+                with self.assertRaisesRegex(sqlite3.OperationalError, str(fault)):
+                    service.index_paths([str(image_path)])
+
+                reopened = FaceIndexService(
+                    detection_service=FakeFaceDetectionService(),
+                    embedding_service=FakeFaceEmbeddingService(),
+                    db_path=database,
+                )
+                self.assertEqual(0, reopened.count_indexed_faces(include_tiny_faces=True))
+                with sqlite3.connect(database) as connection:
+                    self.assertEqual(("ok",), connection.execute("PRAGMA integrity_check").fetchone())
+
+    def test_face_index_finishes_committed_batch_when_cancel_arrives_after_commit(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "late-cancel.jpg"
+            Image.new("RGB", (48, 48), (20, 30, 40)).save(image_path)
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+            cancelled = False
+
+            def _cancel_after_commit(name: str) -> None:
+                nonlocal cancelled
+                if name == "after_commit":
+                    cancelled = True
+
+            service._face_index_write_checkpoint = _cancel_after_commit  # type: ignore[method-assign]
+            result = service.index_paths([str(image_path)], cancel_check=lambda: cancelled)
+
+            self.assertTrue(result.completion_survives_cancellation)
+            self.assertEqual(1, result["written_images"])
+            self.assertEqual(1, service.count_indexed_faces(include_tiny_faces=True))
 
     def test_index_paths_cancellation_releases_pending_crops_before_any_batch_write(self):
         class CancellingDetector(FakeFaceDetectionService):
@@ -3382,6 +4019,85 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(candidate_paths[1000:], [item.image_path for item in last.items])
             self.assertIsNone(last.next_offset)
 
+    def test_face_folder_review_page_reuses_a_scoped_candidate_snapshot(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside_tmp:
+            root = Path(tmp)
+            outside = Path(outside_tmp) / "outside.jpg"
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+            candidate_paths = [str(root / f"image_{index:04d}.jpg") for index in range(1005)]
+            candidate_paths.append(str(outside))
+            normalize_calls: list[str] = []
+            original_normalize = service._normalize_path_for_match
+            service._normalize_path_for_match = lambda path: (  # type: ignore[method-assign]
+                normalize_calls.append(str(path)) or original_normalize(path)
+            )
+
+            snapshot = service.prepare_folder_review_candidate_snapshot(
+                str(root), candidate_paths=candidate_paths, scope_roots=[str(root)]
+            )
+            calls_after_prepare = len(normalize_calls)
+            first = service.load_folder_review_image_page(
+                str(root),
+                candidate_paths=candidate_paths,
+                scope_roots=[str(root)],
+                offset=0,
+                limit=500,
+                _candidate_snapshot=snapshot,
+            )
+            second = service.load_folder_review_image_page(
+                str(root),
+                candidate_paths=candidate_paths,
+                scope_roots=[str(root)],
+                offset=500,
+                limit=500,
+                _candidate_snapshot=snapshot,
+            )
+
+            self.assertEqual(1005, first.total_count)
+            self.assertEqual(1005, second.total_count)
+            self.assertEqual(candidate_paths[:500], [item.image_path for item in first.items])
+            self.assertEqual(candidate_paths[500:1000], [item.image_path for item in second.items])
+            self.assertNotIn(str(outside), snapshot.source_paths)
+            self.assertLess(len(normalize_calls) - calls_after_prepare, 16)
+
+    def test_face_folder_review_candidate_snapshot_rejects_a_symlink_scope_escape(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "selected"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            escape = root / "escape"
+            try:
+                escape.symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Symlinks are unavailable for this test: {error}")
+            inside = root / "inside.jpg"
+            escaped = escape / "outside.jpg"
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+
+            snapshot = service.prepare_folder_review_candidate_snapshot(
+                str(root),
+                candidate_paths=[str(inside), str(escaped)],
+                scope_roots=[str(root)],
+            )
+            page = service.load_folder_review_image_page(
+                str(root),
+                candidate_paths=[str(inside), str(escaped)],
+                scope_roots=[str(root)],
+                _candidate_snapshot=snapshot,
+            )
+
+            self.assertEqual((str(inside),), snapshot.source_paths)
+            self.assertEqual([str(inside)], [item.image_path for item in page.items])
+
     def test_animal_bundle_status_reports_missing_and_ready_states(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3735,6 +4451,44 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(("yunet_2026may",), result.promoted_interrupted)
             self.assertTrue((target / "detector.onnx").is_file())
             self.assertFalse(staging.exists())
+
+    def test_face_model_promotion_recovers_both_directory_switch_boundaries(self):
+        class _ProcessExit(BaseException):
+            pass
+
+        for crash_boundary in ("previous_staged", "target_published"):
+            with self.subTest(boundary=crash_boundary), TemporaryDirectory() as tmp:
+                settings = SimpleNamespace(cache_dir=Path(tmp))
+                installer = FaceModelInstaller(settings=settings)
+                target = installer.bundle_dir("yunet_2026may")
+                target.mkdir(parents=True)
+                installer._copy_catalog_metadata("yunet_2026may", target)
+                old_payload = target / "detector.onnx"
+                old_payload.write_bytes(b"old-verified-model")
+                installer._write_install_record(old_payload, bundle_id="yunet_2026may")
+                staging = target.parent / ".yunet_2026may.boundary.installing"
+                staging.mkdir()
+                installer._copy_catalog_metadata("yunet_2026may", staging)
+                new_payload = staging / "detector.onnx"
+                new_payload.write_bytes(b"new-verified-model")
+                installer._write_install_record(new_payload, bundle_id="yunet_2026may")
+
+                def _exit_at(name, *_args):
+                    if name == crash_boundary:
+                        raise _ProcessExit(name)
+
+                with patch.object(installer, "_promotion_checkpoint", side_effect=_exit_at):
+                    with self.assertRaises(_ProcessExit):
+                        installer._promote_bundle_directory(staging, target)
+
+                restarted = FaceModelInstaller(settings=settings)
+                first = restarted.recover_managed_models()
+                second = restarted.recover_managed_models()
+                self.assertEqual((), first.failures)
+                self.assertEqual((), second.failures)
+                self.assertEqual(b"new-verified-model", (target / "detector.onnx").read_bytes())
+                self.assertEqual([], list(target.parent.glob(".yunet_2026may.*.previous")))
+                self.assertFalse(staging.exists())
 
     def test_face_model_installer_respects_manual_delete_during_recovery(self):
         with TemporaryDirectory() as tmp:
@@ -5511,6 +6265,47 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(np.allclose(captured["query_embedding"], expected, atol=1e-5))
             self.assertEqual({(str(image_a), 0), (str(image_b), 0)}, set(captured["exclude"]))
 
+    def test_face_album_keeps_pending_proposals_out_of_normal_membership(self):
+        """A pending name must be review-only, never a second album row."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_a = root / "alice.jpg"
+            image_b = root / "unreviewed.jpg"
+            for path, color in ((image_a, (20, 30, 40)), (image_b, (30, 40, 50))):
+                Image.new("RGB", (64, 64), color).save(path)
+            service = FaceIndexService(
+                detection_service=FakeFaceDetectionService(),
+                embedding_service=FakeFaceEmbeddingService(),
+                db_path=root / "faces.sqlite3",
+            )
+            service.save_face_records(
+                [
+                    FaceIndexRecord(str(image_a), 0, (0, 0, 36, 36), 0.99, np.array([1.0, 0.0], dtype=np.float32)),
+                    FaceIndexRecord(str(image_b), 0, (0, 0, 36, 36), 0.98, np.array([0.0, 1.0], dtype=np.float32)),
+                ],
+                mtime_ns=1,
+                file_size=1,
+                assess_quality=False,
+            )
+            service.label_indexed_faces("Alice", [(str(image_a), 0)], similarity_threshold=0.5)
+            service.accept_pending_face_labels(
+                [assignment.proposal_id for assignment in service.load_pending_face_labels(include_tiny_faces=True)]
+            )
+            service.label_indexed_faces("Bob", [(str(image_b), 0)], similarity_threshold=0.5)
+
+            initial = service.load_face_album_initial_page(
+                group_kinds=("named", "unlabeled"), include_tiny_faces=True
+            )
+            self.assertEqual({"named", "unlabeled"}, {group.group_kind for group in initial.groups.items})
+            self.assertNotIn("pending", {group.group_kind for group in initial.groups.items})
+            self.assertIsNotNone(initial.members)
+            self.assertEqual(str(image_a), initial.members.items[0].image_path)
+
+            pending = service.load_face_album_group_page(group_kinds=("pending",), include_tiny_faces=True)
+            self.assertEqual(["pending"], [group.group_kind for group in pending.items])
+            pending_members = service.load_face_album_member_page("pending", include_tiny_faces=True)
+            self.assertEqual([str(image_b)], [record.image_path for record in pending_members.items])
+
     def test_saved_identity_threshold_overrides_global_match_floor(self):
         with TemporaryDirectory() as tmp:
             image_a = Path(tmp) / "a.jpg"
@@ -5852,6 +6647,58 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(2, metrics["cache_hits"])
         self.assertEqual(0, metrics["cache_misses"])
         self.assertIn("Skipped model load", metrics["runtime_reason"])
+
+    def test_embedding_cuda_oom_bisects_until_each_item_succeeds(self):
+        service = object.__new__(EmbeddingService)
+        service.model_manager = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        bundle = SimpleNamespace(input_mode="tensor")
+        prepared = {"tensor": torch.zeros((4, 2), dtype=torch.float32), "phash": None}
+        observed_batch_sizes: list[int] = []
+
+        def _run(_bundle, batch):
+            size = int(batch["tensor"].shape[0])
+            observed_batch_sizes.append(size)
+            if size > 1:
+                raise RuntimeError("CUDA out of memory: injected fixture")
+            return [np.asarray([float(size), 0.0], dtype=np.float32)]
+
+        with patch.object(service, "_run_model", side_effect=_run), patch(
+            "ml.embeddings.torch.cuda.empty_cache"
+        ) as empty_cache:
+            outputs, used_backoff = service._run_model_with_backoff(bundle, prepared)
+
+        self.assertTrue(used_backoff)
+        self.assertEqual(4, len(outputs))
+        self.assertEqual([4, 2, 1, 1, 2, 1, 1], observed_batch_sizes)
+        self.assertEqual(3, empty_cache.call_count)
+
+    def test_embedding_cpu_oom_is_reported_without_cuda_backoff(self):
+        service = object.__new__(EmbeddingService)
+        service.model_manager = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+        bundle = SimpleNamespace(input_mode="tensor")
+        prepared = {"tensor": torch.zeros((2, 2), dtype=torch.float32), "phash": None}
+
+        with patch.object(service, "_run_model", side_effect=RuntimeError("CPU out of memory: injected fixture")), patch(
+            "ml.embeddings.torch.cuda.empty_cache"
+        ) as empty_cache:
+            with self.assertRaisesRegex(RuntimeError, "CPU out of memory"):
+                service._run_model_with_backoff(bundle, prepared)
+
+        empty_cache.assert_not_called()
+
+    def test_embedding_cuda_single_item_oom_is_reported_without_retry_loop(self):
+        service = object.__new__(EmbeddingService)
+        service.model_manager = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        bundle = SimpleNamespace(input_mode="tensor")
+        prepared = {"tensor": torch.zeros((1, 2), dtype=torch.float32), "phash": None}
+
+        with patch.object(service, "_run_model", side_effect=RuntimeError("CUDA out of memory: injected fixture")), patch(
+            "ml.embeddings.torch.cuda.empty_cache"
+        ) as empty_cache:
+            with self.assertRaisesRegex(RuntimeError, "CUDA out of memory"):
+                service._run_model_with_backoff(bundle, prepared)
+
+        empty_cache.assert_not_called()
 
     def test_pipeline_runs_multiple_backends_and_builds_membership(self):
         with TemporaryDirectory() as tmp:

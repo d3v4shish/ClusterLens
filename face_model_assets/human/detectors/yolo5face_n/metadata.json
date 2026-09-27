@@ -8,7 +8,7 @@
   "hardware_class": "Edge GPU / desktop GPU",
   "recommended_pair_id": "arcface_r50",
   "source_url": "https://github.com/deepcam-cn/yolov5-face",
-  "license": "Verify YOLO5Face model license before distribution.",
+  "license": "GPL-3.0 repository; pretrained-weight and training-data redistribution still require release review.",
   "input_name": "images",
   "input_size": [640, 640],
   "output_boxes_name": "boxes",

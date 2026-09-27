@@ -69,7 +69,10 @@ def test_face_album_pages_are_bounded_scoped_and_embedding_free(tmp_path: Path) 
     first_page = service.load_face_album_group_page(folder_prefix=str(scope), limit=2)
     second_page = service.load_face_album_group_page(folder_prefix=str(scope), offset=2, limit=2)
 
-    assert first_page.total_count == 5
+    # Pending assignments stay in Review and must not become a duplicate
+    # normal-All-Faces group. The explicit pending request below covers that
+    # separate surface.
+    assert first_page.total_count == 4
     assert first_page.next_offset == 2
     assert [item.group_id for item in first_page.items] == ["person:Alice", "person:Bob"]
     assert len(second_page.items) == 2

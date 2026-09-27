@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QRect, QSize, Qt, pyqtSignal
@@ -10,15 +11,17 @@ from PyQt6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QDialog,
 
 from app.path_scope import PathScope
 from app.services.thumbnails import ThumbnailService
-from ui.async_job import AsyncJob, start_job_in_thread, wait_for_thread_shutdown
+from ui.async_job import AsyncJob, defer_async_job_dispose, start_job_in_thread, wait_for_thread_shutdown
 from ui.common import HelpIconButton
 from ui.error_mbox import confirmBox
 from ui.entity_picker import EntityPickerDialog
 from ui.gallery_pane import GalleryPane
+from ui.icons import apply_icon
 from ui.job_manager import JobManager
 from ui.list_models import ListEntry, ListEntryModel, PagedListEntryModel, SidebarListEntryDelegate
 from ui.search_pane import FaceTileItem, FaceTileItemDelegate, FaceTileListModel
-from ui.theme import COLORS
+from ui.theme import COLORS, apply_field_size, get_theme_manager
+from ui.work_coordinator import JobSpec, WorkCoordinator
 
 if TYPE_CHECKING:
     from app.services.face_search import FaceIndexService, FaceSearchResult, NamedPhotoSummary
@@ -42,6 +45,21 @@ NAME_HOVER_PREVIEW_MAX_ITEMS = 9
 NAME_HOVER_PREVIEW_CACHE_SIZE = 24
 NAME_SIMILAR_FACE_TILE_SIZE = QSize(112, 112)
 NAME_SIMILAR_FACE_LIMIT = 60
+
+
+@dataclass(frozen=True)
+class _NameHoverPreviewLayout:
+    image_size: QSize
+    columns: int
+    max_items: int
+    popup_width: int
+
+
+@dataclass(frozen=True)
+class _NameHoverPreviewPayload:
+    image: QImage
+    shown_count: int
+    cooccurring_people: tuple[tuple[str, int], ...]
 
 
 class NameHoverPreviewPopup(QFrame):
@@ -88,18 +106,64 @@ class NameHoverPreviewPopup(QFrame):
         self.summary_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.summary_label)
 
+        self.people_label = QLabel("")
+        self.people_label.setObjectName("nameHoverPreviewPeople")
+        self.people_label.setWordWrap(True)
+        self.people_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.people_label.setStyleSheet(f'color: {COLORS["text_muted"]};')
+        self.people_label.hide()
+        layout.addWidget(self.people_label)
+
         self.note_label = QLabel("")
         self.note_label.setStyleSheet(f'color: {COLORS["text_muted"]};')
         layout.addWidget(self.note_label)
         self.setFixedWidth(300)
+        manager = get_theme_manager()
+        if manager is not None:
+            manager.theme_changed.connect(self._apply_theme)
 
-    def set_name_details(self, name: str, *, face_count: int, photo_count: int, loading: bool) -> None:
+    def _apply_theme(self, *_args) -> None:
+        self.setStyleSheet(
+            f"QFrame#nameHoverPreviewPopup {{ background: {COLORS['surface_raised']}; "
+            f"border: 1px solid {COLORS['border_strong']}; border-radius: 8px; }} "
+            f"QLabel {{ color: {COLORS['text']}; }}"
+        )
+        self.image_label.setStyleSheet(
+            f"background: {COLORS['surface_sunken']}; border: 1px solid {COLORS['border']};"
+        )
+        self.people_label.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.note_label.setStyleSheet(f"color: {COLORS['text_muted']};")
+
+    def set_preview_layout(self, layout: _NameHoverPreviewLayout) -> None:
+        self.image_label.setFixedSize(layout.image_size)
+        self.setFixedWidth(layout.popup_width)
+
+    def set_name_details(self, name: str, *, face_count: int, photo_count: int, max_items: int, loading: bool) -> None:
         self.title_label.setText(str(name))
         self.summary_label.setText(f"{int(photo_count)} photo(s) · {int(face_count)} saved face(s)")
-        self.note_label.setText(f"Showing up to {NAME_HOVER_PREVIEW_MAX_ITEMS} photos")
+        self.people_label.clear()
+        self.people_label.hide()
+        self.note_label.setText(f"Preparing up to {int(max_items)} photos")
         if loading:
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText("Loading preview...")
+
+    def set_preview_details(
+        self,
+        *,
+        shown_count: int,
+        photo_count: int,
+        cooccurring_people: tuple[tuple[str, int], ...],
+    ) -> None:
+        self.note_label.setText(f"Showing {int(shown_count)} of {int(photo_count)} photo(s)")
+        visible_people = tuple((str(name), int(count)) for name, count in cooccurring_people[:6] if str(name).strip())
+        if not visible_people:
+            self.people_label.clear()
+            self.people_label.hide()
+            return
+        detail = ", ".join(f"{name} ({count})" for name, count in visible_people)
+        self.people_label.setText(f"Also in these photos: {detail}")
+        self.people_label.show()
 
     def set_preview_image(self, image: QImage | None) -> None:
         if image is None or image.isNull():
@@ -123,12 +187,14 @@ class NamesPane(QWidget):
         parent=None,
         *,
         job_manager: JobManager | None = None,
+        work_coordinator: WorkCoordinator | None = None,
         active_scope_provider: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self._face_service_provider = face_service_provider
         self._active_scope_provider = active_scope_provider
         self.job_manager = job_manager
+        self.work_coordinator = work_coordinator
         self._entries: list[ListEntry] = []
         self._selected_name = ""
         self._refresh_token = 0
@@ -158,10 +224,13 @@ class NamesPane(QWidget):
         self._hover_preview_job = None
         self._hover_preview_thread = None
         self._retained_hover_preview_refs: list[tuple[object | None, object | None]] = []
-        self._hover_preview_cache: OrderedDict[tuple[object, ...], QImage] = OrderedDict()
-        self._operation_job_ids: dict[str, int] = {}
+        self._hover_preview_cache: OrderedDict[tuple[object, ...], _NameHoverPreviewPayload] = OrderedDict()
+        self._operation_job_ids: dict[AsyncJob, int] = {}
+        self._coordinated_job_ids: dict[AsyncJob, int] = {}
+        self._operation_threads: list[tuple[AsyncJob, object]] = []
         self._visible_operation_slot = ""
         self._build_ui()
+        self.gallery.configure_jobs(self.job_manager, self.work_coordinator, origin="People")
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -170,39 +239,46 @@ class NamesPane(QWidget):
 
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("Names")
+        title = QLabel("People")
         title.setProperty("role", "section")
         title.setToolTip(NAMES_HELP)
         self.help_button = HelpIconButton(NAMES_HELP, self, help_key="names_workspace")
-        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button = QPushButton("")
+        self.refresh_button.setProperty("iconOnly", True)
+        self.refresh_button.setAccessibleName("Refresh people")
         self.refresh_button.setToolTip("Reload durable saved names and their photo counts from the global face database.")
+        apply_icon(self.refresh_button, "retry")
         self.refresh_button.clicked.connect(self.refresh_names)
-        self.open_in_gallery_button = QPushButton("Open in Gallery")
+        self.open_in_gallery_button = QPushButton("Photos")
         self.open_in_gallery_button.setToolTip(
-            "Open the active name's exact labeled photos in the top-level Gallery. This does not search similar faces."
+            "Open the active name's exact labeled photos as the current photo set. This does not search similar faces."
         )
-        self.open_in_gallery_button.setAccessibleName("Open named photos in Gallery")
+        self.open_in_gallery_button.setAccessibleName("Open named photos")
         self.open_in_gallery_button.clicked.connect(self._open_named_photos_in_gallery)
         self.open_in_gallery_button.setEnabled(False)
-        self.find_similar_button = QPushButton("Find Similar Faces")
+        apply_icon(self.open_in_gallery_button, "reveal")
+        self.find_similar_button = QPushButton("Similar")
         self.find_similar_button.setToolTip(
             "Search the selected saved name's identity prototype and show up to 60 matching face crops, including unlabeled similar faces."
         )
         self.find_similar_button.setAccessibleName("Find faces similar to selected name")
         self.find_similar_button.clicked.connect(self._find_similar_faces)
         self.find_similar_button.setEnabled(False)
-        self.deep_find_similar_button = QPushButton("Deep Name + Similar")
+        apply_icon(self.find_similar_button, "similar")
+        self.deep_find_similar_button = QPushButton("Deep similar")
         self.deep_find_similar_button.setToolTip(
             "Search the complete saved face index through newly found unlabeled faces, then review the combined result before saving names."
         )
         self.deep_find_similar_button.clicked.connect(self._deep_find_similar_faces)
         self.deep_find_similar_button.setEnabled(False)
+        apply_icon(self.deep_find_similar_button, "similar")
         title_row.addWidget(title)
         title_row.addWidget(self.help_button)
         self.scope_combo = QComboBox(self)
         self.scope_combo.addItem("Active roots", "active")
         self.scope_combo.addItem("All indexed faces", "global")
         self.scope_combo.setToolTip("Names and similarity searches use active roots by default. Choose All indexed faces only when you intentionally want the global face library.")
+        apply_field_size(self.scope_combo, "short")
         self.scope_combo.currentIndexChanged.connect(lambda _index: self.active_scope_changed())
         title_row.addWidget(self.scope_combo)
         title_row.addStretch(1)
@@ -212,12 +288,14 @@ class NamesPane(QWidget):
         title_row.addWidget(self.refresh_button)
         layout.addLayout(title_row)
 
-        self.status_label = QLabel("Open Names to load saved face labels.")
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "helper")
         self.status_label.setToolTip(NAMES_HELP)
+        self.status_label.hide()
         layout.addWidget(self.status_label)
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setAccessibleName("Names workspace operation progress")
+        self.progress_bar.setAccessibleName("People workspace operation progress")
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
 
@@ -232,7 +310,7 @@ class NamesPane(QWidget):
         sidebar_layout.setSpacing(6)
         sidebar_title_row = QHBoxLayout()
         sidebar_title_row.setContentsMargins(0, 0, 0, 0)
-        sidebar_title = QLabel("Saved names")
+        sidebar_title = QLabel("People")
         sidebar_title.setToolTip(NAMES_HELP)
         sidebar_title_row.addWidget(sidebar_title)
         sidebar_title_row.addWidget(HelpIconButton(NAMES_HELP, sidebar, help_key="saved_names"))
@@ -250,6 +328,7 @@ class NamesPane(QWidget):
         self.names_model = PagedListEntryModel(self, page_size=50)
         self.names_list = QListView(sidebar)
         self.names_list.setObjectName("namesWorkspaceList")
+        self.names_list.setAccessibleName("Saved people")
         self.names_list.setProperty("sidebarList", True)
         self.names_list.setModel(self.names_model)
         self.names_list.setItemDelegate(SidebarListEntryDelegate(self.names_list))
@@ -297,11 +376,11 @@ class NamesPane(QWidget):
         self.show_named_photos_button.setToolTip("Return to the selected name's exact durable labeled-photo list.")
         self.show_named_photos_button.clicked.connect(self._show_named_photos)
         self.open_selected_similar_face_button = QPushButton("Open Selected Photo")
-        self.open_selected_similar_face_button.setToolTip("Open the selected matching face's photo in Gallery with its face-region context.")
+        self.open_selected_similar_face_button.setToolTip("Open the selected matching face's photo with its face-region context.")
         self.open_selected_similar_face_button.setEnabled(False)
         self.open_selected_similar_face_button.clicked.connect(self._open_selected_similar_face_in_gallery)
         self.open_similar_faces_button = QPushButton("Open Match Photos")
-        self.open_similar_faces_button.setToolTip("Open every photo with a matching face in the top-level Gallery.")
+        self.open_similar_faces_button.setToolTip("Open every photo with a matching face as the current photo set.")
         self.open_similar_faces_button.setEnabled(False)
         self.open_similar_faces_button.clicked.connect(self._open_similar_faces_in_gallery)
         self.select_all_deep_faces_button = QPushButton("Select All Unlabelled")
@@ -327,6 +406,7 @@ class NamesPane(QWidget):
             self,
         )
         self.similar_faces_list = QListView(self.similar_faces_panel)
+        self.similar_faces_list.setAccessibleName("Faces similar to the selected person")
         self.similar_faces_list.setObjectName("namesSimilarFacesList")
         self.similar_faces_list.setViewMode(QListView.ViewMode.IconMode)
         self.similar_faces_list.setResizeMode(QListView.ResizeMode.Adjust)
@@ -365,6 +445,7 @@ class NamesPane(QWidget):
         self.progress_bar.show()
         if text:
             self.status_label.setText(str(text))
+            self.status_label.show()
 
     def _finish_operation_progress(self, slot: str) -> None:
         if self._visible_operation_slot != str(slot):
@@ -407,11 +488,7 @@ class NamesPane(QWidget):
         self._photos_token += 1
         self._similar_token += 1
         for job in (self._refresh_job, self._photos_job, self._similar_job, self._deep_similar_job):
-            if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    pass
+            self._cancel_operation_job(job)
         self._clear_similar_face_results()
         self.refresh_names(preserve_name=self._current_name() or self._selected_name)
 
@@ -427,6 +504,7 @@ class NamesPane(QWidget):
         scope_roots = self._scope_roots()
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Loading saved names...")
+        self.status_label.show()
 
         def _run(progress, cancel_check):
             progress(-1, "Loading saved names...")
@@ -450,9 +528,18 @@ class NamesPane(QWidget):
             conflicts = int(getattr(recovery, "conflict_count", 0) or 0) if recovery is not None else 0
             if conflicts:
                 recovery_text += f" {conflicts} conflicting older proposal(s) remain in review."
-            self.status_label.setText(f"{len(list(summaries or []))} saved name(s).{recovery_text}")
+            if recovery_text:
+                self.status_label.setText(f"{len(list(summaries or []))} saved name(s).{recovery_text}")
+                self.status_label.show()
+            else:
+                self.status_label.setText(f"{len(list(summaries or []))} saved name(s).")
+                self.status_label.hide()
 
-        self._start_job("refresh", _run, _done, lambda _message: self.status_label.setText("Could not load saved names."))
+        def _failed(_message: str) -> None:
+            self.status_label.setText("Could not load saved people.")
+            self.status_label.show()
+
+        self._start_job("refresh", _run, _done, _failed)
 
     def _set_summaries(self, summaries: list["NamedPhotoSummary"], *, preserve_name: str) -> None:
         self._name_summaries = {
@@ -555,27 +642,55 @@ class NamesPane(QWidget):
         generation = self._hover_preview_generation
         face_count = int(getattr(summary, "face_count", 0) or 0)
         photo_count = int(getattr(summary, "photo_count", 0) or 0)
+        layout = self._name_hover_preview_layout()
+        self._hover_popup.set_preview_layout(layout)
         self._hover_popup.set_name_details(
             name,
             face_count=face_count,
             photo_count=photo_count,
+            max_items=layout.max_items,
             loading=True,
         )
         self._position_name_hover_preview()
         self._hover_popup.show()
-        cache_key = (self._name_preview_epoch, name, face_count, photo_count)
+        cache_key = (
+            self._name_preview_epoch,
+            name,
+            face_count,
+            photo_count,
+            layout.image_size.width(),
+            layout.image_size.height(),
+            layout.columns,
+            layout.max_items,
+        )
         cached = self._hover_preview_cache.get(cache_key)
         if cached is not None:
             self._hover_preview_cache.move_to_end(cache_key)
             self._apply_name_hover_preview(cached, generation)
             return
-        self._start_name_hover_preview_job(name, cache_key, generation)
+        self._start_name_hover_preview_job(name, cache_key, generation, layout, photo_count)
+
+    def _name_hover_preview_layout(self) -> _NameHoverPreviewLayout:
+        screen = self.names_list.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 0, 0)
+        if available.width() >= 1900 and available.height() >= 900:
+            return _NameHoverPreviewLayout(QSize(480, 352), columns=5, max_items=20, popup_width=520)
+        if available.width() >= 1320 and available.height() >= 760:
+            return _NameHoverPreviewLayout(QSize(336, 252), columns=4, max_items=12, popup_width=376)
+        return _NameHoverPreviewLayout(
+            NAME_HOVER_PREVIEW_IMAGE_SIZE,
+            columns=3,
+            max_items=NAME_HOVER_PREVIEW_MAX_ITEMS,
+            popup_width=300,
+        )
 
     def _start_name_hover_preview_job(
         self,
         name: str,
         cache_key: tuple[object, ...],
         generation: int,
+        layout: _NameHoverPreviewLayout,
+        photo_count: int,
     ) -> None:
         service = self._face_service_provider()
         scope_roots = self._scope_roots()
@@ -586,27 +701,49 @@ class NamesPane(QWidget):
             paths = list(self._call_scoped(service.list_named_photo_paths, name, scope_roots=scope_roots) or [])
             if cancel_check():
                 return None
+            preview_paths = paths[:layout.max_items]
             image = ThumbnailService(qimage_cache_size=32).build_contact_sheet_qimage(
-                paths[:NAME_HOVER_PREVIEW_MAX_ITEMS],
-                NAME_HOVER_PREVIEW_IMAGE_SIZE,
-                max_items=NAME_HOVER_PREVIEW_MAX_ITEMS,
-                columns=3,
+                preview_paths,
+                layout.image_size,
+                max_items=layout.max_items,
+                columns=layout.columns,
                 cancel_check=cancel_check,
             )
             if cancel_check():
                 return None
-            return {"generation": generation, "cache_key": cache_key, "image": image}
+            cooccurring_people: tuple[tuple[str, int], ...] = ()
+            cooccurrence_method = getattr(service, "list_named_photo_cooccurrences", None)
+            if callable(cooccurrence_method) and preview_paths:
+                raw_people = self._call_scoped(
+                    cooccurrence_method,
+                    name,
+                    preview_paths,
+                    scope_roots=scope_roots,
+                )
+                normalized_people: list[tuple[str, int]] = []
+                for person in raw_people or ():
+                    if isinstance(person, tuple):
+                        person_name = str(person[0] if person else "")
+                        count = int(person[1] if len(person) > 1 else 0)
+                    else:
+                        person_name = str(getattr(person, "person_name", "") or "")
+                        count = int(getattr(person, "photo_count", 0) or 0)
+                    if person_name:
+                        normalized_people.append((person_name, count))
+                cooccurring_people = tuple(normalized_people)
+            payload = _NameHoverPreviewPayload(image, len(preview_paths), cooccurring_people)
+            return {"generation": generation, "cache_key": cache_key, "preview": payload, "photo_count": photo_count}
 
         job = AsyncJob(_run)
 
         def _completed(payload) -> None:
             if not isinstance(payload, dict) or int(payload.get("generation", -1)) != self._hover_preview_generation:
                 return
-            image = payload.get("image")
-            if not isinstance(image, QImage):
-                image = QImage()
-            self._remember_name_hover_preview(cache_key, image)
-            self._apply_name_hover_preview(image, generation)
+            preview = payload.get("preview")
+            if not isinstance(preview, _NameHoverPreviewPayload):
+                preview = _NameHoverPreviewPayload(QImage(), 0, ())
+            self._remember_name_hover_preview(cache_key, preview)
+            self._apply_name_hover_preview(preview, generation)
 
         def _failed(_message: str) -> None:
             if generation == self._hover_preview_generation:
@@ -619,20 +756,53 @@ class NamesPane(QWidget):
         job.completed.connect(_completed)
         job.failed.connect(_failed)
         job.cancelled.connect(_cancelled)
+        for signal in (job.completed, job.failed, job.cancelled):
+            signal.connect(lambda *_args, job=job: self._coordinated_job_ids.pop(job, None))
         self._hover_preview_job = job
-        thread = start_job_in_thread(job)
-        self._hover_preview_thread = thread
-        thread.finished.connect(lambda thread=thread, job=job: self._on_name_hover_preview_thread_finished(job, thread))
 
-    def _apply_name_hover_preview(self, image: QImage, generation: int) -> None:
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            self._hover_preview_thread = thread
+            thread.finished.connect(
+                lambda thread=thread, job=job: self._on_name_hover_preview_thread_finished(job, thread)
+            )
+
+        if self.work_coordinator is None:
+            _launch()
+            return
+        source_reads = tuple(scope_roots) if scope_roots is not None else ("/",)
+        coordinated_job_id = self.work_coordinator.submit_async_job(
+            JobSpec(
+                "Loading saved-name preview",
+                origin="People",
+                foreground=False,
+                io_bound=True,
+                source_reads=source_reads,
+                data_home_read=True,
+            ),
+            job,
+            _launch,
+        )
+        manager = self.job_manager or self.work_coordinator.job_manager
+        state = manager.get(coordinated_job_id)
+        if state is not None and state.status in {"queued", "running", "cancelling"}:
+            self._coordinated_job_ids[job] = coordinated_job_id
+
+    def _apply_name_hover_preview(self, preview: _NameHoverPreviewPayload, generation: int) -> None:
         if generation != self._hover_preview_generation or not self._hover_name:
             return
-        self._hover_popup.set_preview_image(image if not image.isNull() else None)
+        summary = self._name_summaries.get(self._hover_name)
+        self._hover_popup.set_preview_image(preview.image if not preview.image.isNull() else None)
+        self._hover_popup.set_preview_details(
+            shown_count=preview.shown_count,
+            photo_count=int(getattr(summary, "photo_count", 0) or 0),
+            cooccurring_people=preview.cooccurring_people,
+        )
         self._position_name_hover_preview()
         self._hover_popup.show()
 
-    def _remember_name_hover_preview(self, cache_key: tuple[object, ...], image: QImage) -> None:
-        self._hover_preview_cache[cache_key] = image
+    def _remember_name_hover_preview(self, cache_key: tuple[object, ...], preview: _NameHoverPreviewPayload) -> None:
+        self._hover_preview_cache[cache_key] = preview
         self._hover_preview_cache.move_to_end(cache_key)
         while len(self._hover_preview_cache) > NAME_HOVER_PREVIEW_CACHE_SIZE:
             self._hover_preview_cache.popitem(last=False)
@@ -676,10 +846,7 @@ class NamesPane(QWidget):
                         self._retained_hover_preview_refs.append((job, thread))
                 except Exception:
                     pass
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_operation_job(job)
         self._hover_preview_job = None
         self._hover_preview_thread = None
 
@@ -701,12 +868,7 @@ class NamesPane(QWidget):
         self._selected_name = name
         self._similar_token += 1
         for job in (self._similar_job, self._deep_similar_job):
-            if job is None:
-                continue
-            try:
-                job.cancel()
-            except Exception:
-                pass
+            self._cancel_operation_job(job)
         self._clear_similar_face_results()
         self._show_named_photos()
         self._photos_token += 1
@@ -1062,6 +1224,7 @@ class NamesPane(QWidget):
             _run,
             _done,
             lambda _message: self.status_label.setText("Could not save the selected deep face labels."),
+            source_writes=tuple(dict.fromkeys(path for path, _face_index in refs)),
         )
 
     def _publish_similar_face_results(self, name: str, matches: list[tuple[object, str, QImage]]) -> None:
@@ -1343,36 +1506,75 @@ class NamesPane(QWidget):
             _run,
             _done,
             lambda _message: self.status_label.setText("Could not save the selected face labels."),
+            source_writes=tuple(paths),
         )
 
-    def _start_job(self, slot: str, fn, on_completed, on_failed) -> None:
+    def _coordination_spec(
+        self,
+        slot: str,
+        *,
+        source_writes: tuple[str, ...] = (),
+    ) -> JobSpec:
+        labels = {
+            "refresh": "Loading saved names",
+            "photos": "Loading named photos",
+            "similar": "Finding similar faces",
+            "deep_similar": "Deep name and similar search",
+            "mutation": "Saving face-region names",
+        }
+        scope_roots = self._scope_roots()
+        source_reads = tuple(scope_roots) if scope_roots is not None else ("/",)
+        mutation = str(slot) == "mutation"
+        data_home_write = str(slot) in {"refresh", "mutation"}
+        return JobSpec(
+            labels.get(str(slot), "People workspace work"),
+            origin="People",
+            foreground=str(slot) in {"refresh", "similar", "deep_similar", "mutation"},
+            io_bound=True,
+            source_reads=source_reads if str(slot) in {"similar", "deep_similar"} else (),
+            source_writes=tuple(source_writes) if mutation else (),
+            data_home_read=not data_home_write,
+            data_home_write=data_home_write,
+            model_cache_read=str(slot) == "deep_similar",
+        )
+
+    def _cancel_operation_job(self, job: AsyncJob | None) -> None:
+        if job is None:
+            return
+        coordinated_job_id = self._coordinated_job_ids.get(job)
+        if coordinated_job_id is not None and self.work_coordinator is not None:
+            self.work_coordinator.cancel(coordinated_job_id)
+            return
+        try:
+            job.cancel()
+        except Exception:
+            pass
+
+    def _start_job(
+        self,
+        slot: str,
+        fn,
+        on_completed,
+        on_failed,
+        *,
+        source_writes: tuple[str, ...] = (),
+    ) -> None:
         old_job = getattr(self, f"_{slot}_job", None)
         if old_job is not None:
-            old_job_id = self._operation_job_ids.pop(str(slot), None)
-            if old_job_id is not None and self.job_manager is not None:
-                self.job_manager.finish(old_job_id, status="cancelled")
-            try:
-                old_job.cancel()
-            except Exception:
-                pass
+            self._cancel_operation_job(old_job)
         job = AsyncJob(fn)
         setattr(self, f"_{slot}_job", job)
         job_id: int | None = None
-        if self.job_manager is not None:
-            label = {
-                "refresh": "Loading saved names",
-                "photos": "Loading named photos",
-                "similar": "Finding similar faces",
-                "deep_similar": "Deep name and similar search",
-                "mutation": "Saving face-region names",
-            }.get(str(slot), "Names workspace work")
+        coordinated = self.work_coordinator is not None
+        spec = self._coordination_spec(str(slot), source_writes=source_writes)
+        if self.job_manager is not None and not coordinated:
             job_id = self.job_manager.register_job(
-                label,
+                spec.label,
                 cancel_fn=job.cancel,
-                origin="Names",
-                foreground=str(slot) in {"refresh", "similar", "deep_similar", "mutation"},
+                origin=spec.origin,
+                foreground=spec.foreground,
             )
-            self._operation_job_ids[str(slot)] = job_id
+            self._operation_job_ids[job] = job_id
             job.progress.connect(
                 lambda value, text, job_id=job_id: self.job_manager.update(
                     job_id,
@@ -1384,64 +1586,90 @@ class NamesPane(QWidget):
             lambda value, text, slot=slot: self._set_operation_progress(str(slot), int(value), str(text))
         )
 
-        def _finish_registered_job(status: str, error: str = "") -> None:
-            current_job_id = self._operation_job_ids.pop(str(slot), None)
+        def _finish_registered_job(status: str, error: str = "", *, update_ui: bool) -> None:
+            current_job_id = self._operation_job_ids.pop(job, None)
             if current_job_id is not None and self.job_manager is not None:
                 self.job_manager.finish(current_job_id, status=status, error=error)
-            self._finish_operation_progress(str(slot))
+            self._coordinated_job_ids.pop(job, None)
+            if update_ui:
+                self._finish_operation_progress(str(slot))
 
         if slot == "refresh":
             self.refresh_button.setEnabled(False)
 
         def _complete(result) -> None:
-            if getattr(self, f"_{slot}_job", None) is not job:
+            is_current = getattr(self, f"_{slot}_job", None) is job
+            _finish_registered_job("finished", update_ui=is_current)
+            if not is_current:
                 return
             setattr(self, f"_{slot}_job", None)
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
-            _finish_registered_job("finished")
             on_completed(result)
 
         def _fail(message: str) -> None:
-            if getattr(self, f"_{slot}_job", None) is not job:
+            is_current = getattr(self, f"_{slot}_job", None) is job
+            _finish_registered_job("failed", str(message), update_ui=is_current)
+            if not is_current:
                 return
             setattr(self, f"_{slot}_job", None)
             if slot == "refresh":
                 self.refresh_button.setEnabled(True)
-            _finish_registered_job("failed", str(message))
             on_failed(message)
 
         def _cancel() -> None:
-            if getattr(self, f"_{slot}_job", None) is job:
+            is_current = getattr(self, f"_{slot}_job", None) is job
+            _finish_registered_job("cancelled", update_ui=is_current)
+            if is_current:
                 setattr(self, f"_{slot}_job", None)
                 if slot == "refresh":
                     self.refresh_button.setEnabled(True)
-                _finish_registered_job("cancelled")
 
         job.completed.connect(_complete)
         job.failed.connect(_fail)
         job.cancelled.connect(_cancel)
-        thread = start_job_in_thread(job)
-        setattr(self, f"_{slot}_thread", thread)
-        thread.finished.connect(lambda thread=thread, slot=slot: self._on_thread_finished(slot, thread))
+        def _launch(_use_cpu_fallback: bool = False) -> None:
+            thread = start_job_in_thread(job)
+            setattr(self, f"_{slot}_thread", thread)
+            self._operation_threads.append((job, thread))
+            thread.finished.connect(
+                lambda thread=thread, job=job, slot=slot: self._on_thread_finished(job, slot, thread)
+            )
 
-    def _on_thread_finished(self, slot: str, thread) -> None:
+        if self.work_coordinator is not None:
+            coordinated_job_id = self.work_coordinator.submit_async_job(spec, job, _launch)
+            state = self.job_manager.get(coordinated_job_id) if self.job_manager is not None else None
+            if state is not None and state.status in {"queued", "running", "cancelling"}:
+                self._coordinated_job_ids[job] = coordinated_job_id
+        else:
+            _launch()
+
+    def _on_thread_finished(self, job: AsyncJob, slot: str, thread) -> None:
+        self._operation_threads[:] = [
+            (existing_job, existing_thread)
+            for existing_job, existing_thread in self._operation_threads
+            if existing_thread is not thread
+        ]
         if getattr(self, f"_{slot}_thread", None) is thread:
             setattr(self, f"_{slot}_thread", None)
+        defer_async_job_dispose(job)
 
     def shutdown_jobs(self, *, timeout_ms: int = 2500) -> bool:
         ready = True
         self._hide_name_hover_preview(cancel_preview=True)
         for slot in ("refresh", "photos", "similar", "deep_similar", "mutation"):
             job = getattr(self, f"_{slot}_job", None)
-            thread = getattr(self, f"_{slot}_thread", None)
-            if job is not None:
-                try:
-                    job.cancel()
-                except Exception:
-                    ready = False
-            if thread is not None:
-                ready = wait_for_thread_shutdown(thread, timeout_ms=timeout_ms) and ready
+            self._cancel_operation_job(job)
+        for _job, thread in list(self._operation_threads):
+            ready = wait_for_thread_shutdown(thread, timeout_ms=timeout_ms) and ready
+        if ready:
+            if self.work_coordinator is not None:
+                for coordinated_job_id in tuple(self._coordinated_job_ids.values()):
+                    self.work_coordinator.finish(coordinated_job_id, status="cancelled")
+            for job, _thread in list(self._operation_threads):
+                defer_async_job_dispose(job)
+            self._coordinated_job_ids.clear()
+            self._operation_threads.clear()
         self._refresh_job = None
         self._refresh_thread = None
         self._photos_job = None

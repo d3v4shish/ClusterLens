@@ -1,8 +1,61 @@
 from __future__ import annotations
 
+from statistics import median
+
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QWheelEvent
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QLabel, QScrollArea
+
+from ui.theme import COLORS, VIEWER_BACKDROP_COLORS, get_theme_manager
+
+
+_SRGB_TO_LINEAR = tuple(
+    (channel / 255.0) / 12.92
+    if (channel / 255.0) <= 0.04045
+    else (((channel / 255.0) + 0.055) / 1.055) ** 2.4
+    for channel in range(256)
+)
+
+
+def adaptive_neutral_backdrop(image: QImage | None) -> str | None:
+    """Classify a decoded preview border into a bounded neutral backdrop."""
+
+    if image is None or image.isNull():
+        return None
+    sample = image.scaled(
+        32,
+        32,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    ).convertToFormat(QImage.Format.Format_RGBA8888)
+    border = 4
+    luminances: list[float] = []
+    candidate_count = 0
+    raw = sample.constBits()
+    raw.setsize(sample.sizeInBytes())
+    pixels = memoryview(raw)
+    bytes_per_line = sample.bytesPerLine()
+    for y in range(sample.height()):
+        for x in range(sample.width()):
+            if border <= x < sample.width() - border and border <= y < sample.height() - border:
+                continue
+            candidate_count += 1
+            offset = y * bytes_per_line + x * 4
+            if pixels[offset + 3] < 64:
+                continue
+            luminances.append(
+                0.2126 * _SRGB_TO_LINEAR[pixels[offset]]
+                + 0.7152 * _SRGB_TO_LINEAR[pixels[offset + 1]]
+                + 0.0722 * _SRGB_TO_LINEAR[pixels[offset + 2]]
+            )
+    if len(luminances) < max(8, candidate_count // 4):
+        return None
+    value = float(median(luminances))
+    if value < 0.22:
+        return VIEWER_BACKDROP_COLORS["black"]
+    if value <= 0.72:
+        return VIEWER_BACKDROP_COLORS["middle_gray"]
+    return VIEWER_BACKDROP_COLORS["light_gray"]
 
 
 class ZoomableImageView(QScrollArea):
@@ -24,6 +77,7 @@ class ZoomableImageView(QScrollArea):
         self._face_boxes_normalized = False
         self._selected_face_indexes: set[int] = set()
         self._face_boxes_dirty = False
+        self._face_boxes_visible = True
         self._draw_mode = False
         self._drag_origin: tuple[int, int] | None = None
         self._draft_box: tuple[int, int, int, int] | None = None
@@ -42,6 +96,39 @@ class ZoomableImageView(QScrollArea):
         # "Fit" should be a true fit-to-viewport operation (including scaling up),
         # otherwise small/preview pixmaps can look like thin strips.
         self._fit_scale_up = True
+        manager = get_theme_manager()
+        self._backdrop_mode = manager.viewer_backdrop if manager is not None else "adaptive_neutral"
+        self._adaptive_backdrop: str | None = None
+        if manager is not None:
+            manager.theme_changed.connect(self._theme_changed)
+            manager.viewer_backdrop_changed.connect(self.set_backdrop_mode)
+        self._apply_backdrop()
+
+    def set_backdrop_mode(self, mode: str) -> None:
+        normalized = str(mode).lower()
+        if normalized not in {"adaptive_neutral", "theme", *VIEWER_BACKDROP_COLORS.keys()}:
+            normalized = "adaptive_neutral"
+        self._backdrop_mode = normalized
+        self._apply_backdrop()
+
+    def set_adaptive_backdrop(self, color: str | None) -> None:
+        self._adaptive_backdrop = str(color) if color else None
+        self._apply_backdrop()
+
+    def current_backdrop_color(self) -> str:
+        if self._backdrop_mode == "adaptive_neutral" and self._adaptive_backdrop:
+            return self._adaptive_backdrop
+        if self._backdrop_mode in VIEWER_BACKDROP_COLORS:
+            return VIEWER_BACKDROP_COLORS[self._backdrop_mode]
+        return str(COLORS["viewer_canvas"])
+
+    def _theme_changed(self, *_args) -> None:
+        self._apply_backdrop()
+
+    def _apply_backdrop(self) -> None:
+        color = self.current_backdrop_color()
+        self.viewport().setStyleSheet(f"background-color: {color};")
+        self._label.setStyleSheet(f"background-color: {color};")
 
     def set_fit_scale_up(self, enabled: bool) -> None:
         self._fit_scale_up = bool(enabled)
@@ -80,6 +167,10 @@ class ZoomableImageView(QScrollArea):
         )
         self._face_boxes_normalized = bool(normalized)
         self._face_boxes_dirty = bool(dirty)
+        self._apply_zoom()
+
+    def set_face_boxes_visible(self, visible: bool) -> None:
+        self._face_boxes_visible = bool(visible)
         self._apply_zoom()
 
     def set_selected_face_indexes(self, indexes) -> None:
@@ -436,7 +527,7 @@ class ZoomableImageView(QScrollArea):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        if self._face_boxes:
+        if self._face_boxes and self._face_boxes_visible:
             canvas = QPixmap(scaled)
             painter = QPainter(canvas)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -454,8 +545,10 @@ class ZoomableImageView(QScrollArea):
                     x2 = int(round(float(box[2]) * scale_x))
                     y2 = int(round(float(box[3]) * scale_y))
                 color = QColor("#EF4444") if self._face_boxes_dirty else QColor("#22C55E")
-                pen = QPen(color, 4 if index in self._selected_face_indexes else 2)
-                painter.setPen(pen)
+                width = 4 if index in self._selected_face_indexes else 2
+                painter.setPen(QPen(QColor("#050607"), width + 2))
+                painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
+                painter.setPen(QPen(color, width))
                 painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
                 if index in self._selected_face_indexes:
                     handle_size = 8
@@ -468,18 +561,27 @@ class ZoomableImageView(QScrollArea):
                             handle_size,
                             QColor("#FFFFFF"),
                         )
-                        painter.setPen(QPen(color, 1))
+                        painter.setPen(QPen(QColor("#050607"), 2))
                         painter.drawRect(
                             handle_x - half_handle,
                             handle_y - half_handle,
                             handle_size,
                             handle_size,
                         )
+                        painter.setPen(QPen(color, 1))
+                        painter.drawRect(
+                            handle_x - half_handle + 1,
+                            handle_y - half_handle + 1,
+                            handle_size - 2,
+                            handle_size - 2,
+                        )
             if self._draft_box is not None:
                 x1 = int(round(min(self._draft_box[0], self._draft_box[2]) * scale_x))
                 y1 = int(round(min(self._draft_box[1], self._draft_box[3]) * scale_y))
                 x2 = int(round(max(self._draft_box[0], self._draft_box[2]) * scale_x))
                 y2 = int(round(max(self._draft_box[1], self._draft_box[3]) * scale_y))
+                painter.setPen(QPen(QColor("#050607"), 4, Qt.PenStyle.DashLine))
+                painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
                 painter.setPen(QPen(QColor("#F59E0B"), 2, Qt.PenStyle.DashLine))
                 painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
             painter.end()
@@ -494,6 +596,8 @@ class ZoomableImageView(QScrollArea):
             y1 = int(round(min(self._draft_box[1], self._draft_box[3]) * scale_y))
             x2 = int(round(max(self._draft_box[0], self._draft_box[2]) * scale_x))
             y2 = int(round(max(self._draft_box[1], self._draft_box[3]) * scale_y))
+            painter.setPen(QPen(QColor("#050607"), 4, Qt.PenStyle.DashLine))
+            painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
             painter.setPen(QPen(QColor("#F59E0B"), 2, Qt.PenStyle.DashLine))
             painter.drawRect(x1, y1, max(2, x2 - x1), max(2, y2 - y1))
             painter.end()
